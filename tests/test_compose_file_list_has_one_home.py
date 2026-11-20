@@ -43,7 +43,8 @@ NOT_THIS_INSTALL = {"test-rotation-rehearsal.sh"}
 # reverse source would be circular), and every caller of those helpers is
 # held to building that list from lib-compose first by
 # test_callers_of_the_addon_stop_helpers_build_the_list_first below.
-CALLERS_LIST = {"lib-bind-sources.sh", "lib-addons.sh"}
+# lib-start-inputs.sh fingerprints the config the launcher's next `up` renders.
+CALLERS_LIST = {"lib-bind-sources.sh", "lib-addons.sh", "lib-start-inputs.sh"}
 ADDON_STOP_HELPERS = ("addons_stop_disabled", "addon_own_services")
 
 # A `docker compose … -f <literal docker-compose.*.yml>` on a live line.

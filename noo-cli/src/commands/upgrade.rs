@@ -1831,6 +1831,11 @@ fn launch_stack(g: &Globals, roll: &Roll, staging: crate::commands::image_stage:
         let mut c = std::process::Command::new("bash");
         c.arg(root.join("scripts/noomesh-start.sh")).arg("--dist")
             .env("NOO_IMAGE_TAG", tag)
+            // A roll recreates every container (new images, new config,
+            // files replaced under their bind mounts). The env form, not
+            // `--recreate`: an older launcher ignores an unknown variable
+            // where it would read the flag as a service name.
+            .env("NOO_START_RECREATE", "1")
             .env("NOO_STUCK_REPORT", &stuck_report)
             .env("NOO_CLI_BIN", &cli_bin)
             .current_dir(root);
@@ -8042,6 +8047,25 @@ mod stage_before_launch_tests {
         let join = up.find(".finish_before_launch(g);").expect("and joins them");
         let launch = up.find("launch_stack(g, &roll, staging, stops)").expect("then launches");
         assert!(start < join && join < launch, "staging is finished before launch_stack");
+    }
+}
+
+#[cfg(test)]
+mod roll_recreates_tests {
+    /// A plain `noo stack start` recreates only the containers whose config
+    /// or secret / config file contents changed (scripts/lib-start-inputs.sh).
+    /// A roll replaces images and files under their bind mounts, so it still
+    /// asks the launcher to recreate every container: the env form, which an
+    /// older launcher ignores where it would read `--recreate` as a service.
+    #[test]
+    fn the_roll_asks_the_launcher_to_recreate_every_container() {
+        let src = crate::test_src::own_code(include_str!("upgrade.rs"));
+        let launch = crate::test_src::fn_body(&src, "fn launch_stack(");
+        let call = launch.find(".arg(root.join(\"scripts/noomesh-start.sh\"))").expect("the launcher call");
+        let builder = &launch[call..];
+        let end = builder.find(".current_dir(root)").expect("the launcher builder");
+        assert!(builder[..end].contains(".env(\"NOO_START_RECREATE\", \"1\")"), "{}", &builder[..end]);
+        assert!(!builder[..end].contains("\"--recreate\""));
     }
 }
 

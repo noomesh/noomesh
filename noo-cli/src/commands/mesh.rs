@@ -665,10 +665,30 @@ pub(crate) fn front_addon_uis(g: &Globals) {
     }
 }
 
-/// `noo stack start [--profile P] [--pull] [--build]` → scripts/noomesh-start.sh
+/// `noo stack start [--profile P] [--pull] [--build] [--recreate]` → scripts/noomesh-start.sh
+///
+/// A plain start recreates only the containers whose compose config or
+/// secret/config file contents changed (scripts/lib-start-inputs.sh);
+/// `--recreate` recreates every one.
 pub fn mesh_start(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
+    let script_args = start_script_args(args)?;
+    let rc = run_script(g, "noomesh-start.sh", &script_args, Some("start"));
+    // The launcher's banner shows the bound IP; the address an operator
+    // actually shares is the tailnet name, which the shell can't read
+    // without jq. Say it here, where tailscale's JSON is easy.
+    if rc == 0 && !g.json {
+        crate::tailnet_serve::print_front_door(8080 + crate::envfile::port_offset(), &crate::envfile::instance());
+    }
+    if rc == 0 {
+        front_addon_uis(g);
+    }
+    Ok(rc)
+}
+
+/// `noo stack start`'s words → the launcher's arguments.
+fn start_script_args(args: &[String]) -> Result<Vec<String>, Unhandled> {
     let mut profile: Option<String> = None;
-    let (mut pull, mut build, mut dist, mut dev) = (false, false, false, false);
+    let (mut pull, mut build, mut dist, mut dev, mut recreate) = (false, false, false, false, false);
     let mut tag: Option<String> = None;
     let mut iter = args.iter();
     while let Some(tok) = iter.next() {
@@ -681,6 +701,7 @@ pub fn mesh_start(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             // `noo stack start --dist --tag vX` at all (host8, 2026-08-31).
             "--dist" => dist = true,
             "--dev" => dev = true,
+            "--recreate" => recreate = true,
             "--tag" => tag = Some(iter.next().ok_or(Unhandled)?.clone()),
             t if t.starts_with("--tag=") => tag = Some(t["--tag=".len()..].to_string()),
             _ => return Err(Unhandled),
@@ -705,17 +726,29 @@ pub fn mesh_start(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     if let Some(t) = tag {
         script_args.extend(["--tag".into(), t]);
     }
-    let rc = run_script(g, "noomesh-start.sh", &script_args, Some("start"));
-    // The launcher's banner shows the bound IP; the address an operator
-    // actually shares is the tailnet name, which the shell can't read
-    // without jq. Say it here, where tailscale's JSON is easy.
-    if rc == 0 && !g.json {
-        crate::tailnet_serve::print_front_door(8080 + crate::envfile::port_offset(), &crate::envfile::instance());
+    if recreate {
+        script_args.push("--recreate".into());
     }
-    if rc == 0 {
-        front_addon_uis(g);
+    Ok(script_args)
+}
+
+#[cfg(test)]
+mod start_args_tests {
+    use super::start_script_args;
+
+    fn a(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
     }
-    Ok(rc)
+
+    /// A plain start recreates only what changed (scripts/lib-start-inputs.sh);
+    /// `--recreate` reaches the launcher, which then recreates every container.
+    #[test]
+    fn recreate_reaches_the_launcher_and_a_plain_start_does_not_pass_it() {
+        assert_eq!(start_script_args(&[]).unwrap(), Vec::<String>::new());
+        assert_eq!(start_script_args(&a(&["--recreate"])).unwrap(), a(&["--recreate"]));
+        assert_eq!(start_script_args(&a(&["--dist", "--recreate", "--tag", "v1"])).unwrap(), a(&["--dist", "--tag", "v1", "--recreate"]));
+        assert!(start_script_args(&a(&["--force-recreate"])).is_err());
+    }
 }
 
 /// `noo stack stop [--volumes]` → scripts/noomesh-stop.sh

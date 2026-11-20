@@ -193,7 +193,7 @@ def test_a_named_restart_refuses_before_anything_runs():
 
 def test_start_removes_lean_leftovers_after_the_up():
     src = (SCRIPTS / "noomesh-start.sh").read_text()
-    up = src.index("noo_compose_up_isolating_stuck compose $COMPOSE_FILES $PROFILE_ARGS up -d --force-recreate")
+    up = src.index("noo_compose_up_isolating_stuck compose $COMPOSE_FILES $PROFILE_ARGS up -d $START_UP_FORCE")
     assert up < src.index('monitoring_remove_when_lean "$ACTIVE_SVCS"')
     # The monitoring profile is in PROFILE_ARGS before the active set is read.
     assert src.index('_mon_profile="$(monitoring_profile_args)"') < src.index("compose_active_services $COMPOSE_FILES $PROFILE_ARGS")

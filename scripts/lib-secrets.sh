@@ -656,6 +656,13 @@ write_secret_files() {
     done <<EOF
 $plan
 EOF
+    # The start's change detection (lib-start-inputs.sh) needs each secret's
+    # KEYED digest, and after the chown below the files are the containers'
+    # to read, not ours: take it now, from our own temp copies.
+    if declare -F start_inputs_secret_digests >/dev/null; then
+        # shellcheck disable=SC2046  # NAME=TMPNAME pairs, one word each
+        start_inputs_secret_digests "$d" $(printf '%s\n' "$plan" | awk -v p=".$$." 'NF { print $1 "=" p $1 }')
+    fi
     if ! _secret_chown_files "$d" "$manifest"; then
         _secret_tmp_cleanup "$d"
         echo "ERROR: could not hand the secret files under $d to their containers' uids." >&2
