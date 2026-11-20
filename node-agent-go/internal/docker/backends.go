@@ -1041,7 +1041,7 @@ func (c *Client) StartBackendSDK(ctx context.Context, backend, model string, gpu
 
 	// Build command: resolved against the container env just built, so a
 	// ${VAR} in it follows the placement (TEI's --model-id ${MODEL_ID}).
-	cmd := resolveCommand(spec.Command, env)
+	cmd := resolveCommand(spec.Command, nil)
 	entrypoint := spec.Entrypoint
 
 	// Container config
