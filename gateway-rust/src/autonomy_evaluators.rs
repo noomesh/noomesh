@@ -2060,7 +2060,7 @@ pub async fn eval_cert_auto_rotate(
     const WARN_DAYS: i64 = 30;
     const NEW_CERT_DAYS: i64 = 90;
 
-    let expiring = certs_expiring_within(WARN_DAYS).await;
+    let expiring = certs_expiring_in(std::path::Path::new(crate::tls::STAGED_PKI_DIR), crate::tls::PkiMount { staged: std::path::Path::new("/nonexistent"), live: std::path::Path::new(crate::tls::LIVE_PKI_MOUNT) }, WARN_DAYS).await;
     let count = expiring.len();
     if count == 0 {
         return Ok(false);
