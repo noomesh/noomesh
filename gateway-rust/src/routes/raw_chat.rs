@@ -182,7 +182,7 @@ impl RawChatError {
         if self.status != StatusCode::NOT_FOUND || self.kind != MODEL_NOT_FOUND || self.public.is_some() {
             return self;
         }
-        if let Some(name) = requested.map(public_model_name).filter(|n| !n.is_empty()) {
+        if let Some(name) = None::<&str>.map(public_model_name).filter(|n| !n.is_empty()) {
             self.public = Some(format!(
                 "model '{name}' is not served: no model, class or alias by that name. \
                  GET /v1/models lists what is served (an operator: {SERVED_MODELS_CMD})"
