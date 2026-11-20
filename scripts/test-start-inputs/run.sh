@@ -102,19 +102,27 @@ a1="$(ids)"
 expect 1 "" "$b1" "$a1" "start, then start again"
 grep -q "4 running, 0 recreated" "$WORK/out" || fail 1 "the start did not say \"4 running, 0 recreated\""
 
-# 2. a's secret CONTENT changes (same size, same mtime). The plain dependent
-#    c and b keep their containers: compose recreates a service for ITS
-#    inputs, not for a dependency's (this job is the judge of that).
-# 8. ...and the secret's readers, a and d, are recreated: exactly those.
+# 2. a's secret CONTENT changes (same size, same mtime). b never moves: its
+#    inputs did not change. c (depends on a, mounts no secret) is recreated
+#    for ITS inputs only on newer compose; older compose (2.24.x, the
+#    oldest the documented route installs) also recreates a recreated
+#    service's dependents. Both are compose's own rule, so the job records
+#    which this compose does instead of asserting one (first run 2026-11-20:
+#    the runner's compose kept c, v2.24.6 recreated it).
+# 8. ...and the secret's readers, a and d, are recreated, every time.
 same_size_edit secrets/a.txt 'alpha-secret-0002'
 start || fail 2 "the start failed"
 a2="$(ids)"
 got2=" $(moved "$a1" "$a2") "
 case "$got2" in
-    *" c "*|*" b "*) fail 2 "a's secret changed: the plain dependent c and b must stay, recreated [${got2# }]" ;;
-    *) pass 2 "a's secret changed: c (depends on a, no secret) and b kept their containers" ;;
+    *" b "*) fail 2 "a's secret changed: b (inputs unchanged, no dependency) must stay, recreated [${got2# }]" ;;
+    *" c "*) pass 2 "a's secret changed: b kept its container; this compose also recreated c, a's dependent (older compose behaviour)" ;;
+    *) pass 2 "a's secret changed: b and c (a's dependent, no secret) kept their containers" ;;
 esac
-expect 8 "a d" "$a1" "$a2" "a shared secret changed: exactly its readers"
+case "$got2" in *" a "*) r_a=1 ;; *) r_a=0 ;; esac
+case "$got2" in *" d "*) r_d=1 ;; *) r_d=0 ;; esac
+if [ "$r_a$r_d" = 11 ]; then pass 8 "a shared secret changed: both its readers (a, d) recreated: [${got2# }]"
+else fail 8 "a shared secret changed: both its readers (a and d) must be recreated, got [${got2# }]"; fi
 grep -q "recreated a: its inputs changed (config secrets/a.txt)" "$WORK/out" \
     && grep -q "recreated d: its inputs changed (config secrets/a.txt)" "$WORK/out" \
     || fail 8 "the start did not name the changed secret file for both readers"
