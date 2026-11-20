@@ -4313,7 +4313,7 @@ async fn api_kb_teams_create(
     ctx: Option<Extension<RequesterCtx>>,
     Json(body): Json<Value>,
 ) -> AppResult {
-    crate::person_gate::require_person(&state.db, ctx.as_deref(), "creating a team").await?;
+
     let raw_name = body_str(&body, "name");
     let trimmed = raw_name.trim();
     let name = trimmed.strip_prefix("team:").unwrap_or(trimmed).to_string();
