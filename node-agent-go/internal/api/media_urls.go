@@ -54,7 +54,7 @@ func remoteInItem(raw json.RawMessage) (string, bool) {
 		// The object named by the part's type (file: {url}) and an Anthropic
 		// source carry the URL inside; their string form is not a URL
 		// (text: "...").
-		objectField := k == "source" || (typ != "" && k == typ)
+		objectField := false
 		if !urlField && !objectField {
 			continue
 		}
