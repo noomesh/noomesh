@@ -29,7 +29,7 @@
 //! decides what "ready" means.
 
 use crate::http::get_json_opt;
-use crate::output::ExitCode;
+use crate::output::{next_cmd, ExitCode};
 use crate::ui::{self, Col, Glyph};
 use crate::{Globals, Unhandled};
 use serde_json::Value;
@@ -8333,14 +8333,15 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             // NATS KV past this 10 s bound).
             let bus = unanswered_nodes_rows(health_body(g).as_ref());
             if g.json {
-                println!("{}", serde_json::json!({ "ok": false, "error": "gateway unreachable", "controller": { "ok": false, "checks": checks_json(&bus) } }));
+                println!("{}", serde_json::json!({ "ok": false, "error": "gateway unreachable", "controller": { "ok": false, "checks": checks_json(&bus) },
+                    "next": GATEWAY_UNREACHABLE_NEXT.iter().map(|(c, _)| next_cmd(c, &[])).collect::<Vec<_>>() }));
             } else {
                 if !bus.is_empty() {
                     render("controller", &bus, true);
                 }
                 let after = waited_for_gateway.map(|s| format!(" after waiting {s}s")).unwrap_or_default();
                 println!("{}", ui::status_line(Glyph::Err, &format!("the gateway did not answer /api/cluster/nodes{after} — nothing can be verified")));
-                ui::guide(&[("noo health", "is the controller up"), ("noo stack status", "which container is not")]);
+                ui::guide(GATEWAY_UNREACHABLE_NEXT);
             }
             return Ok(1);
         };
@@ -8359,9 +8360,12 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         let tag = if here == Vantage::Controller { controller_stack_tag() } else { stack_tag_from_gateway(&body) };
         let now = now_unix();
         let roll = crate::commands::upgrade::last_roll();
-        if !g.json {
+        // The tally closes the text and fills `summary` under --json alike.
+        tally.context = format!(" — {} node(s) on {tag}", selected.len());
+        if g.json {
+            json_out.insert("stack_tag".into(), Value::String(tag.clone()));
+        } else {
             println!("{}", ui::header("cluster verify", Some(&format!("{} node(s) · controller {tag}", selected.len()))));
-            tally.context = format!(" — {} node(s) on {tag}", selected.len());
         }
         let mut node_json = Vec::new();
         // Each node's gateway reads (desired config, door pins, the bus and
@@ -8383,6 +8387,7 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             all_ok &= node_ok;
             if g.json {
                 node_json.push(serde_json::json!({ "node": id, "ok": node_ok, "checks": checks_json(&checks) }));
+                tally.add(&format!("node {id}"), &checks);
             } else {
                 sections.push((id.to_string(), checks));
             }
@@ -8434,13 +8439,14 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                 all_ok &= seat_ok;
                 if g.json {
                     seat_json.push(serde_json::json!({ "seat": name, "ok": seat_ok, "checks": checks_json(&checks) }));
+                    tally.add(&format!("seat {name}"), &checks);
                 } else {
                     let title = format!("seat {name}");
                     show(&title, &checks, g.verbose, brief, &[]);
                     tally.add(&title, &checks);
                 }
             }
-            json_out.insert("seats".into(), Value::Array(seat_json));
+            json_out.insert("seats".into(), seats_json(listed.is_some(), seat_json));
             laps.push(("seats".into(), seats_from.elapsed()));
         }
     }
@@ -9017,6 +9023,7 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             let mut cj = checks_json(&checks);
             with_warmup_json(&mut cj, "loki", loki_seen.as_ref());
             json_out.insert("controller".into(), serde_json::json!({ "ok": c_ok, "checks": cj }));
+            tally.add("controller", &checks);
         } else {
             if !want_nodes {
                 println!("{}", ui::header("cluster verify", Some("controller")));
@@ -9032,8 +9039,7 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         render_timings(&laps, started.elapsed());
     }
     if g.json {
-        json_out.insert("ok".into(), Value::Bool(all_ok));
-        json_out.insert("starting".into(), Value::Bool(any_starting));
+        json_verdict(&mut json_out, all_ok, any_starting, &tally);
         println!("{}", Value::Object(json_out));
     } else if !g.verbose {
         // The digest closes on one verdict, then the way to every row.
@@ -9621,7 +9627,42 @@ fn checks_json(checks: &[Check]) -> Value {
         "verdict": match c.verdict { Verdict::Ok => "ok", Verdict::Warn => "warn", Verdict::Fail => "fail", Verdict::Starting => "starting", Verdict::Accepted => "accepted" },
         "detail": c.detail,
         "remedy": c.remedy,
+        "tier": tier_json(brief_tier(c)),
     })).collect())
+}
+
+/// A row's brief tier as `--json` names it: where the onboard brief groups a
+/// WARN ("later": worth doing later; "not_here": says nothing on this box),
+/// null for a row shown in full. Pure.
+fn tier_json(t: Option<Tier>) -> Option<&'static str> {
+    match t {
+        Some(Tier::Later) => Some("later"),
+        Some(Tier::NotHere) => Some("not_here"),
+        None => None,
+    }
+}
+
+/// What a verify that could not read the node list suggests, in the text
+/// guide and as `next` under --json.
+const GATEWAY_UNREACHABLE_NEXT: &[(&str, &str)] = &[("noo health", "is the controller up"), ("noo stack status", "which container is not")];
+
+/// The `seats` field of --json: the seats judged, `[]` when the registry has
+/// none, null when the gateway did not answer the list (unknown, not none).
+/// Pure.
+fn seats_json(listed: bool, seats: Vec<Value>) -> Value {
+    if listed { Value::Array(seats) } else { Value::Null }
+}
+
+/// The closing fields of --json: the verdict, `summary` (the same line the
+/// text closes on), `next` (the re-run while a row is still starting, else
+/// `[]`) and `stack_tag` (null when no node list was read). Pure.
+fn json_verdict(out: &mut serde_json::Map<String, Value>, all_ok: bool, any_starting: bool, tally: &Tally) {
+    out.insert("ok".into(), Value::Bool(all_ok));
+    out.insert("starting".into(), Value::Bool(any_starting));
+    out.insert("summary".into(), Value::String(verdict_line(tally).1));
+    let next: Vec<Value> = if any_starting { vec![next_cmd("noo cluster verify --wait", &[])] } else { Vec::new() };
+    out.insert("next".into(), Value::Array(next));
+    out.entry("stack_tag").or_insert(Value::Null);
 }
 
 /// Attach a warm-up row's `[judged …]` fields as `warmup` on its object in
@@ -17289,5 +17330,68 @@ mod agent_cert_tests {
         assert_eq!(row.verdict, Verdict::Warn);
         assert!(row.detail.contains("node-b: cannot be checked") && row.detail.contains("(192.0.2.41)"), "{}", row.detail);
         assert!(row.remedy.as_deref().unwrap().contains("noo security pki status"));
+    }
+}
+
+#[cfg(test)]
+mod json_parity_tests {
+    use super::*;
+
+    /// --json names each row's brief tier as the onboard brief groups it:
+    /// "later", "not_here", or null for a row shown in full.
+    #[test]
+    fn json_rows_carry_the_brief_tier() {
+        let rows = checks_json(&[
+            warn("last backup", "none yet", None),
+            warn("tailnet policy", "not read: no API key", None),
+            warn("tailnet policy", "port 22 open to all", None),
+            fail("last backup", "x", "noo backup run"),
+            ok("bus", "ok"),
+        ]);
+        assert_eq!(rows[0]["tier"], "later");
+        assert_eq!(rows[1]["tier"], "not_here");
+        assert!(rows[2]["tier"].is_null(), "a policy read and wrong is shown in full");
+        assert!(rows[3]["tier"].is_null(), "a FAIL is never tiered");
+        assert!(rows[4]["tier"].is_null());
+    }
+
+    /// --json `summary` is the very line the text closes on; `next` is the
+    /// re-run only while a row is still starting; no node list = null tag.
+    #[test]
+    fn json_summary_is_the_verdict_line_and_next_follows_starting() {
+        let mut t = Tally { context: " — 1 node(s) on v0.6.13".into(), ..Tally::default() };
+        t.add("node a", &[fail("bus", "x", "noo fix")]);
+        let mut out = serde_json::Map::new();
+        json_verdict(&mut out, false, false, &t);
+        assert_eq!(out["summary"], verdict_line(&t).1.as_str());
+        assert_eq!(out["summary"], "1 problem needs you: bus (node a)");
+        assert_eq!(out["next"], serde_json::json!([]));
+        assert!(out["stack_tag"].is_null());
+        assert_eq!(out["ok"], false);
+        let mut t = Tally::default();
+        t.add("controller", &[Check { name: "loki", verdict: Verdict::Starting, detail: "starting".into(), remedy: None }]);
+        let mut out = serde_json::Map::new();
+        out.insert("stack_tag".into(), "v0.6.13".into());
+        json_verdict(&mut out, false, true, &t);
+        assert_eq!(out["summary"], verdict_line(&t).1.as_str());
+        assert_eq!(out["next"], serde_json::json!([{ "kind": "command", "command": "noo cluster verify --wait" }]));
+        assert_eq!(out["starting"], true);
+        assert_eq!(out["stack_tag"], "v0.6.13", "a tag read stays");
+    }
+
+    /// A verify that could not read the node list names the same two steps
+    /// as the text guide.
+    #[test]
+    fn unreachable_next_is_the_text_guide() {
+        let cmds: Vec<&str> = GATEWAY_UNREACHABLE_NEXT.iter().map(|(c, _)| *c).collect();
+        assert_eq!(cmds, ["noo health", "noo stack status"]);
+    }
+
+    /// `seats: []` is "none enrolled"; null is "the gateway did not say".
+    #[test]
+    fn json_seats_unknown_is_null_not_empty() {
+        assert!(seats_json(false, Vec::new()).is_null());
+        assert_eq!(seats_json(true, Vec::new()), serde_json::json!([]));
+        assert_eq!(seats_json(true, vec![serde_json::json!({"seat": "s"})]).as_array().map(Vec::len), Some(1));
     }
 }

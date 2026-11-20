@@ -722,7 +722,7 @@ pub fn offboard(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         ui::guide(&[
             ("noo offboard --check", "confirms nothing is left"),
             ("noo onboard", "set this machine up again"),
-            ("noo enroll <controller-url>", "or join it to another controller as a worker"),
+            ("noo enroll noo1.<blob>", "or join another fleet: paste the line `noo cluster bootstrap-token create --node <name>` prints on its controller"),
         ]);
     }
     Ok(0)

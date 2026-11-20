@@ -217,12 +217,18 @@ class PaiMintBootstrapToken(ToolDef):
 
     def format_response(self, data: Any) -> str:
         if isinstance(data, dict) and data.get("enroll_command"):
-            return (f"Bootstrap token minted for {data.get('node_name')} "
-                    f"(single-use, expires {data.get('expires_at')}).\n"
-                    f"Send these to the machine's owner, to run on that machine as their user:\n\n"
-                    f"1. {data.get('install_command', '')}\n"
-                    f"2. {data['enroll_command']}\n\n"
-                    f"Then on the controller: {data.get('provision_command', '')}")
+            # `run_on` / `needs_human` come from the gateway (one string for
+            # the CLI's paste and this door); an older gateway sends neither.
+            run_on = data.get("run_on") or "that machine as their user"
+            out = (f"Bootstrap token minted for {data.get('node_name')} "
+                   f"(single-use, expires {data.get('expires_at')}).\n"
+                   f"Send these to the machine's owner, to run on {run_on}:\n\n"
+                   f"1. {data.get('install_command', '')}\n"
+                   f"2. {data['enroll_command']}\n\n"
+                   f"Then on the controller: {data.get('provision_command', '')}")
+            if data.get("needs_human"):
+                out += f"\n\nNeeds a person: {data['needs_human']}"
+            return out
         return str(data)
 
 

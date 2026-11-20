@@ -2152,7 +2152,9 @@ pub fn secrets_setup(ctx: &mut Ctx) -> bool {
         // in, the operator replaces it — the new value is shown once, from a
         // terminal, and nothing that was never shown is ever read back out.
         ctx.warn("Admin password auto-generated and stored encrypted — never printed. To log in, set a new one from a terminal you are sitting at:");
-        ctx.raw("    noo security admin-password reset");
+        for line in CI_ADMIN_RESET_LINES {
+            ctx.raw(line);
+        }
         ("admin".to_string(), Some(pw))
     } else {
         let user = ctx.asker.ask(&Prompt::new("Admin username").default("admin"));
@@ -11161,6 +11163,28 @@ mod monitoring_choice_tests {
         assert!(body.contains("\"Install dashboards, log search and request traces (Grafana, Loki, Tempo; about 250 MiB idle)?\", default_full"), "{body}");
         let usage = crate::usage::USAGE.iter().find(|(w, _, _)| *w == ["onboard"]).expect("onboard usage").1;
         assert!(usage.contains("[--monitoring-full|--no-monitoring-full]"), "{usage}");
+    }
+}
+
+/// How a `--ci` install's admin logs in: replace the never-shown password.
+/// At a terminal, plain; from a script or agent (no terminal), `--stdout`
+/// lets the new value go to the pipe once and `--yes` skips the prompt.
+const CI_ADMIN_RESET_LINES: &[&str] = &[
+    "    noo security admin-password reset",
+    "    noo security admin-password reset --stdout --yes   # from a script or agent: prints the new one once",
+];
+
+#[cfg(test)]
+mod ci_admin_reset_tests {
+    /// Both forms are ones `admin-password reset` parses: plain, and the
+    /// agent form with `--stdout --yes`.
+    #[test]
+    fn ci_admin_reset_names_the_agent_form() {
+        let lines = super::CI_ADMIN_RESET_LINES;
+        assert_eq!(lines[0].trim(), "noo security admin-password reset");
+        assert!(lines[1].trim().starts_with("noo security admin-password reset --stdout --yes"), "{}", lines[1]);
+        let args: Vec<String> = ["--stdout", "--yes"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(crate::commands::security::parse_admin_password_reset(&args).ok(), Some((true, true)));
     }
 }
 

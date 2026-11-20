@@ -303,6 +303,32 @@ fn compose_enroll_command(url: &str, token: &str, tsk: &str, ca_sha256: &str, no
     )
 }
 
+/// Where the enrollment paste runs (`run_on` on the mint answer).
+const PASTE_RUN_ON: &str = "the new machine, as its own user";
+
+/// What a person must do during the paste (`needs_human`): the one string
+/// the CLI prints and an agent reads.
+const PASTE_NEEDS_HUMAN: &str =
+    "the enroll command runs sudo; a person types the password unless that machine has passwordless sudo";
+
+/// One `next` step: `{"kind": "command", "command": "<one shell line>"}`,
+/// with `"nodes"` only when the command targets named nodes. The CLI's
+/// `output::next_cmd` builds the same shape. Pure.
+pub(crate) fn next_cmd(cmd: &str, nodes: &[&str]) -> Value {
+    let mut o = json!({ "kind": "command", "command": cmd });
+    if !nodes.is_empty() {
+        o["nodes"] = json!(nodes);
+    }
+    o
+}
+
+/// The mint answer's `next`: install, enroll, provision, in the order they
+/// run; provision names the bound node when there is one. Pure.
+fn paste_next(install: &str, enroll: &str, provision: &str, node: Option<&str>) -> Value {
+    let nodes: Vec<&str> = node.into_iter().collect();
+    json!([next_cmd(install, &[]), next_cmd(enroll, &[]), next_cmd(provision, &nodes)])
+}
+
 /// Where the cluster CA certificate lives, in the order `/bootstrap/ca.crt`
 /// serves it: the env override, the compose mount (`${NOO_PKI_DIR}:/app/pki`),
 /// the repo-relative dev path. ONE list, because the pin in the paste must be
@@ -539,6 +565,11 @@ async fn bootstrap_token_create(
     )
     .await;
 
+    let install_command = compose_install_command(&cli_install_repo());
+    let enroll_command = compose_enroll_command(&gateway, &raw, &tsk, &ca_sha256, node_name.as_deref());
+    let provision_command = format!("noo cluster provision {} --wait", node_name.as_deref().unwrap_or("<node>"));
+    let next = paste_next(&install_command, &enroll_command, &provision_command, node_name.as_deref());
+
     Ok(Json(json!({
         "status": "ok",
         "id": id.to_string(),
@@ -551,9 +582,15 @@ async fn bootstrap_token_create(
         // `noo enroll`. The fetched-script `one_liner` that used to ride
         // here is retired; an older CLI falls back to composing
         // the paste itself when these are absent.
-        "install_command": compose_install_command(&cli_install_repo()),
-        "enroll_command": compose_enroll_command(&gateway, &raw, &tsk, &ca_sha256, node_name.as_deref()),
-        "provision_command": format!("noo cluster provision {} --wait", node_name.as_deref().unwrap_or("<node>")),
+        "install_command": install_command,
+        "enroll_command": enroll_command,
+        "provision_command": provision_command,
+        // For an agent handing the paste on: where it runs, what a person
+        // must do (the CLI prints `needs_human` as its own line), and the
+        // three commands in the order they run.
+        "run_on": PASTE_RUN_ON,
+        "needs_human": PASTE_NEEDS_HUMAN,
+        "next": next,
         "joins_tailnet": !tsk.is_empty(),
         // Stale records under this name that were removed so the node keeps
         // its name (last seen > 10 min ago); `tailnet_clear_error` when the
@@ -1831,6 +1868,27 @@ async fn serve_prep_script() -> impl IntoResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The mint answer tells an agent where the paste runs, what a person
+    /// must do, and the three commands in order (provision names the node).
+    #[test]
+    fn the_mint_answer_carries_run_on_needs_human_and_next() {
+        assert_eq!(PASTE_RUN_ON, "the new machine, as its own user");
+        assert!(PASTE_NEEDS_HUMAN.contains("runs sudo") && PASTE_NEEDS_HUMAN.contains("passwordless sudo"));
+        let next = paste_next("i", "e", "noo cluster provision node_a --wait", Some("node_a"));
+        assert_eq!(next, json!([
+            { "kind": "command", "command": "i" },
+            { "kind": "command", "command": "e" },
+            { "kind": "command", "command": "noo cluster provision node_a --wait", "nodes": ["node_a"] }
+        ]));
+        let next = paste_next("i", "e", "p", None);
+        assert!(next[2].get("nodes").is_none());
+        let own = crate::test_src::own_code(include_str!("bootstrap.rs"));
+        let create = crate::test_src::fn_body(&own, "async fn bootstrap_token_create(");
+        for field in ["\"run_on\": PASTE_RUN_ON", "\"needs_human\": PASTE_NEEDS_HUMAN", "\"next\": next"] {
+            assert!(create.contains(field), "the mint answer lost {field}");
+        }
+    }
 
     /// Redemption refuses a token whose expiry is not ahead of the current
     /// time: a fixed time, or `<`, would let an expired (or just-expired)

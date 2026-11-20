@@ -453,7 +453,9 @@ whatever it is called here. Warn only when the evidence is absent.
 
 - `--json`: stdout carries exactly one JSON value, no styling; stderr
   carries nothing on success and one `{"error","code","hint"}` object on
-  failure.
+  failure. The value is the gateway's body plus what the text tells a
+  person: `next` (an array of `output::next_cmd` objects), `warnings`,
+  `summary`. Guidance printed in text mode has a field in `--json`.
 - `--quiet`: stdout carries only the captured value(s), one per line, no
   styling; stderr carries errors only. Commands with no captured value
   print nothing. Exit codes unchanged.
