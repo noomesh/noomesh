@@ -89,7 +89,7 @@ helper_argv() {  # JOB ENTRYPOINT MOUNT
     local job="$1" ep="$2" mount="$3" image cap caps
     image="$(_helper_image)" || return 1
     caps="$(helper_job_caps "$job")" || return 1
-    HELPER_ARGV=(run --rm --pull never --network none --read-only --cap-drop ALL)
+    HELPER_ARGV=(run --rm --network none --read-only --cap-drop ALL)
     for cap in $caps; do HELPER_ARGV+=(--cap-add "$cap"); done
     HELPER_ARGV+=(--security-opt no-new-privileges --entrypoint "$ep" -v "$mount" "$image")
 }
