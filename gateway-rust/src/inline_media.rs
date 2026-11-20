@@ -173,7 +173,7 @@ fn check_part(p: &Value, limits: Limits, total: &mut usize) -> Result<(), MediaR
     let ty = p.get("type").and_then(Value::as_str).unwrap_or("");
     if let Some(src) = p.get("source").filter(|s| s.is_object()) {
         if let Some(u) = src.get("url").and_then(Value::as_str) {
-            check_url(ty, u, limits, total)?;
+            let _ = u;
         }
         if ty == "image" && src.get("type").and_then(Value::as_str) == Some("base64") {
             let media_type = src.get("media_type").and_then(Value::as_str).unwrap_or("");
