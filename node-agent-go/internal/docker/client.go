@@ -829,10 +829,12 @@ func (c *Client) RunningBackends(ctx context.Context) (map[string]string, error)
 			backends["ollama"] = model
 
 		case "embedding":
-			model := envMap["MODEL_ID"]
-			if model == "" {
-				model = findArgValue(cmdArgs, "--model-id")
-			}
+			// TEI's --model-id beats its MODEL_ID env: the flag is the
+			// model that runs. An agent before the fix passed the node
+			// default there while MODEL_ID named the placed model; read
+			// back MODEL_ID-first, such a container looked converged and
+			// was never recreated.
+			model := teiModelOf(envMap, cmdArgs)
 			if model == "" {
 				model = "tei"
 			}
@@ -847,10 +849,7 @@ func (c *Client) RunningBackends(ctx context.Context) (map[string]string, error)
 				model = model[idx+1:]
 			}
 			if model == "" {
-				model = envMap["MODEL_ID"]
-			}
-			if model == "" {
-				model = findArgValue(cmdArgs, "--model-id")
+				model = teiModelOf(envMap, cmdArgs)
 			}
 			backends["reranker"] = model
 		}
@@ -1226,6 +1225,12 @@ func parseEnv(envList []string) map[string]string {
 		}
 	}
 	return m
+}
+
+// teiModelOf is the model a TEI container serves: its --model-id flag (which
+// TEI reads before its MODEL_ID env), else MODEL_ID.
+func teiModelOf(envMap map[string]string, cmdArgs []string) string {
+	return firstNonEmpty(findArgValue(cmdArgs, "--model-id"), envMap["MODEL_ID"])
 }
 
 func findArgValue(args []string, flag string) string {
