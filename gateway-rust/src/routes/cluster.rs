@@ -5499,7 +5499,7 @@ pub(crate) fn node_holds_ollama_tag(node: Option<&Value>, tag: &str) -> Option<b
 /// record): unknown. Pure.
 pub(crate) fn node_may_pull_ollama_registry(node: Option<&Value>) -> Option<bool> {
     let report = node?.get("node_local").filter(|r| r.is_object())?;
-    Some(report["declared"].as_array().is_some_and(|d| d.iter().any(|k| k["key"].as_str() == Some("NOO_ALLOW_OLLAMA_REGISTRY_PULL"))))
+    Some(report["declared"].as_array().is_some_and(|d| d.iter().any(|k| k["key"].as_str() == Some("NOO_ALLOW_OLLAMA_REGISTRY_PULL_OFF"))))
 }
 
 /// The 409 code of the ollama tag refusal: `noo cluster place` reads it
