@@ -280,6 +280,10 @@ type Reconciler struct {
 	// Guarded by pullMu.
 	knownImportOnly map[string]bool
 
+	// pullSleep is the wait between in-pull retries of a registry pull;
+	// nil means sleepCtx. Tests set it so they do not wait.
+	pullSleep func(context.Context, time.Duration) error
+
 	// nudges counts Nudge calls (taken or coalesced), for tests.
 	nudges atomic.Uint64
 	// backendReady says whether a backend this agent just started answers
@@ -1187,7 +1191,11 @@ func (r *Reconciler) ensureOllamaModel(
 		// A short in-pull retry for a registry blip first (both lanes, docker
 		// and native, pass through here); only what still fails takes the
 		// ollamaPullRetryAfter backoff below.
-		out, err := pullWithRetry(ctx, model, pull, sleepCtx)
+		sleep := r.pullSleep
+		if sleep == nil {
+			sleep = sleepCtx
+		}
+		out, err := pullWithRetry(ctx, model, pull, sleep)
 		r.pullMu.Lock()
 		defer r.pullMu.Unlock()
 		st.inFlight = false

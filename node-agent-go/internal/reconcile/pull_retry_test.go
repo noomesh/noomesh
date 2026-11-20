@@ -180,3 +180,51 @@ func TestPullWithRetryStopsWhenContextEnds(t *testing.T) {
 		t.Fatalf("err=%v calls=%d", err, calls)
 	}
 }
+
+// The reconciler itself must run a pull through the in-pull retry: a 503
+// blip is retried and the model arrives without the 10-minute backoff.
+func TestEnsureOllamaModel_RegistryBlipRetriedInPlace(t *testing.T) {
+	r := presenceFixture(t, false)
+	var slept []time.Duration
+	r.pullSleep = func(_ context.Context, d time.Duration) error { slept = append(slept, d); return nil }
+	calls := 0
+	done := make(chan struct{})
+	p := placement{Backend: "ollama", Model: "gemma3:1b", DesiredState: "running"}
+	r.ensureOllamaModel(context.Background(), "host9", "ollama", p,
+		func(context.Context, string) (bool, error) { return false, nil },
+		func(context.Context, string) (string, error) {
+			calls++
+			if calls == 1 {
+				return "", errors.New("ollama pull gemma3:1b exited 1 in c: Error: pull model manifest: 503: busy")
+			}
+			close(done)
+			return "success", nil
+		})
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the blip was not retried in place")
+	}
+	// The goroutine records the outcome after the pull returns.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		r.pullMu.Lock()
+		st := r.ollamaPulls["gemma3:1b"]
+		settled := st != nil && !st.inFlight
+		failed := st != nil && (!st.lastFailed.IsZero() || st.failures != 0)
+		r.pullMu.Unlock()
+		if settled {
+			if failed {
+				t.Fatal("a retried blip must not set the 10-minute backoff")
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("pull never settled")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if calls != 2 || len(slept) != 1 || slept[0] != 10*time.Second {
+		t.Fatalf("calls=%d slept=%v, want 2 calls and one 10s wait", calls, slept)
+	}
+}
