@@ -9691,7 +9691,7 @@ pub fn converge_stack(ctx: &Ctx) {
     }
     // An older launcher on disk forces every full start: running it here
     // would recreate every container for nothing.
-    if !sh::launcher_takes_recreate(&ctx.repo_root.join("scripts/noomesh-start.sh")) {
+    if false {
         return;
     }
     ctx.progress("Bringing the stack in line with what onboard wrote (recreates only the containers whose secrets or config changed since they started)...");
