@@ -12,7 +12,9 @@ noo doctor docker    # read-only; exit 1 when Docker is damaged, with the recove
 When `noo health` shows something down it prints the `noo stack logs <dep>`
 command to run next.
 
-## Docker
+## For people
+
+### Docker
 
 | Symptom | Fix |
 |---|---|
@@ -20,14 +22,14 @@ command to run next.
 | Every container is `Exited (255)` after a reboot, usually on WSL2 | `noo doctor docker`, follow the recovery recipe it prints, then `noo stack start`. It never repairs on its own. |
 | On WSL2 the controller stops by itself after a while with no terminal open (everything down, nodes lose the controller) | WSL2 idled its VM out. Set `vmIdleTimeout=-1` under `[wsl2]` in `%UserProfile%\.wslconfig` (Windows 11), run `wsl --shutdown` once, then `noo stack start`. See [install.md](install.md). |
 
-## Ports
+### Ports
 
 | Symptom | Fix |
 |---|---|
 | `noo stack start` refuses because a port is in use | `ss -ltnp \| grep 8080` finds what holds it. It is usually another noomesh instance or a stray container: `noo stack status`. To run a second stack on purpose, see [multi-instance.md](multi-instance.md). |
 | Dashboard unreachable | It is `https://localhost:8080`. Grafana runs only if you said yes to dashboards in the wizard (`noo stack monitoring on` adds it later); then it is at `https://localhost:3000`. The browser wizard (`noo onboard --web`) listens on `http://127.0.0.1:7080` only while it runs. |
 
-## The browser warns about the certificate
+### The browser warns about the certificate
 
 The dashboard is served with a certificate from your install's own CA, so a
 browser warns until it trusts that CA. This is expected and is not a fault.
@@ -38,7 +40,7 @@ nothing installed) or trust the CA:
 The `noo` CLI itself refuses a non-loopback `http://` gateway URL (exit 3,
 `tls_untrusted`) rather than send your credential in the clear.
 
-## The stack starts but chat does not work
+### The stack starts but chat does not work
 
 - **The model is still loading.** After the first start the backend can take
   minutes to load, longer on CPU. Chat says the backend is not ready. Wait,
@@ -52,7 +54,7 @@ The `noo` CLI itself refuses a non-loopback `http://` gateway URL (exit 3,
 - **An environment change had no effect.** A plain restart keeps the old
   environment: `noo stack restart --force <service>`.
 
-## Start-up refusals
+### Start-up refusals
 
 `noo stack start` checks before it launches and tells you the fix:
 
@@ -62,7 +64,7 @@ The `noo` CLI itself refuses a non-loopback `http://` gateway URL (exit 3,
 | bind-mount sources are missing or the wrong type | run each `fix:` line it prints; for a directory sitting where a file belongs, `sudo rmdir` it first |
 | the gateway restarts in a loop | `docker logs noo-gateway --tail 200`: a drifted database password (`noo security secrets resync --all`), a missing certificate (`noo security pki status`) or a failed migration (`noo db status`) |
 
-## Locked out
+### Locked out
 
 Reset the admin password on the controller:
 
@@ -75,3 +77,36 @@ is the normal route after a non-interactive install.
 
 More: [operator-manual.md](../operating/operator-manual.md) has the
 day-to-day troubleshooting table, and `noo --help` lists every command.
+
+## For agents
+
+Triage in this order and read before you change anything:
+
+1. `noo whoami`: the `noo stack` verbs act on this host only, so they need
+   `controller` or `both`.
+2. `noo --json health`: exit 0 is healthy, 5 degraded (the body names the
+   dependency), 3 the gateway did not answer.
+3. `noo doctor docker`: read-only; exit 1 means Docker is damaged.
+
+Then, by what you found:
+
+- **A dependency is down:** `noo stack logs <dep> --tail 200` first. An
+  environment or secret change that had no effect needs
+  `noo stack restart --force <service>`; a plain restart keeps the old
+  environment.
+- **A model is still loading:** chat says its backend is not ready. It
+  clears by itself: wait for `noo health` to exit 0, restart nothing.
+- **"No backend available":** `noo --json cluster status` shows what is
+  placed and running.
+- **A start-up refusal:** run the read-only check it names first
+  (`noo security secrets audit`, `noo security pki status`, `noo db status`)
+  and report what it says. Changing secrets or database passwords
+  (`noo security secrets resync --all`, `noo onboard --only secrets`) is the
+  person's call.
+
+Leave to a person: the recovery recipe `noo doctor docker` prints (it
+removes containers and clears Docker's state), anything on the Windows side
+of WSL2, trusting the cluster CA in a browser, and resetting the admin
+password (`noo security admin-password reset` shows the new one once; never
+capture it in a log). Never point `noo` at a non-loopback `http://` URL: it
+refuses with exit 3 (`tls_untrusted`), and that refusal is correct.
