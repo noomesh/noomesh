@@ -3165,7 +3165,7 @@ pub(crate) fn fleet_has_gpu(fleet: &[Value]) -> Option<bool> {
 /// How many nodes `/api/cluster/nodes` lists. `None` when the list is
 /// empty: an unread fleet is not a one-node one.
 pub(crate) fn fleet_node_count(fleet: &[Value]) -> Option<usize> {
-    (!fleet.is_empty()).then_some(fleet.len())
+    Some(fleet.len())
 }
 
 /// The `default chat` row: where an unpinned request (`default`, `auto`, no
