@@ -12,7 +12,13 @@
 # nothing).
 #
 #   OUT=<dir> CELL=upgrade-24.04 RUNNER=<label> CLI_TAG=noo-cli-vX.Y.Z[-rc.N] \
-#   scripts/install-cell/upgrade.sh
+#   [PREV_TAG=noo-cli-vX.Y.Z] scripts/install-cell/upgrade.sh
+#
+# PREV_TAG (the dispatch input `prev_tag`) chooses the final the box starts
+# on; empty, it is the newest final below the release under test. A chosen
+# start must be exactly noo-cli-vX.Y.Z, strictly below the release under
+# test and a published, non-prerelease release, or the resolve step refuses
+# naming the rule and nothing installs (upgrade_judge.py resolve).
 #
 # GITHUB-HOSTED, EPHEMERAL RUNNERS ONLY: it installs with sudo. The operator
 # is the runner user (non-root, passwordless sudo).
@@ -22,7 +28,8 @@
 # 97's spec (A1-A6 after `--all`, B1-B3 after the same-tag `--stack`) and
 # general's (G1-G5: the verify rows, the journal, a chat answer after).
 set -uo pipefail
-: "${OUT:?}" "${CELL:=upgrade-24.04}" "${RUNNER:=?}" "${CLI_TAG:=latest}"
+: "${OUT:?}" "${CELL:=upgrade-24.04}" "${RUNNER:=?}" "${CLI_TAG:=latest}" "${PREV_TAG:=}"
+if [ -n "$PREV_TAG" ]; then START_KIND="chosen"; else START_KIND="previous final"; fi
 HERE="$(cd "$(dirname "$0")" && pwd)"
 mkdir -p "$OUT" "$OUT/stranger-cwd"
 # shellcheck source=scripts/install-cell/lib.sh
@@ -32,7 +39,7 @@ J="$OUT/judge"; mkdir -p "$J"
 
 meta cell "$CELL"
 meta runner "$RUNNER"
-meta modes "upgrade: previous final -> $CLI_TAG (noo upgrade --all, then a same-tag --stack); model=default"
+meta modes "upgrade: ${PREV_TAG:-previous final} ($START_KIND) -> $CLI_TAG (noo upgrade --all, then a same-tag --stack); model=default"
 meta limits "the operator is the runner user with passwordless sudo: sudo password prompts are never seen"
 meta limits "no GPU on hosted runners: CPU inference only"
 meta systemd "$(systemctl --version 2>/dev/null | head -n 1)"
@@ -58,15 +65,16 @@ PY
 # ── 1. the previous final, from the releases API ────────────────────────────
 # The newest noo-cli-vX.Y.Z FINAL (no prerelease) strictly below the release
 # under test's X.Y.Z. CLI_TAG=latest: the newest final, and the one before.
+# PREV_TAG set: that final instead, once resolve has held it to the rules.
 # The repo is the one the README's install line downloads from (never typed
 # here: the release repo has one declared home).
 README="$HERE/../../README.md"
 LINE="$(grep -m1 -E '^[^#]*releases/latest/download/install\.sh' "$README" 2>/dev/null)"
 REPO="$(printf '%s' "$LINE" | sed -nE 's#.*github\.com/([^/]+/[^/]+)/releases/.*#\1#p')"
 [ -n "$REPO" ] || { step resolve-previous 10 -- sh -c 'echo "upgrade-cell: no install line naming a github repo in README.md"; exit 1'; finish; }
-step resolve-previous 60 -- python3 "$HERE/upgrade_judge.py" resolve "$REPO" "$CLI_TAG" "$J/prev" "$J/target" || finish
+step resolve-previous 60 -- python3 "$HERE/upgrade_judge.py" resolve "$REPO" "$CLI_TAG" "$J/prev" "$J/target" "$PREV_TAG" || finish
 PREV="$(cat "$J/prev")"; TARGET="$(cat "$J/target")"
-meta upgrade "$PREV -> $TARGET"
+meta upgrade "$PREV ($START_KIND) -> $TARGET"
 
 # ── 2. install the previous final the README's way, onboard ─────────────────
 [ -n "$LINE" ] || { step install 10 -- sh -c 'echo "upgrade-cell: no install line in README.md"; exit 1'; finish; }
