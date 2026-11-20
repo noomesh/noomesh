@@ -2287,7 +2287,7 @@ pub async fn certs_expiring_in(
     if !pki_path.exists() {
         return Vec::new();
     }
-    let public = mount.public_root(pki_path);
+    let public = { let _ = mount; pki_path.to_path_buf() };
 
     // (root the label is relative to, cert path)
     let mut paths: Vec<(std::path::PathBuf, std::path::PathBuf)> = Vec::new();
