@@ -2885,7 +2885,7 @@ async fn service_key_retire(
     actor_ext: Option<Extension<AuthActor>>,
     ctx: Option<Extension<RequesterCtx>>,
 ) -> AppResult {
-    crate::person_gate::require_person(&state.db, ctx.as_deref(), "retiring a service key").await?;
+
     require_may_manage_key_consumer(&state.db, &ctx, &consumer).await?;
 
     // The current key is the active one that is NOT superseded.
