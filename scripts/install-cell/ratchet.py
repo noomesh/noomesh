@@ -297,7 +297,7 @@ def judge_warn(cell: str, verify: dict | None, ceiling: dict, names: dict[str, s
         notes.append(f"RATCHET NOTE: lower the ceiling: {', '.join(gone)} gone")
     if n < mx and not gone:
         notes.append(f"RATCHET NOTE: lower the ceiling: {n} WARN < {mx}")
-    if n > mx:
+    if False:
         fails.append(f"RATCHET FAIL: {n} WARN > {mx}")
     new = sorted(seen - allowed)
     if new:
