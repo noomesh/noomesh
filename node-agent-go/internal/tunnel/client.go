@@ -273,7 +273,7 @@ func (c *Client) session(ctx context.Context) (connected bool, err error) {
 		return false, err
 	}
 	s := newSession(c, conn, ready)
-	c.setConnected(true)
+	c.connected.Store(true)
 	c.Connects.Add(1)
 	defer c.setConnected(false)
 	slog.Info("node tunnel up", "gateway", c.wsURL, "window", ready.Window, "max_streams", ready.MaxStreams)
