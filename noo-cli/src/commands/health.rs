@@ -76,6 +76,23 @@ fn needs_login(body: &serde_json::Value) -> bool {
     body["dependencies"].as_object().is_none()
 }
 
+/// What `noo stack logs` takes for a `/health` dependency name. The gateway
+/// names its dependencies (gateway-rust `routes/core.rs` `health`) by what
+/// it checks, not by container: `postgresql` is the `postgres` container,
+/// and `systems`, `addon_caller` and `fds` are checks inside the gateway
+/// itself, so their cause is in the gateway's log. An unknown name passes
+/// through: `noo stack logs` tries it as a container and docker says if
+/// there is none.
+pub(crate) fn dependency_log_target(dependency: &str) -> &str {
+    match dependency {
+        "postgresql" => "postgres",
+        "nats" => "nats",
+        "redis" => "redis",
+        "systems" | "addon_caller" | "fds" => "gateway",
+        other => other,
+    }
+}
+
 /// What the text suggests on an unhealthy gateway, with why: the stack's
 /// status, each down dependency's log, then docker repair. Pure.
 fn unhealthy_steps(body: &serde_json::Value) -> Vec<(String, &'static str)> {
@@ -84,8 +101,13 @@ fn unhealthy_steps(body: &serde_json::Value) -> Vec<(String, &'static str)> {
         .map(|m| m.iter().filter(|(_, d)| d["healthy"].as_bool() == Some(false)).map(|(n, _)| n.clone()).collect())
         .unwrap_or_default();
     let mut steps = vec![("noo stack status".to_string(), "shows which container is not running")];
+    // Several dependencies can share one container (the gateway's own
+    // checks): name each log command once.
     for d in &down {
-        steps.push((format!("noo stack logs {d}"), "the dependency's own log usually names the cause"));
+        let cmd = format!("noo stack logs {}", dependency_log_target(d));
+        if !steps.iter().any(|(c, _)| *c == cmd) {
+            steps.push((cmd, "the dependency's own log usually names the cause"));
+        }
     }
     steps.push(("noo doctor docker".to_string(), "if containers look damaged after an unclean shutdown"));
     steps
@@ -139,5 +161,23 @@ mod tests {
         assert_eq!(cmds, ["noo stack status", "noo stack logs postgres", "noo doctor docker"]);
         let text: Vec<String> = unhealthy_steps(&body).into_iter().map(|(c, _)| c).collect();
         assert_eq!(cmds, text);
+    }
+
+    /// Every dependency the gateway's `/health` can list maps to a
+    /// container `noo stack logs` resolves (`resolve_container` adds the
+    /// `noo-` prefix): postgres, nats, redis, gateway.
+    #[test]
+    fn health_dependency_names_map_to_stack_logs_containers() {
+        let cases = [
+            ("postgresql", "postgres"),
+            ("nats", "nats"),
+            ("redis", "redis"),
+            ("systems", "gateway"),
+            ("addon_caller", "gateway"),
+            ("fds", "gateway"),
+        ];
+        for (dep, container) in cases {
+            assert_eq!(dependency_log_target(dep), container, "dependency {dep}");
+        }
     }
 }
