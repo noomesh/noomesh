@@ -104,7 +104,7 @@ pub struct WsTicketBody {
     pub socket: String,
 }
 
-/// POST /api/ws-ticket — `{socket}`: a single-use ticket for opening one of the console's sockets (`/ws/coordinator`, `/ws/collab`) from a browser, which cannot send an Authorization header on a WebSocket. Send the access token as `Authorization: Bearer`; open `<socket>?ticket=<ticket>` within 30 seconds. A token that has expired, or ends within 30 seconds, is refused with 401 (refresh it and mint again). The ticket is bound to this person and this socket and is consumed by the first handshake that presents it. A delegated or harness credential cannot mint one.
+/// POST /api/ws-ticket — `{socket}`: a single-use ticket for opening one of the console's sockets (`/ws/coordinator`, `/ws/collab`) from a browser, which cannot send an Authorization header on a WebSocket. Send the access token as `Authorization: Bearer`; open `<socket>?ticket=<ticket>` within 30 seconds. The ticket is bound to this person and this socket and is consumed by the first handshake that presents it. A delegated or harness credential cannot mint one.
 pub async fn ws_ticket(
     headers: axum::http::HeaderMap,
     ctx: Option<axum::Extension<auth::RequesterCtx>>,
