@@ -967,6 +967,12 @@ verify` reports it:
   model layer must be the controller's GGUF, by sha256. The other layers
   (template, parameters) are not anchored yet.
 
+Every model the node holds is in the row on every report. Until the agent
+has checked it (right after the agent starts, or before a new model's first
+check) it reads "<model>: not yet checked": not a problem, and not a verdict.
+The row's verdict comes from the checked models alone, and a row whose models
+are all not yet checked is OK.
+
 A mismatch is repaired from the controller (the bad blobs are removed, then
 the model is re-installed or rebuilt from the verified GGUF). A pulled model
 is not repaired: the record of a pull holds no bytes, so a blob it needs is
@@ -982,8 +988,11 @@ controller's own node it is `noo models pull <model>`, which pulls through the
 gateway's Ollama and writes the record. `noo models pull` reaches no other
 node, so on any other node (a container or a Mac's native Ollama) the remedy
 stages the tag on the controller and imports it there: `noo models fetch
-ollama:<tag>`, then `noo cluster import-model <node> ollama:<tag>` (harrier, an
-artifact: `noo cluster import-model <node> harrier`). The record is the
+ollama:<tag>`, then `noo cluster import-model <node> ollama:<tag>`. harrier
+is an artifact, never a registry tag, on every node kind: `noo cluster
+import-model <node> harrier` on another node, and on the controller's own node
+`noo models pull harrier`, which copies the release artifact into the stack's
+embed container. The record is the
 manifest the pull installed, written only when every layer the registry's
 manifest names (config, weights, template, parameters, licence) is in it with
 the same digest and size, and it adds only the manifest Ollama pulled (whose
