@@ -67,8 +67,26 @@ pub(crate) const STATE_ROWS: [&str; 3] = ["loki at rest", "tempo at rest", "graf
 /// switch (`off` keeps it) is judged at rest as ever: `None`. `holds_data`
 /// is asked only for one of the three on lean, when the directory exists.
 pub(crate) fn state_dir_row(name: &'static str, monitoring: &Status, exists: bool, holds_data: impl FnOnce() -> bool) -> Option<Check> {
-    (lean(monitoring) && STATE_ROWS.contains(&name) && (!exists || !holds_data())).then(|| row(name))
+    if !lean(monitoring) || !STATE_ROWS.contains(&name) {
+        return None;
+    }
+    // The row says what it saw, so a reader (or a judge) has the evidence
+    // in the row instead of trusting it: no directory, or an empty one.
+    let seen = if !exists {
+        NO_DIR
+    } else if !holds_data() {
+        EMPTY_DIR
+    } else {
+        return None;
+    };
+    Some(ok(name, format!("{DETAIL}; {seen}")))
 }
+
+/// What a by-choice state-dir row saw: the directory is absent.
+pub(crate) const NO_DIR: &str = "no directory";
+/// What a by-choice state-dir row saw: the directory exists and holds no
+/// file ([`holds_data`] is false).
+pub(crate) const EMPTY_DIR: &str = "its directory is empty";
 
 /// Does the directory hold anything: an entry that is not a directory (a
 /// file, a link, a socket), anywhere below it. Empty directories nested in
@@ -138,7 +156,7 @@ mod tests {
     }
 
     fn by_choice(c: &Check) -> bool {
-        c.verdict == Verdict::Ok && c.detail == DETAIL && c.detail.contains("`noo stack monitoring on`")
+        c.verdict == Verdict::Ok && c.detail.starts_with(DETAIL) && c.detail.contains("`noo stack monitoring on`")
     }
 
     // ── loki (and its warm-up wrapper) ───────────────────────────────
@@ -259,6 +277,7 @@ mod tests {
             let c = state_dir_row(name, &lean, false, || panic!("{name}: an absent directory is never read"))
                 .unwrap_or_else(|| panic!("{name}: absent on lean is by choice"));
             assert!(by_choice(&c), "{c:?}");
+            assert_eq!(c.detail, format!("{DETAIL}; {NO_DIR}"), "{name}: the row says it saw no directory");
             assert_eq!(c.name, name);
             // Data from before the switch: judged at rest as ever.
             assert!(state_dir_row(name, &lean, true, || true).is_none(), "{name}: a directory with data must still be judged on lean");
@@ -287,6 +306,7 @@ mod tests {
         for name in STATE_ROWS {
             let c = state_dir_row(name, &lean, true, || holds_data(&dir)).unwrap_or_else(|| panic!("{name}: empty on lean is by choice"));
             assert!(by_choice(&c), "{c:?}");
+            assert_eq!(c.detail, format!("{DETAIL}; {EMPTY_DIR}"), "{name}: the row says its directory is empty");
         }
         std::fs::write(dir.join("rules/fake/index"), b"x").unwrap();
         assert!(holds_data(&dir), "a file two levels down is data");
