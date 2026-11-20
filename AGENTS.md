@@ -24,8 +24,8 @@ gateway (`gateway-rust/`), a Go node agent (`node-agent-go/`), the `noo` CLI
 
 ## Where to read, by topic
 
-Each page has a `## For people` part and a `## For agents` part; read the
-second.
+Pages are moving to a `## For people` part and a `## For agents` part. Where a
+page has the agent part, read that; these have it so far:
 
 | topic | page |
 |---|---|
@@ -35,8 +35,9 @@ second.
 
 The code is the truth; generated references (`docs/cli/`, the OpenAPI spec)
 are rebuilt from it. A running install's state is what
-`noo --json cluster verify --controller` reports; its config is
-`noomesh.yaml` in the install root.
+`noo --json cluster verify --wait` reports for the whole cluster (exit 0 means
+healthy; exit 1 means run each failing row's remedy; `--controller` checks the
+controller alone); its config is `noomesh.yaml` in the install root.
 
 ## How to verify a change
 
