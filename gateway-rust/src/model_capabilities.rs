@@ -121,6 +121,20 @@ mod tests {
         }
     }
 
+    /// The rows derived from each model's own GGUF metadata (recomputed by
+    /// tests/test_model_kv_rows.py). They match the exact tag: a quantised
+    /// variant of another size is not charged this model's cache.
+    #[test]
+    fn derived_kv_rows_serve_their_exact_tag() {
+        let kv = |m: &str| lookup(m).and_then(|r| r.kv_bytes_per_token);
+        assert_eq!(kv("qwen2.5:0.5b"), Some(12288), "24 layers x 2 kv heads x 64 x K+V x f16");
+        assert_eq!(kv("qwen3:4b"), Some(147456));
+        assert_eq!(kv("registry.ollama.ai/library/qwen3:4b"), Some(147456));
+        assert_eq!(kv("gemma4:e2b"), Some(16384), "the measured row stays");
+        assert_eq!(kv("qwen3:4b-instruct-2507-q4_K_M"), None, "another build is not this row");
+        assert_eq!(kv("harrier"), None);
+    }
+
     #[test]
     fn glob_is_star_only() {
         assert!(glob("a*", "abc") && glob("*c", "abc") && glob("a*c", "abc") && glob("abc", "abc") && glob("a*b*c", "aXbYc"));

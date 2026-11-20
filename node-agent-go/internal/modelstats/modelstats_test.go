@@ -245,3 +245,61 @@ func TestRunningContextComesFromPsBesideTheCeiling(t *testing.T) {
 		}
 	}
 }
+
+// An /api/show model_info for qwen2.5:0.5b (its GGUF header, read from the
+// registry): no key_length, so the head size is embedding_length / head_count.
+// 24 layers x 2 kv heads x 64 x K+V x f16 = 12288 bytes a token.
+const showQwen05 = `{"model_info":{"general.architecture":"qwen2","qwen2.block_count":24,
+ "qwen2.embedding_length":896,"qwen2.attention.head_count":14,"qwen2.attention.head_count_kv":2,"qwen2.context_length":32768}}`
+
+func TestShowArchReadsTheAttentionShape(t *testing.T) {
+	want := &Arch{Layers: 24, KVHeads: 2, HeadDim: 64}
+	if got := ShowArch([]byte(showQwen05)); got == nil || *got != *want {
+		t.Fatalf("ShowArch = %+v, want %+v", got, want)
+	}
+	if kv := int64(24 * 2 * 64 * 2 * 2); kv != 12288 {
+		t.Fatalf("the shape prices %d bytes a token, want 12288", kv)
+	}
+	// key_length wins over embedding/heads; a per-layer head_count_kv is read
+	// as its largest and the larger of key and value length is the head size
+	// (Gemma: global layers hold 512, sliding ones 256): never below the truth.
+	gemma := `{"model_info":{"general.architecture":"gemma4","gemma4.block_count":48,"gemma4.embedding_length":3840,
+	 "gemma4.attention.head_count":16,"gemma4.attention.head_count_kv":[8,8,8,8,8,1],"gemma4.attention.key_length":512,"gemma4.attention.value_length":512}}`
+	if got := ShowArch([]byte(gemma)); got == nil || *got != (Arch{Layers: 48, KVHeads: 8, HeadDim: 512}) {
+		t.Fatalf("gemma ShowArch = %+v", got)
+	}
+}
+
+func TestShowArchIsNilWhenAnyFieldIsMissing(t *testing.T) {
+	for _, b := range []string{
+		``, `{}`, `not json`,
+		`{"model_info":{"qwen2.block_count":24}}`,
+		`{"model_info":{"general.architecture":"qwen2","qwen2.block_count":24,"qwen2.attention.head_count_kv":2}}`,
+		`{"model_info":{"general.architecture":"qwen2","qwen2.attention.head_count_kv":2,"qwen2.embedding_length":896,"qwen2.attention.head_count":14}}`,
+		`{"model_info":{"general.architecture":"qwen2","qwen2.block_count":24,"qwen2.attention.head_count_kv":0,"qwen2.attention.key_length":64}}`,
+	} {
+		if got := ShowArch([]byte(b)); got != nil {
+			t.Errorf("ShowArch(%q) = %+v, want nil", b, got)
+		}
+	}
+}
+
+func TestFillReportsTheArchOncePerModelAndTheWireCarriesIt(t *testing.T) {
+	var c Ceilings
+	n := 0
+	show := func(string) ([]byte, error) { n++; return []byte(showQwen05), nil }
+	stats := []ModelStat{{Name: "qwen2.5:0.5b", digest: "a"}}
+	c.Fill(stats, show)
+	c.Fill(stats, show)
+	if n != 1 || stats[0].Arch == nil || stats[0].Arch.Layers != 24 || stats[0].ContextLength != 32768 {
+		t.Fatalf("n=%d stats=%+v", n, stats[0])
+	}
+	b, _ := json.Marshal(stats[0])
+	if !strings.Contains(string(b), `"arch":{"layers":24,"kv_heads":2,"head_dim":64}`) {
+		t.Fatalf("wire: %s", b)
+	}
+	b, _ = json.Marshal(ModelStat{Name: "m"})
+	if strings.Contains(string(b), "arch") {
+		t.Fatalf("an unknown arch is omitted: %s", b)
+	}
+}
