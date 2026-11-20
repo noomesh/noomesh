@@ -1120,6 +1120,15 @@ pub(crate) fn parse_place_with(a: &mut Args) -> Result<PlaceArgs, ArgError> {
     Ok(PlaceArgs { node, backend, model, port, tls, image, stopped, force, role, kind, env_changes, on, keep_warm, retune })
 }
 
+/// `auto` as the model is resolved only for the `harness` backend (the
+/// gateway's `apply_harness_policy` points it at the node's chat
+/// placement). For ollama, vllm or llamacpp it would place a model
+/// literally named "auto": refused before anything is sent. Pure.
+pub(crate) fn auto_model_refusal(backend: &str, model: &str) -> Option<&'static str> {
+    (model == "auto" && backend != "harness")
+        .then_some("auto picks a model only for harness: name a model, see `noo models recommended`")
+}
+
 /// `noo cluster place NODE BACKEND MODEL [--on cpu|gpu] [--env KEY=VALUE]... [--port P] [--tls]
 /// [--image IMG] [--stopped]` — PUT /api/cluster/nodes/{node}/placements/{backend}.
 /// Declares that NODE should run BACKEND with MODEL; the node-agent
@@ -1133,6 +1142,9 @@ pub fn cluster_place(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     let PlaceArgs { node, backend, model, port, tls, image, stopped, force, mut role, kind, mut env_changes, on, keep_warm, retune } =
         parse_place_with(&mut Args::new(args))?;
     let (node, backend, model) = (&node, &backend, &model);
+    if let Some(why) = auto_model_refusal(backend, model) {
+        crate::output::fail(g.json, crate::output::ExitCode::Usage, "bad_model", why, Some("noo models recommended"));
+    }
     if let Some(k) = &kind {
         if backend != "harness" {
             crate::output::fail(g.json, crate::output::ExitCode::Usage, "bad_kind",
@@ -3585,6 +3597,20 @@ fn harness_kind_names() -> Vec<String> {
 #[cfg(test)]
 mod harness_kind_tests {
     use super::*;
+
+    /// `auto` is a model only the harness resolves; for a model backend it
+    /// would place a model literally named "auto".
+    #[test]
+    fn auto_as_a_model_is_refused_for_every_backend_but_the_harness() {
+        assert_eq!(auto_model_refusal("harness", "auto"), None);
+        for backend in ["ollama", "vllm", "llamacpp"] {
+            let why = auto_model_refusal(backend, "auto").unwrap_or_else(|| panic!("{backend} auto must be refused"));
+            assert!(why.contains("only for harness") && why.contains("`noo models recommended`"), "{why}");
+            assert_eq!(auto_model_refusal(backend, "gemma4:e2b"), None, "{backend}: a named model is placed");
+        }
+        let (_, about) = crate::usage::lookup(&["cluster", "place"]).expect("cluster place usage");
+        assert!(about.contains("auto: harness only"), "the usage line says auto is harness only: {about:?}");
+    }
 
     #[test]
     fn the_kinds_come_from_the_shipped_table() {
