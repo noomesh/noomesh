@@ -54,7 +54,7 @@ GOOD_CTL = [
 
 def cell(tmp, roll=ROLL_OK, stack=STACK_OK, journal=JOURNAL_OK, roll_rc="0", self_rows=None, ctl_rows=None,
          chat="ok\n", chat_rc=0, unit=True, sudo_journal="", unit_user=None, stack_journal=None, exec_start=None,
-         start_log=START_OK, start_rc=0, start_after=SNAP):
+         start_log=START_OK, start_rc=0, start_after=SNAP, events=None):
     out, j = tmp / "out", tmp / "out" / "judge"
     (out / "logs").mkdir(parents=True)
     j.mkdir()
@@ -72,6 +72,8 @@ def cell(tmp, roll=ROLL_OK, stack=STACK_OK, journal=JOURNAL_OK, roll_rc="0", sel
     (j / "verify-after.json").write_text(v)
     (j / "verify-final.json").write_text(v)
     (out / "logs" / "chat-after.log").write_text(chat)
+    if events is not None:
+        (out / "logs" / "docker-events-upgrade.jsonl").write_text(events)
     steps = [{"step": "chat-after", "rc": chat_rc}]
     if start_log is not None:
         (out / "logs" / "start-after-upgrade.log").write_text(start_log)
@@ -332,3 +334,78 @@ def test_upgrade_sh_runs_the_plain_start_after_the_stack_and_before_chat():
     body = text[start:chat]
     assert '"$HERE/recreated.py" "$J"' in body and "noo stack start; rc=$?" in body
     assert 'snap "$2/start-after.before"' in body and 'snap "$2/start-after.after"' in body
+
+
+# ── NO-DOCKERHUB: the daemon touches no Docker Hub image ────────────────────
+sys.path.insert(0, str(JUDGE.parent))
+import upgrade_judge as uj  # noqa: E402
+
+DIGEST = "@sha256:" + "a" * 64
+
+
+def ev(typ, act, t=1763629800, **attrs):
+    a = {"Attributes": attrs}
+    if typ == "image":
+        a["ID"] = attrs.get("name", "")
+    return json.dumps({"Type": typ, "Action": act, "time": t, "Actor": a}) + "\n"
+
+
+def test_image_registry_classification():
+    hub = ["alpine:latest", "alpine", "library/alpine", "docker.io/library/alpine", "index.docker.io/library/alpine:3",
+           "registry-1.docker.io/x/y", "noomesh/stunnel:latest", "vllm/vllm-openai:v0.25.0" + DIGEST]
+    for r in hub:
+        assert uj.is_hub_pull(r), r
+    for r in ["ghcr.io/x/y" + DIGEST, "localhost/x", "localhost:5000/x/y:1", "quay.io/a/b:1", "registry.example.com:443/a"]:
+        assert not uj.is_hub_pull(r), r
+    assert uj.image_parts("docker.io/library/alpine:3") == ("docker.io", "alpine")
+    assert uj.image_parts("ghcr.io/x/y" + DIGEST) == ("ghcr.io", "x/y")
+    assert uj.image_parts("localhost:5000/x/y:1") == ("localhost:5000", "x/y")
+    assert uj.image_parts("sha256:" + "b" * 64) == (None, "sha256:" + "b" * 64)
+
+
+def test_a_container_is_hub_only_if_pulled_known_or_spelled():
+    # locally built, never pulled: bare names that must not fail
+    for r in ("noo-sandbox-base:latest", "noo-browser:latest", "localhost/x", "sha256:" + "c" * 64):
+        assert not uj.is_hub_container(r, set()), r
+    # the well-known Hub names, however spelled
+    for r in ("alpine", "alpine:latest", "library/alpine", "docker.io/library/alpine", "busybox", "ubuntu:24.04"):
+        assert uj.is_hub_container(r, set()), r
+    # a bare org/name is Hub only when it was pulled in the window
+    assert not uj.is_hub_container("noomesh/stunnel:latest", set())
+    assert uj.is_hub_container("noomesh/stunnel:latest", {"noomesh/stunnel"})
+    assert not uj.is_hub_container("ghcr.io/x/y" + DIGEST, {"x/y"})
+
+
+def test_no_dockerhub_passes_with_counts(tmp_path):
+    e = (ev("image", "pull", name="ghcr.io/x/y") + ev("container", "create", image="ghcr.io/x/y" + DIGEST, name="g")
+         + ev("container", "create", image="noo-browser:latest", name="b") + ev("container", "start", image="alpine"))
+    rc, got = cell(tmp_path, events=e)
+    assert " PASS: " in got["NO-DOCKERHUB"], got["NO-DOCKERHUB"]
+    assert "1 pull(s) by registry [ghcr.io x1]" in got["NO-DOCKERHUB"] and "2 container create(s)" in got["NO-DOCKERHUB"]
+    assert "noo-browser x1" in got["NO-DOCKERHUB"] and "x/y x1" in got["NO-DOCKERHUB"], got["NO-DOCKERHUB"]
+
+
+def test_no_dockerhub_fails_naming_a_hub_pull_and_an_alpine_create(tmp_path):
+    e = ev("image", "pull", t=1763629801, name="noomesh/stunnel:latest") + ev("container", "create", t=1763629802, image="alpine", name="chgrp")
+    rc, got = cell(tmp_path, events=e)
+    g = got["NO-DOCKERHUB"]
+    assert rc == 1 and " FAIL: " in g and "2 Docker Hub image event(s)" in g, g
+    assert "pull noomesh/stunnel:latest" in g and "create alpine (container chgrp)" in g and ":" in g.split("FAIL:")[1], g
+
+
+def test_no_dockerhub_not_judged_without_events(tmp_path):
+    rc, got = cell(tmp_path)
+    assert " NOT JUDGED: " in got["NO-DOCKERHUB"] and "file missing" in got["NO-DOCKERHUB"], got["NO-DOCKERHUB"]
+    rc, got = cell(tmp_path / "b", events="")
+    assert " NOT JUDGED: " in got["NO-DOCKERHUB"] and "file empty" in got["NO-DOCKERHUB"], got["NO-DOCKERHUB"]
+    rc, got = cell(tmp_path / "c", events="not json\n")
+    assert " NOT JUDGED: " in got["NO-DOCKERHUB"] and "1 unparseable" in got["NO-DOCKERHUB"], got["NO-DOCKERHUB"]
+
+
+def test_upgrade_sh_watches_docker_across_the_roll_and_plain_start_only():
+    text = (JUDGE.parent / "upgrade.sh").read_text()
+    start, roll = text.index("events --format '{{json .}}' --filter type=image --filter type=container"), text.index('ROLL_T0="$(date +%s)"')
+    stop, chat = text.index('kill "$EVENTS_PID"'), text.index("step chat-after ")
+    assert text.index("step before-roll") < start < roll
+    assert text.index("step start-after-upgrade ") < stop < chat
+    assert "logs/docker-events-upgrade.jsonl" in text and "pkill" not in text

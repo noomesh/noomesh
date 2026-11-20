@@ -24,6 +24,7 @@ import re
 import stat
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 
@@ -224,6 +225,107 @@ def is_own_sudo(line, own):
     if d + "/" not in SUDO_BIN_DIRS:
         return False
     return base + sep + args in own
+
+
+# ── NO-DOCKERHUB: the Docker daemon touches no Docker Hub image ─────────────
+# upgrade.sh records `docker events` (image + container) across `noo upgrade
+# --all`, the same-tag `--stack`, the plain `noo stack start` after them
+# (and the cell's own remove-netns-unit step between): the NEW version's
+# roll and start, never the previous final's onboard/start.
+HUB_HOSTS = ("docker.io", "index.docker.io", "registry-1.docker.io")
+# Images a container can name without a registry that are Docker Hub's, and
+# that no noomesh build is called: the leak the 0.6.28 `docker run alpine
+# chgrp` was. Compared on the normalised repo (no host, `library/`, tag, digest).
+HUB_KNOWN = ("alpine", "busybox", "hello-world", "debian", "ubuntu")
+
+
+def image_parts(ref):
+    """(registry, repo) of an image reference. registry is the host Docker
+    would contact: Docker's own rule, the first path part is a host only when
+    it holds a `.` or `:` or is `localhost`; otherwise (bare `name`, bare
+    `org/name`) the image is Docker Hub's, registry "docker.io". Tag and
+    digest are dropped; Hub aliases and a leading `library/` are folded so
+    `alpine`, `library/alpine` and `docker.io/library/alpine` share the repo
+    `alpine`. An image id (`sha256:...`) names no registry: (None, id)."""
+    ref = (ref or "").strip()
+    ref = ref.split("@", 1)[0]
+    if not ref or re.fullmatch(r"(sha256:)?[0-9a-f]{12,64}", ref):
+        return None, ref
+    first, sep, rest = ref.partition("/")
+    if sep and ("." in first or ":" in first or first == "localhost"):
+        host, path = first, rest
+    else:
+        host, path = "docker.io", ref
+    if host in HUB_HOSTS:
+        host = "docker.io"
+        if path.startswith("library/"):
+            path = path[len("library/"):]
+    # a tag is a `:` after the last `/`
+    last = path.rsplit("/", 1)
+    last[-1] = last[-1].split(":", 1)[0]
+    return host, "/".join(last)
+
+
+def is_hub_pull(ref):
+    """A `pull` event names a Docker Hub image: the registry is Docker Hub's,
+    whether spelled out or implied by a bare name or org/name."""
+    return image_parts(ref)[0] == "docker.io"
+
+
+def is_hub_container(ref, pulled_repos):
+    """A container `create` runs a Docker Hub image. A bare `noo-browser:latest`
+    reads as Hub but is a LOCAL build that is never pulled, so a bare name
+    alone is not a verdict. Hub only when (1) the reference spells a Hub host,
+    or (2) that repo was pulled from Hub in this window, or (3) it is one of
+    the well-known Hub-only names (HUB_KNOWN). A create event carries no repo
+    digest, so a locally-held Hub image created without a pull in the window
+    and not in HUB_KNOWN is not caught here (it has no registry to read)."""
+    ref = (ref or "").strip()
+    head = ref.split("@", 1)[0].partition("/")[0]
+    if head in HUB_HOSTS:
+        return True
+    host, repo = image_parts(ref)
+    if host != "docker.io":
+        return False
+    return repo in pulled_repos or repo in HUB_KNOWN
+
+
+def judge_dockerhub(lines):
+    """(verdict, why) from `docker events --format '{{json .}}'` lines."""
+    pulls, creates, bad, n = [], [], 0, 0
+    for l in lines:
+        if not l.strip():
+            continue
+        try:
+            e = json.loads(l)
+            a = e.get("Actor") or {}
+            attrs = a.get("Attributes") or {}
+            typ, act = e.get("Type"), e.get("Action") or e.get("status")
+            when = time.strftime("%H:%M:%S", time.gmtime(e.get("time") or 0))
+            if typ == "image" and act == "pull":
+                pulls.append((when, attrs.get("name") or a.get("ID") or e.get("id") or ""))
+            elif typ == "container" and act == "create":
+                creates.append((when, attrs.get("image") or "", attrs.get("name") or ""))
+            n += 1
+        except (ValueError, AttributeError):
+            bad += 1
+    if not n:
+        return "NOT JUDGED", "docker events recorded no event (%d unparseable line(s))" % bad
+    pulled = {image_parts(r)[1] for _, r in pulls if is_hub_pull(r)}
+    off = ["%s pull %s" % (t, r) for t, r in pulls if is_hub_pull(r)]
+    off += ["%s create %s (container %s)" % (t, r, c) for t, r, c in creates if is_hub_container(r, pulled)]
+    if off:
+        return "FAIL", "%d Docker Hub image event(s): %s" % (len(off), "; ".join(off))
+    by_reg, by_img = {}, {}
+    for _, r in pulls:
+        h = image_parts(r)[0] or "?"
+        by_reg[h] = by_reg.get(h, 0) + 1
+    for _, r, _c in creates:
+        k = image_parts(r)[1] or "?"
+        by_img[k] = by_img.get(k, 0) + 1
+    fmt = lambda d: ", ".join("%s x%d" % kv for kv in sorted(d.items())) or "none"
+    return "PASS", "no Docker Hub pull or container: %d pull(s) by registry [%s]; %d container create(s) by image [%s]" % (
+        len(pulls), fmt(by_reg), len(creates), fmt(by_img))
 
 
 def judge():
@@ -446,6 +548,16 @@ def judge():
         say("G5", "PASS" if rec.get("rc") == 0 and body else "FAIL",
             "noo chat answered after the upgrade: %s" % one(" ".join(body[-2:]), 160) if rec.get("rc") == 0 and body
             else "noo chat exit %s: %s" % (rec.get("rc"), one(" ".join(body[-2:]), 200)))
+
+    # ── the Docker daemon, across the new version's roll and plain start ──
+    ev = text(os.path.join(out, "logs", "docker-events-upgrade.jsonl"))
+    if ev is None or not ev.strip():
+        err = one(text(os.path.join(out, "logs", "docker-events-upgrade.err")), 200)
+        say("NO-DOCKERHUB", "NOT JUDGED", "no docker events were recorded (%s)%s"
+            % ("file missing" if ev is None else "file empty", "; watcher said: " + err if err else ""), 600)
+    else:
+        v_, why = judge_dockerhub(ev.splitlines())
+        say("NO-DOCKERHUB", v_, why, 4000)
 
     print("\n".join(lines))
     return 1 if failed else 0
