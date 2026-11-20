@@ -73,6 +73,35 @@ pub(crate) const THIRD_PARTY_LOCK_ROWS: &[&str] = &[
     "nats", "nginx", "redis", "loki", "tempo", "prometheus", "alertmanager", "grafana", "node-exporter", "tei", "tei-cpu", "vllm",
 ];
 
+/// Lock rows that pin an ARTIFACT image: files the CLI unpacks with `docker
+/// create` + `docker cp`, never a container anything runs. harrier, the
+/// default embedder, is published once under its own tag
+/// (publish-harrier.yml) and the release pins it by digest
+/// (scripts/harrier-artifact.json, written into the lock by the `lock` job),
+/// so every fetch is `<prefix>/harrier@sha256:…`. Never staged from the lock
+/// (`<prefix>/harrier:<release tag>` does not exist; nodes import the weights
+/// from the controller's store), and no compose service reads its
+/// `NOO_IMAGE_DIGEST_HARRIER`.
+pub(crate) const ARTIFACT_LOCK_ROWS: &[&str] = &["harrier"];
+
+/// The signed lock's line vouching for the GGUF inside the pinned harrier
+/// image: `# harrier-gguf-sha256 <64 hex>`, the sha256 the image's own
+/// `harrier.sha256` names, which a node's harrier model layer must equal.
+pub(crate) const HARRIER_GGUF_LINE: &str = "# harrier-gguf-sha256 ";
+
+/// What a stack lock pins harrier to: the artifact image digest
+/// (`sha256:…`) and, when the lock carries it, the GGUF's
+/// (`sha256:…`). None when the lock has no `harrier@sha256:` row (a release
+/// before harrier was locked).
+pub(crate) fn harrier_pin_in(lock: &str) -> Option<(String, Option<String>)> {
+    let image = parse_lock(lock).into_iter().find(|r| r.name == "harrier")?.digest;
+    let gguf = lock.lines().find_map(|l| {
+        let hex = l.trim_end().strip_prefix(HARRIER_GGUF_LINE)?.trim();
+        (hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit())).then(|| format!("sha256:{}", hex.to_ascii_lowercase()))
+    });
+    Some((image, gguf))
+}
+
 /// Backend doors pinned to their own image instead of the release
 /// (config/door-images.json; the node agent embeds a byte-equal copy). Each
 /// pin is staged on every lock stage under source [`DOOR_PIN_SOURCE`], which
@@ -190,12 +219,13 @@ pub(crate) fn parse_lock(text: &str) -> Vec<LockRow> {
 
 pub(crate) fn node_bound(name: &str) -> bool {
     !CONTROLLER_ONLY.contains(&name) && !name.starts_with("deps-") && !THIRD_PARTY_LOCK_ROWS.contains(&name) && !ON_DEMAND_LOCK_ROWS.contains(&name)
+        && !ARTIFACT_LOCK_ROWS.contains(&name)
 }
 
 /// Does `stage_lock` stage this lock row? Node-bound release images, or
-/// every release image with `--all-images`; a third-party row never.
+/// every release image with `--all-images`; a third-party or artifact row never.
 pub(crate) fn stages_from_lock(name: &str, all: bool) -> bool {
-    !THIRD_PARTY_LOCK_ROWS.contains(&name) && (all || node_bound(name))
+    !THIRD_PARTY_LOCK_ROWS.contains(&name) && !ARTIFACT_LOCK_ROWS.contains(&name) && (all || node_bound(name))
 }
 
 /// Docker/uname arch spellings → the two the rail serves.
@@ -1532,6 +1562,38 @@ mod tests {
             assert!(staged.contains(&"llamacpp") && staged.contains(&"ollama"), "all={all}: {staged:?}");
         }
         assert!(stages_from_lock("gateway", true) && !stages_from_lock("gateway", false));
+    }
+
+    /// The harrier row pins an artifact, not a release image: it parses like
+    /// any row, is never staged (`--all-images` included) and never counts as
+    /// node-bound, and its gguf line is read beside it.
+    #[test]
+    fn the_harrier_artifact_row_is_never_staged() {
+        let lock = format!("# stack v0.6.29\ngateway@{D}\nharrier@{D}\nllamacpp@{D}\n");
+        let rows = parse_lock(&lock);
+        assert!(rows.iter().any(|r| r.name == "harrier"), "the row parses like any other");
+        for all in [false, true] {
+            let staged: Vec<&str> = rows.iter().map(|r| r.name.as_str()).filter(|n| stages_from_lock(n, all)).collect();
+            assert!(!staged.contains(&"harrier"), "all={all}: {staged:?}");
+            assert!(staged.contains(&"llamacpp"), "all={all}: {staged:?}");
+        }
+        assert!(!node_bound("harrier"));
+        assert!(!lock_pinned_refs(&lock, "ghcr.io/noomesh", "v0.6.29").iter().any(|r| r.contains("harrier")));
+        assert!(!lock_node_refs(&lock, "ghcr.io/noomesh", "v0.6.29").iter().any(|r| r.contains("harrier")));
+    }
+
+    #[test]
+    fn the_harrier_pin_is_read_from_the_lock() {
+        let img = "sha256:2fe41964a009bda0c55f299b632b122bcb4561ca4a833e3293c9f3cc685bab79";
+        let gguf = "5f26506ab57fd817ce4a8b9d24946a60d40bc76d82a2defa7cd754ae01e9de80";
+        let lock = format!("# stack v0.6.29\n{HARRIER_GGUF_LINE}{gguf}\ngateway@{D}\nharrier@{img}\n");
+        assert_eq!(harrier_pin_in(&lock), Some((img.to_string(), Some(format!("sha256:{gguf}")))));
+        // A lock with the row but no gguf line: the image is still pinned.
+        assert_eq!(harrier_pin_in(&format!("harrier@{img}\n")), Some((img.to_string(), None)));
+        // A release before harrier was locked: nothing pinned.
+        assert_eq!(harrier_pin_in(&format!("# stack v0.6.28\ngateway@{D}\n")), None);
+        // A malformed gguf line is not a pin.
+        assert_eq!(harrier_pin_in(&format!("{HARRIER_GGUF_LINE}xyz\nharrier@{img}\n")), Some((img.to_string(), None)));
     }
 
     #[test]

@@ -133,18 +133,19 @@ jobs:
           echo "sibling_ref=$line" >> "$GITHUB_OUTPUT"
           echo "$tag (${commit:0:8}) is on origin/$line; siblings build from their $line"
 
-      # harrier is the default embedder and ships as an OCI model artifact
-      # (<namespace>/harrier:v1), versioned independently of the stack
-      # tag, so it is in no matrix and no lock row: `noo onboard` and `noo
-      # migrate import` pull it by the fixed :v1 tag. It is published by
-      # publish-harrier.yml, once. A release that cannot be installed
-      # (rc.3: `denied`, no embedder, RAG down) must not start, so ask for
-      # it the way a fresh host does: anonymously, before any login.
-      - name: The harrier embedder artifact is published and public
+      # harrier is the default embedder and ships as an OCI model artifact,
+      # published once by publish-harrier.yml under its own tag. The release
+      # pins it BY DIGEST (scripts/harrier-artifact.json; the lock job writes
+      # the `harrier@sha256:` row), and every install pulls that digest, never
+      # the mutable :v1. A release whose pinned artifact cannot be installed
+      # (rc.3: `denied`, no embedder, RAG down) must not start, so ask for it
+      # the way a fresh host does: anonymously, before any login, by digest.
+      - name: The pinned harrier embedder artifact is published and public
         run: |
           set -eu
-          if ! docker manifest inspect "${REGISTRY}/${OWNER}/harrier:v1" >/dev/null 2>&1; then
-            echo "::error::${REGISTRY}/${OWNER}/harrier:v1 is not pullable anonymously (absent, or the package is private). Run the 'publish harrier artifact' workflow once (after uploading the models-harrier-v1 release assets), then set the package public, then re-run this release."
+          ref="$(python3 scripts/harrier-artifact-pin.py ref --registry "$REGISTRY" --owner "$OWNER")"
+          if ! docker manifest inspect "$ref" >/dev/null 2>&1; then
+            echo "::error::$ref (the digest scripts/harrier-artifact.json pins) is not pullable anonymously (absent, or the package is private). Publish it with the 'publish harrier artifact' workflow and set the package public, or fix the pinned digest; then re-run this release."
             exit 1
           fi
 
@@ -1076,6 +1077,21 @@ jobs:
               open(f"digests/staged-base-{img}", "w").write(row + "\n")
               print(row)
           PY
+
+      # The harrier embedder artifact, by the digest the repo pins
+      # (scripts/harrier-artifact.json), NEVER a tag resolved now: the
+      # script pulls that digest anonymously, checks every file against the
+      # image's harrier.sha256 and that file against the pinned GGUF sha,
+      # and writes `harrier@sha256:...` plus `# harrier-gguf-sha256 <hex>`
+      # (the GGUF a node's harrier model layer must equal; `noo cluster
+      # verify`) into digests/. The CLI never stages or runs the row
+      # (image_stage.rs ARTIFACT_LOCK_ROWS); onboard, `noo models pull
+      # harrier`, the roll's embedder ensure and `noo cluster import-model`
+      # pull exactly it. Before any login in this job; no seed in this step.
+      - name: Pin the harrier embedder artifact by its repo digest
+        run: |
+          set -eu
+          python3 scripts/harrier-artifact-pin.py rows --registry "$REGISTRY" --owner "$OWNER" --out digests
 
       # Third-party images the stack runs straight from their upstream
       # registry by a FIXED compose tag (ollama, nats, nginx, redis, loki,

@@ -1,0 +1,8 @@
+{
+  "_comment": "The harrier embedder artifact the release pins (images-release.yml: the release-line check and the lock job read this file; scripts/harrier-artifact-pin.py). `digest` is the OCI image publish-harrier.yml pushed; `gguf_sha256` is what that image's own harrier.sha256 names for harrier-Q4_K_M.gguf (the models-harrier-v1 release asset). The lock job pulls <registry>/<owner>/harrier@<digest>, checks its files against harrier.sha256 and that file against gguf_sha256, and writes `harrier@<digest>` and `# harrier-gguf-sha256 <gguf_sha256>` into the signed stack lock. It never resolves a tag. A new harrier is a new tag from publish-harrier.yml (which refuses to overwrite one) and a bump here.",
+  "image": "harrier",
+  "tag": "v1",
+  "digest": "sha256:2fe41964a009bda0c55f299b632b122bcb4561ca4a833e3293c9f3cc685bab79",
+  "gguf": "harrier-Q4_K_M.gguf",
+  "gguf_sha256": "5f26506ab57fd817ce4a8b9d24946a60d40bc76d82a2defa7cd754ae01e9de80"
+}
