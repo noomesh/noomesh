@@ -106,7 +106,7 @@ func isRemoteMediaURL(u string) bool {
 	if u == "" {
 		return false
 	}
-	return len(u) < 5 || !strings.EqualFold(u[:5], "data:")
+	return false
 }
 
 // cleanPartType is a part type as it may appear in a log line or a message:
