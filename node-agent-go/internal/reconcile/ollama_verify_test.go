@@ -5,6 +5,7 @@ package reconcile
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -135,5 +136,132 @@ func TestOllamaVerifyAdoptedLaneIsTheRuntimes(t *testing.T) {
 		if got := adoptedLane(rt); got != want {
 			t.Errorf("adoptedLane(%q) = %q, want %q", rt, got, want)
 		}
+	}
+}
+
+// reportedModels is the report's model names, in order.
+func reportedModels(t *testing.T, l *ollamaVerifyLoop) []string {
+	t.Helper()
+	rows, _ := l.report().([]dockerpkg.OllamaVerifyResult)
+	out := make([]string, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, r.Model)
+	}
+	return out
+}
+
+func reportedRow(t *testing.T, l *ollamaVerifyLoop, model string) dockerpkg.OllamaVerifyResult {
+	t.Helper()
+	rows, _ := l.report().([]dockerpkg.OllamaVerifyResult)
+	for _, r := range rows {
+		if r.Model == model {
+			return r
+		}
+	}
+	t.Fatalf("%s is not in the report: %+v", model, rows)
+	return dockerpkg.OllamaVerifyResult{}
+}
+
+// blockedLoop is a loop whose checks never finish during the test: after an
+// agent restart, nothing has a result yet.
+func blockedLoop(t *testing.T) *ollamaVerifyLoop {
+	t.Helper()
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	return newOllamaVerifyLoop(func(_ context.Context, model string, _ string) dockerpkg.OllamaVerifyResult {
+		<-release
+		return dockerpkg.OllamaVerifyResult{Model: model, State: dockerpkg.OllamaVerified}
+	}, nil)
+}
+
+// i1067: after a restart (no results), every scheduled model is in the
+// report, before its check has run.
+func TestOllamaVerifyScheduledModelsAreReportedBeforeTheirCheck(t *testing.T) {
+	l := blockedLoop(t)
+	l.schedule(context.Background(), []string{"qwen2.5:0.5b", "harrier"}, dockerpkg.OllamaLaneStack)
+	got := reportedModels(t, l)
+	if len(got) != 2 || got[0] != "harrier" || got[1] != "qwen2.5:0.5b" {
+		t.Fatalf("report = %v, want both scheduled models", got)
+	}
+}
+
+// i1067: a model not checked yet is a pending row: its state, the reason,
+// its lane, and no anchor or remedy.
+func TestOllamaVerifyUncheckedModelIsAPendingRow(t *testing.T) {
+	l := newOllamaVerifyLoop(nil, nil)
+	l.list([]string{"harrier"}, dockerpkg.OllamaLaneStack)
+	r := reportedRow(t, l, "harrier")
+	if r.State != dockerpkg.OllamaPending || r.Reason != "not yet checked (the agent checks it on its next pass)" ||
+		r.Lane != dockerpkg.OllamaLaneStack || r.Remedy != "" || r.Anchor != "" || r.CheckedAt != "" {
+		t.Fatalf("pending row = %+v", r)
+	}
+}
+
+// i1067: a model with a result shows the result, not a pending row.
+func TestOllamaVerifyCheckedModelShowsItsResult(t *testing.T) {
+	l := newOllamaVerifyLoop(func(_ context.Context, model string, _ string) dockerpkg.OllamaVerifyResult {
+		return dockerpkg.OllamaVerifyResult{Model: model, State: dockerpkg.OllamaUnverified, Anchor: dockerpkg.OllamaAnchorNone, Reason: "no controller record"}
+	}, nil)
+	l.list([]string{"harrier", "qwen2.5:0.5b"}, dockerpkg.OllamaLaneStack)
+	l.runPass(context.Background(), []string{"harrier"}, dockerpkg.OllamaLaneStack)
+	if r := reportedRow(t, l, "harrier"); r.State != dockerpkg.OllamaUnverified || r.Reason != "no controller record" {
+		t.Fatalf("harrier = %+v, want its result", r)
+	}
+}
+
+// i1067: retain drops a model no longer placed from the report, checked
+// or not.
+func TestOllamaVerifyRetainDropsAnUnplacedModelFromTheReport(t *testing.T) {
+	l := newOllamaVerifyLoop(nil, nil)
+	l.list([]string{"harrier", "qwen2.5:0.5b"}, dockerpkg.OllamaLaneStack)
+	l.retain([]string{"qwen2.5:0.5b"})
+	if got := reportedModels(t, l); len(got) != 1 || got[0] != "qwen2.5:0.5b" {
+		t.Fatalf("report = %v, want harrier dropped", got)
+	}
+}
+
+// selfNodeRows is the controller's own node with an agent-run embedder: a
+// chat model and harrier on the stack's Ollama.
+var selfNodeRows = []placement{
+	{Backend: "ollama", Model: "qwen2.5:0.5b", Role: "chat", DesiredState: "running"},
+	{Backend: "ollama", Model: "harrier", Role: "embed", DesiredState: "running"},
+}
+
+// i1067, the source of the flap: each model's presence is its own
+// /api/tags read, and a failed read clears it (unknown). A model unknown on
+// a tick is not checked then, but stays in the report: the model set is the
+// same on every pass, whichever reads failed.
+func TestOllamaVerifyModelSetIsStableAcrossPasses(t *testing.T) {
+	modelpresence.Reset()
+	t.Cleanup(modelpresence.Reset)
+	l := blockedLoop(t)
+	r := &Reconciler{ollamaVerify: l}
+	want := "harrier,qwen2.5:0.5b"
+	for i, harrierKnown := range []bool{false, true, false} {
+		modelpresence.Set("ollama", modelpresence.Entry{Model: "qwen2.5:0.5b", Role: "chat", Present: true})
+		if harrierKnown {
+			modelpresence.Set("ollama#embed", modelpresence.Entry{Model: "harrier", Role: "embed", Present: true})
+		} else {
+			modelpresence.Clear("ollama#embed")
+		}
+		r.verifyOllamaModels(context.Background(), selfNodeRows, dockerpkg.OllamaLaneStack)
+		if got := strings.Join(reportedModels(t, l), ","); got != want {
+			t.Fatalf("pass %d (harrier read ok=%v): report = %s, want %s", i, harrierKnown, got, want)
+		}
+	}
+}
+
+// i1067: a placed model the server answered it does NOT hold (and never
+// checked) is not reported: only what the node holds, or may hold.
+func TestOllamaVerifyKnownAbsentModelIsNotReported(t *testing.T) {
+	modelpresence.Reset()
+	t.Cleanup(modelpresence.Reset)
+	l := blockedLoop(t)
+	r := &Reconciler{ollamaVerify: l}
+	modelpresence.Set("ollama", modelpresence.Entry{Model: "qwen2.5:0.5b", Role: "chat", Present: true})
+	modelpresence.Set("ollama#embed", modelpresence.Entry{Model: "harrier", Role: "embed", Present: false})
+	r.verifyOllamaModels(context.Background(), selfNodeRows, dockerpkg.OllamaLaneStack)
+	if got := reportedModels(t, l); len(got) != 1 || got[0] != "qwen2.5:0.5b" {
+		t.Fatalf("report = %v, want only the held model", got)
 	}
 }

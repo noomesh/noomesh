@@ -78,7 +78,15 @@ const (
 	// the agent may not read it (permission). Report only, with its own
 	// remedy: nothing is known about the bytes.
 	OllamaCannotRead = "cannot-read"
+	// OllamaPending: a model the node holds whose check has not run yet
+	// (after an agent restart, or before its first pass). It is reported,
+	// never left out, so the row's model set does not change with the
+	// agent's memory (i1067). Not a verdict: no anchor, no remedy.
+	OllamaPending = "pending"
 )
+
+// OllamaPendingReason is a pending row's reason.
+const OllamaPendingReason = "not yet checked (the agent checks it on its next pass)"
 
 // The lane a verifier checks: which Ollama, and so which store. The adopted
 // lanes carry backendrt.Native's Runtime() labels.

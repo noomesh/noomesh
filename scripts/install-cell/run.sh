@@ -397,8 +397,10 @@ for n in j.get(\"nodes\") or []:
             sys.exit()
 print(\"verdict=absent detail=no ollama models row for \" + me)
 " "$(hostname)" 2>&1)"
+    # i1067: a held model the agent has not checked yet is an OK row that
+    # says "not yet checked": still pending, so wait for its check.
+    case "$out" in *"not yet checked"*|*"not checked yet"*|verdict=absent*) sleep 30; continue ;; esac
     case "$out" in verdict=ok*) break ;; esac
-    case "$out" in *"not checked yet"*|verdict=absent*) sleep 30; continue ;; esac
     break
   done
   echo "$out"
@@ -407,6 +409,8 @@ print(\"verdict=absent detail=no ollama models row for \" + me)
   # from the container onboard pulled into (noo-ollama-embed on a one-box).
   oc="$(onboard_ollama_container)"
   ov="$( { docker exec "$oc" ollama --version 2>/dev/null || sudo -n docker exec "$oc" ollama --version 2>/dev/null; } | sed -n "s/.*version is //p" | head -n 1)"
+  # Still not checked after the retries: not verified, so not a PASS.
+  case "$out" in *"not yet checked"*) out="verdict=pending (the agent had not checked it after 6 min) ${out}" ;; esac
   case "$out" in
     verdict=ok*) echo "OLLAMA-VERIFIED PASS (ollama ${ov:-?} in $oc): the model onboard pulled is verified against the controller'"'"'s record of its pull: ${out#*detail=}" ;;
     *) echo "OLLAMA-VERIFIED FAIL (ollama ${ov:-?} in $oc): a fresh install'"'"'s ollama models row should read verified, not: ${out}"; exit 1 ;;

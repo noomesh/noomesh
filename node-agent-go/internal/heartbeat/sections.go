@@ -234,8 +234,10 @@ var (
 	secOllamaVerify = payloadSection{name: "ollamaVerify", add: func(r *Reporter, p map[string]any) {
 		// Each placed Ollama model checked against the controller's store
 		// (reconcile/ollama_verify.go): state, anchor and the model layer's
-		// digest, so the controller sees every node's weight digest. OMITTED
-		// until a check has run: an empty list would claim "none placed".
+		// digest, so the controller sees every node's weight digest. Every
+		// model the node holds is a row, a "pending" one until its check has
+		// run (i1067). OMITTED while nothing is listed: an empty list would
+		// claim "none placed".
 		if ov := r.ollamaVerifyReport(); ov != nil {
 			p["ollama_verify"] = ov
 		}

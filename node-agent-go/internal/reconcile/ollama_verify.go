@@ -50,7 +50,13 @@ type ollamaVerifyLoop struct {
 	mu      sync.Mutex
 	results map[string]dockerpkg.OllamaVerifyResult
 	lastRun map[string]time.Time
-	busy    bool
+	// listed is the report's model set (model -> lane): every model the
+	// node holds, or may hold, whether or not its check has run. report()
+	// gives one row per model here (and per stored result), so the set
+	// does not depend on which checks have finished since the agent
+	// started (i1067).
+	listed map[string]string
+	busy   bool
 	// refusal is the standing backend_start reason ("" = none).
 	refusal string
 	// refusalsLogged counts transitions into a (new) refusal: what the
@@ -69,6 +75,20 @@ func newOllamaVerifyLoop(verify func(context.Context, string, string) dockerpkg.
 		now:     time.Now,
 		results: map[string]dockerpkg.OllamaVerifyResult{},
 		lastRun: map[string]time.Time{},
+		listed:  map[string]string{},
+	}
+}
+
+// list replaces the report's model set: models (checked or not) on lane.
+func (l *ollamaVerifyLoop) list(models []string, lane string) {
+	if l == nil {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.listed = make(map[string]string, len(models))
+	for _, m := range models {
+		l.listed[m] = lane
 	}
 }
 
@@ -93,6 +113,11 @@ func (l *ollamaVerifyLoop) schedule(ctx context.Context, models []string, lane s
 		return
 	}
 	l.mu.Lock()
+	// A model scheduled is a model the node holds: reported from now on,
+	// pending until its check has run, whether or not a pass starts now.
+	for _, m := range models {
+		l.listed[m] = lane
+	}
 	if l.busy {
 		if len(l.dueLocked(models)) > 0 {
 			l.missed = true
@@ -200,6 +225,11 @@ func (l *ollamaVerifyLoop) retain(models []string) {
 		keep[m] = true
 	}
 	l.mu.Lock()
+	for m := range l.listed {
+		if !keep[m] {
+			delete(l.listed, m)
+		}
+	}
 	dropped := false
 	for m := range l.results {
 		if !keep[m] {
@@ -233,20 +263,44 @@ func (l *ollamaVerifyLoop) refused(model string) bool {
 	return l.results[model].State == dockerpkg.OllamaRefused
 }
 
-// report is the heartbeat's `ollama_verify`: one row per placed model
-// checked, sorted; nil (key omitted) before any check.
+// report is the heartbeat's `ollama_verify`: one row per listed model and
+// per stored result, sorted. A listed model whose check has not run (after an
+// agent restart, or before its first pass) is a pending row, never left out:
+// the row's model set must not change with nothing changing on the box
+// (i1067). nil (key omitted) when nothing is listed or checked.
 func (l *ollamaVerifyLoop) report() any {
 	if l == nil {
 		return nil
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if len(l.results) == 0 {
+	names := map[string]bool{}
+	for m := range l.results {
+		names[m] = true
+	}
+	for m := range l.listed {
+		names[m] = true
+	}
+	if len(names) == 0 {
 		return nil
 	}
-	out := make([]dockerpkg.OllamaVerifyResult, 0, len(l.results))
-	for _, m := range sortedResultKeys(l.results) {
-		out = append(out, l.results[m])
+	keys := make([]string, 0, len(names))
+	for m := range names {
+		keys = append(keys, m)
+	}
+	sort.Strings(keys)
+	out := make([]dockerpkg.OllamaVerifyResult, 0, len(keys))
+	for _, m := range keys {
+		if res, ok := l.results[m]; ok {
+			out = append(out, res)
+			continue
+		}
+		out = append(out, dockerpkg.OllamaVerifyResult{
+			Model:  m,
+			State:  dockerpkg.OllamaPending,
+			Reason: dockerpkg.OllamaPendingReason,
+			Lane:   l.listed[m],
+		})
 	}
 	return out
 }
@@ -276,6 +330,15 @@ func (r *Reconciler) clearBackendStart(backend string) {
 // every placed model the server holds, and reports a refused one absent.
 // lane is the Ollama checked (dockerpkg.OllamaLane*): the agent's container,
 // or the adopted lane's Runtime() ("native", "stack"), whose store differs.
+//
+// The report's model set is every placed model NOT known absent: held, or
+// unknown this tick. Unknown is ensureOllamaModel's "could not ask" (each
+// model is its own /api/tags read, on the adopted lane with a 2 s probe
+// timeout, and a failed read clears that model's presence): such a model is
+// not checked this tick, but it stays in the report (its last result, or
+// pending). Before i1067 the set was "models with a result", and a model
+// whose read failed on the tick after a restart was missing from the report
+// until a later tick read it: the row moved with nothing changed on the box.
 func (r *Reconciler) verifyOllamaModels(ctx context.Context, rows []placement, lane string) {
 	if r.ollamaVerify == nil {
 		return
@@ -287,7 +350,7 @@ func (r *Reconciler) verifyOllamaModels(ctx context.Context, rows []placement, l
 	}
 	primary := ordered[0]
 	presence := modelpresence.Report()
-	var placed, held []string
+	var placed, held, listed []string
 	seen := map[string]bool{}
 	for _, p := range ordered {
 		model := strings.TrimSpace(p.Model)
@@ -296,11 +359,16 @@ func (r *Reconciler) verifyOllamaModels(ctx context.Context, rows []placement, l
 		}
 		seen[model] = true
 		placed = append(placed, model)
-		if e, ok := presence[presenceKey(p.Backend, p, primary, ordered)]; ok && e.Present {
+		e, known := presence[presenceKey(p.Backend, p, primary, ordered)]
+		if known && e.Present {
 			held = append(held, model)
+		}
+		if !known || e.Present {
+			listed = append(listed, model)
 		}
 	}
 	r.ollamaVerify.retain(placed)
+	r.ollamaVerify.list(listed, lane)
 	r.ollamaVerify.schedule(ctx, held, lane)
 	for _, p := range ordered {
 		model := strings.TrimSpace(p.Model)

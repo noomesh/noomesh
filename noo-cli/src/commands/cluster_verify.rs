@@ -858,6 +858,20 @@ pub(crate) fn model_stores_check(id: &str, n: &Value) -> Option<Check> {
 /// switch that marks a model trusted. No row when the agent does not report it
 /// (no Ollama placement, or an agent that predates the check).
 ///
+/// harrier's remedy is its artifact path on every node kind, decided before
+/// the node kind: on another node `noo cluster import-model <node> harrier`;
+/// on the controller's own node `noo models pull harrier`, which for harrier
+/// is NOT a registry pull but the release artifact copied into the stack's
+/// embed container (`models_pull` -> `pull_harrier`). import-model is wrong
+/// there: the agent's import creates into noo-ollama or a host `ollama`
+/// binary, never the stack's embed Ollama the self node adopts.
+///
+/// A `pending` model (held, its check not run yet: after an agent restart)
+/// is not a problem: the detail says "<model>: not yet checked" and the
+/// verdict is the checked models' alone, OK when all are pending. The node
+/// lists every model it holds on every report (i1067), so the row's model
+/// set does not move between reports.
+///
 /// The stack lane (the controller's own node checking the stack's Ollama,
 /// `lane: "stack"`) is report-only: compose manages that Ollama, so a
 /// mismatch names the re-pull, not "not repaired here". A store file the
@@ -868,11 +882,20 @@ pub(crate) fn model_stores_check(id: &str, n: &Value) -> Option<Check> {
 pub(crate) fn ollama_models_check(id: &str, n: &Value) -> Option<Check> {
     // `noo models pull` acts on the gateway's Ollama: the controller's own
     // node only. Elsewhere the model is staged and imported onto that node.
+    // harrier is an artifact, never a registry tag: its path wins on every
+    // node kind, before the self-node branch (i1067).
     fn ollama_remedy(id: &str, n: &Value, model: &str) -> String {
-        if n["self_node"].as_bool() == Some(true) {
+        let self_node = n["self_node"].as_bool() == Some(true);
+        if model == "harrier" {
+            if self_node {
+                // `pull_harrier`: the release artifact into the stack's
+                // embed container, the Ollama the self node adopts.
+                "noo models pull harrier".to_string()
+            } else {
+                format!("noo cluster import-model {id} harrier")
+            }
+        } else if self_node {
             format!("noo models pull {model}")
-        } else if model == "harrier" {
-            format!("noo cluster import-model {id} harrier")
         } else {
             format!("noo models fetch ollama:{model} && noo cluster import-model {id} ollama:{model}")
         }
@@ -886,6 +909,8 @@ pub(crate) fn ollama_models_check(id: &str, n: &Value) -> Option<Check> {
     let mut good = Vec::new();
     let mut warns = Vec::new();
     let mut fails = Vec::new();
+    // Held, not checked yet: never a problem, never a verdict.
+    let mut pending: Vec<String> = Vec::new();
     let mut remedies: Vec<String> = Vec::new();
     // Remedies that are not a re-pull (an unreadable store): their own line.
     let mut read_fixes: Vec<String> = Vec::new();
@@ -901,6 +926,7 @@ pub(crate) fn ollama_models_check(id: &str, n: &Value) -> Option<Check> {
                 if layer.is_empty() { String::new() } else { format!(", weights {layer}") },
                 if r["state"] == "rebuilt" { ", repaired from the controller" } else { "" })),
             "refused" => { fails.push(format!("{model}: {reason}")); remedies.push(pull()); }
+            "pending" => pending.push(format!("{model}: not yet checked")),
             "unverified" => {
                 let why = if reason.is_empty() { "no controller record" } else { reason };
                 // A re-pull of an hf.co/ ref records nothing: no remedy to give.
@@ -937,17 +963,24 @@ pub(crate) fn ollama_models_check(id: &str, n: &Value) -> Option<Check> {
         lines.push(format!("on {id}: {fix}"));
     }
     let remedy = (!lines.is_empty()).then(|| lines.join("\n"));
+    let not_yet = if pending.is_empty() { String::new() } else { format!("; {}", pending.join("; ")) };
     if !fails.is_empty() {
         let mut d = format!("refused (does not match the controller, and the repair failed): {}", fails.join("; "));
         if !warns.is_empty() { d.push_str(&format!("; also {}", warns.join("; "))); }
+        d.push_str(&not_yet);
         return Some(fail(NAME, d, remedy.unwrap_or_default()));
     }
     if !warns.is_empty() {
         let mut d = warns.join("; ");
         if !good.is_empty() { d.push_str(&format!("; verified: {}", good.join(", "))); }
+        d.push_str(&not_yet);
         return Some(warn(NAME, d, remedy));
     }
-    Some(ok(NAME, format!("verified against the controller: {}", good.join(", "))))
+    if good.is_empty() {
+        // Every model pending: nothing checked yet, nothing wrong.
+        return Some(ok(NAME, pending.join("; ")));
+    }
+    Some(ok(NAME, format!("verified against the controller: {}{not_yet}", good.join(", "))))
 }
 
 /// The `harness egress` row (enforcement step 1): whether this node's harness,
@@ -16841,6 +16874,65 @@ mod ollama_models_tests {
             "reason": "no controller record"}]});
         let c = ollama_models_check("node-a", &n).unwrap();
         assert_eq!(c.remedy.as_deref(), Some("on node-a: noo cluster import-model node-a harrier"));
+    }
+
+    /// i1067: harrier's artifact path wins on the controller's own node too.
+    /// There it is `noo models pull harrier` (`pull_harrier`: the release
+    /// artifact into the stack's embed container), never import-model, whose
+    /// create goes to noo-ollama or a host binary, not the stack's Ollama.
+    #[test]
+    fn harrier_on_the_controllers_own_node_takes_the_artifact_path() {
+        let n = json!({"self_node": true, "ollama_verify": [{"model": "harrier", "state": "unverified", "anchor": "none",
+            "lane": "stack", "reason": "no controller record"}]});
+        let c = ollama_models_check("ctrl", &n).unwrap();
+        assert_eq!(c.remedy.as_deref(), Some("on ctrl: noo models pull harrier"));
+        // Another model on the same node keeps the gateway's re-pull.
+        let n = json!({"self_node": true, "ollama_verify": [{"model": "qwen2.5:0.5b", "state": "unverified", "anchor": "none",
+            "lane": "stack", "reason": "no controller record"}]});
+        assert_eq!(ollama_models_check("ctrl", &n).unwrap().remedy.as_deref(), Some("on ctrl: noo models pull qwen2.5:0.5b"));
+    }
+
+    /// i1067: a held model whose check has not run (after an agent restart)
+    /// is not a problem: the verdict is the checked models', and the detail
+    /// names it as not yet checked.
+    #[test]
+    fn a_pending_model_beside_a_verified_one_is_ok() {
+        let n = json!({"self_node": true, "ollama_verify": [
+            {"model": "harrier", "state": "pending", "anchor": "", "lane": "stack",
+             "reason": "not yet checked (the agent checks it on its next pass)"},
+            {"model": "qwen2.5:0.5b", "state": "verified", "anchor": "mirror", "lane": "stack"}]});
+        let c = ollama_models_check("ctrl", &n).unwrap();
+        assert_eq!(c.verdict, Verdict::Ok, "{}", c.detail);
+        assert!(c.detail.starts_with("verified against the controller: qwen2.5:0.5b ("), "{}", c.detail);
+        assert!(c.detail.ends_with("; harrier: not yet checked"), "{}", c.detail);
+        assert_eq!(c.remedy, None);
+    }
+
+    /// i1067: every model pending is OK, "not yet checked", never a WARN and
+    /// never "verified".
+    #[test]
+    fn every_model_pending_is_ok_not_yet_checked() {
+        let n = json!({"ollama_verify": [
+            {"model": "harrier", "state": "pending", "anchor": "", "reason": "not yet checked"},
+            {"model": "qwen2.5:0.5b", "state": "pending", "anchor": "", "reason": "not yet checked"}]});
+        let c = ollama_models_check("node-a", &n).unwrap();
+        assert_eq!(c.verdict, Verdict::Ok, "{}", c.detail);
+        assert_eq!(c.detail, "harrier: not yet checked; qwen2.5:0.5b: not yet checked");
+        assert_eq!(c.remedy, None);
+    }
+
+    /// i1067: a pending model adds no remedy and does not decide the verdict;
+    /// beside a checked WARN it is still named.
+    #[test]
+    fn a_pending_model_beside_a_warn_is_named_and_adds_no_remedy() {
+        let n = json!({"ollama_verify": [
+            {"model": "gemma4:e2b", "state": "unverified", "anchor": "none", "reason": "no controller record"},
+            {"model": "harrier", "state": "pending", "anchor": "", "reason": "not yet checked"}]});
+        let c = ollama_models_check("node-a", &n).unwrap();
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.ends_with("; harrier: not yet checked"), "{}", c.detail);
+        assert_eq!(c.remedy.as_deref(),
+            Some("on node-a: noo models fetch ollama:gemma4:e2b && noo cluster import-model node-a ollama:gemma4:e2b"));
     }
 
     /// A mirror anchor says what it proves: the bytes are the ones the

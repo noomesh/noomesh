@@ -140,6 +140,14 @@ def test_a_model_pulled_before_the_record_existed_is_a_note_not_a_fail(tmp_path)
     assert rc == 0 and " NOTE: " in got["G2"] and "noo models pull gemma4:e2b" in got["G2"], got["G2"]
 
 
+def test_a_model_not_yet_checked_is_a_note_not_a_pass(tmp_path):
+    # i1067: right after the roll the agent lists a held model as pending;
+    # the row is OK, but nothing about the bytes is proven yet.
+    rows = GOOD_SELF[:2] + [{"name": "ollama models", "verdict": "ok", "detail": "gemma4:e2b: not yet checked"}]
+    rc, got = cell(tmp_path, self_rows=rows)
+    assert rc == 0 and " NOTE: " in got["G2"] and "gemma4:e2b: not yet checked" in got["G2"], got["G2"]
+
+
 def test_a_backend_start_refusal_or_a_used_lane_fails(tmp_path):
     rows = GOOD_SELF + [{"name": "backend starts", "verdict": "fail", "detail": "runner-a: llamacpp: model_missing: m.gguf"}]
     ctl = GOOD_CTL[:2] + [{"name": "legacy lanes", "verdict": "warn", "detail": "requests from a node with no node certificate were REFUSED 3 time(s)"}]
