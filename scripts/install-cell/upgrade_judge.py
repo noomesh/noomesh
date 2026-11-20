@@ -236,7 +236,7 @@ HUB_HOSTS = ("docker.io", "index.docker.io", "registry-1.docker.io")
 # Images a container can name without a registry that are Docker Hub's, and
 # that no noomesh build is called: the leak the 0.6.28 `docker run alpine
 # chgrp` was. Compared on the normalised repo (no host, `library/`, tag, digest).
-HUB_KNOWN = ("alpine", "busybox", "hello-world", "debian", "ubuntu")
+HUB_KNOWN = ("busybox", "hello-world", "debian", "ubuntu")
 
 
 def image_parts(ref):
