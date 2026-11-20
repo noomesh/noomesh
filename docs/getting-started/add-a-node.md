@@ -25,8 +25,6 @@ The node is ready when `verify` shows no FAIL. Each row that fails names the com
 
 ## For agents
 
-<!-- fa: check every command, flag, refusal and remedy below against noo-cli before this merges -->
-
 - **Mint** on the controller: `noo cluster bootstrap-token create --node <node>`.
   - Options: `[--ttl <1h|30m|24h|secs>] [--cidr <cidr>] [--role <role>]`,
     `[--with-tailscale|--no-tailscale]`.
