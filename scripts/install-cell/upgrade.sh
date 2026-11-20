@@ -119,7 +119,7 @@ step before-roll 120 -- bash -c '
 # docker group yet, the watcher is sudo's, and so is its stop.
 DOCKER="docker"; docker info >/dev/null 2>&1 || DOCKER="sudo -n docker"
 mkdir -p "$OUT/logs"
-$DOCKER events --format '{{json .}}' --filter type=image --filter type=container \
+$DOCKER events --format '{{json .}}' --filter type=image --filter type=volume \
     > "$OUT/logs/docker-events-upgrade.jsonl" 2> "$OUT/logs/docker-events-upgrade.err" < /dev/null &
 EVENTS_PID=$!
 echo "$EVENTS_PID" > "$J/docker-events.pid"
