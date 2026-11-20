@@ -3576,7 +3576,7 @@ pub async fn require_any_auth(
             }
             if claims.act.is_some() && !delegated_subject_enabled(&state.db, &claims.sub).await {
                 tracing::warn!(subject = %claims.sub, "delegated token refused: subject disabled or absent");
-                return Ok(unauthenticated());
+                return Err(StatusCode::UNAUTHORIZED);
             }
             if crate::worker_delegation::is_worker_delegated(&claims) {
                 tracing::info!(
