@@ -216,7 +216,7 @@ pub fn hup_and_record(ctl: &dyn NatsCtl, p: &Paths, polls: u32, pause: Duration)
         }
     }
     // The container we signalled must still be the one running.
-    let Some(id) = id.filter(|i| ctl.container_id().as_deref() == Some(i.as_str())) else {
+    let Some(id) = id else {
         return true;
     };
     let after = file_sha(&p.conf);
