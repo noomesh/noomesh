@@ -5472,14 +5472,23 @@ fn ollama_listed_name(m: &str) -> String {
 }
 
 /// Does the node already hold `tag`? From its heartbeat's
-/// `available_models` (the tags its ollama lists, as strings or `{name}`).
-/// None when the record or the list is absent: unknown, never "no". Pure.
+/// `available_models`: the tags its ollama lists (`/api/tags`, always
+/// `name:tag`) and the GGUF files in its MODELS_DIR (bare stems), as strings
+/// or `{name}`. Listed = yes. NOT listed is a known "no" only when the same
+/// list shows the node's ollama answered: it carries at least one ollama tag
+/// (a name with a `:`). An ollama that is down, still starting, or holds
+/// nothing yet reports no tag at all, and the heartbeat has no field that
+/// tells "answered with none" from "did not answer", so an empty list is
+/// unknown, never "no". None when the record or the list is absent. Pure.
 pub(crate) fn node_holds_ollama_tag(node: Option<&Value>, tag: &str) -> Option<bool> {
     let want = ollama_listed_name(tag);
     let list = node?["available_models"].as_array()?;
-    Some(list.iter().any(|v| {
-        v.as_str().or_else(|| v.get("name").and_then(Value::as_str)).is_some_and(|n| ollama_listed_name(n) == want)
-    }))
+    let names: Vec<&str> = list.iter().filter_map(|v| v.as_str().or_else(|| v.get("name").and_then(Value::as_str))).collect();
+    if names.iter().any(|n| ollama_listed_name(n) == want) {
+        return Some(true);
+    }
+    let ollama_answered = names.iter().any(|n| n.contains(':'));
+    ollama_answered.then_some(false)
 }
 
 /// May the node's agent pull an ollama tag from the public registry
@@ -5492,6 +5501,10 @@ pub(crate) fn node_may_pull_ollama_registry(node: Option<&Value>) -> Option<bool
     let report = node?.get("node_local").filter(|r| r.is_object())?;
     Some(report["declared"].as_array().is_some_and(|d| d.iter().any(|k| k["key"].as_str() == Some("NOO_ALLOW_OLLAMA_REGISTRY_PULL"))))
 }
+
+/// The 409 code of the ollama tag refusal: `noo cluster place` reads it
+/// (noo-cli `OLLAMA_TAG_NOT_STAGED`) to show `next` instead of retrying.
+pub(crate) const OLLAMA_TAG_NOT_STAGED: &str = "ollama_tag_not_staged";
 
 /// The refusal for an ollama tag a node cannot get.
 pub(crate) fn ollama_tag_refusal(node_id: &str, tag: &str) -> String {
@@ -5730,7 +5743,7 @@ async fn placement_put(
                 OllamaTagCheck::Refuse(msg) if !body.force => {
                     tracing::warn!(node = %node_id, tag = %tag, "placement.ollama_tag_not_staged");
                     let fetch = format!("noo models fetch ollama:{tag}");
-                    return Err(AppError::ConflictNext { msg, next: json!([super::bootstrap::next_cmd(&fetch, &[])]) });
+                    return Err(AppError::ConflictNext { code: OLLAMA_TAG_NOT_STAGED, msg, next: json!([super::bootstrap::next_cmd(&fetch, &[])]) });
                 }
                 OllamaTagCheck::Refuse(msg) => fit_warnings.push(format!("forced past an unstaged ollama tag: {msg}")),
             }
@@ -10984,7 +10997,8 @@ mod ollama_tag_check_tests {
         let put = crate::test_src::fn_body(&own, "async fn placement_put(");
         assert!(put.contains("OllamaTagCheck::Refuse(msg) if !body.force => {"), "a 409 without --force");
         assert!(put.contains("let fetch = format!(\"noo models fetch ollama:{tag}\");"), "the fetch command");
-        assert!(put.contains("return Err(AppError::ConflictNext { msg, next: json!([super::bootstrap::next_cmd(&fetch, &[])]) });"), "next in the agreed shape");
+        assert!(put.contains("return Err(AppError::ConflictNext { code: OLLAMA_TAG_NOT_STAGED, msg, next: json!([super::bootstrap::next_cmd(&fetch, &[])]) });"), "next in the agreed shape");
+        assert_eq!(OLLAMA_TAG_NOT_STAGED, "ollama_tag_not_staged", "the code the CLI reads");
         assert!(put.contains("OllamaTagCheck::Refuse(msg) => fit_warnings.push(format!(\"forced past an unstaged ollama tag: {msg}\")),"), "--force: a warning");
         assert!(put.contains("OllamaTagCheck::Warn(w) => fit_warnings.push(w),"), "unknown: a warning in the answer");
         let next = json!([super::super::bootstrap::next_cmd("noo models fetch ollama:gemma4:12b", &[])]);
@@ -10995,12 +11009,12 @@ mod ollama_tag_check_tests {
     #[tokio::test]
     async fn conflict_next_answers_409_with_next() {
         use axum::response::IntoResponse;
-        let r = AppError::ConflictNext { msg: "m".into(), next: json!([{"kind": "command", "command": "c"}]) }.into_response();
+        let r = AppError::ConflictNext { code: "k", msg: "m".into(), next: json!([{"kind": "command", "command": "c"}]) }.into_response();
         assert_eq!(r.status(), axum::http::StatusCode::CONFLICT);
         let bytes = axum::body::to_bytes(r.into_body(), usize::MAX).await.expect("the body reads");
         let body: Value = serde_json::from_slice(&bytes).expect("json");
-        assert_eq!(body, json!({"error": "m", "next": [{"kind": "command", "command": "c"}]}));
-        assert_eq!(AppError::ConflictNext { msg: "m".into(), next: Value::Null }.to_string(), "m");
+        assert_eq!(body, json!({"error": "m", "code": "k", "next": [{"kind": "command", "command": "c"}]}));
+        assert_eq!(AppError::ConflictNext { code: "k", msg: "m".into(), next: Value::Null }.to_string(), "m");
     }
 
     #[test]
@@ -11031,15 +11045,26 @@ mod ollama_tag_check_tests {
     }
 
     /// The node holds it when its ollama lists it (`available_models`);
-    /// `library/` and `:latest` do not matter.
+    /// `library/` and `:latest` do not matter. Not listed is a "no" only
+    /// while the list shows its ollama answered (an ollama tag in it).
     #[test]
     fn the_node_holds_a_tag_its_heartbeat_lists() {
-        let n = json!({"available_models": ["gemma4:12b", {"name": "someone/m:latest"}, "harrier.gguf"]});
+        let n = json!({"available_models": ["gemma4:12b", {"name": "someone/m:latest"}, "harrier"]});
         assert_eq!(node_holds_ollama_tag(Some(&n), "gemma4:12b"), Some(true));
         assert_eq!(node_holds_ollama_tag(Some(&n), "library/Gemma4:12b"), Some(true));
         assert_eq!(node_holds_ollama_tag(Some(&n), "someone/m"), Some(true));
-        assert_eq!(node_holds_ollama_tag(Some(&n), "gemma4:27b"), Some(false));
-        assert_eq!(node_holds_ollama_tag(Some(&json!({"available_models": []})), "gemma4"), Some(false), "an empty list is a fact");
+        assert_eq!(node_holds_ollama_tag(Some(&n), "gemma4:27b"), Some(false), "its ollama answered and does not list it");
+    }
+
+    /// An ollama that is down or still starting lists nothing while the tag
+    /// may sit on its disk: an empty list, or one with only GGUF files, is
+    /// unknown (a warning), never a refusal.
+    #[test]
+    fn an_empty_list_is_unknown_not_no() {
+        assert_eq!(node_holds_ollama_tag(Some(&json!({"available_models": []})), "gemma4"), None, "empty: unknown");
+        assert_eq!(node_holds_ollama_tag(Some(&json!({"available_models": ["harrier", {"name": "qwen-7b"}]})), "gemma4"), None, "GGUF files only: ollama did not answer");
+        let held = node_holds_ollama_tag(Some(&json!({"available_models": []})), "gemma4");
+        assert!(matches!(ollama_tag_check("node_a", "gemma4", Some(false), held, Some(false)), OllamaTagCheck::Warn(_)), "never refused");
         assert_eq!(node_holds_ollama_tag(Some(&json!({})), "gemma4"), None, "no list: unknown");
         assert_eq!(node_holds_ollama_tag(None, "gemma4"), None, "no record: unknown");
     }

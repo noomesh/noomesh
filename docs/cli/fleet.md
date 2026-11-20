@@ -112,8 +112,9 @@ node refuses a tag the controller has not staged (`ollama_registry_pull_refused`
 `noo cluster place` refuses such a tag up front (409, with
 `noo models fetch ollama:<tag>` as its next step) when the store does not
 hold it, the node does not hold it, and the node does not declare
-`NOO_ALLOW_OLLAMA_REGISTRY_PULL`; when one of those is unknown it places
-with a warning. `--force` places it anyway.
+`NOO_ALLOW_OLLAMA_REGISTRY_PULL`; when one of those is unknown (a node
+whose Ollama lists no tags yet counts as unknown) it places with a
+warning. `--force` places it anyway.
 
 ```sh
 noo models fetch ollama:qwen2.5:7b-instruct
