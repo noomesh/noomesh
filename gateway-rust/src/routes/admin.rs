@@ -2303,8 +2303,9 @@ async fn security_pki_status(_op: OperatorOrInternal) -> AppResult {
     let pki_dir = crate::tls::pki_dir().map(|p| p.to_string_lossy().into_owned())
         .filter(|p| std::path::Path::new(p).join("ca.crt").exists())
         .or_else(|| {
-            // Check common Docker container paths (entrypoint.py copies to /tmp/pki)
-            ["/tmp/pki", "/app/pki"].iter()
+            // The container paths: the copy stage_pki makes at start, then
+            // the mount it copied from.
+            [crate::tls::STAGED_PKI_DIR, crate::tls::LIVE_PKI_MOUNT].iter()
                 .find(|p| std::path::Path::new(p).join("ca.crt").exists())
                 .map(|p| p.to_string())
         })
@@ -2312,11 +2313,20 @@ async fn security_pki_status(_op: OperatorOrInternal) -> AppResult {
             let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
             format!("{home}/.config/mesh/pki")
         });
+    Ok(Json(pki_status_body(&pki_dir, crate::tls::PkiMount::container()).await))
+}
 
-    let pki_path = std::path::Path::new(&pki_dir);
+/// The `/api/security/pki/status` body for a resolved PKI directory.
+/// `ca` and `gateway` are read from `pki_dir` (the staged copy in the
+/// container: they change only with a restart, which re-stages); `nodes`
+/// from the live mount (`PkiMount::public_root`), so a node enrolled after
+/// the gateway started is listed.
+async fn pki_status_body(pki_dir: &str, mount: crate::tls::PkiMount<'_>) -> Value {
+    let pki_path = std::path::Path::new(pki_dir);
     if !pki_path.exists() || !pki_path.join("ca.crt").exists() {
-        return Ok(Json(json!({"status": "not_initialized"})));
+        return json!({"status": "not_initialized"});
     }
+    let public = mount.public_root(pki_path);
 
     let ca_cert_path = pki_path.join("ca.crt");
     let gw_cert_path = pki_path.join("gateway").join("gateway.crt");
@@ -2334,7 +2344,7 @@ async fn security_pki_status(_op: OperatorOrInternal) -> AppResult {
     }
 
     // Scan node certs
-    let nodes_dir = pki_path.join("nodes");
+    let nodes_dir = public.join("nodes");
     if nodes_dir.exists() {
         if let Ok(mut rd) = tokio::fs::read_dir(&nodes_dir).await {
             let mut node_certs = Vec::new();
@@ -2363,11 +2373,11 @@ async fn security_pki_status(_op: OperatorOrInternal) -> AppResult {
         "not_initialized"
     };
 
-    Ok(Json(json!({
+    json!({
         "status": status,
         "pki_dir": pki_dir,
         "certs": certs,
-    })))
+    })
 }
 
 /// Read a PEM certificate file and extract basic info.
@@ -5644,5 +5654,32 @@ mod container_name_tests {
         let check = body.find("if !is_container_name(container)").expect("the name check");
         let url = body.find("format!(\"/logs/{container}").expect("the log URL");
         assert!(check < url, "the container name is checked before the URL is built");
+    }
+}
+
+#[cfg(test)]
+mod pki_status_live_nodes_tests {
+    use super::*;
+    use crate::cert_expiry::test_pki;
+
+    // i1118: `/api/security/pki/status` lists a node enrolled after the
+    // gateway started (its cert is in the live mount, not the staged copy),
+    // with the same response shape.
+    #[tokio::test]
+    async fn a_node_enrolled_after_start_is_listed() {
+        let pki = test_pki::started("status", 3650);
+        pki.enrol_late("late", 5);
+        let staged = pki.staged.to_str().expect("utf-8 temp path");
+        let body = pki_status_body(staged, pki.mount()).await;
+        assert_eq!(body["status"], "initialized", "{body}");
+        assert_eq!(body["pki_dir"], staged, "pki_dir still names the resolved dir");
+        assert!(body["certs"]["ca"].is_object() && body["certs"]["gateway"].is_object(), "{body}");
+        let nodes = body["certs"]["nodes"].as_array().expect("nodes listed");
+        let mut ids: Vec<&str> = nodes.iter().filter_map(|n| n["node_id"].as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec!["early", "late"], "{body}");
+        let late = nodes.iter().find(|n| n["node_id"] == "late").expect("late listed");
+        let path = late["cert"]["path"].as_str().expect("cert path");
+        assert!(path.starts_with(pki.live.to_str().expect("utf-8")), "read from the live mount: {path}");
     }
 }
