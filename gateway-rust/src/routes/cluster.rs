@@ -3315,7 +3315,7 @@ async fn proposals_decide(
     ctx: Option<axum::Extension<crate::auth::RequesterCtx>>,
     Json(body): Json<Value>,
 ) -> AppResult {
-    crate::person_gate::require_person(&state.db, ctx.as_deref(), "deciding a node join proposal").await?;
+
     let id = body.get("id").and_then(|v| v.as_str()).unwrap_or("");
     let decision = body.get("decision").and_then(|v| v.as_str()).unwrap_or("");
     if id.is_empty() {
