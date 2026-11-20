@@ -538,22 +538,12 @@ def test_a_shared_secret_is_an_input_of_every_reader(tmp_path: Path) -> None:
 
 # ── onboard ends converged ─────────────────────────────────────────────────
 
-def test_onboard_sequence_then_start_recreates_nothing(tmp_path: Path) -> None:
-    """The 0.6.29-rc.1 install matrix, replayed on the fingerprint (no docker).
-
-    A container carries the label it was created with; compose recreates it
-    when the start's label differs. Onboard's Service Setup start labels every
-    container (L0). Then onboard keeps writing: its `restart --force worker
-    trellion` (service keys) recreates those two WITHOUT a label, the self node
-    lands its certificate in pki/public/nodes and its NATS user in users.conf
-    (nats is HUPed, still on L0), the model step writes noomesh.yaml, and (in
-    rc.1's order) the posture restart recreates the gateway without a label.
-    The first plain
-    start after that recreated gateway, nats, trellion and worker: the cell's
-    START-IDEMPOTENT failure. Onboard's own last start (converge_stack) is that
-    plain start; after it, the operator's start computes the same labels and
-    recreates nothing, and a later edit of noomesh.yaml still recreates its
-    readers."""
+def _onboard_install(tmp_path: Path):
+    """An install shaped like the four services the rc.1 cell recreated (and
+    redis, which has no file input), plus a `start(tag, only)` that runs the
+    launcher's fingerprint as noomesh-start.sh (no --only) or
+    noomesh-restart.sh (--only the services it recreates) does, committing
+    the state as both do after a good `up`, and returning the labels."""
     i = Install(tmp_path)
     r, d = i.root, i.rundir
     (r / "noomesh.yaml").write_text("cluster: {}\n")
@@ -579,43 +569,170 @@ def test_onboard_sequence_then_start_recreates_nothing(tmp_path: Path) -> None:
             "noo_svc_key_trellion": {"file": f"{d}/noo_svc_key_trellion"},
         },
     }
+    state = tmp_path / "start-inputs.json"
 
-    def start(tag: str) -> dict[str, str]:
+    def start(tag: str, only: tuple[str, ...] = ()) -> dict[str, str]:
         res = subprocess.run(
             ["python3", str(HELPER), "fingerprint", "--key-file", str(i.key), "--root", str(r),
-             "--pki-dir", str(pki), "--override-out", str(tmp_path / f"o{tag}.yml"),
-             "--state-out", str(tmp_path / f"s{tag}.json")],
+             "--pki-dir", str(pki), "--old-state", str(state),
+             *[x for s in only for x in ("--only", s)],
+             "--override-out", str(tmp_path / f"o{tag}.yml"), "--state-out", f"{state}.new"],
             input=json.dumps(cfg), capture_output=True, text=True, timeout=60)
         assert res.returncode == 0, res.stderr
+        os.replace(f"{state}.new", state)  # start_inputs_commit_state / the report's mv
         return {m.group(1): m.group(2) for m in re.finditer(
             r'^  "(.+)":\n    labels:\n      noo\.inputs: "([0-9a-z:]+)"$', (tmp_path / f"o{tag}.yml").read_text(), re.M)}
 
-    def up(carried: dict[str, str | None], labels: dict[str, str]) -> set[str]:
-        moved = {s for s in labels if carried.get(s) != labels[s]}
-        carried.update({s: labels[s] for s in moved})
-        return moved
+    return i, r, d, pki, state, start
 
-    # Service Setup: `noomesh-start.sh --recreate` labels every container.
-    carried: dict[str, str | None] = dict(start("0"))
-    assert set(carried) == {"gateway", "nats", "worker", "trellion", "redis"}
-    # Service keys minted; the launcher writes them; `restart --force` (no label).
-    (d / "noo_svc_key_worker").write_text("svc-worker-key")
-    (d / "noo_svc_key_trellion").write_text("svc-trellion-key")
-    carried["worker"] = carried["trellion"] = None
-    # The self node: its certificate, its NATS user (nats HUPed, not recreated).
+
+def _up(carried: dict[str, str], labels: dict[str, str], only: tuple[str, ...] = (), force: bool = False) -> set[str]:
+    """compose `up`: a container is recreated when its label differs (or
+    --force-recreate); it then carries the label it was made with. `only` =
+    the services named on a targeted `up` (none = all)."""
+    targets = set(only) or set(labels)
+    moved = {s for s in targets if force or carried.get(s) != labels[s]}
+    carried.update({s: labels[s] for s in moved})
+    return moved
+
+
+def test_onboard_sequence_then_start_recreates_nothing(tmp_path: Path) -> None:
+    """The 0.6.29-rc.1 install matrix, replayed on the fingerprint (no docker).
+
+    rc.1: the first plain start after onboard recreated gateway, nats,
+    trellion and worker (START-IDEMPOTENT FAIL). Two causes: onboard writes
+    inputs after its Service Setup start, and its own `noomesh-restart.sh
+    --force` recreates carried no `noo.inputs` label. Now the restarts label
+    (lib-start-inputs.sh start_inputs_label_for_up) and onboard ends with the
+    operator's own plain start, after the posture restart. In onboard's order:
+      Service Setup start (--recreate)            every container, labelled
+      self node: its certificate, its NATS user   nats HUPed, not recreated
+      service keys, `restart --force worker trellion`   labelled
+      the model step writes noomesh.yaml
+      posture `restart --force gateway`           labelled (after every gateway write)
+      converge_stack: the plain start             EXACTLY nats, worker, trellion
+      the operator's `noo stack start`            nothing
+    and a later edit of noomesh.yaml still recreates its three readers."""
+    _, r, d, pki, _, start = _onboard_install(tmp_path)
+    carried: dict[str, str] = {}
+    assert _up(carried, start("svc"), force=True) == {"gateway", "nats", "worker", "trellion", "redis"}
     (pki / "public" / "nodes" / "self").mkdir()
     (pki / "public" / "nodes" / "self" / "birth.crt").write_text("-----BEGIN CERTIFICATE-----\n")
     (r / "monitoring" / "nats" / "users.conf").write_text("users: [gateway, worker, node-self]\n")
-    # The model step; then rc.1's posture restart (`restart --force gateway`,
-    # no label). Onboard now converges first, and the posture check after it
-    # finds nothing pending on a fresh install; either way the gateway moves.
+    (d / "noo_svc_key_worker").write_text("svc-worker-key")
+    (d / "noo_svc_key_trellion").write_text("svc-trellion-key")
+    keys = ("worker", "trellion")
+    assert _up(carried, start("keys", keys), keys, force=True) == set(keys)
     (r / "noomesh.yaml").write_text("cluster:\n  default_backend: ollama\n")
-    carried["gateway"] = None
+    assert _up(carried, start("posture", ("gateway",)), ("gateway",), force=True) == {"gateway"}
 
-    # Onboard's last start: exactly the services the cell saw recreated.
-    assert up(carried, start("1")) == {"gateway", "nats", "trellion", "worker"}
+    # Onboard's last start: nats for users.conf (HUP-reloaded, but kept in the
+    # label until the reload is recorded), worker and trellion for the
+    # noomesh.yaml written after their recreate. NOT the gateway.
+    assert _up(carried, start("converge")) == {"nats", "trellion", "worker"}
     # The install matrix's start-idempotent: nothing.
-    assert up(carried, start("2")) == set()
+    assert _up(carried, start("cell")) == set()
     # #1412 still holds for a real change afterwards.
     (r / "noomesh.yaml").write_text("cluster:\n  default_backend: vllm\n")
-    assert up(carried, start("3")) == {"gateway", "worker", "trellion"}
+    assert _up(carried, start("edit")) == {"gateway", "worker", "trellion"}
+
+
+def test_a_labelled_forced_restart_then_a_plain_start_recreates_nothing(tmp_path: Path) -> None:
+    """`noo stack restart --force worker` (noomesh-restart.sh) after a rotated
+    key: the restart labels what it recreates, so the next plain start moves
+    nothing. Unlabelled, as before this change, the plain start recreated it
+    again. The restart records only the service it recreated: a service it
+    did not touch keeps its old record, so the start still names its file."""
+    _, r, d, _, state, start = _onboard_install(tmp_path)
+    carried: dict[str, str] = {}
+    _up(carried, start("0"), force=True)
+    (d / "noo_svc_key_worker").write_text("rotated")
+    (r / "monitoring" / "nats" / "users.conf").write_text("users: [gateway, worker, more]\n")
+    assert _up(carried, start("restart", ("worker",)), ("worker",), force=True) == {"worker"}
+    rec = json.loads(state.read_text())["services"]
+    assert rec["worker"]["inputs"][f"{d}/noo_svc_key_worker"] != "", "the restart recorded the worker"
+    before = dict(rec["nats"]["inputs"])
+    # The plain start: only nats (its own file changed); the worker stays.
+    assert _up(carried, start("plain")) == {"nats"}
+    assert _up(carried, start("again")) == set()
+    # Unlabelled (the old restart): the container carries no label, and the
+    # next plain start recreates it whatever changed.
+    carried["worker"] = ""
+    assert _up(carried, start("unlabelled")) == {"worker"}
+    assert before != json.loads(state.read_text())["services"]["nats"]["inputs"]
+
+
+def test_restart_only_records_the_services_it_recreated(tmp_path: Path) -> None:
+    i = Install(tmp_path)
+    _, _, s0 = i.fingerprint(tag="0")
+    (i.rundir / "noo_jwt_secret").write_text("rotated")
+    (i.rundir / "postgres_password").write_text("rotated-pg")
+    ov, st = tmp_path / "o.yml", tmp_path / "s.json"
+    r = subprocess.run(["python3", str(HELPER), "fingerprint", "--key-file", str(i.key), "--root", str(i.root),
+                        "--data-dir", str(i.data), "--old-state", str(tmp_path / "state0.json"), "--only", "gateway",
+                        "--override-out", str(ov), "--state-out", str(st)],
+                       input=json.dumps(i.config()), capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, r.stderr
+    s1 = json.loads(st.read_text())
+    assert s1["services"]["gateway"] != s0["services"]["gateway"], "the recreated service is recorded"
+    assert s1["services"]["postgres"] == s0["services"]["postgres"], "an untouched one keeps its record"
+    assert "postgres" in ov.read_text(), "the override still labels every service"
+
+
+# ── every `up` outside a start carries the labels ───────────────────────────
+
+RESTART = ROOT / "scripts" / "noomesh-restart.sh"
+REBUILD = ROOT / "scripts" / "noomesh-rebuild.sh"
+
+
+def _code_lines(path: Path) -> list[str]:
+    return [l for l in path.read_text().splitlines() if not l.lstrip().startswith("#")]
+
+
+@pytest.mark.parametrize("script", [RESTART, REBUILD], ids=["restart", "rebuild"])
+def test_every_up_outside_a_start_is_labelled(script: Path) -> None:
+    """noomesh-restart.sh (every `noo stack restart --force`, `secrets rotate`,
+    onboard's own recreates) and noomesh-rebuild.sh run `docker compose … up`
+    outside a start. Each `up` must follow start_inputs_label_for_up in the
+    same branch (it appends .noo-start-inputs.yml to $COMPOSE_FILES), and the
+    library must be sourced before load_secrets (the secret-file writer leaves
+    the keyed digests the labels read)."""
+    lines = _code_lines(script)
+    text = "\n".join(lines)
+    assert "lib-start-inputs.sh" in text, f"{script.name} does not source lib-start-inputs.sh"
+    src = text.index("lib-start-inputs.sh")
+    assert src < text.index("load_secrets ||"), "lib-start-inputs.sh must be sourced before load_secrets"
+    ups = [n for n, l in enumerate(lines)
+           if re.search(r"(docker compose|noo_compose_up_isolating_stuck compose)\b.*\bup -d\b", l)]
+    assert ups, "no `up` found: this guard is stale"
+    for n in ups:
+        window = lines[max(0, n - 6):n]
+        label = [l for l in window if "start_inputs_label_for_up" in l]
+        blanket_after_labelled = script == REBUILD and any(
+            "start_inputs_label_for_up" in l for l in lines[max(0, n - 30):n])
+        assert label or blanket_after_labelled, f"{script.name}:{n + 1} runs `up` without the labels: {lines[n].strip()}"
+        assert "$COMPOSE_FILES" in lines[n], f"{script.name}:{n + 1}: the `up` must read $COMPOSE_FILES (the override is appended there)"
+
+
+def test_restart_commits_its_state_only_after_a_good_up() -> None:
+    text = "\n".join(_code_lines(RESTART))
+    assert text.count("start_inputs_label_for_up") == 3, "the full, the named and the missing-container `up`"
+    assert text.count("start_inputs_commit_state") == 3 and text.count("start_inputs_discard_state") == 3
+
+
+def test_label_for_up_never_forces_and_appends_the_override(tmp_path: Path) -> None:
+    out = subprocess.run(["bash", "-c", f"""
+        ui_note() {{ echo "NOTE $*"; }}
+        . {LIB}
+        _start_inputs_usable() {{ return 0; }}
+        docker() {{ echo '{{"services": {{"a": {{}}}}}}'; }}
+        export NOO_START_INPUTS_KEY_FILE={tmp_path}/k NOO_START_INPUTS_OVERRIDE={tmp_path}/o.yml NOO_START_INPUTS_STATE={tmp_path}/s.json
+        START_INPUTS_OVERRIDE={tmp_path}/o.yml START_INPUTS_STATE={tmp_path}/s.json
+        COMPOSE_FILES="-f base.yml"; PROFILE_ARGS=""; START_RECREATE=true
+        start_inputs_label_for_up a; echo "rc=$? force=[$START_UP_FORCE] files=[$COMPOSE_FILES] only=[${{START_INPUTS_ONLY:-}}]"
+        start_inputs_commit_state; [ -f {tmp_path}/s.json ] && echo committed
+    """], capture_output=True, text=True, timeout=60, cwd=tmp_path)
+    assert f"rc=0 force=[] files=[-f base.yml -f {tmp_path}/o.yml] only=[]" in out.stdout, out.stdout + out.stderr
+    assert "--recreate" not in out.stdout, "a restart's label pass never says it forces every container"
+    assert "committed" in out.stdout
+    assert '"a":' in (tmp_path / "o.yml").read_text()

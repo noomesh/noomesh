@@ -48,7 +48,7 @@ service is recreated on every start (the old, safe behaviour) and it is said.
 Subcommands (exit 0 ok, 2 usage/input error, 3 key refused):
   secret-digests --key-file K --dir D --out F NAME=TMPNAME...
   fingerprint    --key-file K --root R [--pki-dir P] [--data-dir X]...
-                 [--secret-digests F] [--cap BYTES] [--old-state S]
+                 [--secret-digests F] [--cap BYTES] [--old-state S] [--only SVC]...
                  --override-out O --state-out S2      < compose-config.json
   report         --before B --after A [--old-state S] --new-state S2 [--root R]
 """
@@ -349,10 +349,14 @@ def cmd_fingerprint(a) -> int:
         lines += [f"  {json.dumps(name)}:", "    labels:", f"      {LABEL}: {json.dumps(new[name]['label'])}"]
     write_private(a.override_out, "\n".join(lines) + "\n")
     # The state for the message: this start's services replace theirs; a
-    # targeted start keeps every other service's entry.
+    # targeted start keeps every other service's entry. --only (a recreate
+    # outside a start, noomesh-restart.sh): only the services it recreates
+    # are recorded, the others keep the inputs their containers were made on.
     old = _load_state(a.old_state)
     merged = dict(old.get("services") or {})
     for name, rec in new.items():
+        if a.only and name not in a.only:
+            continue
         merged[name] = {"inputs": {p: v for p, v in rec["inputs"].items()}}
     if old.get("key_id") not in (None, key_id(key)):
         # Values made with another key compare as "everything changed".
@@ -452,6 +456,7 @@ def main(argv: list[str]) -> int:
     f.add_argument("--secret-digests", default="")
     f.add_argument("--cap", type=int, default=DEFAULT_CAP)
     f.add_argument("--old-state", default="")
+    f.add_argument("--only", action="append", default=[])
     f.add_argument("--override-out", required=True)
     f.add_argument("--state-out", required=True)
     r = sub.add_parser("report", allow_abbrev=False)
