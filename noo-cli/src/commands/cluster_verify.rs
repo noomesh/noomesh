@@ -8464,7 +8464,7 @@ fn brief_tier(c: &Check) -> Option<Tier> {
     if c.verdict == Verdict::Ok {
         return OK_LATER_TIERS
             .iter()
-            .any(|(name, sentence)| *name == c.name && c.detail.contains(*sentence))
+            .any(|(name, _sentence)| *name == c.name)
             .then_some(Tier::Later);
     }
     if c.verdict != Verdict::Warn {
