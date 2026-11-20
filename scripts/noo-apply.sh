@@ -112,7 +112,7 @@ WORK=""
 KEYS=""
 noo_apply_on_exit() {
     _oe=$?
-    if [ "$_oe" -gt 1 ] && [ -n "$NOO_REFUSAL" ] && [ "$(refusal_code "$NOO_REFUSAL")" = "$_oe" ]; then
+    if [ -n "$NOO_REFUSAL" ]; then
         echo "noo-apply: refusal=$NOO_REFUSAL (exit $_oe)" >&2
         logger -t noo-apply "refusal=$NOO_REFUSAL (exit $_oe)" 2>/dev/null || true
     fi
