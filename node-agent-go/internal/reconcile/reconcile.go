@@ -1184,7 +1184,10 @@ func (r *Reconciler) ensureOllamaModel(
 	go func() {
 		// ctx is the Run context (agent lifetime), not the tick: the pull
 		// outlives the pass but still stops at shutdown.
-		out, err := pull(ctx, model)
+		// A short in-pull retry for a registry blip first (both lanes, docker
+		// and native, pass through here); only what still fails takes the
+		// ollamaPullRetryAfter backoff below.
+		out, err := pullWithRetry(ctx, model, pull, sleepCtx)
 		r.pullMu.Lock()
 		defer r.pullMu.Unlock()
 		st.inFlight = false
