@@ -304,7 +304,7 @@ def judge_dockerhub(lines):
             when = time.strftime("%H:%M:%S", time.gmtime(e.get("time") or 0))
             if typ == "image" and act == "pull":
                 pulls.append((when, attrs.get("name") or a.get("ID") or e.get("id") or ""))
-            elif typ == "container" and act == "create":
+            elif typ == "container" and act == "start":
                 creates.append((when, attrs.get("image") or "", attrs.get("name") or ""))
             n += 1
         except (ValueError, AttributeError):
