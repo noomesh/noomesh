@@ -402,9 +402,11 @@ adapters. Google support does not automatically enable other providers.
   private sync**, or the `sync` call below) is the owner's choice.
 - **Personal content is owner-only, and never yours by delegation.** A
   delegated credential (MCP door, agent, harness) receives no personal
-  evidence, and `include_personal` / `noo rag query --personal` is refused
-  for it. Never use a person's own login credential to opt in on their
-  behalf.
+  evidence. Its `include_personal` / `noo rag query --personal` is refused
+  without an error: the reply answers from shared sources only and carries
+  `personal_sources_refused: true`, so check that flag. Only the boolean
+  `true` opts in at all. Never use a person's own login credential to opt
+  in on their behalf.
 - **Never rotate `NOO_INTEGRATIONS_KEY` in place:** the wrong key makes the
   stored credentials, documents and cursors unreadable (see below).
 - The exact API, ownership rules, sync limits and the authorization
