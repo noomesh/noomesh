@@ -205,6 +205,9 @@ pub(crate) enum AuditKind {
     SeatTokenCreate,
     SeatTokenDenied,
     SeatTokenRevoke,
+    /// A route that changes who can do what refused a credential that is not
+    /// a person's (`crate::person_gate`, i1096).
+    PersonRequiredRefused,
     SecurityPostureProfile,
     SecurityPostureRetiredRowRemoved,
     SecurityPostureSet,
@@ -384,6 +387,7 @@ impl AuditKind {
             Self::UserSetPassword => "user_set_password",
             Self::UserSetRole => "user_set_role",
             Self::UserSetScopes => "user_set_scopes",
+            Self::PersonRequiredRefused => "person_required_refused",
             Self::WalksAdminView => "walks_admin_view",
             Self::Other(s) => s,
         }
@@ -524,6 +528,7 @@ impl AuditKind {
             Self::UserSetPassword => Severity::Info,
             Self::UserSetRole => Severity::Info,
             Self::UserSetScopes => Severity::Info,
+            Self::PersonRequiredRefused => Severity::Warning,
             Self::WalksAdminView => Severity::Warning,
             Self::Other(_) => Severity::Info,
         }
@@ -661,6 +666,7 @@ impl AuditKind {
             "user_set_password" => Self::UserSetPassword,
             "user_set_role" => Self::UserSetRole,
             "user_set_scopes" => Self::UserSetScopes,
+            "person_required_refused" => Self::PersonRequiredRefused,
             "walks_admin_view" => Self::WalksAdminView,
             other => Self::Other(other.to_string()),
         }
@@ -800,6 +806,7 @@ impl AuditKind {
             Self::UserSetRole,
             Self::UserSetScopes,
             Self::WalksAdminView,
+            Self::PersonRequiredRefused,
         ]
     }
 }
@@ -1263,6 +1270,7 @@ mod tests {
         "org_create",
         "peer_deregistered",
         "peer_token_minted",
+        "person_required_refused",
         "perspective_ended",
         "perspective_started",
         "prompt_skill_promoted",
@@ -1344,7 +1352,7 @@ mod tests {
         let mut want: Vec<String> = PINNED.iter().map(|s| s.to_string()).collect();
         want.sort();
         assert_eq!(got, want, "a kind was renamed, added or dropped: edit PINNED on purpose");
-        assert_eq!(PINNED.len(), 130);
+        assert_eq!(PINNED.len(), 131);
     }
 
     #[test]

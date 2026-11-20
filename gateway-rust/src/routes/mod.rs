@@ -135,6 +135,10 @@ pub enum AppError {
     /// of a `noo upgrade --all` that ran while the gateway had no Redis
     /// client (0.6.3 -> 0.6.4 roll, 2026-10-15).
     UnavailableRetry { code: &'static str, detail: String, retry_after_secs: u64 },
+    /// 403 with a MACHINE-READABLE `code` beside the prose `error`, so a
+    /// client branches on the code, not on an English sentence. First use:
+    /// `person_required` (`crate::person_gate`), i1096.
+    ForbiddenCode { code: &'static str, msg: String },
 }
 
 /// The message the error carries, without the variant name.
@@ -153,7 +157,8 @@ impl std::fmt::Display for AppError {
             | Self::BadRequest(m)
             | Self::Conflict(m)
             | Self::Forbidden(m)
-            | Self::Unavailable(m) => m,
+            | Self::Unavailable(m)
+            | Self::ForbiddenCode { msg: m, .. } => m,
             Self::RetryLater { msg, .. } | Self::TooManyRequests { msg, .. } => msg,
             Self::UnavailableRetry { detail, .. } => detail,
         };
@@ -170,6 +175,9 @@ impl IntoResponse for AppError {
             Self::BadRequest(m) => (StatusCode::BAD_REQUEST, m),
             Self::Conflict(m) => (StatusCode::CONFLICT, m),
             Self::Forbidden(m) => (StatusCode::FORBIDDEN, m),
+            Self::ForbiddenCode { code, msg } => {
+                return (StatusCode::FORBIDDEN, Json(json!({"error": msg, "code": code}))).into_response();
+            }
             Self::Unavailable(m) => (StatusCode::SERVICE_UNAVAILABLE, m),
             Self::TooManyRequests { msg, retry_after_secs } => {
                 let mut r = (StatusCode::TOO_MANY_REQUESTS, Json(json!({"error": msg, "retry_after_secs": retry_after_secs}))).into_response();

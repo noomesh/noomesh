@@ -276,7 +276,13 @@ pub fn origin_of(ctx: &Option<axum::Extension<RequesterCtx>>) -> Origin {
 /// that passes the claim test but names no such account (a service identity with a plain-looking
 /// name, a deleted or disabled user) is not a person.
 pub async fn resolve_origin(db: &sqlx::PgPool, ctx: &Option<axum::Extension<RequesterCtx>>) -> Origin {
-    match origin_of(ctx) {
+    resolve_origin_of(db, ctx.as_ref().map(|axum::Extension(r)| r)).await
+}
+
+/// [`resolve_origin`] for a requester already taken out of its extension (an
+/// `authz` extractor holds a bare [`RequesterCtx`]).
+pub async fn resolve_origin_of(db: &sqlx::PgPool, r: Option<&RequesterCtx>) -> Origin {
+    match origin_of_requester(r) {
         Origin::Person { account, role } => {
             let human: bool = crate::repo::users::is_enabled(db, &account)
                 .await

@@ -350,6 +350,7 @@ async fn user_set_password(
     ctx: Option<Extension<RequesterCtx>>,
     Json(body): Json<PasswordBody>,
 ) -> AppResult {
+    crate::person_gate::require_person(&state.db, ctx.as_deref(), "resetting an account's password").await?;
     let by = security_users_mutation_guard(&ctx)?.sub.clone();
     // a password reset is a full account takeover — and this statement
     // also clears `locked_until`, so it is the lockout bypass too.
@@ -2564,6 +2565,7 @@ async fn service_key_issue(
     ctx: Option<Extension<RequesterCtx>>,
     Json(body): Json<IssueKeyBody>,
 ) -> AppResult {
+    crate::person_gate::require_person(&state.db, ctx.as_deref(), "issuing a service key").await?;
     if body.consumer.trim().is_empty() {
         return Err(AppError::BadRequest("consumer is required".into()));
     }
@@ -2863,6 +2865,7 @@ async fn service_key_retire(
     actor_ext: Option<Extension<AuthActor>>,
     ctx: Option<Extension<RequesterCtx>>,
 ) -> AppResult {
+    crate::person_gate::require_person(&state.db, ctx.as_deref(), "retiring a service key").await?;
     require_may_manage_key_consumer(&state.db, &ctx, &consumer).await?;
 
     // The current key is the active one that is NOT superseded.
@@ -2932,6 +2935,7 @@ async fn service_key_revoke(
     actor_ext: Option<Extension<AuthActor>>,
     ctx: Option<Extension<RequesterCtx>>,
 ) -> AppResult {
+    crate::person_gate::require_person(&state.db, ctx.as_deref(), "revoking a service key").await?;
     // revoking an Admin's bound key is a denial of service against that
     // account's MCP/inference access.
     require_may_manage_key_consumer(&state.db, &ctx, &consumer).await?;
@@ -2990,6 +2994,7 @@ async fn service_key_revoke_and_disable(
     actor_ext: Option<Extension<AuthActor>>,
     ctx: Option<Extension<RequesterCtx>>,
 ) -> AppResult {
+    crate::person_gate::require_person(&state.db, ctx.as_deref(), "revoking a service key and disabling its account").await?;
     let consumer = consumer.trim().to_string();
     let bound: Option<(Option<String>,)> = sqlx::query_as(
         "SELECT user_id FROM noo_service_keys \
@@ -3068,6 +3073,7 @@ async fn service_key_rotate(
     ctx: Option<Extension<RequesterCtx>>,
     Json(body): Json<RotateBody>,
 ) -> AppResult {
+    crate::person_gate::require_person(&state.db, ctx.as_deref(), "rotating a service key").await?;
     validate_key_scopes(&body.scopes)?;
     // rotation mints a NEW bearer credential for whoever the key is
     // bound to, so it is an issue by another name.
@@ -3154,6 +3160,7 @@ async fn service_key_set_quota(
     ctx: Option<Extension<RequesterCtx>>,
     Json(body): Json<QuotaBody>,
 ) -> AppResult {
+    crate::person_gate::require_person(&state.db, ctx.as_deref(), "setting a service key's quota").await?;
     // throttling an Admin's key to 1 rpm is the same denial of service
     // as revoking it, one step slower.
     require_may_manage_key_consumer(&state.db, &ctx, &consumer).await?;
@@ -3187,19 +3194,6 @@ async fn service_key_set_quota(
     })))
 }
 
-/// A key's policy is set by a person: any other origin (a service key, a
-/// token exchanged from one, an add-on, a harness door, a delegated
-/// credential, an account that is gone or disabled) is 403. Keys never
-/// manage keys.
-fn person_sets_key_policy(origin: crate::task_guard::Origin) -> Result<(), AppError> {
-    match origin {
-        crate::task_guard::Origin::Person { .. } => Ok(()),
-        crate::task_guard::Origin::Agent { via, .. } => Err(AppError::Forbidden(format!(
-            "a key's context-overflow mode is set by a person, not by {via}"
-        ))),
-    }
-}
-
 #[derive(Deserialize)]
 struct ContextOverflowBody {
     mode: String,
@@ -3211,8 +3205,8 @@ struct ContextOverflowBody {
 /// operator 2026-11-15.
 ///
 /// Set by a person, never by a key: a service key, a token exchanged from
-/// one, a harness door or a delegated credential is refused 403
-/// ([`crate::task_guard::resolve_origin`]), so no key widens or narrows
+/// one, a harness door or a delegated credential is refused
+/// 403 `person_required` ([`crate::person_gate`]), so no key widens or narrows
 /// its own or another key's answer. The operator CLI's token is a person's.
 async fn service_key_set_context_overflow(
     State(state): State<Arc<AppState>>,
@@ -3221,7 +3215,7 @@ async fn service_key_set_context_overflow(
     ctx: Option<Extension<RequesterCtx>>,
     Json(body): Json<ContextOverflowBody>,
 ) -> AppResult {
-    person_sets_key_policy(crate::task_guard::resolve_origin(&state.db, &ctx).await)?;
+    crate::person_gate::require_person(&state.db, ctx.as_deref(), "setting a key's context-overflow mode").await?;
     require_may_manage_key_consumer(&state.db, &ctx, &consumer).await?;
     let Some(mode) = crate::service_keys::ContextOverflow::parse(&body.mode) else {
         return Err(AppError::BadRequest(format!(
@@ -5632,7 +5626,7 @@ pub(crate) mod tests {
             ("async fn service_key_rotate(", &["require_may_manage_key_consumer("]),
             ("async fn service_key_revoke(", &["require_may_manage_key_consumer("]),
             ("async fn service_key_set_quota(", &["require_may_manage_key_consumer("]),
-            ("async fn service_key_set_context_overflow(", &["person_sets_key_policy(crate::task_guard::resolve_origin(&state.db, &ctx).await)?;", "require_may_manage_key_consumer("]),
+            ("async fn service_key_set_context_overflow(", &["crate::person_gate::require_person(", "require_may_manage_key_consumer("]),
             ("async fn proposal_decide(", &["require_may_grant_value(", "require_may_manage("]),
             ("async fn api_users_disable(", &["require_may_manage(", "require_not_last_admin("]),
         ];
@@ -5996,40 +5990,5 @@ mod key_cache_invalidation_tests {
         assert!(got.is_some_and(|c| c.name == consumer), "a just-issued key is unknown until the snapshot expires");
         // No cleanup statement: the consumer is unique per run in a scratch
         // database, and a query here would raise this file's repo ratchet.
-    }
-}
-
-/// Keys never manage keys (i802 opt-in, operator 2026-11-15): who may set a
-/// key's context-overflow mode.
-#[cfg(test)]
-mod key_policy_setter_tests {
-    use super::person_sets_key_policy;
-    use crate::auth::{Actor, RequesterCtx, Role};
-    use crate::task_guard::origin_of_requester;
-
-    fn ctx(sub: &str, harness: Option<&str>, act: Option<&str>) -> RequesterCtx {
-        RequesterCtx {
-            sub: sub.into(),
-            scopes: vec!["admin".into()],
-            role: Role::Admin,
-            harness: harness.map(str::to_string),
-            act: act.map(|a| Actor { sub: a.into(), iss_user: None, task: None, feature: None }),
-        }
-    }
-
-    #[test]
-    fn a_person_sets_it_and_no_key_or_agent_does() {
-        assert!(person_sets_key_policy(origin_of_requester(Some(&ctx("owner", None, None)))).is_ok(), "the operator, CLI or console");
-        for (who, c) in [
-            ("a token exchanged from a key", ctx("owner", None, Some("key:paiserve"))),
-            ("an add-on's exchanged token", ctx("addon:example", None, None)),
-            ("a service identity", ctx("svc:grafana", None, None)),
-            ("a harness door", ctx("owner", Some("claude-code"), None)),
-            ("a delegated credential", ctx("owner", None, Some("worker:run-1"))),
-        ] {
-            let refused = person_sets_key_policy(origin_of_requester(Some(&c)));
-            assert!(matches!(refused, Err(crate::routes::AppError::Forbidden(_))), "{who} must be refused");
-        }
-        assert!(person_sets_key_policy(origin_of_requester(None)).is_err(), "a bare service key carries no requester");
     }
 }
