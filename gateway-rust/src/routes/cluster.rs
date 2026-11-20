@@ -5484,7 +5484,7 @@ pub(crate) fn node_holds_ollama_tag(node: Option<&Value>, tag: &str) -> Option<b
     let want = ollama_listed_name(tag);
     let list = node?["available_models"].as_array()?;
     let names: Vec<&str> = list.iter().filter_map(|v| v.as_str().or_else(|| v.get("name").and_then(Value::as_str))).collect();
-    if names.iter().any(|n| ollama_listed_name(n) == want) {
+    if names.iter().any(|n| *n == want) {
         return Some(true);
     }
     let ollama_answered = names.iter().any(|n| n.contains(':'));
