@@ -1,5 +1,5 @@
 {
-  "_comment": "Model capabilities, the FALLBACK for what a node does not report yet (i226 decision 3). The model's weights declare its context ceiling (GGUF <arch>.context_length, HF config max_position_embeddings); the node reports it from the model it serves (heartbeat model_stats[].context_length; Ollama today, noomesh-internal i285) and that report wins. This table caps the window harness placement judges a kind against only where no node reports it: vLLM and llama.cpp placements, and agents older than the report. Each row's `match` globs are tried against the placement's model id, lower-cased, with any registry or org prefix up to the last '/' removed; the first row that matches wins. A model with no row is unknown: no ceiling is assumed, so nothing is refused for it. `max_context` is the model's own context ceiling in tokens; `evidence` says where the number was read. `kv_bytes_per_token` is the cache one token costs per slot, MEASURED on a running daemon; the chat-context memory fit (gateway chat_context.rs, i802) uses it where present instead of placement_fit's conservative fallback. A row with `kv_source.basis` \"derived\" is computed from the model's own GGUF metadata (layers, kv heads, head dim, K+V, f16) kept in tests/fixtures/model_kv/ollama_gguf_metadata.json, and tests/test_model_kv_rows.py recomputes it; a derived figure is the FULL-attention one (sliding windows and shared layers are not credited), so it is never below the truth. Every model onboard can pick has such a row. Derived rows match their exact tag, not a prefix, so a quantised variant of another size never takes them.",
+  "_comment": "Model capabilities, the FALLBACK for what a node does not report yet (i226 decision 3). The model's weights declare its context ceiling (GGUF <arch>.context_length, HF config max_position_embeddings); the node reports it from the model it serves (heartbeat model_stats[].context_length; Ollama today, noomesh-internal i285) and that report wins. This table caps the window harness placement judges a kind against only where no node reports it: vLLM and llama.cpp placements, and agents older than the report. Each row's `match` globs are tried against the placement's model id, lower-cased, with any registry or org prefix up to the last '/' removed; the first row that matches wins. A model with no row is unknown: no ceiling is assumed, so nothing is refused for it. `max_context` is the model's own context ceiling in tokens; `evidence` says where the number was read. `kv_bytes_per_token` is the cache one token costs per slot, MEASURED on a running daemon; the chat-context memory fit (gateway chat_context.rs, i802) uses it where present instead of placement_fit's conservative fallback. A row with `kv_source.basis` \"derived\" is computed from the model's own GGUF metadata (layers, kv heads, head dim, K+V, f16) kept in tests/fixtures/model_kv/ollama_gguf_metadata.json, and tests/test_model_kv_rows.py recomputes it; a derived figure is the FULL-attention one (sliding windows and shared layers are not credited), so it is never below the truth. Every model onboard can pick has such a row, except the gemma4 models that declare a sliding window (e4b, 12b, 26b, 31b): full attention over-states their cache 2.4-12.9x and a per-token figure cannot model a window, so they keep the weights estimate until a context-aware figure (followup); gemma4:e2b keeps its measured row. Derived rows match their exact tag, not a prefix, so a quantised variant of another size never takes them.",
   "models": [
     {
       "family": "gemma-4-12b",
@@ -8,14 +8,7 @@
         "gemma4:12b*"
       ],
       "max_context": 262144,
-      "evidence": "text_config.max_position_embeddings of google/gemma-4-12B-it-qat-w4a16-ct and gemma4.context_length of Ollama gemma4:12b, both 262144, read on node-a 2026-10-27; kv_bytes_per_token derived, not guessed: GGUF header of Ollama gemma4:12b (sha256:bb722270d543), gemma4.block_count 48, attention.head_count_kv per layer, [1, 8], key/value length per layer type, summed over the layers x (K + V) x 2 bytes (f16); copy of the fields in tests/fixtures/model_kv/ollama_gguf_metadata.json, read 2026-11-20",
-      "kv_bytes_per_token": 344064,
-      "kv_source": {
-        "basis": "derived",
-        "fixture": "tests/fixtures/model_kv/ollama_gguf_metadata.json",
-        "model": "gemma4:12b",
-        "margin": "full attention: every layer charged for the whole context, none cut to its 1024-token window, none shared (0 layers share KV), K and V both charged; f16 even when OLLAMA_KV_CACHE_TYPE is q8_0/q4_0 (placement_fit scales it down per row)"
-      }
+      "evidence": "text_config.max_position_embeddings of google/gemma-4-12B-it-qat-w4a16-ct and gemma4.context_length of Ollama gemma4:12b, both 262144, read on node-a 2026-10-27"
     },
     {
       "family": "gemma4-e2b",
@@ -45,48 +38,6 @@
         "margin": "none needed: every layer is full attention, f16 K and V; f16 even when OLLAMA_KV_CACHE_TYPE is q8_0/q4_0 (placement_fit scales it down per row)"
       },
       "evidence": "kv_bytes_per_token derived, not guessed: GGUF header of Ollama qwen2.5:0.5b (sha256:c5396e06af29), qwen2.block_count 24, attention.head_count_kv 2, key/value length 896/14 (embedding_length/head_count), summed over the layers x (K + V) x 2 bytes (f16); copy of the fields in tests/fixtures/model_kv/ollama_gguf_metadata.json, read 2026-11-20"
-    },
-    {
-      "family": "gemma4-e4b",
-      "match": [
-        "gemma4:e4b"
-      ],
-      "kv_bytes_per_token": 100352,
-      "kv_source": {
-        "basis": "derived",
-        "fixture": "tests/fixtures/model_kv/ollama_gguf_metadata.json",
-        "model": "gemma4:e4b",
-        "margin": "full attention: every layer charged for the whole context, none cut to its 512-token window, none shared (18 layers share KV), K and V both charged; f16 even when OLLAMA_KV_CACHE_TYPE is q8_0/q4_0 (placement_fit scales it down per row)"
-      },
-      "evidence": "kv_bytes_per_token derived, not guessed: GGUF header of Ollama gemma4:e4b (sha256:370c2879f176), gemma4.block_count 42, attention.head_count_kv 2, key/value length per layer type, summed over the layers x (K + V) x 2 bytes (f16); copy of the fields in tests/fixtures/model_kv/ollama_gguf_metadata.json, read 2026-11-20"
-    },
-    {
-      "family": "gemma4-26b",
-      "match": [
-        "gemma4:26b"
-      ],
-      "kv_bytes_per_token": 225280,
-      "kv_source": {
-        "basis": "derived",
-        "fixture": "tests/fixtures/model_kv/ollama_gguf_metadata.json",
-        "model": "gemma4:26b",
-        "margin": "full attention: every layer charged for the whole context, none cut to its 1024-token window, none shared (0 layers share KV), K and V both charged; f16 even when OLLAMA_KV_CACHE_TYPE is q8_0/q4_0 (placement_fit scales it down per row)"
-      },
-      "evidence": "kv_bytes_per_token derived, not guessed: GGUF header of Ollama gemma4:26b (sha256:a8bdd07a49b8), gemma4.block_count 30, attention.head_count_kv per layer, [2, 8], key/value length per layer type, summed over the layers x (K + V) x 2 bytes (f16); copy of the fields in tests/fixtures/model_kv/ollama_gguf_metadata.json, read 2026-11-20"
-    },
-    {
-      "family": "gemma4-31b",
-      "match": [
-        "gemma4:31b"
-      ],
-      "kv_bytes_per_token": 901120,
-      "kv_source": {
-        "basis": "derived",
-        "fixture": "tests/fixtures/model_kv/ollama_gguf_metadata.json",
-        "model": "gemma4:31b",
-        "margin": "full attention: every layer charged for the whole context, none cut to its 1024-token window, none shared (0 layers share KV), K and V both charged; f16 even when OLLAMA_KV_CACHE_TYPE is q8_0/q4_0 (placement_fit scales it down per row)"
-      },
-      "evidence": "kv_bytes_per_token derived, not guessed: GGUF header of Ollama gemma4:31b (sha256:cd20f2b3f2e3), gemma4.block_count 60, attention.head_count_kv per layer, [4, 16], key/value length per layer type, summed over the layers x (K + V) x 2 bytes (f16); copy of the fields in tests/fixtures/model_kv/ollama_gguf_metadata.json, read 2026-11-20"
     },
     {
       "family": "qwen3-0.6b",

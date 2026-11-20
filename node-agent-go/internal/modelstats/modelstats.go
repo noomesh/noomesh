@@ -182,7 +182,8 @@ type Arch struct {
 // `attention.head_count_kv` (one number, or one per layer: the largest),
 // and the head size, `attention.key_length` / `value_length` (the larger)
 // else `embedding_length` / `attention.head_count`. nil when any of them is
-// missing or not above 0.
+// missing or not above 0, or when the model declares a sliding window shorter
+// than its context.
 func ShowArch(body []byte) *Arch {
 	var v struct {
 		ModelInfo map[string]any `json:"model_info"`
@@ -208,6 +209,18 @@ func ShowArch(body []byte) *Arch {
 			return m
 		}
 		return 0
+	}
+	// A model that declares a sliding window shorter than its context caches
+	// only the window on most layers. Reported as layers x kv_heads x head_dim
+	// the gateway would price it at FULL attention, which over-states it
+	// 2.4-12.9x (gemma4 at 4096-32768 tokens), and a per-token figure cannot
+	// model a window. So no arch is reported: such a model keeps the weights
+	// estimate until a context-aware figure exists (0.6.30 followup). A window
+	// as long as the context (phi3's 131072 of 16384) limits nothing.
+	if sw := num("attention.sliding_window"); sw > 0 {
+		if ctx := num("context_length"); ctx <= 0 || sw < ctx {
+			return nil
+		}
 	}
 	layers, kvHeads := num("block_count"), num("attention.head_count_kv")
 	dim := max(num("attention.key_length"), num("attention.value_length"))

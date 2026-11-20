@@ -9,13 +9,23 @@ reported its architecture, so placement_fit charged the 144 KiB/token chat floor
 (a 0.5B model's real KV is 12 KiB/token). The fix is a row, never a guess:
 
 - `config/model-capabilities.json` carries `kv_bytes_per_token` for each model
-  the wizard (`noo-cli/src/onboard/steps.rs`, `noo-cli/src/catalog.rs`) can offer
+  (except the windowed ones, below) the wizard (`noo-cli/src/onboard/steps.rs`, `noo-cli/src/catalog.rs`) can offer
   and for the rehearsal's tiny model (`scripts/install-cell/run.sh`);
 - each row says where it came from (`kv_source`): the GGUF header of the Ollama
   model, whose attention fields are copied, and only those, to
   `tests/fixtures/model_kv/ollama_gguf_metadata.json`;
 - this test recomputes every derived row from that copy, so a hand-edited
   number, or a fixture that no longer says what the row says, is red.
+
+Windowed models have NO derived row. A GGUF that declares a sliding window
+shorter than its context (gemma4: 512-1024 tokens of 131072-262144) caches
+only the window on most layers, so the full-attention figure over-states it
+2.4-12.9x (e2b 140% at 4096 tokens up to 12b 1192% at 32768) and a
+per-token number cannot model a window. They stay on the 0.6.28 pricing (the
+weights estimate, or the measured gemma4:e2b row) until a context-aware figure
+exists (0.6.30 followup). The agent does not report their architecture either
+(node-agent-go modelstats.ShowArch), or the gateway would price them at full
+attention by that path.
 
 Margin kept (the same text is in each row's `kv_source.margin`): a derived figure
 is the FULL-attention one. Sliding windows are not credited (a gemma layer is
@@ -83,6 +93,25 @@ def lookup(model: str):
     return next((r for r in ROWS if any(_glob(p, m) for p in r["match"])), None)
 
 
+def windowed(model: str) -> bool:
+    """The GGUF declares a sliding window shorter than the model's context."""
+    g = FX["models"][model]["gguf"]
+    p = g["general.architecture"] + "."
+    w = g.get(p + "attention.sliding_window", 0)
+    return 0 < w < g[p + "context_length"]
+
+
+# Windowed models with no row of their own, listed on purpose: each is priced by
+# the 0.6.28 estimate (weights per GB, 144 KiB floor) until a context-aware
+# figure exists. A model that gains a window, or a row, makes this test red.
+WINDOWED_UNPRICED = {
+    "gemma4:e4b": "windowed: priced by the 0.6.28 estimate until a context-aware figure",
+    "gemma4:12b": "windowed: priced by the 0.6.28 estimate until a context-aware figure",
+    "gemma4:26b": "windowed: priced by the 0.6.28 estimate until a context-aware figure",
+    "gemma4:31b": "windowed: priced by the 0.6.28 estimate until a context-aware figure",
+}
+
+
 def onboard_pickable() -> dict[str, str]:
     """name -> where onboard's source names it."""
     out: dict[str, str] = {}
@@ -118,6 +147,8 @@ def test_every_onboard_pickable_model_has_a_kv_row():
     missing = []
     for name, where in sorted(onboard_pickable().items()):
         row = lookup(name)
+        if name in WINDOWED_UNPRICED:
+            continue
         if row is None or not row.get("kv_bytes_per_token"):
             missing.append(f"{name} ({where})")
     assert not missing, "no kv_bytes_per_token row for: " + "; ".join(missing)
@@ -143,7 +174,24 @@ def test_every_derived_row_is_recomputed_from_the_checked_in_metadata():
             assert 0 < row["kv_bytes_per_token"] <= full, f"{row['family']}: a measured figure above its own full-attention bound"
         # The row serves the model it was derived for and no other tag of the family.
         assert lookup(src["model"]) is row, f"{src['model']} resolves to another row first"
-    assert seen >= 20, seen
+    assert seen >= 19, seen
+
+
+def test_windowed_models_have_no_derived_row_and_the_list_is_exact():
+    # Full attention over-states a sliding-window model 2.4-12.9x; per-token
+    # pricing cannot model a window. gemma4:e2b keeps its MEASURED row (the
+    # daemon was seen holding 13-16 KiB), which is close to the truth.
+    listed = {m for m in FX["models"] if windowed(m) and not (lookup(m) or {}).get("kv_bytes_per_token")}
+    assert listed == set(WINDOWED_UNPRICED), sorted(listed ^ set(WINDOWED_UNPRICED))
+    for m in WINDOWED_UNPRICED:
+        row = lookup(m)
+        assert row is None or not row.get("kv_bytes_per_token"), f"{m}: a windowed model must not get a full-attention row"
+    for row in ROWS:
+        src = row.get("kv_source")
+        if src and src["basis"] == "derived":
+            assert not windowed(src["model"]), f"{row['family']}: derived from a windowed model"
+    e2b = lookup("gemma4:e2b")
+    assert e2b["kv_source"]["basis"] == "measured" and e2b["kv_bytes_per_token"] == 16384
 
 
 def test_the_figures_that_motivated_the_rows():

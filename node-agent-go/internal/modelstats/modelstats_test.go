@@ -303,3 +303,17 @@ func TestFillReportsTheArchOncePerModelAndTheWireCarriesIt(t *testing.T) {
 		t.Fatalf("an unknown arch is omitted: %s", b)
 	}
 }
+
+func TestShowArchIsNilForASlidingWindowModel(t *testing.T) {
+	gemma := `{"model_info":{"general.architecture":"gemma4","gemma4.block_count":48,"gemma4.embedding_length":3840,"gemma4.context_length":262144,
+	 "gemma4.attention.head_count":16,"gemma4.attention.head_count_kv":[8,8,8,8,8,1],"gemma4.attention.key_length":512,"gemma4.attention.sliding_window":1024}}`
+	if got := ShowArch([]byte(gemma)); got != nil {
+		t.Fatalf("a windowed model reports no arch (full attention over-states it 2.4-12.9x): %+v", got)
+	}
+	// A window as long as the context limits nothing: phi3's 131072 of 16384.
+	phi := `{"model_info":{"general.architecture":"phi3","phi3.block_count":40,"phi3.embedding_length":5120,"phi3.context_length":16384,
+	 "phi3.attention.head_count":40,"phi3.attention.head_count_kv":10,"phi3.attention.sliding_window":131072}}`
+	if got := ShowArch([]byte(phi)); got == nil || *got != (Arch{Layers: 40, KVHeads: 10, HeadDim: 128}) {
+		t.Fatalf("phi3 ShowArch = %+v", got)
+	}
+}
