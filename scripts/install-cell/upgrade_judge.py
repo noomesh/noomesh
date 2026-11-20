@@ -302,7 +302,7 @@ def judge_dockerhub(lines):
             attrs = a.get("Attributes") or {}
             typ, act = e.get("Type"), e.get("Action") or e.get("status")
             when = time.strftime("%H:%M:%S", time.gmtime(e.get("time") or 0))
-            if typ == "image" and act == "pull":
+            if typ == "image" and act == "tag":
                 pulls.append((when, attrs.get("name") or a.get("ID") or e.get("id") or ""))
             elif typ == "container" and act == "create":
                 creates.append((when, attrs.get("image") or "", attrs.get("name") or ""))
