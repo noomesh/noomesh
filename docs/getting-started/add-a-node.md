@@ -35,6 +35,8 @@ The node is ready when `verify` shows no FAIL. Each row that fails names the com
     works), then the enrollment line (`noo enroll noo1.…`).
   - The line holds a single-use token: don't paste it into chats, issues or
     logs. It is spent on first use, and an unused one expires (`--ttl`).
+    If the line leaks or the machine never enrolls:
+    `noo cluster bootstrap-token revoke <id>` (the id mint printed).
 - **Refusals at mint:**
   - `node_name` must be ≤ 64 characters of `[a-zA-Z0-9._-]`;
   - `localhost` and `node-agent` are refused (every node certificate carries
