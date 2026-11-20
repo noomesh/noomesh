@@ -589,7 +589,9 @@ harness can run on.
   the controller: `noo cluster vendor status` shows what is staged and
   which nodes need it, `noo cluster vendor stage <kind>` fetches it on the
   controller (150–250 MB, checked against the pinned sha256), then
-  `noo cluster provision <node>` ships it. A foreign CLI never runs
+  `noo cluster provision <node>` ships it (`noo cluster vendor install
+  <node> <kind>…` carries a CLI on a node whatever its placement names).
+  A foreign CLI never runs
   unjailed; on a node without the jail its tasks are checkpointed with the
   reason.
 - **A refusal names its reason:** `noo cluster status` prints
@@ -597,8 +599,12 @@ harness can run on.
   CLI not installed). A node whose chat window is below the kind's floor is
   refused with the numbers and the `--env` line that raises it; `--force`
   past that is the person's call.
-- **Probing:** `noo-gateway harness probe --kind <kind> --mock-model` tests
-  the wire and the flags as yourself and changes nothing outside its temp
-  workspace; exit 0 only when every test passed. The real mode reads the
-  node's root-only harness env and runs with `sudo` on the node: the
-  person's.
+- **Probing a foreign kind:** `noo-gateway harness probe --kind
+  <claude-code|copilot|codex> --mock-model` tests the wire and the flags as
+  yourself and changes nothing outside its temp workspace; exit 0 only when
+  every test passed (there is no probe for `noo`). The real mode takes the
+  model from `NOO_HARNESS_MODEL_URL` / `NOO_HARNESS_MODEL` /
+  `NOO_HARNESS_BACKEND` first; only when it falls back to the root-only
+  `/etc/noo-harness.env` does it need `sudo` on the node, and that is the
+  person's. As root it runs the vendor CLI as `--run-as` (default
+  `nobody`), never as uid 0.
