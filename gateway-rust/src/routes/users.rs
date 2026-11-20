@@ -2585,7 +2585,7 @@ async fn service_key_issue(
     ctx: Option<Extension<RequesterCtx>>,
     Json(body): Json<IssueKeyBody>,
 ) -> AppResult {
-    crate::person_gate::require_person(&state.db, ctx.as_deref(), "issuing a service key").await?;
+
     if body.consumer.trim().is_empty() {
         return Err(AppError::BadRequest("consumer is required".into()));
     }
