@@ -174,6 +174,24 @@ are under `nodes[].checks`, controller rows under
 | voice listeners | `voice_listeners` | `!`, `x` | Whether the voice doors (whisper, piper) require a cluster client certificate, refuse plain HTTP and publish no host port. | `noo upgrade --stack` restores the shipped overlay, then `noo stack restart --force whisper piper`. |
 | voice models | `voice_models` | `!`, `x` | Whether the voice models are staged and the voice containers run offline. | `noo models pull <model>` for a missing model; `noo upgrade --stack` for an online container. |
 
+## Seat rows (kiosk displays)
+
+| Row | id | Can be | Means | Clears when |
+|---|---|---|---|---|
+| display | `display` | `!`, `x` | Whether the seat's display is running and shows the console this controller serves. | On the seat run the printed `noo kiosk reload`, or the repair `sudo <seat noo> kiosk seat-sync --migrate` when the display is down. |
+| display binaries | `display_binaries` | `!`, `x` | Whether the seat's display runs its scripts from the shared kiosk directory, where seat updates reach them, not from a home or root-installed copy. | On the seat run the repair `sudo <seat noo> kiosk seat-sync --migrate`. |
+| display held | `display_held` | `!` | The last update changed the display but did not restart it, because its unit or scripts could not be trusted to come back; it runs what it started with. | On the seat run the repair `sudo <seat noo> kiosk seat-sync --migrate`. |
+| display rollback | `display_rollback` | `x` | The last update's display did not stay up, so the previous display scripts were put back (or putting them back failed). | Read the seat's `journalctl -u kiosk.service` and fix the cause; the row clears when a later update applies. |
+| kiosk env | `kiosk_env` | `!` | Whether the seat can read its kiosk settings file; if not, its mode, view and quality are unknown. | On the seat run the repair `sudo <seat noo> kiosk seat-sync --migrate`. |
+| kiosk unit | `kiosk_unit` | `!` | Whether the seat's display unit is this release's; the seat's own sync cannot update a root-installed unit. | On the seat run the repair `sudo <seat noo> kiosk seat-sync --migrate`. |
+| kiosk watchdog | `kiosk_watchdog` | `!` | Whether the seat's root-installed display watchdog is this release's; the seat's own sync cannot update it. | On the seat run the repair `sudo <seat noo> kiosk seat-sync --migrate`. |
+| kiosk-serve | `kiosk_serve` | `!`, `x` | Whether the seat's kiosk-serve unit is active, or no kiosk is set up on the seat. | Set it up with `noo kiosk setup` on the seat, or read its `journalctl -u kiosk-serve` when it failed. |
+| seat binding | `seat_binding` | `x` | Whether the seat is bound to its tailnet device (so its display can mint a kiosk token) and not revoked. | Bind it with `noo kiosk seats bind <seat> <device>`; a revoked seat needs `noo kiosk seat-token <seat>`. |
+| seat bundle | `seat_bundle` | `!`, `x` | Whether the update bundle staged for the seat was applied, and applied cleanly. | Run `noo upgrade --seats`; a bundle not applied yet clears on the seat's next sync. |
+| seat cli | `seat_cli` | `!`, `x` | Whether the seat's `noo` (and its user's copy) is the controller's version. | Run `noo upgrade --seats`. |
+| seat layout | `seat_layout` | `!` | Whether the seat is still on the old root layout, where no updates apply until it is migrated. | On the seat run the printed `sudo … kiosk seat-sync --migrate`. |
+| seat online | `seat_online` | `x` | Whether the seat has reached the controller recently (its sync timer runs). | On the seat check `systemctl status noo-seat-sync.timer` and `journalctl -u noo-seat-sync`. |
+
 ## `noo security at-rest preflight-firmware` rows
 
 | Row | id | Can be | Means | Clears when |
