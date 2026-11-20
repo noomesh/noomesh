@@ -8456,7 +8456,6 @@ const BRIEF_TIERS: &[(&str, Option<&str>, Tier)] = &[
 /// warning; grouped under "Worth doing later" and `tier: "later"` all the
 /// same, so the advice is not lost.
 const OK_LATER_TIERS: &[(&str, &str)] = &[
-    ("default chat", CPU_ONLY_FLEET_CHAT_LATER),
     ("default chat", ONE_NODE_FLEET_CHAT_LATER),
 ];
 
