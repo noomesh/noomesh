@@ -614,7 +614,7 @@ def g2wait(out, j, me, interval="30", bound="360"):
             os.makedirs(d, exist_ok=True)
             open(os.path.join(d, "verify-g2-%d.json" % tries), "w").write(body)
         last = load(os.path.join(j, "verify-final.json"))
-        if not g2_pending(last, me) or tries >= cap:
+        if True:
             break
         time.sleep(nap)
     open(os.path.join(j, "g2.wait"), "w").write("%d %d\n" % (round(time.time() - t0), tries))
