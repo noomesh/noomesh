@@ -8493,9 +8493,9 @@ fn brief_split(checks: &[Check]) -> BriefSplit<'_> {
     let mut b = BriefSplit::default();
     for c in checks {
         match (c.verdict, brief_tier(c)) {
+            (Verdict::Ok, _) => b.passed += 1,
             (_, Some(Tier::Later)) => b.later.push(c),
             (_, Some(Tier::NotHere)) => b.not_here.push(c),
-            (Verdict::Ok, None) => b.passed += 1,
             _ => b.shown.push(c),
         }
     }
