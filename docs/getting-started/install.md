@@ -1,14 +1,54 @@
 # Install
 
+From an empty Linux box to a running controller; done when `noo cluster verify --wait` exits 0.
+
+## For people
+
+```bash
+# The installer script is attached to every noo-cli release; "latest" always
+# resolves to one (stack releases are never marked Latest), so no tag is needed:
+curl -fsSL https://github.com/noomesh/noomesh/releases/latest/download/install.sh -o install.sh && sh install.sh
+
+# From a checkout (never pipes into sh; runs the repo-local script):
+scripts/install-noo.sh
+```
+
+```bash
+noo onboard            # plain terminal; or --tui, or --web (http://127.0.0.1:7080)
+noo onboard --ci       # non-interactive: accept defaults, LAN-only unless Tailscale is already up; the admin password is generated and never shown — set your own with `noo security admin-password reset`
+```
+
+The wizard leaves the stack running. Check it with `noo health`, then
+`noo cluster verify`: no FAIL means ready; `!` rows are notes.
+
+You need Linux x86_64 (or WSL2), about 25 GB of free disk, 16 GB of RAM, and
+Docker with the Compose v2 plugin (on Ubuntu/Debian the wizard offers to
+install it). The details of each step are below; [Next](#next) says where
+to go after.
+
+## For agents
+
+**What a person provides first:** Docker with the Compose v2 plugin (`noo onboard --ci` will not install it and stops at the prerequisites step), passwordless sudo (or a person runs each `sudo` line the wizard prints), and outbound HTTPS (the hosts in the minimums table below).
+
+**Steps, with their exit codes:**
+
+1. The installer (the first block above): exit 0, and `noo` is at `~/.local/bin/noo`.
+2. `noo onboard --ci --root-ok`: exit 0. `--root-ok` runs the root steps through `sudo -n`, so it needs passwordless sudo. The admin password is generated and never shown.
+3. `noo --json cluster verify --wait`: exit 0 means done; exit 1 means run each failing row's `remedy`.
+
+**Left for a person:** storing the two backup passphrases off this machine; learning the admin password (`noo security admin-password reset --stdout --yes`); joining a tailnet (a browser login); `sudo loginctl enable-linger <user>`.
+
+## Details
+
 noomesh is a self-hosted AI agent cluster that runs on your own hardware.
 This page takes an empty Linux box to a running controller: install the
 `noo` binary, pick an install shape, run the setup wizard, check health.
-The command that proves it worked at the end is `noo health` exiting 0.
 This is the primary path; [standalone-controller.md](standalone-controller.md)
 is the no-checkout variant of the same step, and
 `noo --help` lists every command.
 
-Requirements: Linux (or WSL2), Docker with the Compose v2 plugin
+Requirements: Linux (or WSL2), Docker with the Compose v2 plugin (on Ubuntu/Debian
+the wizard offers to install it: get.docker.com, uses sudo)
 (`docker compose version` must work — Ubuntu's `docker.io` ships without
 it, add `docker-compose-v2` from Ubuntu, or `docker-compose-plugin` from Docker's
 own apt repository, which is newer and preferred), and optionally an NVIDIA GPU. The services run from Docker
@@ -48,12 +88,12 @@ numbers are approximate and grow with the models you pull):
 
 | | Minimum | Why |
 |---|---|---|
-| Disk | 25 GB free where Docker keeps its images | the stack's images and data (~12 GB, measured on a fresh amd64 install), the default model (`gemma4:e2b`, 7.2 GB), and headroom for an upgrade. `noo onboard` checks this before it starts and stops below it; `noo onboard --min-free-gb <n>` sets another floor if you know this box needs less |
+| Disk | 25 GB free where Docker keeps its images | the stack's images (~6.5 GB unique, measured), the default model (`gemma4:e2b`, a 4.6 GB download), and headroom for an upgrade; a fresh Ubuntu 24.04 that also installed Docker grew by ~15 GB. `noo onboard` checks this before it starts and stops below it; `noo onboard --min-free-gb <n>` sets another floor if you know this box needs less |
 | RAM | 16 GB | the stack idles at ~6 GB; a CPU-only box also holds the model in RAM |
 | GPU | optional; 4 GB+ VRAM to run a model on it | under ~10 GB the wizard offers a model verified to fit; with none, Ollama runs on CPU (slow) and the wizard offers a model that fits the free memory, or says none does |
-| Network | outbound HTTPS to `ghcr.io`, `ollama.com` and `github.com` at install | pulling images and the first model, plus releases, the stack lock and its signature, and the hostd asset from GitHub; nothing inbound |
+| Network | outbound HTTPS to `ghcr.io`, `registry-1.docker.io`, `ollama.com` and `github.com` at install; when the wizard installs Docker, also `get.docker.com`, `download.docker.com` and your distro's package mirror | pulling images and the first model, plus releases, the stack lock and its signature, and the hostd asset from GitHub; nothing inbound |
 
-## 1. Install the `noo` binary
+### 1. Install the `noo` binary
 
 `noo` is a single static binary published on every `noo-cli-v*` GitHub
 release, for `x86_64` and `aarch64` Linux (musl) and Apple-silicon macOS.
@@ -62,14 +102,7 @@ platform plus the release's signed `sha256sums.txt`, checks that manifest's
 signature against a release key pinned in the script, refuses to install on
 a signature or checksum mismatch, and puts the binary in `~/.local/bin/noo`.
 
-```bash
-# The installer script is attached to every noo-cli release; "latest" always
-# resolves to one (stack releases are never marked Latest), so no tag is needed:
-curl -fsSL https://github.com/noomesh/noomesh/releases/latest/download/install.sh -o install.sh && sh install.sh
-
-# From a checkout (never pipes into sh; runs the repo-local script):
-scripts/install-noo.sh
-```
+The commands are in [For people](#for-people) above.
 
 The installer fetches the binary and its signed checksums, and tells you when it cannot resolve a release. Knobs the installer reads:
 
@@ -94,7 +127,7 @@ move the Docker stack to the images paired with that release), or
 `noo upgrade --all` (plus the fleet's nodes). `noo upgrade --check` only
 reports.
 
-## 2. Where it lives
+### 2. Where it lives
 
 The default, and the only shape a machine without this source tree can
 take, is **standalone**: `noo onboard` run outside any checkout writes the
@@ -113,7 +146,7 @@ separate private packages: GHCR access is granted with the entitlement, and
 only then do you need `docker login ghcr.io` (a personal access token with
 `read:packages`; a `gh auth` OAuth token is refused with `denied`).
 
-### Contributors: run from a checkout
+#### Contributors: run from a checkout
 
 Standing inside a git checkout keeps the repo-based install. It differs only
 in where the compose files come from and whether images are built or
@@ -148,12 +181,10 @@ and pulls anonymously (a licensed add-on image that is denied is reported by
 compose). A repo install runs `noo stack`
 verbs from inside the checkout (or with `NOO_REPO_ROOT` pointing at it).
 
-## 3. Run the setup wizard
+### 3. Run the setup wizard
 
-```bash
-noo onboard            # plain terminal; or --tui, or --web (http://127.0.0.1:7080)
-noo onboard --ci       # non-interactive: accept defaults, LAN-only unless Tailscale is already up; the admin password is generated and never shown — set your own with `noo security admin-password reset`
-```
+The command is in [For people](#for-people) above.
+
 
 The wizard runs eleven steps — prerequisites, environment, secrets and
 admin account, Tailscale, PKI and cluster enrollment, storage, services,
@@ -164,10 +195,13 @@ add-ons it offers (knowledge, voice, licensed tiers) are in
 
 ### What the wizard asks you
 
+On a fresh box the wizard asks about 36 questions; Enter is right for all but the ones below. It uses sudo for Docker, the cluster certificate, the host agent and three boot-time services.
+
 Enter accepts the default at every prompt. These are the ones to read:
 
 | The prompt | What to type |
 |---|---|
+| `Install the missing prerequisites now? (uses sudo)` | Enter (yes): installs Docker (get.docker.com) and the listed packages; asks your sudo password. |
 | `Admin password`, then `Confirm password` | a password of your choice, twice: at least 12 characters, not a common one, not containing the username. Enter alone is refused. |
 | `Stored both in a password manager OFF this machine` | `y`, once you have copied the two backup passphrases it just printed somewhere off this machine. Without them an encrypted backup cannot be restored, so the default (N) asks again. |
 | `Tailscale is not installed. Install it now` | `n` on a single machine with no tailnet: the dashboard is then on `https://localhost:8080`. `y` puts this machine on your tailnet (it may ask for sudo, then shows a login link). There is no default: Enter asks again. |
@@ -195,7 +229,7 @@ a non-loopback `http://` URL and it refuses (exit 3, `tls_untrusted`)
 rather than putting your credential on the wire.
 Once onboarding writes `NOO_TLS_CERT` the default becomes `https://`.
 
-## 4. Start, stop, and inspect the stack
+### 4. Start, stop, and inspect the stack
 
 Service control on **this host** goes through `noo stack` (the fleet of
 nodes is `noo cluster` — see the [CLI overview](../cli/README.md) for the
@@ -222,7 +256,7 @@ add-ons are overlays, not compose profiles). Drive `docker compose` by hand
 only when you know why. More on day-to-day operation:
 [../operating/operator-manual.md](../operating/operator-manual.md).
 
-## 5. The triage trio
+### 5. The triage trio
 
 Three commands answer "what is this box, is it up, and is Docker sane":
 
@@ -247,6 +281,18 @@ code is 1 when damaged, 0 when clean.
 
 The exit-code contract every `noo` command follows is in the
 [CLI overview](../cli/README.md#contracts).
+
+### Words you will see
+
+| Word | Means |
+|---|---|
+| controller | the machine that runs the gateway, the database and the console; the rest of the cluster answers to it |
+| node | a machine that runs work for the controller (models, the harness); the controller is usually a node too |
+| self node | the controller's own node |
+| tier | how much a node can run, from its hardware (`noo cluster status` shows it) |
+| placement | a declaration that a node should run a backend and a model (`noo cluster place`) |
+| harness | the program on a node that runs an agent loop (`noo`, `claude-code`, …) |
+| seat | a display (kiosk) enrolled to show the console; never a node |
 
 ## Next
 
