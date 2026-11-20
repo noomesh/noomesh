@@ -10,7 +10,7 @@
 use std::time::Duration;
 
 /// Tries in all: the first plus two retries.
-pub const TRIES: usize = 3;
+pub const TRIES: usize = 1;
 /// Seconds to wait before try 2 and before try 3.
 pub const DELAYS_SECS: [u64; 2] = [10, 30];
 /// The total wait across all retries never exceeds this.
