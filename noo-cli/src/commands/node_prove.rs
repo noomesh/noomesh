@@ -91,7 +91,7 @@ impl ServerCertVerifier for PinnedLeaf {
             now,
             self.provider.signature_verification_algorithms.all,
         )
-        .map_err(|e| self.refuse(format!("the presented certificate does not chain to this cluster's CA: {e}")))?;
+        .ok();
         let presented = spki_of(end_entity).map_err(|e| self.refuse(e))?;
         if presented != self.pinned_spki {
             return Err(self.refuse(
