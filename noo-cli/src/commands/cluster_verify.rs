@@ -6298,7 +6298,7 @@ pub(crate) fn agent_protect_check(nodes: &[(String, bool)], reports: &[(String, 
         return Some(warn(
             "agent protect",
             detail,
-            Some(provision_each(&unheld)),
+            Some(provision_each(&unheld[..1])),
         ));
     }
     Some(ok("agent protect", format!("the node agent writes only where it must on {}", held.join(", "))))
