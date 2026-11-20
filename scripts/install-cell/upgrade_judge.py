@@ -255,7 +255,9 @@ def judge():
     else:
         s1 = "installing noo-netns-restore.service: staged to the self-node"
         s2 = "noo-netns-restore.service installed and enabled by the self-node's applier"
-        a, b = [l.strip() for l in stack.splitlines() if s1 in l and "whose applier installs it (no sudo)" in l], s2 in stack
+        # Case-insensitive: the CLI's ui::step capitalises a step's first
+        # letter ("> Installing …"), so rc.1's cell FAILed B1 on a pass.
+        a, b = [l.strip() for l in stack.splitlines() if s1 in l.lower() and "whose applier installs it (no sudo)" in l], s2 in stack.lower()
         if a and b:
             say("B1", "PASS", a[0] + " + " + s2)
         else:
