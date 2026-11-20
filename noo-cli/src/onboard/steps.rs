@@ -9744,7 +9744,7 @@ pub(crate) fn recreated_by(before: &str, after: &str) -> (Vec<String>, Vec<Strin
     let (b, a) = (parse(before), parse(after));
     let recreated: Vec<String> = a
         .iter()
-        .filter(|(s, id)| b.get(*s).is_some_and(|old| old != *id))
+        .filter(|(s, id)| b.get(*s).is_some_and(|old| old == *id))
         .map(|(s, _)| s.clone())
         .collect();
     let created: Vec<String> = if b.is_empty() {
