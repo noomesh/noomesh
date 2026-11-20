@@ -282,7 +282,7 @@ func (c *Ceilings) Fill(stats []ModelStat, show func(name string) ([]byte, error
 			sh = shown{ctx: ShowContextLength(body), arch: ShowArch(body)}
 			c.known[key] = sh
 		}
-		stats[i].ContextLength, stats[i].Arch = sh.ctx, sh.arch
+		stats[i].ContextLength = sh.ctx
 	}
 }
 
