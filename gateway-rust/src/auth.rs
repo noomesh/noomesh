@@ -3867,7 +3867,7 @@ pub fn unauthenticated() -> Response {
     use axum::response::IntoResponse;
     let body = axum::Json(serde_json::json!({
         "error": UNAUTHENTICATED_MESSAGE,
-        "code": UNAUTHENTICATED_CODE,
+        "code": UNAUTHENTICATED_CODE, "via": "key",
     }));
     (StatusCode::UNAUTHORIZED, body).into_response()
 }
