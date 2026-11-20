@@ -104,6 +104,12 @@ THIRD_PARTY: dict[str, dict[str, str]] = {
     "vllm": {"compose": "vllm/vllm-openai", "repo": "docker.io/vllm/vllm-openai", "ver": "v[A-Za-z0-9._-]*"},
 }
 
+# The lock row noo-cli's throwaway helper container rides (noo-cli/src/
+# helper_image.rs: the bind-mount probe, the data-dir chown, `cluster verify`'s
+# `du`). It is the nginx row, so one bump of the mirrored nginx moves the
+# stack and the helper together; tests/test_helper_image_ride.py ties them.
+HELPER_ROW = "nginx"
+
 ATTEMPTS = 4
 
 

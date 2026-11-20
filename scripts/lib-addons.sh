@@ -372,8 +372,18 @@ addons_stop_disabled() {
         case ",${_NOO_ADDONS_REFUSED}," in *",$_asd_n,"*) continue ;; esac
         _asd_o="$(addon_overlay "$_asd_n" 2>/dev/null)"
         if [ -z "$_asd_o" ]; then
-            printf '%s\n' "$NOO_ADDON_MAP" | grep -qx "${_asd_n}=0" \
-                && echo "! add-on $_asd_n is declared off but its overlay is gone, so its containers were NOT checked: noo doctor orphans" >&2
+            # Said only when this project HAS containers composed from that
+            # add-on's overlay (compose labels every container with the files
+            # it was created from). A declared-off add-on that was never
+            # installed has none: nothing broke, nothing to say. A failed
+            # listing is unknown, so it is said too.
+            if printf '%s\n' "$NOO_ADDON_MAP" | grep -qx "${_asd_n}=0"; then
+                if ! _asd_cf="$(docker ps -a --filter "label=com.docker.compose.project=${_asd_proj}" \
+                        --format '{{.Label "com.docker.compose.project.config_files"}}' 2>/dev/null)" \
+                    || printf '%s\n' "$_asd_cf" | tr ',' '\n' | grep -qF "/addons/${_asd_n}/"; then
+                    echo "! add-on $_asd_n is declared off but its overlay is gone, so its containers were NOT checked: noo doctor orphans" >&2
+                fi
+            fi
             continue
         fi
         for _asd_s in $(addon_own_services "$_asd_o"); do
@@ -538,4 +548,19 @@ addons_stop_leftovers() {
         echo "       Fix:  noo stack restart --force   (an add-on stop must never take down a core service: report it)"
     } >&2
     return 1
+}
+
+# The gateway's compose environment that is NOT in .env or noomesh.yaml: the
+# trellion split's two knobs, exported by the launcher. docker-compose.cluster.yml
+# interpolates both into the gateway service (NOO_WORKER_SUPERVISOR,
+# NOO_MIGRATIONS_ENVS), so they are part of the gateway's compose config hash.
+# `noo stack start`, `restart --force` and `rebuild` each used to export (or
+# not export) them on their own: restart exported neither, so `noo cluster
+# nats-creds rotate --restart` recreated the gateway with NOO_MIGRATIONS_ENVS
+# empty and the next plain start, which exports `mesh`, recreated it again
+# ("its compose config or image changed", 0.6.29-rc.2 install matrix). ONE
+# function, called by all three at the top level, before any compose render.
+addons_export_launcher_env() {
+    export NOO_WORKER_SUPERVISOR="external"
+    export NOO_MIGRATIONS_ENVS="${NOO_MIGRATIONS_ENVS:-mesh}"
 }

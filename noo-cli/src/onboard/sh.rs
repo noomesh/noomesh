@@ -491,6 +491,82 @@ pub fn stream_status(ctx: &Ctx, mut cmd: Command) -> i32 {
     child.wait().map(|s| s.code().unwrap_or(1)).unwrap_or(1)
 }
 
+/// [`stream_status`] that also returns the tail of what the command printed,
+/// so a caller can classify a failure. The live output is unchanged: the
+/// console gets the bytes as they arrive (progress rewrites included), the
+/// TUI gets its `Line` events. Only the last [`CAPTURE_TAIL`] bytes are kept.
+pub fn stream_status_captured(ctx: &Ctx, mut cmd: Command) -> (i32, String) {
+    use std::io::{Read as _, Write as _};
+    use std::sync::Mutex;
+    let tail: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+    let keep = |chunk: &[u8]| {
+        if let Ok(mut t) = tail.lock() {
+            t.extend_from_slice(chunk);
+            if t.len() > CAPTURE_TAIL {
+                let cut = t.len() - CAPTURE_TAIL;
+                t.drain(..cut);
+            }
+        }
+    };
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            ctx.warn(&format!("failed to spawn command: {e}"));
+            return (1, String::new());
+        }
+    };
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let ui = ctx.ui;
+    let console = ui.inherit_stdio();
+    let keep = &keep;
+    std::thread::scope(|s| {
+        for (pipe, to_stderr) in [(stdout.map(box_read), false), (stderr.map(box_read), true)] {
+            let Some(mut pipe) = pipe else { continue };
+            s.spawn(move || {
+                if console {
+                    let mut buf = [0u8; 4096];
+                    while let Ok(n) = pipe.read(&mut buf) {
+                        if n == 0 {
+                            break;
+                        }
+                        keep(&buf[..n]);
+                        if to_stderr {
+                            let mut o = std::io::stderr();
+                            let _ = o.write_all(&buf[..n]);
+                            let _ = o.flush();
+                        } else {
+                            let mut o = std::io::stdout();
+                            let _ = o.write_all(&buf[..n]);
+                            let _ = o.flush();
+                        }
+                    }
+                } else {
+                    use std::io::BufRead as _;
+                    let reader = std::io::BufReader::new(pipe);
+                    for line in reader.lines().map_while(Result::ok) {
+                        keep(line.as_bytes());
+                        keep(b"\n");
+                        let emitted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            ui.emit(crate::onboard::event::UiEvent::Line(format!("  {line}")));
+                        }));
+                        if emitted.is_err() {
+                            break;
+                        }
+                    }
+                }
+            });
+        }
+    });
+    let code = child.wait().map(|s| s.code().unwrap_or(1)).unwrap_or(1);
+    let text = tail.lock().map(|t| String::from_utf8_lossy(&t).replace('\r', "\n")).unwrap_or_default();
+    (code, text)
+}
+
+/// How much of a command's output [`stream_status_captured`] keeps.
+const CAPTURE_TAIL: usize = 8192;
+
 /// Where one container ended up, by compose's last progress word for it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ContainerEnd {

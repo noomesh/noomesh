@@ -46,6 +46,8 @@ echo "[build-llamacpp] arch=${ARCH} platform=${PLATFORM} ref=${LLAMACPP_REF}"
 
 # Foreign arch → ensure qemu/binfmt is registered (idempotent).
 if [ "$ARCH" != "$HOST_ARCH" ]; then
+  # DEV-ONLY (a maintainer building the image; never run on an install): the
+  # busybox here is a throwaway emulation probe, not a runtime image.
   if ! docker run --rm --platform "$PLATFORM" busybox true >/dev/null 2>&1; then
     echo "[build-llamacpp] registering qemu/binfmt for ${ARCH} (needs --privileged)…"
     docker run --privileged --rm tonistiigi/binfmt --install "$ARCH"

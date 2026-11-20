@@ -40,6 +40,9 @@ if ! declare -F ui_note >/dev/null 2>&1; then
     ui_note() { printf '    %s\n' "$*"; }
 fi
 
+# shellcheck source=lib-helper-image.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib-helper-image.sh"
+
 secrets_backend() {
     local env_file="${1:-.env}"
     local backend="${NOO_SECRETS_BACKEND:-}"
@@ -564,13 +567,21 @@ _secret_chown_files() {
     # decrypted store (and, mid-launch, a stale image pin from it that the
     # launcher re-asserts later); a `docker run` that only chowns files needs
     # none of it, only the way to reach the daemon.
+    # The helper (lib-helper-image.sh, job `secrets-chown` = CHOWN +
+    # DAC_READ_SEARCH, only the secrets dir mounted); NOO_SECRET_CHOWN_IMAGE
+    # stays an operator override of the image, nothing else. Its docker calls
+    # (the presence check and pull as well as the run) get the same minimal
+    # environment: a stale pin from the store must not reach any docker call.
+    local -a _denv=(env -i PATH="$PATH" HOME="${HOME:-/}" ${DOCKER_HOST:+DOCKER_HOST="$DOCKER_HOST"} ${DOCKER_CONFIG:+DOCKER_CONFIG="$DOCKER_CONFIG"}
+        ${DOCKER_CONTEXT:+DOCKER_CONTEXT="$DOCKER_CONTEXT"} ${DOCKER_TLS_VERIFY:+DOCKER_TLS_VERIFY="$DOCKER_TLS_VERIFY"}
+        ${DOCKER_CERT_PATH:+DOCKER_CERT_PATH="$DOCKER_CERT_PATH"} ${XDG_RUNTIME_DIR:+XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR"}
+        ${NOO_STACK_LOCK:+NOO_STACK_LOCK="$NOO_STACK_LOCK"} ${NOO_HELPER_COMPOSE:+NOO_HELPER_COMPOSE="$NOO_HELPER_COMPOSE"}
+        ${NOO_SECRET_CHOWN_IMAGE:+HELPER_IMAGE_OVERRIDE="$NOO_SECRET_CHOWN_IMAGE"})
+    "${_denv[@]}" bash -c '. "$1/lib-helper-image.sh" && helper_ensure_present' _ "$_NOO_HELPER_LIB" || return 1
+    HELPER_IMAGE_OVERRIDE="${NOO_SECRET_CHOWN_IMAGE:-}" helper_argv secrets-chown sh "$d":/d || return 1
     # shellcheck disable=SC2016  # expands inside the container
-    env -i PATH="$PATH" HOME="${HOME:-/}" ${DOCKER_HOST:+DOCKER_HOST="$DOCKER_HOST"} ${DOCKER_CONFIG:+DOCKER_CONFIG="$DOCKER_CONFIG"} \
-        ${DOCKER_CONTEXT:+DOCKER_CONTEXT="$DOCKER_CONTEXT"} ${DOCKER_TLS_VERIFY:+DOCKER_TLS_VERIFY="$DOCKER_TLS_VERIFY"} \
-        ${DOCKER_CERT_PATH:+DOCKER_CERT_PATH="$DOCKER_CERT_PATH"} ${XDG_RUNTIME_DIR:+XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR"} \
-        docker run --rm --network none --read-only --cap-drop ALL --cap-add CHOWN --cap-add DAC_READ_SEARCH \
-        --security-opt no-new-privileges -v "$d":/d "${NOO_SECRET_CHOWN_IMAGE:-alpine}" \
-        sh -c 'cd /d && while read -r u f; do chown "$u:$u" -- "$f" || exit 1; done < "$1"' sh "$m" >/dev/null
+    "${_denv[@]}" docker "${HELPER_ARGV[@]}" \
+        -c 'cd /d && while read -r u f; do chown "$u:$u" -- "$f" || exit 1; done < "$1"' sh "$m" >/dev/null
 }
 
 # _secret_form_conflicts <compose-file>... - overlays that still source a
@@ -666,7 +677,7 @@ EOF
     if ! _secret_chown_files "$d" "$manifest"; then
         _secret_tmp_cleanup "$d"
         echo "ERROR: could not hand the secret files under $d to their containers' uids." >&2
-        echo "       Fix: make sure docker can run '${NOO_SECRET_CHOWN_IMAGE:-alpine}' (docker pull ${NOO_SECRET_CHOWN_IMAGE:-alpine}), or run the launcher as root." >&2
+        echo "       Fix: make sure docker can run '${NOO_SECRET_CHOWN_IMAGE:-$(helper_image_ref 2>/dev/null)}' (docker pull it), or run the launcher as root." >&2
         return 1
     fi
     while read -r name var owner; do

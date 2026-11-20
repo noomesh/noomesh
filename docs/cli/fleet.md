@@ -30,7 +30,7 @@ Retired in 0.6.12 (each still answers with its successor instead of "unknown com
 
 `noo cluster show <node>` prints a **Chat context** line per chat model on an Ollama: `running` is the context the daemon runs the model at now (`?` when the node does not report it), `decided` is the one context every chat call to that Ollama asks for (the placement's `OLLAMA_CONTEXT_LENGTH`, else the tier profile's context, capped by the model's ceiling), and `capped` says why memory took it below that, with the numbers. `--json` carries the rows as `chat_contexts`.
 
-Both the tuned context and the decided one are sized on a **declared basis**: the node's RAM less a 10% headroom, less 2.5 GB for the stack on the controller's own box, less every declared model at its weights' file size plus its cache and overhead. A live memory reading is never used, because Ollama's resident figure leaves out the memory-mapped weights and so reads the box emptier the moment a model loads. The same box with the same placements therefore always gets the same context, loaded or not. On the controller's own box, when the chat model runs in the stack's own Ollama (the agent manages no Ollama there, as on a one-box), the slots counted are the stack's `compose_env` `OLLAMA_EMBED_NUM_PARALLEL`, whatever the placement says, because that daemon never takes a placement's env. The cache per token comes from one table: measured where config/model-capabilities.json has a figure, else the model's reported architecture, else an estimate from the weights. The reason line says which. `noo cluster place` prints the context it chose and why; a placement keeps its context when it is placed again with the same model and target, including on upgrade. To re-run the tuner deliberately: `noo cluster place <node> ollama <model> --retune`.
+Both the tuned context and the decided one are sized on a **declared basis**: the node's RAM less a 10% headroom, less 2.5 GB for the stack on the controller's own box, less every declared model at its weights' file size plus its cache and overhead. A live memory reading is never used, because Ollama's resident figure leaves out the memory-mapped weights and so reads the box emptier the moment a model loads. The same box with the same placements therefore always gets the same context, loaded or not. On the controller's own box, when the chat model runs in the stack's own Ollama (the agent manages no Ollama there, as on a one-box), the slots counted are the stack's `compose_env` `OLLAMA_EMBED_NUM_PARALLEL`, whatever the placement says, because that daemon never takes a placement's env. The cache per token comes from one table: where config/model-capabilities.json has a row (every model the install wizard offers has one, derived from the model's own layers, KV heads and head size at full attention, or measured), else the architecture the node reports for the model (the agent reads it from Ollama), else an estimate from the weights. The reason line says which. `noo cluster place` prints the context it chose and why; a placement keeps its context when it is placed again with the same model and target, including on upgrade. To re-run the tuner deliberately: `noo cluster place <node> ollama <model> --retune`.
 
 ## Recipes
 
@@ -869,7 +869,10 @@ drain_started, drained_at}`, plus `workload` for a reservation and
   streams carried by the tunnel and by HTTPS. It is a warning reading
   `NOT CHECKED` (never ok) for a node that does not advertise a tunnel, which
   keeps taking streaming calls over HTTPS :8081; a node that advertises one
-  while the gateway holds none, or gets no answer, FAILS. See
+  while the gateway holds none, or gets no answer, FAILS (not inside the
+  first 75 s after a gateway start: the node is still redialing). `noo onboard`'s
+  closing verify first waits up to 15 s for its own node's tunnel to report in;
+  `noo cluster verify` itself never waits. See
   [The node-held tunnel](../security/node-agent.md#the-node-held-tunnel).
 - `noo cluster verify host3` has a `gpu` row: `+ free`, or
   `! yielded: vllm paused (foreign 11.2 GB, memory-accounting)`. Yielded and

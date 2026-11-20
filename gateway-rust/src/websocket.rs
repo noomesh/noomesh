@@ -56,6 +56,19 @@ pub fn mint_ws_ticket(claims: auth::Claims, socket: &str) -> String {
     id
 }
 
+/// Mint a ticket only when it cannot outlive the access token behind it: the
+/// bearer check carries a 60 s leeway, but [`verify_ws_ticket`] re-checks `exp`
+/// strictly, so a token that is expired, or ends within [`WS_TICKET_TTL`], would
+/// be minted a ticket the socket refuses with 4401 ("do not reconnect") while
+/// the client, never shown a 401, never refreshes. Refusing here is the 401
+/// that makes it refresh. `now` is Unix seconds.
+pub fn mint_ws_ticket_checked(claims: auth::Claims, socket: &str, now: u64) -> Result<String, String> {
+    if (claims.exp as u64) <= now.saturating_add(WS_TICKET_TTL.as_secs()) {
+        return Err("the access token has expired (or ends within the ticket's life): refresh it and mint again".into());
+    }
+    Ok(mint_ws_ticket(claims, socket))
+}
+
 /// Redeem a ticket for `socket`. Single use: the ticket is removed whether or
 /// not it matches, so it can be tried exactly once.
 fn redeem_ws_ticket(ticket: &str, socket: &str) -> Option<auth::Claims> {
@@ -119,7 +132,11 @@ pub async fn ws_ticket(
     let Ok(claims) = auth::verify_token(token, &auth::jwt_secret()) else {
         return refuse(StatusCode::UNAUTHORIZED, "not an access token".into());
     };
-    let ticket = mint_ws_ticket(claims, &body.socket);
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(u64::MAX);
+    let ticket = match mint_ws_ticket_checked(claims, &body.socket, now) {
+        Ok(t) => t,
+        Err(why) => return refuse(StatusCode::UNAUTHORIZED, why),
+    };
     let mut resp = axum::Json(json!({
         "ticket": ticket,
         "param": "ticket",
@@ -794,6 +811,59 @@ mod ws_ticket_tests {
         assert!(verify_ws_ticket(&params(Some(&t), None), "/ws/coordinator", SECRET).is_err(), "single use");
         let stale = mint_ws_ticket(claims(-1), "/ws/coordinator");
         assert!(verify_ws_ticket(&params(Some(&stale), None), "/ws/coordinator", SECRET).unwrap_err().contains("expired"));
+    }
+
+    /// rc.3 finding, fixed: the bearer check's 60 s leeway let an expired token
+    /// be minted a ticket the socket then refused (4401, no reconnect, no
+    /// refresh). The mint now refuses it with the expiry reason (the handler
+    /// answers 401), and mints nothing. Function level (verify_token, then
+    /// `mint_ws_ticket_checked`, then `verify_ws_ticket`).
+    #[test]
+    fn a_token_inside_the_leeway_is_refused_at_the_mint_not_at_the_socket() {
+        use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        for ago in [1u64, 30, 59] {
+            let body = json!({"sub": "alice", "exp": now - ago, "role": "user", "scopes": ["read"],
+                              "iss": auth::JWT_ISSUER, "aud": auth::JWT_AUDIENCE});
+            let tok = encode(&Header::new(Algorithm::HS256), &body, &EncodingKey::from_secret(SECRET.as_bytes())).unwrap();
+            let claims = auth::verify_token(&tok, SECRET).expect("inside the 60 s leeway the bearer still verifies");
+            let e = mint_ws_ticket_checked(claims, "/ws/coordinator", now).unwrap_err();
+            assert!(e.contains("expired"), "{ago} s ago: {e}");
+        }
+    }
+
+    /// The mint refuses any token that ends within the ticket's own life, so a
+    /// ticket never outlives its token; one second beyond is minted, and that
+    /// ticket redeems.
+    #[test]
+    fn the_mint_refuses_a_token_that_ends_within_the_ticket_life() {
+        let now = 1_900_000_000u64;
+        let ttl = WS_TICKET_TTL.as_secs() as i64;
+        let at = |exp_in: i64| auth::Claims { exp: (now as i64 + exp_in) as usize, ..claims(0) };
+        assert!(mint_ws_ticket_checked(at(-1), "/ws/coordinator", now).is_err(), "already expired");
+        assert!(mint_ws_ticket_checked(at(0), "/ws/coordinator", now).is_err(), "expires now");
+        assert!(mint_ws_ticket_checked(at(ttl), "/ws/coordinator", now).is_err(), "ends exactly at the ticket's end");
+        assert!(mint_ws_ticket_checked(at(ttl + 1), "/ws/coordinator", now).is_ok(), "outlives the ticket by 1 s");
+    }
+
+    /// Redeem stays strict, never loosened to the leeway: a ticket whose token
+    /// has expired (minted past the check, as only a bug could) is refused.
+    #[test]
+    fn redeem_refuses_an_expired_token_strictly() {
+        let t = mint_ws_ticket(claims(-1), "/ws/coordinator");
+        let e = verify_ws_ticket(&params(Some(&t), None), "/ws/coordinator", SECRET).unwrap_err();
+        assert!(e.contains("has expired"), "{e}");
+    }
+
+    /// The route answers the refusal as a 401, from the checked mint, never
+    /// from the bare `mint_ws_ticket`.
+    #[test]
+    fn the_ticket_route_answers_an_expiring_token_with_401() {
+        let own = crate::test_src::own_code(include_str!("websocket.rs"));
+        let handler = crate::test_src::fn_body(&own, "pub async fn ws_ticket(");
+        assert!(handler.contains("mint_ws_ticket_checked(claims"), "the route must mint through the check");
+        assert!(!handler.contains(" mint_ws_ticket("), "the route must not call the unchecked mint");
+        assert!(handler.contains("Err(why) => return refuse(StatusCode::UNAUTHORIZED, why)"));
     }
 
     /// i515c: a JWT in a console socket URL is refused, with the way to do it

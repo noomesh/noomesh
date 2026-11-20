@@ -51,6 +51,13 @@ type Options struct {
 	// 1 s / 60 s, jittered). NotOfferedRetry is the long interval used when
 	// the gateway answers that it has no tunnel (default 10 min).
 	RetryMin, RetryMax, NotOfferedRetry time.Duration
+
+	// OnChange, when set, runs on every change of Connected(): true right
+	// after a session's handshake, false right after it ends. The agent
+	// passes a heartbeat kick, so the controller's record of the tunnel
+	// follows the tunnel within about a second, not up to a beat later. It
+	// must not block.
+	OnChange func(connected bool)
 }
 
 // Client holds the node's tunnel to the controller.
@@ -108,6 +115,17 @@ func New(opt Options) (*Client, error) {
 // Connected is true while a session is up (handshake complete). The
 // heartbeat advertises control_transports.tunnel from it.
 func (c *Client) Connected() bool { return c.connected.Load() }
+
+// setConnected stores the state and, only when it CHANGED, tells OnChange, so the flag is already
+// right when the hook's heartbeat reads it.
+func (c *Client) setConnected(v bool) {
+	if c.connected.Swap(v) == v {
+		return // not a change: a repeated state never beats again
+	}
+	if c.opt.OnChange != nil {
+		c.opt.OnChange(v)
+	}
+}
 
 // notOfferedError: the gateway answered the upgrade with a status that means
 // "no tunnel here" (an older gateway, the tunnel switched off) or a refusal.
@@ -255,9 +273,9 @@ func (c *Client) session(ctx context.Context) (connected bool, err error) {
 		return false, err
 	}
 	s := newSession(c, conn, ready)
-	c.connected.Store(true)
+	c.setConnected(true)
 	c.Connects.Add(1)
-	defer c.connected.Store(false)
+	defer c.setConnected(false)
 	slog.Info("node tunnel up", "gateway", c.wsURL, "window", ready.Window, "max_streams", ready.MaxStreams)
 	err = s.serve(ctx)
 	if err != nil && ctx.Err() == nil {

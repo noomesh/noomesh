@@ -86,6 +86,9 @@ case "$args" in
   "ps -q"*"com.docker.compose.service="*)
     svc="${args##*com.docker.compose.service=}"; svc="${svc%% *}"
     grep -qx "$svc" "$RUNNING" 2>/dev/null && echo "cid-$svc" ;;
+  "ps -a --filter label=com.docker.compose.project="*"config_files"*)
+    # The files this project's containers were composed from ($FAKE_CONFIG_FILES).
+    case "$args" in *"com.docker.compose.project=${FAKE_PROJECT:-noomesh} "*) echo "${FAKE_CONFIG_FILES:-}" ;; esac ;;
   "ps -a"*"com.docker.compose.service="*)
     # Only this install's project answers (FAKE_PROJECT, default noomesh).
     case "$args" in *"com.docker.compose.project=${FAKE_PROJECT:-noomesh} "*) ;; *) exit 0 ;; esac
@@ -528,7 +531,9 @@ def test_only_this_installs_project_matches(tmp_path: Path) -> None:
 
 
 def test_a_declared_off_addon_without_its_overlay_is_said(tmp_path: Path) -> None:
-    r = _off_run(tmp_path, "", with_overlay=False)
+    # It WAS installed: this project's containers carry its overlay path.
+    r = _off_run(tmp_path, "", with_overlay=False,
+                 env_extra={"FAKE_CONFIG_FILES": "/x/docker-compose.cluster.yml,/x/addons/rhold/docker-compose.yml"})
     assert "rc=0" in r.stdout, (r.stdout, r.stderr)
     assert "add-on rhold is declared off but its overlay is gone, so its containers were NOT checked: noo doctor orphans" in r.stderr
 
@@ -552,10 +557,21 @@ RH_VOICE_OVERLAY = """services:
 """
 
 
+def test_a_never_installed_declared_off_addon_prints_nothing(tmp_path: Path) -> None:
+    # A fresh install declares evolve/trellion_intel off and never had them:
+    # no container of the project was composed from their overlay, so there is
+    # nothing "gone" to warn about (0.6.29-rc.2 install matrix, every start).
+    r = _off_run(tmp_path, "", with_overlay=False,
+                 env_extra={"FAKE_CONFIG_FILES": "/x/docker-compose.cluster.yml,/x/docker-compose.trellion.yml"})
+    assert "rc=0" in r.stdout, (r.stdout, r.stderr)
+    assert "overlay is gone" not in r.stderr and "noo doctor orphans" not in r.stderr, r.stderr
+
+
 def test_a_hyphenated_declared_off_addon_without_its_overlay_is_said(tmp_path: Path) -> None:
     # harness 0.6.17 review a3: the map's name pattern had no `-`, so
     # `rh-voice=0` with its overlay gone was never listed, and skipped silently.
-    r = _off_run(tmp_path, "", with_overlay=False, addon="rh-voice")
+    r = _off_run(tmp_path, "", with_overlay=False, addon="rh-voice",
+                 env_extra={"FAKE_CONFIG_FILES": "/x/addons/rh-voice/docker-compose.yml"})
     assert "rc=0" in r.stdout, (r.stdout, r.stderr)
     assert "add-on rh-voice is declared off but its overlay is gone, so its containers were NOT checked: noo doctor orphans" in r.stderr, r.stderr
 

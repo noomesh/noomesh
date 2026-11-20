@@ -138,7 +138,14 @@ pub fn kv_per_token(model: &str, role: &str, weights_gb: Option<f64>, arch: Opti
             return Some((b as f64, "measured"));
         }
     }
-    if let Some(a) = arch.filter(|a| a.is_object()) {
+    // An embedder or reranker keeps its weights-based row even when its node
+    // reports an architecture. WHY: it holds no growing per-slot KV for a
+    // conversation; it encodes one input at a fixed short context (EMBED_NUM_CTX,
+    // RERANK_CTX), so the per-GB figure, calibrated on a measured harrier, is the
+    // truth. The agent reports an arch for EVERY model it holds, and a decoder
+    // style layers x kv_heads x head_dim x num_ctx would over-charge an encoder
+    // (harrier: about 0.1 GB to about 0.9 GB).
+    if let Some(a) = arch.filter(|a| !encoder && a.is_object()) {
         if let (Some(l), Some(h), Some(d)) = (a["layers"].as_f64(), a["kv_heads"].as_f64(), a["head_dim"].as_f64()) {
             // K and V, f16 (2 bytes each element).
             return Some((l * h * d * 2.0 * 2.0, "architecture"));
@@ -822,7 +829,7 @@ pub fn evaluate(node: &Value, specs: &[Spec], embed_ctx: u64) -> Report {
         let kv = kv_per_token(&s.model, &s.role, w, st.and_then(|x| x.get("arch")));
         let kv_basis = kv.map(|(_, b)| b).unwrap_or("unknown");
         notes.push(match kv_basis {
-            "measured" => "KV per token measured for this model (config/model-capabilities.json)".into(),
+            "measured" => "KV per token from this model's row in config/model-capabilities.json (measured, or derived from its own metadata)".into(),
             "architecture" => "KV from model architecture".into(),
             "estimate" => "KV from the conservative per-token estimate (no measured figure, architecture not reported)".into(),
             _ => "KV unknown (no size known)".into(),
@@ -1329,6 +1336,14 @@ mod tests {
         let est = evaluate(&host6(), &[spec("embed", "harrier", Some("4"))], 1024);
         assert_eq!(est.rows[0].source, "estimated");
         assert!((est.rows[0].total_gb - 1.1).abs() < 0.15, "harrier estimate {} is near the 1.1 GB measured on host8", est.rows[0].total_gb);
+    }
+
+    #[test]
+    fn an_embedder_is_priced_from_its_weights_not_its_reported_architecture() {
+        let a = json!({"layers": 28, "kv_heads": 8, "head_dim": 128});
+        assert_eq!(kv_per_token("harrier", "embed", Some(0.4), Some(&a)), Some((0.4 * KV_BYTES_PER_TOKEN_PER_GB_WEIGHTS, "estimate")));
+        assert_eq!(kv_per_token("bge-reranker", "rerank", Some(0.4), Some(&a)), Some((0.4 * KV_BYTES_PER_TOKEN_PER_GB_WEIGHTS, "estimate")), "a reranker too");
+        assert_eq!(kv_per_token("m:7b", "chat", Some(4.0), Some(&a)).map(|k| k.1), Some("architecture"));
     }
 
     #[test]

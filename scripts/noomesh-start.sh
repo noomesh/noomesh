@@ -149,8 +149,7 @@ addons_report_licensed
 #                               host MCP port
 #   NOO_MIGRATIONS_ENVS       → memory alembic runs in noo-trellion; the
 #                               gateway applies mesh only
-export NOO_WORKER_SUPERVISOR="external"
-export NOO_MIGRATIONS_ENVS="${NOO_MIGRATIONS_ENVS:-mesh}"
+addons_export_launcher_env   # NOO_WORKER_SUPERVISOR, NOO_MIGRATIONS_ENVS (lib-addons.sh, shared with restart and rebuild)
 # ── Trellion add-on switch ─────────────────────────────────────────────
 # The switch is `addons.trellion` in noomesh.yaml (read by addon_on in
 # lib-addons.sh). The old NOO_TRELLION_ENABLED env flag is retired and
@@ -400,6 +399,7 @@ source "$SCRIPT_DIR/lib-bind-addr.sh"
 resolve_bind_addr
 resolve_location
 # Load secrets (no-op unless NOO_SECRETS_BACKEND=sops; fails closed on decrypt error).
+source "$SCRIPT_DIR/lib-helper-image.sh"
 source "$SCRIPT_DIR/lib-secrets.sh"
 load_secrets || { echo "aborting: secrets load failed" >&2; exit 1; }
 require_core_secrets || exit 1
@@ -749,11 +749,14 @@ if [ ${#SERVICES[@]} -eq 0 ]; then
     # names this command). Silence on success — one more line on every start
     # is not worth it.
     if [ -f noomesh.yaml ]; then
-        if ! docker run --rm -v "$PWD/noomesh.yaml":/f alpine \
-                sh -c 'chgrp 65532 /f && chmod 660 /f' 2>/dev/null; then
+        # The helper (lib-helper-image.sh: the stack's own nginx by digest,
+        # never Docker Hub) mounts that ONE file, nothing else; job
+        # `chgrp-file` = CHOWN (chgrp) + FOWNER (chmod a file we do not own).
+        if ! { helper_ensure_present && helper_run chgrp-file sh "$PWD/noomesh.yaml":/f \
+                -c 'chgrp 65532 /f && chmod 660 /f'; } >/dev/null 2>&1; then
             echo "NOTE: could not make noomesh.yaml group-writable by the gateway (gid 65532) — \
 'noo config set' and dashboard settings writes will fail with a permission error. To fix: \
-docker run --rm -v \"\$PWD/noomesh.yaml\":/f alpine sh -c 'chgrp 65532 /f && chmod 660 /f'" >&2
+sudo chgrp 65532 noomesh.yaml && sudo chmod 660 noomesh.yaml" >&2
         fi
     fi
 

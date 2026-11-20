@@ -12,6 +12,8 @@
 # local_image_namespace / legacy_image_namespaces — the single definition of
 # which namespaces this repo builds into (see the --images block below).
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib-dist.sh"
+# shellcheck source=lib-helper-image.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib-helper-image.sh"
 
 
 # Auto-include override file if it exists (user directory mounts)
@@ -376,7 +378,8 @@ if [ "$DEEP_CLEAN" = true ]; then
         if confirm "Wipe contents of $dir?"; then
             # find -mindepth 1 keeps the mount dir itself; chown makes the
             # empty dir writable by the service uid so the next init works.
-            if docker run --rm -v "$dir":/wipe alpine sh -c \
+            # Job `wipe` (CHOWN + DAC_OVERRIDE), only this one dir mounted.
+            if helper_ensure_present && helper_run wipe sh "$dir":/wipe -c \
                 "find /wipe -mindepth 1 -exec rm -rf {} + 2>/dev/null; chown $chown_to /wipe"; then
                 ui_done "Wiped $dir"
             else

@@ -79,13 +79,43 @@ pub fn read_not_after(path: &Path) -> Option<i64> {
     Some(cert.tbs_certificate().validity().not_after.to_unix_duration().as_secs() as i64)
 }
 
-/// Recursively collect `*.crt` under `dir`, sorted — mirroring
+/// The PKI trees the gateway reads from the LIVE mount, never the staged
+/// copy: the CLI's certificate-only mirror (`public/nodes`,
+/// `public/services`), updated in place on every enrolment and rotation.
+pub const PUBLIC_TREES: [&str; 2] = ["nodes", "services"];
+
+/// Recursively collect `*.crt` under a PKI resolved to `pki_dir`, with its
+/// [`PUBLIC_TREES`] read under `public_root` (`tls::PkiMount::public_root`;
+/// `pki_dir` itself when that is live). Each cert comes with the root it is
+/// relative to, sorted by that relative path — mirroring
 /// `sorted(self.pki_dir.rglob("*.crt"))` so report ordering is stable.
-pub fn find_certs(dir: &Path) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    collect(dir, &mut out);
-    out.sort();
+pub fn find_certs_in(pki_dir: &Path, public_root: &Path) -> Vec<(PathBuf, PathBuf)> {
+    let mut own = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(pki_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let public = entry.file_name().to_str().is_some_and(|n| PUBLIC_TREES.contains(&n));
+            if path.is_dir() {
+                if !public {
+                    collect(&path, &mut own);
+                }
+            } else if path.extension().and_then(|e| e.to_str()) == Some("crt") {
+                own.push(path);
+            }
+        }
+    }
+    let mut out: Vec<(PathBuf, PathBuf)> = own.into_iter().map(|p| (pki_dir.to_path_buf(), p)).collect();
+    for tree in PUBLIC_TREES {
+        let mut found = Vec::new();
+        collect(&public_root.join(tree), &mut found);
+        out.extend(found.into_iter().map(|p| (public_root.to_path_buf(), p)));
+    }
+    out.sort_by(|a, b| relative(&a.0, &a.1).cmp(relative(&b.0, &b.1)));
     out
+}
+
+fn relative<'a>(root: &Path, path: &'a Path) -> &'a Path {
+    path.strip_prefix(root).unwrap_or(path)
 }
 
 fn collect(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -116,25 +146,23 @@ pub fn format_date(unix: i64) -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
-/// All certs under `pki_dir` expiring within `warn_days`.
+/// All certs [`find_certs_in`] finds expiring within `warn_days`.
 ///
 /// Port of `get_expiring_certs`, including its `days_left <= warn_days`
 /// comparison — note that already-expired certs (negative `days_left`) are
 /// included, which is intended: they are the most urgent, not the least.
-pub fn expiring_certs(pki_dir: &Path, warn_days: i64, now_unix: i64) -> Vec<CertInfo> {
+/// Names and roles are relative to the root each cert was found under, so
+/// `nodes/x/node.crt` reads the same from the staged copy or the mount.
+pub fn expiring_certs_in(pki_dir: &Path, public_root: &Path, warn_days: i64, now_unix: i64) -> Vec<CertInfo> {
     let mut out = Vec::new();
-    for path in find_certs(pki_dir) {
+    for (root, path) in find_certs_in(pki_dir, public_root) {
         let Some(not_after) = read_not_after(&path) else { continue };
         let days_left = days_between(now_unix, not_after);
         if days_left <= warn_days {
             out.push(CertInfo {
-                name: path
-                    .strip_prefix(pki_dir)
-                    .unwrap_or(&path)
-                    .display()
-                    .to_string(),
+                name: relative(&root, &path).display().to_string(),
                 path: path.display().to_string(),
-                role: role_of(pki_dir, &path),
+                role: role_of(&root, &path),
                 expires: format_date(not_after),
                 days_left,
             });
@@ -224,10 +252,10 @@ mod tests {
         // Non-.crt files are ignored entirely.
         std::fs::write(dir.join("gateway/key.pem"), b"garbage").unwrap();
 
-        let found = find_certs(&dir);
+        let found = find_certs_in(&dir, &dir);
         assert_eq!(found.len(), 2, "only .crt files are scanned");
         // Unparseable ones drop out rather than aborting the scan.
-        assert!(expiring_certs(&dir, 30, 1_754_000_000).is_empty());
+        assert!(expiring_certs_in(&dir, &dir, 30, 1_754_000_000).is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -236,6 +264,115 @@ mod tests {
     fn format_date_is_iso() {
         // 2026-08-01T00:00:00Z
         assert_eq!(format_date(1_785_542_400), "2026-08-01");
+    }
+}
+
+/// Fixtures for the readers of the PUBLIC trees (followup i1118): a PKI as
+/// the gateway sees it after start, and a node enrolled after that.
+#[cfg(test)]
+pub(crate) mod test_pki {
+    use std::path::{Path, PathBuf};
+
+    /// A PEM certificate for `cn` whose notAfter is `days` from now.
+    pub(crate) fn cert_pem(cn: &str, days: i64) -> String {
+        let mut params = rcgen::CertificateParams::new(vec![cn.to_string()]).unwrap();
+        params.not_after = time::OffsetDateTime::now_utc() + time::Duration::days(days);
+        let key = rcgen::KeyPair::generate().unwrap();
+        params.self_signed(&key).unwrap().pem()
+    }
+
+    pub(crate) fn write(path: &Path, body: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+    }
+
+    /// The live mount and the staged copy, after start.
+    pub(crate) struct Started {
+        pub root: PathBuf,
+        pub live: PathBuf,
+        pub staged: PathBuf,
+    }
+
+    impl Started {
+        pub(crate) fn mount(&self) -> crate::tls::PkiMount<'_> {
+            crate::tls::PkiMount { staged: &self.staged, live: &self.live }
+        }
+
+        /// Enrol `node` AFTER start: its cert lands in the live mount only,
+        /// the way the CLI's in-place mirror sync puts it there.
+        pub(crate) fn enrol_late(&self, node: &str, days: i64) {
+            write(&self.live.join("nodes").join(node).join("node.crt"), &cert_pem(node, days));
+        }
+    }
+
+    impl Drop for Started {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    /// A live mount holding the CA, the gateway's leaf (both far from
+    /// expiry) and node `early` (notAfter `early_days` from now), staged by
+    /// the real `stage_pki` — the start.
+    pub(crate) fn started(tag: &str, early_days: i64) -> Started {
+        let root = std::env::temp_dir().join(format!(
+            "noo-pki-live-{tag}-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let live = root.join("app-pki");
+        let staged = root.join("tmp-pki");
+        write(&live.join("ca.crt"), &cert_pem("noo-ca", 3650));
+        write(&live.join("gateway/gateway.crt"), &cert_pem("gateway", 3650));
+        write(&live.join("gateway/gateway.key"), "not read by these tests");
+        write(&live.join("nodes/early/node.crt"), &cert_pem("early", early_days));
+        crate::startup_tasks::stage_pki(&live, &staged).expect("stage the fixture PKI");
+        assert!(staged.join("nodes/early/node.crt").is_file(), "the fixture staged the start-time nodes");
+        Started { root, live, staged }
+    }
+}
+
+#[cfg(test)]
+mod public_tree_tests {
+    use super::*;
+
+    fn names(found: &[(PathBuf, PathBuf)]) -> Vec<String> {
+        found.iter().map(|(root, p)| relative(root, p).display().to_string()).collect()
+    }
+
+    // A node enrolled after start is in the live mount and not in the
+    // staged copy. Scanning the staged copy alone (the old reader) misses
+    // it; the split scan finds it, once, and names it the same way.
+    #[test]
+    fn a_node_enrolled_after_start_is_found_on_the_live_mount() {
+        let pki = test_pki::started("expiry", 3650);
+        pki.enrol_late("late", 5);
+        let staged_only = names(&find_certs_in(&pki.staged, &pki.staged));
+        assert!(!staged_only.contains(&"nodes/late/node.crt".to_string()), "the fixture must reproduce the defect: {staged_only:?}");
+
+        let public = pki.mount().public_root(&pki.staged);
+        assert_eq!(public, pki.live, "the staged copy's public trees are read from the live mount");
+        assert_eq!(
+            names(&find_certs_in(&pki.staged, &public)),
+            vec!["ca.crt", "gateway/gateway.crt", "nodes/early/node.crt", "nodes/late/node.crt"],
+        );
+        let now = jiff::Timestamp::now().as_second();
+        let expiring = expiring_certs_in(&pki.staged, &public, 30, now);
+        assert_eq!(expiring.len(), 1, "{expiring:?}");
+        assert_eq!(expiring[0].name, "nodes/late/node.crt");
+        assert_eq!(expiring[0].role, "node");
+        assert!(expiring[0].days_left <= 5, "{expiring:?}");
+    }
+
+    // A live PKI dir (the mount itself, or NOO_PKI_DIR on the host) is its
+    // own public root, and the scan is the plain recursive one.
+    #[test]
+    fn a_live_dir_is_its_own_public_root() {
+        let pki = test_pki::started("own-root", 3650);
+        pki.enrol_late("late", 5);
+        assert_eq!(pki.mount().public_root(&pki.live), pki.live);
+        let found = names(&find_certs_in(&pki.live, &pki.live));
+        assert_eq!(found, vec!["ca.crt", "gateway/gateway.crt", "nodes/early/node.crt", "nodes/late/node.crt"]);
     }
 }
 
@@ -266,7 +403,8 @@ fn verify_against_real_pki() {
         panic!("set NOO_VERIFY_PKI_DIR to a real PKI directory");
     };
     let now = jiff::Timestamp::now().as_second();
-    let certs = expiring_certs(std::path::Path::new(&dir), 99_999, now);
+    let root = std::path::Path::new(&dir);
+    let certs = expiring_certs_in(root, root, 99_999, now);
     assert!(!certs.is_empty(), "no certificates parsed from {dir}");
     for c in &certs {
         println!("{}|{}|{}|{}", c.name, c.role, c.expires, c.days_left);

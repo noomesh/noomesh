@@ -23,6 +23,7 @@ on:
       - 'scripts/noo-start-inputs.py'
       - 'scripts/lib-stuck-container.sh'
       - 'scripts/test-start-inputs/**'
+      - 'noo-cli/src/commands/nats_reload.rs'
       - '.github/workflows/start-inputs.yml'
   # A merge group has no path filter: the queue builds it, this lane reports.
   merge_group:

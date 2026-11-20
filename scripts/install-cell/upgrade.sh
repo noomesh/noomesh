@@ -25,7 +25,7 @@
 #
 # Every judged assert prints exactly one line, `UPGRADE <id> PASS|FAIL|NOT
 # REACHED: <why>`, quoting the product's own line on a FAIL. The asserts are
-# 97's spec (A1-A6 after `--all`, B1-B3 after the same-tag `--stack`) and
+# 97's spec (A1-A7 after `--all`, B1-B4 after the same-tag `--stack`) and
 # general's (G1-G5: the verify rows, the journal, a chat answer after).
 set -uo pipefail
 : "${OUT:?}" "${CELL:=upgrade-24.04}" "${RUNNER:=?}" "${CLI_TAG:=latest}" "${PREV_TAG:=}"
@@ -111,6 +111,20 @@ step before-roll 120 -- bash -c '
   python3 "$3" before "$2/verify-before.json" "$1"
 ' before "$SELF" "$J" "$HERE/upgrade_judge.py"
 
+# The Docker daemon's own record of the new version's roll: image + container
+# events from here to the end of the plain start after the upgrade (UPGRADE
+# NO-DOCKERHUB judges them: no Docker Hub pull, no Docker Hub container).
+# Started AFTER the previous final's onboard and start (which may pull
+# alpine), stopped by PID, never by pattern. When the operator is not in the
+# docker group yet, the watcher is sudo's, and so is its stop.
+DOCKER="docker"; docker info >/dev/null 2>&1 || DOCKER="sudo -n docker"
+mkdir -p "$OUT/logs"
+$DOCKER events --format '{{json .}}' --filter type=image --filter type=container \
+    > "$OUT/logs/docker-events-upgrade.jsonl" 2> "$OUT/logs/docker-events-upgrade.err" < /dev/null &
+EVENTS_PID=$!
+echo "$EVENTS_PID" > "$J/docker-events.pid"
+sleep 1
+
 # ── 3. the roll: --all to the release under test ────────────────────────────
 ROLL_T0="$(date +%s)"
 step upgrade-all 3600 -- noo upgrade --all --version "$TARGET" --yes
@@ -134,10 +148,37 @@ sudo -n journalctl --no-pager --since "@$ROLL_T0" 2>/dev/null | grep -E "noo-app
 step remove-netns-unit 60 -- sh -c 'echo "unit before: $(ls -l /etc/systemd/system/noo-netns-restore.service 2>&1)"
   sudo -n rm -f /etc/systemd/system/noo-netns-restore.service && sudo -n systemctl daemon-reload; echo "__rm=$?"
   echo "unit after: $(ls /etc/systemd/system/noo-netns-restore.service 2>&1)"'
+# B3 reads the sudo journal from STACK_T0 at whole-second resolution: the
+# cell's own sudos just above (the roll-window journalctl, the rm, the
+# daemon-reload) landed in STACK_T0's second and counted as the --stack's
+# (0.6.26 -> rc.1, run 44706791256: "3 sudo command(s) during the --stack").
+# One second apart, they are strictly earlier; B3 also ignores exactly those
+# commands, arguments included (upgrade_judge.py own_sudo_commands).
+sleep 1
 STACK_T0="$(date +%s)"
 step upgrade-stack-same-tag 2400 -- noo upgrade --stack --version "$TARGET" --yes
 echo "$?" > "$J/stack.rc"
 STACK_T1="$(date +%s)"
+
+# ── 4b. a plain start after the upgrade recreates nothing (B4) ─────────────
+# Every container the upgrade made must carry the start-inputs labels, or the
+# operator's next plain `noo stack start` recreates it (the release lead).
+# Snapshots before and after with recreated.py, the parser run.sh's
+# start-idempotent uses; the step's own exit is the start's. Here, before
+# chat-after: the start is judged on the stack exactly as the upgrade left it
+# (nothing between could move a container), and G5's chat then proves the
+# stack still answers after it. After STACK_T1, so recreated.py's `sudo -n
+# docker` fallback is outside B3's window.
+step start-after-upgrade 1800 -- sh -c 'python3 "$1" snap "$2/start-after.before" || exit 1
+  noo stack start; rc=$?
+  python3 "$1" snap "$2/start-after.after"
+  exit $rc' _ "$HERE/recreated.py" "$J"
+
+# The window ends here: `noo upgrade --all`, the same-tag `--stack` (with the
+# cell's remove-netns-unit step between them) and the plain start. Not chat-after.
+sleep 1
+if [ "$DOCKER" = "docker" ]; then kill "$EVENTS_PID" 2>/dev/null; else sudo -n kill "$EVENTS_PID" 2>/dev/null; fi
+wait "$EVENTS_PID" 2>/dev/null
 
 # ── 5. a chat answer after both ────────────────────────────────────────────
 step chat-after 900 -- noo chat --message "Reply with the single word ok."
@@ -150,6 +191,6 @@ sudo -n journalctl -t noo-apply --no-pager --since "@$ROLL_T0" 2>/dev/null | pyt
 sudo -n journalctl --no-pager --since "@$ROLL_T0" 2>/dev/null | grep -E "noo-apply|noo-fetch|noo-node-agent" \
   | python3 "$CELL_PY" redact > "$J/node.journal"
 sudo -n journalctl _COMM=sudo --no-pager --since "@$STACK_T0" --until "@$STACK_T1" 2>/dev/null | python3 "$CELL_PY" redact > "$J/sudo-stack.journal"
-export J SELF ROLL_T0 OUT
+export J SELF ROLL_T0 STACK_T0 STACK_T1 OUT
 step judge 120 -- python3 "$HERE/upgrade_judge.py" judge
 finish

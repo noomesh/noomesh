@@ -388,7 +388,7 @@ client would send door requests to the proxy.
 |---|---|
 | Old node (no `tunnel`) | HTTPS, as before |
 | Old gateway, new node | The dial gets `404`/`403`; the node logs **one** line (`not available from this controller`), stays on HTTPS and asks again every ~10 min |
-| Tunnel not up (reconnecting) | `control_transports.tunnel` is false from the next heartbeat; calls use HTTPS. Reconnect backoff is 1 s doubling to 60 s, jittered |
+| Tunnel not up (reconnecting) | `control_transports.tunnel` is false from the next heartbeat (the agent kicks one at once on every connect and every loss, at least 2 s after the previous beat); calls use HTTPS. Reconnect backoff is 1 s doubling to 60 s, jittered |
 | Tunnel drops mid-stream | In-flight streams end with a **distinct** error (`tunnel_lost: the tunnel to node X dropped (...)`, counted in `control_calls.tunnel_aborts`), never a clean end. Over the loopback door the response is cut without its terminating chunk. The node cancels the handlers (their contexts end) |
 | Drop before the response head, a read (`GET`/`HEAD`) | One retry over HTTPS, logged and counted (`fallbacks`) |
 | Drop before the response head, anything else | The node is reported unreachable (`tunnel-lost`); **never retried**: the node may have run it |
@@ -998,6 +998,8 @@ Only when a repair fails, or cannot be made, is the model refused: the node stop
 gateway routes elsewhere, and the row is a FAIL naming the model, the blob
 and the remedy. Hashing is cached by file identity (device, inode, size,
 mtime, ctime), so only the first check after a change reads the whole file.
+
+A node's first pull of a registry tag retries a registry blip in place (a 5xx or a connect/timeout error: 3 tries, waits of 10 s then 30 s, logged as `reconcile.ollama_pull_retry`); a 404 or an auth refusal fails at once, and what still fails falls back to the 10-minute backoff.
 
 A model the controller has no record of (a hand `ollama pull`) is never
 refused: the row WARNs with a remedy that acts on THAT node's Ollama. On the

@@ -4447,8 +4447,10 @@ pub(crate) fn ensure_dir_ownership(dir: &str, owner: &str) -> Result<(), String>
     if !empty {
         return Ok(());
     }
+    let image = crate::helper_image::ensure_present(&mut |_| {})?;
+    let argv = crate::helper_image::run_argv(&image, dir, &crate::helper_image::Job::Chown { owner });
     match Command::new("docker")
-        .args(["run", "--rm", "-v", &format!("{dir}:/d"), "alpine", "chown", owner, "/d"])
+        .args(&argv)
         .output()
     {
         Ok(o) if o.status.success() => Ok(()),
@@ -4889,16 +4891,23 @@ fn create_storage_dirs(ctx: &mut Ctx, root: &Path) -> usize {
 
 fn verify_bind_mount(ctx: &mut Ctx, root: &str) {
     if ctx.dry_run {
-        ctx.dry(&format!("docker run --rm -v {root}/noo-data:/test alpine touch /test/.bind-mount-ok"));
+        ctx.dry(&format!("docker run --rm --pull never --network none --read-only --cap-drop ALL --cap-add DAC_OVERRIDE --entrypoint touch -v {root}/noo-data:/test <the stack's nginx image, by digest> /test/.bind-mount-ok"));
         return;
     }
-    if !sh::docker_image_exists("alpine:latest") {
-        ctx.progress("Pulling alpine image for bind-mount test...");
-        let _ = sh::docker(&["pull", "alpine:latest"]);
-    }
+    // The helper is the stack's own nginx (pulled anyway, by the same
+    // digest); the storage step runs before the stack images are pulled, so
+    // fetch that one image here.
+    let image = match crate::helper_image::ensure_present(&mut |m| ctx.progress(m)) {
+        Ok(i) => i,
+        Err(e) => {
+            ctx.warn(&format!("Docker bind-mount test not run: {e}"));
+            return;
+        }
+    };
     let test_dir = format!("{root}/noo-data");
-    let vol = format!("{test_dir}:/test");
-    let (code, out) = sh::docker(&["run", "--rm", "-v", &vol, "alpine:latest", "touch", "/test/.bind-mount-ok"]);
+    let argv = crate::helper_image::run_argv(&image, &test_dir, &crate::helper_image::Job::Touch { marker: ".bind-mount-ok" });
+    let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+    let (code, out) = sh::docker(&argv);
     let marker = Path::new(&test_dir).join(".bind-mount-ok");
     let _ = std::fs::remove_file(marker);
     if code == 0 {
@@ -8242,9 +8251,18 @@ fn pull_ollama(ctx: &mut Ctx, model: &str) {
     );
     // Stream pull output live (inherited stdio on the console; forwarded
     // Line events when the TUI owns the terminal).
-    let mut cmd = Command::new("docker");
-    cmd.args(["exec", target, "ollama", "pull", model]);
-    let code = sh::stream_status(ctx, cmd);
+    // A registry blip (a 503, a connect timeout) is retried, bounded and said
+    // line by line; a 404 or an auth refusal fails at once with its reason
+    // (commands/pull_retry.rs holds the one classifier).
+    let (code, pull_out) = crate::commands::pull_retry::pull_with_retry(
+        || {
+            let mut cmd = Command::new("docker");
+            cmd.args(["exec", target, "ollama", "pull", model]);
+            sh::stream_status_captured(ctx, cmd)
+        },
+        |line| ctx.warn(line),
+        std::thread::sleep,
+    );
     if code == 0 {
         let record = crate::commands::ollama_stage::record_after_pull(pending, |r| {
             crate::commands::ollama_stage::read_container_manifest(target, r)
@@ -8268,6 +8286,9 @@ fn pull_ollama(ctx: &mut Ctx, model: &str) {
         ctx.state.backend_used = "ollama".to_string();
         ctx.success(&format!("Model {model} pulled via Ollama"));
     } else {
+        if let Some(why) = crate::commands::pull_retry::last_error_line(&pull_out) {
+            ctx.warn(&format!("Ollama pull failed: {why}"));
+        }
         ctx.warn(&format!("Ollama pull did not complete — your choice IS saved (OLLAMA_MODEL={model}); the next stack start pulls it, or retry now: docker exec {target} ollama pull {model}"));
     }
 }

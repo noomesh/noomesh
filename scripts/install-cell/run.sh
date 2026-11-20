@@ -697,6 +697,77 @@ if [ "$CELL" = "$CONTEXT_PIN_CELL" ] && [ -f "$CONTEXT_FIT" ]; then
     judged_ctx context-fit-doesnt-fit 300 doesnt-fit --expect-backend ollama
 fi
 
+# ── the real CLI's reload and forced restart (the release lead) ──────────
+# ONLY the default cell, and AFTER first-answer, the three start checks and
+# the probes that judge the fresh install: it rotates a live credential and
+# recreates the stack, so it must not touch what those judge, nor the
+# first-answer seconds compared across runs. Every other cell skips it with a
+# NOTE (a step of no time). Its output is prefixed (`rotate| `, …): the
+# rotation's own warnings are the harness's doing, not a stranger's, and stay
+# out of the summary's warning count.
+#
+# What the code does (noo-cli nats_users.rs rotate_controller_principals):
+# `noo cluster nats-creds rotate worker` mints the worker's password, re-
+# renders users.conf and HUPs nats (hup_nats); with --restart it then runs
+# `scripts/noomesh-restart.sh --force` with NO service named, which force-
+# recreates EVERY stack container (nats included), not only the holders it
+# names (noo-worker, noo-trellion, noo-trellion-intel). So a --restart
+# replaces the nats a reload record names, and the record is never used:
+# START-AFTER-PROVISION could not be judged after it. Two phases, then:
+#   1. rotate worker WITHOUT --restart (users.conf changes, nats is HUPed
+#      and the confirmed reload recorded), `noo cluster provision <self>
+#      --wait` (re-renders and HUPs again), then a plain start:
+#      START-AFTER-PROVISION: nats NOT recreated (PASS), recreated (FAIL
+#      with the launcher's reason lines), NOTE on a build that records no
+#      reload. The worker and trellion ARE recreated there (their input
+#      changed): what the plain start is for.
+#   2. rotate worker --restart (the stack recreated by noomesh-restart.sh
+#      --force, which labels what it recreates since #1462), then a plain
+#      start: START-AFTER-FORCED-RESTART: nothing the restart recreated
+#      (worker and trellion among them) is recreated again; FAIL names each
+#      with its reason line. No NOTE fallback.
+FORCED_RESTART_CELL=ubuntu-24.04-amd64-default
+if [ "$CELL" = "$FORCED_RESTART_CELL" ]; then
+step start-after-rotation 3600 -- bash -c '
+  rc_py="$1"; out="$2"; v=0
+  m="$(find "$HOME" -maxdepth 4 -name .noo-standalone -print -quit 2>/dev/null)"
+  inst="${m%/.noo-standalone}"; inst="${inst:-${NOO_REPO_ROOT:-$HOME/.noo}}"
+  conf="$inst/monitoring/nats/users.conf"
+  tmp="$(mktemp -d)"; trap "rm -rf $tmp" EXIT
+  sum() { python3 -c "import hashlib, sys; print(hashlib.sha256(open(sys.argv[1], \"rb\").read()).hexdigest())" "$1" 2>/dev/null; }
+  run() { local tag="$1" log="$2"; shift 2; "$@" > "$log" 2>&1; local rc=$?; sed "s/^/$tag| /" "$log"; return $rc; }
+  last() { grep -v "^[[:space:]]*$" "$1" | tail -n 1 | cut -c1-200; }
+  # phase 1
+  c0="$(sum "$conf")"
+  run rotate "$tmp/rotate.log" noo cluster nats-creds rotate worker --yes; rrc=$?
+  if [ "$rrc" != 0 ]; then
+    echo "START-AFTER-PROVISION FAIL: noo cluster nats-creds rotate worker exited $rrc: $(last "$tmp/rotate.log")"
+    echo "START-AFTER-FORCED-RESTART FAIL: not run: the rotation failed"; exit 1
+  fi
+  run provision "$tmp/provision.log" timeout 900 noo cluster provision "$(hostname)" --wait; prc=$?
+  c1="$(sum "$conf")"
+  if [ -z "$c0" ] || [ -z "$c1" ]; then ch=unknown; elif [ "$c0" = "$c1" ]; then ch=no; else ch=yes; fi
+  echo "users.conf changed by the rotation and the provision: $ch"
+  rec="$(python3 "$rc_py" reload-record "$inst/.noo-start-inputs.json")"
+  echo "nats reload record before the start: $rec"
+  python3 "$rc_py" snap "$out/start-d.before"
+  run start "$tmp/start.log" noo stack start; src=$?
+  python3 "$rc_py" snap "$out/start-d.after"
+  python3 "$rc_py" after-provision START-AFTER-PROVISION "$out/start-d.before" "$out/start-d.after" \
+    "$tmp/start.log" "$src" "$ch" "$rec" "$tmp/provision.log" "$prc" || v=1
+  # phase 2
+  run rotate-restart "$tmp/rotate2.log" noo cluster nats-creds rotate worker --restart --yes; r2=$?
+  python3 "$rc_py" snap "$out/start-e.restarted"
+  run start "$tmp/start2.log" noo stack start; s2=$?
+  python3 "$rc_py" snap "$out/start-e.after"
+  python3 "$rc_py" after-forced-restart START-AFTER-FORCED-RESTART "$out/start-d.after" "$out/start-e.restarted" \
+    "$out/start-e.after" "$tmp/start2.log" "$s2" "$r2" "$tmp/rotate2.log" || v=1
+  exit $v' _ "$RC_PY" "$OUT"
+else
+step start-after-rotation 10 -- sh -c 'echo "START-AFTER-PROVISION NOTE: runs in the $1 cell only (it rotates the worker NATS credential and recreates the stack)"
+  echo "START-AFTER-FORCED-RESTART NOTE: runs in the $1 cell only"' _ "$FORCED_RESTART_CELL"
+fi
+
 # PROBE (fa, rc.1 rehearsal A-reboot.status, i677): a container that joins
 # another's network namespace (network_mode: service:<door>; noo-ollama-embed
 # joins noo-stunnel-ollama-embed) must be running after EVERY dockerd start.

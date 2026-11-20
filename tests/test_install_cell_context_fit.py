@@ -520,3 +520,44 @@ def test_the_agent_probe_keeps_evidence_only_when_it_times_out():
     assert 'timeout 300 noo inference agent' in arm
     assert 'if [ "$arc" = 124 ]; then' in arm and '"$RAG_AGENT_EVIDENCE" --since "$a0"' in arm
     assert "RAG_AGENT_EVIDENCE" in run_sh[run_sh.index("export RAG_QUERY_LINE"):].split("\n", 1)[0]
+
+
+# --- the gateway's reason behind the socket's "Authentication failed" ---------
+
+_TEXT_AUTH = ("\x1b[2m2026-11-20T10:00:01Z\x1b[0m \x1b[33m WARN\x1b[0m gateway::ws_coordinator: "
+              "ws_coordinator auth failed error=the access token behind this ticket has expired")
+_JSON_AUTH = json.dumps({"timestamp": "t", "level": "WARN", "fields": {
+    "message": "ws_coordinator auth failed", "error": "ticket unknown, already used, expired, or for another socket"}})
+
+
+def test_the_gateway_reason_of_an_auth_failure_is_read_from_text_and_json_lines():
+    assert CF.auth_failure_reasons([_TEXT_AUTH, "unrelated line", _JSON_AUTH]) == [
+        "the access token behind this ticket has expired",
+        "ticket unknown, already used, expired, or for another socket"]
+    assert CF.auth_failure_reasons(None) == [] and CF.auth_failure_reasons(["nothing"]) == []
+    assert CF.log_facts([_TEXT_AUTH])["auth_failures"] == ["the access token behind this ticket has expired"]
+    assert CF.log_facts(None)["auth_failures"] == []
+
+
+def test_an_authentication_failed_turn_prints_the_gateway_reason_and_is_not_reclassified():
+    facts = CF.log_facts([_TEXT_AUTH])
+    e = CF.with_auth_reason("Authentication failed", facts)
+    assert e.startswith("Authentication failed") and "error" not in e.split("[")[0]
+    assert "the access token behind this ticket has expired" in e
+    # Still a build finding (a failed turn), NOT the harness-credential NOT JUDGED.
+    assert not CF.auth_refused(e)
+    # No line / unreadable log: says so, still the error. Other errors untouched.
+    assert "no `ws_coordinator auth failed` line" in CF.with_auth_reason("Authentication failed", CF.log_facts(["x"]))
+    assert "could not be read" in CF.with_auth_reason("Authentication failed", CF.log_facts(None))
+    assert CF.with_auth_reason("no done frame within 300 s", facts) == "no done frame within 300 s"
+    assert CF.with_auth_reason(None, facts) is None
+
+
+def test_timed_turn_appends_the_gateway_reason_to_the_turn_error(monkeypatch):
+    monkeypatch.setattr(CF, "chat_turn", lambda *a, **k: {"text": "", "error": "Authentication failed", "calls": [],
+                                                          "approval": False, "done": None})
+    monkeypatch.setattr(CF, "gateway_log", lambda since, until: [_TEXT_AUTH])
+    monkeypatch.setattr(CF.time, "sleep", lambda s: None)
+    chat, facts, _ = CF.timed_turn("hi", "https://g", 5)
+    assert chat["error"].startswith("Authentication failed [gateway reason: the access token behind this ticket has expired")
+    assert facts["auth_failures"]

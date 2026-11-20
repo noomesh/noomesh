@@ -1776,6 +1776,9 @@ services:
     build:
       context: .
       dockerfile: docker/Dockerfile.airllm
+    # `:latest` on purpose: airllm is built on the inference node itself
+    # (build: above, pull_policy: build), profile `airllm` only, never in a
+    # default install and never pulled from any registry.
     image: noomesh/airllm:latest
     pull_policy: build
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-airllm
@@ -3331,6 +3334,10 @@ services:
   model-cache:
     # The official nginx image from OUR mirror, never Docker Hub
     # (mirror-images.yml copies nginx:1.30.7-alpine by this digest; bump both).
+    # noo-cli also runs its throwaway helper container (bind-mount probe,
+    # data-dir chown, verify's du) from THIS image line, entrypoint
+    # overridden: noo-cli/src/helper_image.rs reads the repo, tag and digest
+    # from it. Keep it one `image: ghcr.io/noomesh/nginx:<tag>${NOO_IMAGE_DIGEST_NGINX:-@sha256:<hex>}` line.
     image: ghcr.io/noomesh/nginx:1.30.7-alpine${NOO_IMAGE_DIGEST_NGINX:-@sha256:caf4e1e032a20f9c3c5e28fc7f25ffd768ad8677b4975c54193075997b3a97e3}
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-model-cache
     profiles: ["controller", "standalone"]

@@ -102,6 +102,36 @@ describe('createSocket', () => {
     expect(FakeWebSocket.instances).toHaveLength(0);
   });
 
+  // rc.3: the gateway now answers 401 at the mint for a token that is expired
+  // or ends within the ticket's 30 s life. The client refreshes once, mints
+  // again with the NEW token, and connects: no onAuthFail, no dead chat.
+  it('a 401 at the mint refreshes once, mints with the new token, and connects', async () => {
+    let tok = 'stale';
+    const onAuthFail = vi.fn();
+    const onOpen = vi.fn();
+    const refreshToken = vi.fn(async () => {
+      tok = 'fresh';
+      return tok;
+    });
+    const seen: Array<string | null> = [];
+    const staleRefusing = (async (url: string, init: RequestInit) => {
+      const auth = new Headers(init.headers).get('Authorization');
+      seen.push(auth);
+      if (auth === 'Bearer stale') return new Response(JSON.stringify({ error: 'the access token has expired' }), { status: 401 });
+      return new Response(JSON.stringify({ ticket: `tik-${(auth ?? '').replace('Bearer ', '')}` }), { status: 200 });
+    }) as unknown as typeof fetch;
+    createSocket('/ws/coordinator', { ...opts(), getToken: () => tok, fetchImpl: staleRefusing, refreshToken, onAuthFail, onOpen });
+    await flush();
+    await flush();
+    expect(refreshToken).toHaveBeenCalledTimes(1);
+    expect(seen).toEqual(['Bearer stale', 'Bearer fresh']);
+    expect(FakeWebSocket.instances).toHaveLength(1);
+    expect(only().url).toBe('wss://gw.test/ws/coordinator?ticket=tik-fresh');
+    only().open();
+    expect(onOpen).toHaveBeenCalledTimes(1);
+    expect(onAuthFail).not.toHaveBeenCalled();
+  });
+
   it('reconnects after a non-auth close', async () => {
     createSocket('/ws/x', opts());
     await flush();

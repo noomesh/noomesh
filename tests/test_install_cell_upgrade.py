@@ -29,6 +29,13 @@ STACK_OK = """\
 JOURNAL_OK = "Nov 18 noo-apply[1]: release-check: generation=2 release=none release-prev=none\nNov 18 noo-apply[1]: applied: agent-env agent-protect=6\n"
 
 
+# The plain start after the upgrade (B4): recreated.py snapshots and the
+# launcher's report (scripts/noo-start-inputs.py report_lines).
+SNAP = "noo-gateway g1 gateway postgres:service_healthy:false\nnoo-nats n1 nats -\nnoo-postgres p1 postgres -\n"
+START_OK = "> Starting the stack\n  Containers          3 running, 0 recreated\n+ stack up\n"
+ROLL_T0, STACK_T0, STACK_T1 = "1763629700", "1763629900", "1763630100"
+
+
 def verify(self_rows, ctl_rows):
     return json.dumps({"nodes": [{"node": SELF, "checks": self_rows}], "controller": {"checks": ctl_rows}})
 
@@ -46,7 +53,8 @@ GOOD_CTL = [
 
 
 def cell(tmp, roll=ROLL_OK, stack=STACK_OK, journal=JOURNAL_OK, roll_rc="0", self_rows=None, ctl_rows=None,
-         chat="ok\n", chat_rc=0, unit=True, sudo_journal="", unit_user=None, stack_journal=None, exec_start=None):
+         chat="ok\n", chat_rc=0, unit=True, sudo_journal="", unit_user=None, stack_journal=None, exec_start=None,
+         start_log=START_OK, start_rc=0, start_after=SNAP, events=None):
     out, j = tmp / "out", tmp / "out" / "judge"
     (out / "logs").mkdir(parents=True)
     j.mkdir()
@@ -64,9 +72,18 @@ def cell(tmp, roll=ROLL_OK, stack=STACK_OK, journal=JOURNAL_OK, roll_rc="0", sel
     (j / "verify-after.json").write_text(v)
     (j / "verify-final.json").write_text(v)
     (out / "logs" / "chat-after.log").write_text(chat)
-    (out / "steps.jsonl").write_text(json.dumps({"step": "chat-after", "rc": chat_rc}) + "\n")
+    if events is not None:
+        (out / "logs" / "docker-events-upgrade.jsonl").write_text(events)
+    steps = [{"step": "chat-after", "rc": chat_rc}]
+    if start_log is not None:
+        (out / "logs" / "start-after-upgrade.log").write_text(start_log)
+        (j / "start-after.before").write_text(SNAP)
+        (j / "start-after.after").write_text(start_after)
+        steps.insert(0, {"step": "start-after-upgrade", "rc": start_rc})
+    (out / "steps.jsonl").write_text("".join(json.dumps(d) + "\n" for d in steps))
     me = subprocess.run(["id", "-un"], capture_output=True, text=True).stdout.strip()
     env = dict(os.environ, OUT=str(out), J=str(j), SELF=SELF, NETNS_UNIT_ENABLED="enabled",
+               ROLL_T0=ROLL_T0, STACK_T0=STACK_T0, STACK_T1=STACK_T1,
                NETNS_UNIT_OWNER="%d:%d" % (os.getuid(), os.getgid()))
     u = tmp / "noo-netns-restore.service"
     if unit:
@@ -80,7 +97,7 @@ def cell(tmp, roll=ROLL_OK, stack=STACK_OK, journal=JOURNAL_OK, roll_rc="0", sel
 def test_a_clean_first_roll_passes_every_assert(tmp_path):
     rc, got = cell(tmp_path)
     assert rc == 0, got
-    for a in ("A1", "A2", "A3", "A4", "A5", "A6", "A7", "B1", "B2", "B3", "G1", "G2", "G3", "G4", "G5"):
+    for a in ("A1", "A2", "A3", "A4", "A5", "A6", "A7", "B1", "B2", "B3", "B4", "G1", "G2", "G3", "G4", "G5"):
         assert " PASS: " in got[a], got[a]
     assert "release-check: generation=2" in got["A2"]
     assert "generation 1) predates the netns-unit kind" in got["A5"]
@@ -158,7 +175,7 @@ def test_a_backend_start_refusal_or_a_used_lane_fails(tmp_path):
 
 def test_a_roll_that_never_ran_is_not_reached(tmp_path):
     rc, got = cell(tmp_path, roll=None, stack=None)
-    for a in ("A1", "A6", "B1", "B3"):
+    for a in ("A1", "A6", "B1", "B3", "B4"):
         assert " NOT REACHED: " in got[a], got[a]
 
 
@@ -222,3 +239,173 @@ def test_b1_matches_the_cli_s_capitalised_step_line(tmp_path):
     rc, got = cell(tmp_path, stack=stack)  # ONLY the capitalised line, as rc.1 printed it
     assert " PASS: " in got["B1"], got["B1"]
     assert "staged to the self-node runner-a" in got["B1"]
+
+
+# ── B3: the cell's own sudos, by exact command (0.6.26 -> rc.1, run 44706791256) ──
+def _sudo(cmd):
+    return "Nov 20 09:08:38 host sudo[9]:   runner : PWD=/home/runner ; USER=root ; COMMAND=%s\n" % cmd
+
+
+CELL_OWN = [
+    "/usr/bin/journalctl --no-pager --since @" + ROLL_T0,
+    "/usr/bin/rm -f /etc/systemd/system/noo-netns-restore.service",
+    "/usr/bin/systemctl daemon-reload",
+]
+
+
+def test_b3_ignores_the_cells_own_three_sudos_by_exact_command(tmp_path):
+    """run 44706791256: the roll-window journalctl, the unit removal and its
+    daemon-reload landed in STACK_T0's second and failed B3."""
+    rc, got = cell(tmp_path, sudo_journal="".join(_sudo(c) for c in CELL_OWN))
+    assert rc == 0 and " PASS: " in got["B3"] and "3 of the cell's own" in got["B3"], got["B3"]
+    # the other exact journalctl invocations upgrade.sh makes next to the window
+    more = ["/usr/bin/journalctl -t noo-apply --no-pager --since @" + ROLL_T0,
+            "/usr/bin/journalctl _COMM=sudo --no-pager --since @%s --until @%s" % (STACK_T0, STACK_T1)]
+    rc, got = cell(tmp_path / "b", sudo_journal="".join(_sudo(c) for c in more))
+    assert " PASS: " in got["B3"], got["B3"]
+
+
+def test_b3_still_fails_a_product_sudo_of_the_same_command_names(tmp_path):
+    for i, cmd in enumerate(["/usr/bin/journalctl -u noo-node-agent",
+                             "/usr/bin/systemctl restart docker",
+                             "/usr/bin/journalctl --no-pager --since @1763629701",
+                             "/usr/bin/rm -f /etc/systemd/system/noo-netns-restore.service.d",
+                             "/tmp/x/systemctl daemon-reload"]):
+        rc, got = cell(tmp_path / str(i), sudo_journal="".join(_sudo(c) for c in CELL_OWN) + _sudo(cmd))
+        assert rc == 1 and " FAIL: " in got["B3"] and "1 sudo command(s)" in got["B3"] and cmd in got["B3"], got["B3"]
+
+
+def test_upgrade_sh_sleeps_before_stack_t0_and_passes_the_window_to_the_judge():
+    text = (JUDGE.parent / "upgrade.sh").read_text()
+    rm = text.index("sudo -n rm -f /etc/systemd/system/noo-netns-restore.service && sudo -n systemctl daemon-reload")
+    t0 = text.index('STACK_T0="$(date +%s)"')
+    assert rm < text.index("sleep 1", rm) < t0
+    assert 'sudo -n journalctl --no-pager --since "@$ROLL_T0"' in text[:rm], "the roll-window capture B3 ignores"
+    assert "export J SELF ROLL_T0 STACK_T0 STACK_T1 OUT" in text
+
+
+# ── A3: the applier's refusal-name line (#1464) ─────────────────────────────
+def test_a3_fails_on_the_applier_refusal_name_line_naming_it(tmp_path):
+    j = JOURNAL_OK + "Nov 20 09:08:38 host noo-fetch[123]: noo-apply: refusal=bundle_decrypt_failed (exit 65)\n"
+    rc, got = cell(tmp_path, journal=j)
+    assert rc == 1 and "A3 FAIL: noo-apply refusal=bundle_decrypt_failed (exit 65)" in got["A3"], got["A3"]
+    rc, got = cell(tmp_path / "b", stack=STACK_OK + "noo-apply: refusal=bundle_decrypt_io (exit 73)\n")
+    assert rc == 1 and "A3 FAIL: noo-apply refusal=bundle_decrypt_io (exit 73)" in got["A3"], got["A3"]
+
+
+def test_a3_counts_only_the_exact_refusal_line(tmp_path):
+    for i, line in enumerate(["Nov 20 09:08:38 host noo-fetch[123]: noo-apply: refusal=Bad Name (exit 65)",
+                              "Nov 20 09:08:38 host noo-fetch[123]: noo-apply: refusal=bundle_decrypt_failed (exit 65) later",
+                              "Nov 20 09:08:38 host noo-fetch[123]: noo-apply: refusal=bundle_decrypt_failed"]):
+        rc, got = cell(tmp_path / str(i), journal=JOURNAL_OK + line + "\n")
+        assert rc == 0 and " PASS: " in got["A3"], (line, got["A3"])
+    rc, got = cell(tmp_path / "none")
+    assert " PASS: " in got["A3"], got["A3"]
+
+
+# ── B4: a plain start after the upgrade recreates nothing ───────────────────
+def test_b4_passes_on_0_recreated(tmp_path):
+    rc, got = cell(tmp_path)
+    assert rc == 0 and got["B4"].startswith("UPGRADE B4 PASS: 0 containers recreated"), got["B4"]
+    assert "3 running, 0 recreated" in got["B4"], got["B4"]
+
+
+def test_b4_fails_naming_each_recreated_container_with_its_reason(tmp_path):
+    after = SNAP.replace(" g1 ", " g2 ").replace(" n1 ", " n2 ")
+    log = ("  Containers          3 running, 2 recreated\n"
+           "    recreated gateway: its compose config or image changed\n"
+           "    recreated nats: its inputs changed (config monitoring/nats/users.conf)\n")
+    rc, got = cell(tmp_path, start_log=log, start_after=after)
+    assert rc == 1 and " FAIL: 2 recreated: noo-gateway, noo-nats" in got["B4"], got["B4"]
+    assert "noo-gateway (recreated gateway: its compose config or image changed)" in got["B4"], got["B4"]
+    assert "noo-nats (recreated nats: its inputs changed (config monitoring/nats/users.conf))" in got["B4"], got["B4"]
+
+
+def test_b4_fails_when_the_start_step_failed(tmp_path):
+    rc, got = cell(tmp_path, start_log="x the stack did not start: noo-gateway unhealthy\n", start_rc=1)
+    assert rc == 1 and " FAIL: noo stack start exited 1: x the stack did not start" in got["B4"], got["B4"]
+
+
+def test_upgrade_sh_runs_the_plain_start_after_the_stack_and_before_chat():
+    text = (JUDGE.parent / "upgrade.sh").read_text()
+    t1, start, chat = (text.index('STACK_T1="$(date +%s)"'), text.index("step start-after-upgrade "),
+                       text.index("step chat-after "))
+    assert t1 < start < chat
+    body = text[start:chat]
+    assert '"$HERE/recreated.py" "$J"' in body and "noo stack start; rc=$?" in body
+    assert 'snap "$2/start-after.before"' in body and 'snap "$2/start-after.after"' in body
+
+
+# ── NO-DOCKERHUB: the daemon touches no Docker Hub image ────────────────────
+sys.path.insert(0, str(JUDGE.parent))
+import upgrade_judge as uj  # noqa: E402
+
+DIGEST = "@sha256:" + "a" * 64
+
+
+def ev(typ, act, t=1763629800, **attrs):
+    a = {"Attributes": attrs}
+    if typ == "image":
+        a["ID"] = attrs.get("name", "")
+    return json.dumps({"Type": typ, "Action": act, "time": t, "Actor": a}) + "\n"
+
+
+def test_image_registry_classification():
+    hub = ["alpine:latest", "alpine", "library/alpine", "docker.io/library/alpine", "index.docker.io/library/alpine:3",
+           "registry-1.docker.io/x/y", "noomesh/stunnel:latest", "vllm/vllm-openai:v0.25.0" + DIGEST]
+    for r in hub:
+        assert uj.is_hub_pull(r), r
+    for r in ["ghcr.io/x/y" + DIGEST, "localhost/x", "localhost:5000/x/y:1", "quay.io/a/b:1", "registry.example.com:443/a"]:
+        assert not uj.is_hub_pull(r), r
+    assert uj.image_parts("docker.io/library/alpine:3") == ("docker.io", "alpine")
+    assert uj.image_parts("ghcr.io/x/y" + DIGEST) == ("ghcr.io", "x/y")
+    assert uj.image_parts("localhost:5000/x/y:1") == ("localhost:5000", "x/y")
+    assert uj.image_parts("sha256:" + "b" * 64) == (None, "sha256:" + "b" * 64)
+
+
+def test_a_container_is_hub_only_if_pulled_known_or_spelled():
+    # locally built, never pulled: bare names that must not fail
+    for r in ("noo-sandbox-base:latest", "noo-browser:latest", "localhost/x", "sha256:" + "c" * 64):
+        assert not uj.is_hub_container(r, set()), r
+    # the well-known Hub names, however spelled
+    for r in ("alpine", "alpine:latest", "library/alpine", "docker.io/library/alpine", "busybox", "ubuntu:24.04"):
+        assert uj.is_hub_container(r, set()), r
+    # a bare org/name is Hub only when it was pulled in the window
+    assert not uj.is_hub_container("noomesh/stunnel:latest", set())
+    assert uj.is_hub_container("noomesh/stunnel:latest", {"noomesh/stunnel"})
+    assert not uj.is_hub_container("ghcr.io/x/y" + DIGEST, {"x/y"})
+
+
+def test_no_dockerhub_passes_with_counts(tmp_path):
+    e = (ev("image", "pull", name="ghcr.io/x/y") + ev("container", "create", image="ghcr.io/x/y" + DIGEST, name="g")
+         + ev("container", "create", image="noo-browser:latest", name="b") + ev("container", "start", image="alpine"))
+    rc, got = cell(tmp_path, events=e)
+    assert " PASS: " in got["NO-DOCKERHUB"], got["NO-DOCKERHUB"]
+    assert "1 pull(s) by registry [ghcr.io x1]" in got["NO-DOCKERHUB"] and "2 container create(s)" in got["NO-DOCKERHUB"]
+    assert "noo-browser x1" in got["NO-DOCKERHUB"] and "x/y x1" in got["NO-DOCKERHUB"], got["NO-DOCKERHUB"]
+
+
+def test_no_dockerhub_fails_naming_a_hub_pull_and_an_alpine_create(tmp_path):
+    e = ev("image", "pull", t=1763629801, name="noomesh/stunnel:latest") + ev("container", "create", t=1763629802, image="alpine", name="chgrp")
+    rc, got = cell(tmp_path, events=e)
+    g = got["NO-DOCKERHUB"]
+    assert rc == 1 and " FAIL: " in g and "2 Docker Hub image event(s)" in g, g
+    assert "pull noomesh/stunnel:latest" in g and "create alpine (container chgrp)" in g and ":" in g.split("FAIL:")[1], g
+
+
+def test_no_dockerhub_not_judged_without_events(tmp_path):
+    rc, got = cell(tmp_path)
+    assert " NOT JUDGED: " in got["NO-DOCKERHUB"] and "file missing" in got["NO-DOCKERHUB"], got["NO-DOCKERHUB"]
+    rc, got = cell(tmp_path / "b", events="")
+    assert " NOT JUDGED: " in got["NO-DOCKERHUB"] and "file empty" in got["NO-DOCKERHUB"], got["NO-DOCKERHUB"]
+    rc, got = cell(tmp_path / "c", events="not json\n")
+    assert " NOT JUDGED: " in got["NO-DOCKERHUB"] and "1 unparseable" in got["NO-DOCKERHUB"], got["NO-DOCKERHUB"]
+
+
+def test_upgrade_sh_watches_docker_across_the_roll_and_plain_start_only():
+    text = (JUDGE.parent / "upgrade.sh").read_text()
+    start, roll = text.index("events --format '{{json .}}' --filter type=image --filter type=container"), text.index('ROLL_T0="$(date +%s)"')
+    stop, chat = text.index('kill "$EVENTS_PID"'), text.index("step chat-after ")
+    assert text.index("step before-roll") < start < roll
+    assert text.index("step start-after-upgrade ") < stop < chat
+    assert "logs/docker-events-upgrade.jsonl" in text and "pkill" not in text

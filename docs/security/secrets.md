@@ -247,7 +247,8 @@ compose creates anything:
   default `CAP_DAC_OVERRIDE` (a test fails if such a service drops it); two
   different non-root uids on one secret are refused at launch. As root the
   launcher `chown`s; as the operator it runs a throwaway container
-  (`alpine`, no network, only `CAP_CHOWN`) over a bind of the directory, the
+  (the stack's own nginx image by digest, never Docker Hub; no network, read-only
+  root, `CAP_CHOWN` and `CAP_DAC_READ_SEARCH` only) over a bind of the directory, the
   pattern `lib-reown.sh` uses, which sees file names and uids but never a value;
 * the directory is `0700`, owned by the launcher's user, not a symlink, and
   must report `tmpfs` (or `ramfs`) for `stat -f -c %T`. Anything else is refused

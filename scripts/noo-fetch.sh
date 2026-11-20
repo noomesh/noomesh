@@ -421,20 +421,44 @@ applier_refusal() {
 # every staging afresh (`openssl smime -encrypt`: a new random content key),
 # so the ciphertext's sha differs from $LAST even for the same bundle; a
 # re-enroll mints a new birth key, and the next staging is encrypted to it.
+# plaintext_is_bundle FILE — the decrypted plaintext is shaped like a bundle:
+# gzip (a controller >= 0.6.5 gzips before encrypting) or a plain tar. A
+# wrong key can "decrypt" to garbage: on an RSA padding error OpenSSL carries
+# on with a random key (its defence against padding oracles), and AES-CBC's
+# padding then validates about 1 time in 256. Exit 0 from openssl alone is
+# therefore no proof that this node's key opened the bundle.
+plaintext_is_bundle() {
+    _pm="$(head -c 2 "$1" 2>/dev/null | od -An -tx1 | tr -d ' \n')"
+    [ "$_pm" = "1f8b" ] && return 0
+    [ "$(dd if="$1" bs=1 skip=257 count=5 2>/dev/null)" = "ustar" ]
+}
+
 decrypt_bundle() {  # sets NOO_REFUSAL and DECRYPT_RECORD; 0 or the report's rc
     DECRYPT_RECORD=0
+    # $SUM was computed from this blob right after the download: a blob that
+    # no longer hashes to it changed on disk. I/O, never a key problem, and
+    # checked first so the answer does not depend on what openssl does.
+    if [ "$(sha256sum "$TMP/blob" 2>/dev/null | cut -d' ' -f1)" != "$SUM" ]; then
+        NOO_REFUSAL=bundle_decrypt_io; return 73
+    fi
     if openssl smime -decrypt -binary -inform DER \
-            -inkey "$KEY" -in "$TMP/blob" -out "$TMP/bundle.tar" 2>"$TMP/err"; then
+            -inkey "$KEY" -in "$TMP/blob" -out "$TMP/bundle.tar" 2>"$TMP/err" \
+        && plaintext_is_bundle "$TMP/bundle.tar"; then
         return 0
     fi
     if ! openssl pkey -in "$KEY" -noout >/dev/null 2>&1; then
         NOO_REFUSAL=birth_key_unreadable; return 78
     fi
-    if [ "$(sha256sum "$TMP/blob" 2>/dev/null | cut -d' ' -f1)" != "$SUM" ] \
-        || openssl smime -decrypt -binary -inform DER \
-            -inkey "$KEY" -in "$TMP/blob" -out /dev/null 2>/dev/null; then
+    # Once more into a scratch file: a bundle there means the first try only
+    # failed writing its output (I/O, retried). Anything else, an error or
+    # garbage, is this key not opening this bundle (recorded).
+    if openssl smime -decrypt -binary -inform DER \
+            -inkey "$KEY" -in "$TMP/blob" -out "$TMP/bundle.check" 2>/dev/null \
+        && plaintext_is_bundle "$TMP/bundle.check"; then
+        rm -f "$TMP/bundle.check"
         NOO_REFUSAL=bundle_decrypt_io; return 73
     fi
+    rm -f "$TMP/bundle.check"
     NOO_REFUSAL=bundle_decrypt_failed; DECRYPT_RECORD=1; return 65
 }
 # decrypt_refused RC — say it, record $LAST only for a mismatch, report RC.

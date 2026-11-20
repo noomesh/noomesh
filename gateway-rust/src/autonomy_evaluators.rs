@@ -2262,7 +2262,7 @@ pub async fn certs_expiring_within(days_threshold: i64) -> Vec<ExpiringCert> {
     let pki_dir = crate::tls::pki_dir().map(|p| p.to_string_lossy().into_owned())
         .filter(|p| std::path::Path::new(p).join("ca.crt").exists())
         .or_else(|| {
-            ["/tmp/pki", "/app/pki"]
+            [crate::tls::STAGED_PKI_DIR, crate::tls::LIVE_PKI_MOUNT]
                 .iter()
                 .find(|p| std::path::Path::new(p).join("ca.crt").exists())
                 .map(|p| p.to_string())
@@ -2271,28 +2271,41 @@ pub async fn certs_expiring_within(days_threshold: i64) -> Vec<ExpiringCert> {
             let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
             format!("{home}/.config/mesh/pki")
         });
+    certs_expiring_in(std::path::Path::new(&pki_dir), crate::tls::PkiMount::container(), days_threshold).await
+}
 
-    let pki_path = std::path::Path::new(&pki_dir);
+/// [`certs_expiring_within`] for a resolved PKI directory. `ca.crt` and
+/// `gateway/` are read from `pki_path` (the staged copy in the container:
+/// they change only with a restart, which re-stages); `nodes/` from the
+/// live mount (`PkiMount::public_root`), so a node enrolled after the
+/// gateway started is watched — by the expiry alert AND auto-rotate.
+pub async fn certs_expiring_in(
+    pki_path: &std::path::Path,
+    mount: crate::tls::PkiMount<'_>,
+    days_threshold: i64,
+) -> Vec<ExpiringCert> {
     if !pki_path.exists() {
         return Vec::new();
     }
+    let public = mount.public_root(pki_path);
 
-    let mut paths: Vec<std::path::PathBuf> = Vec::new();
+    // (root the label is relative to, cert path)
+    let mut paths: Vec<(std::path::PathBuf, std::path::PathBuf)> = Vec::new();
     let ca = pki_path.join("ca.crt");
     if ca.exists() {
-        paths.push(ca);
+        paths.push((pki_path.to_path_buf(), ca));
     }
     let gw = pki_path.join("gateway").join("gateway.crt");
     if gw.exists() {
-        paths.push(gw);
+        paths.push((pki_path.to_path_buf(), gw));
     }
-    let nodes_dir = pki_path.join("nodes");
+    let nodes_dir = public.join("nodes");
     if nodes_dir.exists() {
         if let Ok(mut rd) = tokio::fs::read_dir(&nodes_dir).await {
             while let Ok(Some(entry)) = rd.next_entry().await {
                 let node_cert = entry.path().join("node.crt");
                 if node_cert.exists() {
-                    paths.push(node_cert);
+                    paths.push((public.clone(), node_cert));
                 }
             }
         }
@@ -2321,7 +2334,7 @@ pub async fn certs_expiring_within(days_threshold: i64) -> Vec<ExpiringCert> {
     // non-zero exit, but now it is one code path instead of three.
     let found = paths
         .iter()
-        .map(|p| (cert_label(pki_path, p), crate::cert_expiry::read_not_after(p)))
+        .map(|(root, p)| (cert_label(root, p), crate::cert_expiry::read_not_after(p)))
         .collect();
     expiring_among(found, now, cutoff)
 }
@@ -4991,5 +5004,98 @@ mod expiring_cert_names_tests {
         let lp = crate::test_src::own_code(lp);
         let expiry = crate::test_src::fn_body(&lp, "async fn eval_cert_expiry(");
         assert!(expiry.contains("expiring_names(&expiring)"), "the cert_expiry_check alert names them too");
+    }
+}
+
+#[cfg(test)]
+mod late_node_expiry_tests {
+    //! i1118: a node enrolled after the gateway started must reach BOTH users
+    //! of `certs_expiring_within` — the expiry alert
+    //! (`autonomy_loop::eval_cert_expiry`) and `eval_cert_auto_rotate` — while
+    //! what auto-rotate DOES stays exactly as it was.
+    use super::*;
+    use crate::cert_expiry::test_pki;
+    use crate::test_src::{fn_body, own_code};
+
+    fn names(certs: &[ExpiringCert]) -> Vec<String> {
+        certs.iter().map(|c| c.name.clone()).collect()
+    }
+
+    // The shared walker, given the staged copy as the gateway resolves it in
+    // the container, names the late node inside the 30-day window.
+    #[tokio::test]
+    async fn a_node_enrolled_after_start_is_inside_the_expiry_watch() {
+        let pki = test_pki::started("evaluator", 3650);
+        pki.enrol_late("late", 5);
+        let got = certs_expiring_in(&pki.staged, pki.mount(), 30).await;
+        assert_eq!(names(&got), vec!["node late"], "{got:?}");
+        assert!(got[0].days_left <= 5, "{got:?}");
+        assert!(expiring_names(&got).starts_with("node late ("), "{}", expiring_names(&got));
+    }
+
+    // Certificates that were visible before the fix are selected exactly as
+    // before (same names, same days): the live mount only ADDS late ones.
+    #[tokio::test]
+    async fn certs_already_visible_are_selected_as_before() {
+        let pki = test_pki::started("as-before", 5);
+        let live = certs_expiring_in(&pki.staged, pki.mount(), 30).await;
+        // The old reader: nodes/ from the staged copy itself.
+        let old = crate::tls::PkiMount { staged: std::path::Path::new("/nonexistent/staged-pki"), live: &pki.live };
+        let staged_only = certs_expiring_in(&pki.staged, old, 30).await;
+        assert_eq!(names(&live), vec!["node early"], "{live:?}");
+        assert_eq!(live, staged_only, "a start-time node is selected as it was");
+
+        pki.enrol_late("late", 10);
+        let after = certs_expiring_in(&pki.staged, pki.mount(), 30).await;
+        assert_eq!(names(&after), vec!["node early", "node late"], "{after:?}");
+        assert_eq!(names(&certs_expiring_in(&pki.staged, old, 30).await), vec!["node early"], "the old reader misses it");
+    }
+
+    // Both call paths reach the live walk: the alert and auto-rotate each
+    // call `certs_expiring_within` once, which resolves the dir and hands it
+    // to `certs_expiring_in` with the container mount, which reads `nodes/`
+    // from `public_root`.
+    #[test]
+    fn the_alert_and_auto_rotate_both_list_through_the_live_walk() {
+        let ev = own_code(include_str!("autonomy_evaluators.rs"));
+        let lp = own_code(include_str!("autonomy_loop.rs"));
+        let within = fn_body(&ev, "pub async fn certs_expiring_within(");
+        assert!(
+            within.contains("certs_expiring_in(") && within.contains("PkiMount::container()"),
+            "certs_expiring_within must list through certs_expiring_in with the container mount"
+        );
+        let walk = fn_body(&ev, "pub async fn certs_expiring_in(");
+        assert!(walk.contains("mount.public_root(pki_path)"), "the walk takes nodes/ from the live mount");
+        assert!(walk.contains("public.join(\"nodes\")"), "nodes/ is joined onto the public root");
+        assert!(!walk.contains("pki_path.join(\"nodes\")"), "nodes/ is never read from the staged copy");
+        let rotate = fn_body(&ev, "pub async fn eval_cert_auto_rotate(");
+        assert_eq!(rotate.matches("certs_expiring_within(WARN_DAYS)").count(), 1, "auto-rotate lists through the shared walk");
+        let alert = fn_body(&lp, "async fn eval_cert_expiry(");
+        assert_eq!(alert.matches("certs_expiring_within(30)").count(), 1, "the alert lists through the shared walk");
+    }
+
+    // What auto-rotate DOES is untouched: it has no directory lookup of its
+    // own (only the list it is handed moved), the same window and renewal
+    // length, the same "nothing expiring → nothing to do" rule, and the one
+    // action — a host-side `rotate pki` with NO cert list, so which certs are
+    // listed can only decide WHETHER it fires, never what gets re-issued.
+    #[test]
+    fn auto_rotate_action_is_unchanged() {
+        let ev = own_code(include_str!("autonomy_evaluators.rs"));
+        let body = fn_body(&ev, "pub async fn eval_cert_auto_rotate(").split_whitespace().collect::<Vec<_>>().join(" ");
+        for lookup in ["pki_dir", "PkiMount", "public_root", "PKI_DIR", "read_dir", "/pki"] {
+            assert!(!body.contains(lookup), "eval_cert_auto_rotate must not look up a PKI dir itself (`{lookup}`)");
+        }
+        for pinned in [
+            "const WARN_DAYS: i64 = 30;",
+            "const NEW_CERT_DAYS: i64 = 90;",
+            "let count = expiring.len(); if count == 0 { return Ok(false); }",
+            "let armed = action_enabled(config);",
+            ".unwrap_or(true); if !armed || dry_run {",
+            "host_spool_write_command( \"rotate\", \"pki\", &[], \"autonomy_cert_auto_rotate\", )",
+        ] {
+            assert!(body.contains(pinned), "auto-rotate's selection or action changed: `{pinned}` is gone");
+        }
+        assert_eq!(body.matches("host_spool_write_command(").count(), 1, "one action, as before");
     }
 }

@@ -988,15 +988,17 @@ pub fn node_credential_payload(repo: &std::path::Path, node: &str) -> Result<Vec
 /// rollout can happen with the fleet up. Best-effort and non-fatal: on a
 /// box where the server is not up yet (a fresh onboard) there is nothing to
 /// reload, and that is not an error.
+///
+/// When the signal is delivered it also waits (up to 3 s) for nats-server's
+/// verdict and records a CONFIRMED reload for the next `noo stack start`
+/// (nats_reload.rs): without it the next plain start recreated nats for the
+/// users.conf it had already re-read, dropping every node's link once.
 pub fn hup_nats() -> bool {
     let prefix = std::env::var("NOO_CONTAINER_PREFIX").unwrap_or_else(|_| "noo".into());
-    std::process::Command::new("docker")
-        .args(["kill", "-s", "HUP", &format!("{prefix}-nats")])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    let root = crate::envfile::repo_root();
+    let paths = super::nats_reload::Paths::for_install(&root, root.join(USERS_CONF));
+    let ctl = super::nats_reload::DockerNats { name: format!("{prefix}-nats") };
+    super::nats_reload::hup_and_record(&ctl, &paths, 30, std::time::Duration::from_millis(100))
 }
 
 // ── `noo cluster nats-users render` ──────────────────────────────────────
