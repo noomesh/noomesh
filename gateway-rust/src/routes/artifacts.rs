@@ -651,10 +651,9 @@ fn hf_unreadable(repo: &str, what: &str, e: &std::io::Error) -> AppError {
 /// The commit `refs/main` names: 40 lowercase hex, or a refusal.
 fn hf_read_rev(repo_dir: &Path, repo: &str) -> Result<String, AppError> {
     let raw = std::fs::read_to_string(repo_dir.join("refs").join("main")).map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
+        {
+            let _ = &e;
             AppError::NotFound(format!("no hf repo '{repo}' with a refs/main in the controller store"))
-        } else {
-            hf_unreadable(repo, "refs/main", &e)
         }
     })?;
     let rev = raw.trim().to_string();
