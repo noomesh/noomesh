@@ -24,7 +24,7 @@ pub(crate) fn tunnel_off_value(v: &str) -> bool {
 /// is not off on purpose. `true` and "no such field" (an older agent) never
 /// wait. Pure.
 pub(crate) fn should_wait_for_tunnel(advertised: Option<bool>, off_on_purpose: bool) -> bool {
-    advertised == Some(false) && !off_on_purpose
+    advertised != Some(true) && !off_on_purpose
 }
 
 /// The operator switched the tunnel off: `NOO_AGENT_TUNNEL` (the node's
