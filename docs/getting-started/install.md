@@ -23,8 +23,15 @@ The wizard leaves the stack running. Check it with `noo health`, then
 
 You need Linux x86_64 (or WSL2), about 25 GB of free disk, 16 GB of RAM, and
 Docker with the Compose v2 plugin (on Ubuntu/Debian the wizard offers to
-install it). The details of each step are below; [Next](#next) says where
-to go after.
+install it). The details of each step are in the agent part below.
+
+**Next:**
+
+- [first-chat.md](first-chat.md) — talk to what you built, ingest a document, find the dashboard
+- [add-ons.md](add-ons.md) — switch on knowledge, voice, the licensed tiers
+- [standalone-controller.md](standalone-controller.md) — a controller from the binary alone
+- [multi-instance.md](multi-instance.md) — several stacks on one host
+- [../cli/README.md](../cli/README.md) — how the `noo` CLI is organised
 
 ## For agents
 
@@ -38,7 +45,7 @@ to go after.
 
 **Left for a person:** storing the two backup passphrases off this machine; learning the admin password (`noo security admin-password reset --stdout --yes`); joining a tailnet (a browser login); `sudo loginctl enable-linger <user>`.
 
-## Details
+### Requirements and platform
 
 noomesh is a self-hosted AI agent cluster that runs on your own hardware.
 This page takes an empty Linux box to a running controller: install the
@@ -296,11 +303,3 @@ The exit-code contract every `noo` command follows is in the
 | embedder | the model that turns your documents into vectors so `noo rag` and chat can search them; noomesh ships one (harrier), set up by the wizard |
 | door | a node's TLS front for a backend: the controller reaches a node's model server only through it |
 | posture | the security settings the wizard sets (for example, whether an agent's commands need approval); `noo security posture list` shows them |
-
-## Next
-
-- [first-chat.md](first-chat.md) — talk to what you built, ingest a document, find the dashboard
-- [add-ons.md](add-ons.md) — switch on knowledge, voice, the licensed tiers
-- [standalone-controller.md](standalone-controller.md) — a controller from the binary alone
-- [multi-instance.md](multi-instance.md) — several stacks on one host
-- [../cli/README.md](../cli/README.md) — how the `noo` CLI is organised
