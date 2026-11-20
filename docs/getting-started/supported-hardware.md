@@ -61,21 +61,21 @@ The tier is derived from the facts a node reports; see
 
 ### What fits where
 
-Advisory. Place with `noo cluster place <node> <backend|harness>
-<model|auto>`; add `--role chat|embed|rerank` to choose the role, and see
-[../cli/fleet.md](../cli/fleet.md) for the rest. A placement that is too big
-for the node is refused.
+Advisory. Three steps: pick a model with `noo models recommended` (it
+suggests models for the cluster's hardware tier, or `--tier <n>`), check it
+with `noo cluster fit <node> --with <backend> <model>`, then place it with
+`noo cluster place <node> <backend> <model>`; add `--role chat|embed|rerank`
+to choose the role, and see [../cli/fleet.md](../cli/fleet.md) for the
+rest. A placement that is too big for the node is refused. Name a model:
+`auto` stands for a model only with the `harness` backend.
 
 | Memory | Place | Example |
 |---|---|---|
-| 16 GB or more of CUDA VRAM | vLLM, a 12B 4-bit chat model | `noo cluster place <node> vllm auto` |
-| 8 to 12 GB VRAM | Ollama, a 12B model | `noo cluster place <node> ollama auto` |
-| 6 GB VRAM or less | Ollama, a 2B to 4B model, or embeddings only | `noo cluster place <node> ollama auto --role embed` |
-| Pi class (4 GB, CPU only) | Embeddings only | `noo cluster place <node> ollama auto --role embed` |
-| Apple unified memory | Ollama, up to roughly three quarters of RAM | `noo cluster place <node> ollama auto` |
-
-`auto` picks a model the node can hold. Name one explicitly if you want a
-particular model.
+| 16 GB or more of CUDA VRAM | vLLM, a 12B 4-bit chat model | `noo cluster place <node> vllm <model>` |
+| 8 to 12 GB VRAM | Ollama, a 12B model | `noo cluster place <node> ollama <model>` |
+| 6 GB VRAM or less | Ollama, a 2B to 4B model, or embeddings only | `noo cluster place <node> ollama <model> --role embed` |
+| Pi class (4 GB, CPU only) | Embeddings only | `noo cluster place <node> ollama <model> --role embed` |
+| Apple unified memory | Ollama, up to roughly three quarters of RAM | `noo cluster place <node> ollama <model>` |
 
 vLLM also needs a GPU of compute capability 7.5 or newer: the pinned image
 (vLLM v0.25.0) is built on CUDA 13.0, which dropped older GPUs such as the
@@ -151,10 +151,13 @@ write to `contact@noomesh.ai`.
   token is redeemed, so the same paste works once it is fixed; a `warn`
   stops nothing. `--skip-prep` skips the preflight and host prep: only on
   the person's word.
-- **Placing:** `noo cluster place <node> <backend> auto` lets the node pick
-  a model it can hold (`--role embed` for embeddings only). A placement too
-  big for the node is refused. vLLM also needs compute capability 7.5 or
-  newer: a known older GPU is refused (place Ollama or llama.cpp instead),
+- **Placing:** pick with `noo models recommended`, check with
+  `noo cluster fit <node> --with <backend> <model>`, then
+  `noo cluster place <node> <backend> <model>` (`--role embed` for
+  embeddings only). Always name the model: `auto` is a model only for the
+  `harness` backend, and for any other backend it would place a model
+  literally named "auto". A placement too big for the node is refused.
+  vLLM also needs compute capability 7.5 or newer: a known older GPU is refused (place Ollama or llama.cpp instead),
   an unknown one goes ahead with a warning.
 - **The Docker-repository fix** in the known issue rewrites apt sources
   with `sudo` on the node and restarts Docker: the person's, in a
