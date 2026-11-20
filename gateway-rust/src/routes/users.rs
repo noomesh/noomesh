@@ -1472,7 +1472,7 @@ async fn user_set_org(
     ctx: Option<Extension<RequesterCtx>>,
     Json(body): Json<SetOrgBody>,
 ) -> AppResult {
-    crate::person_gate::require_person(&state.db, ctx.as_deref(), "moving an account to another org").await?;
+
     // the org is the top tenant boundary — moving an account across it
     // changes what that account can see.
     require_may_manage(&state.db, &ctx, &username).await?;
