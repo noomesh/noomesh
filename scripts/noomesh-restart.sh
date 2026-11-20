@@ -47,6 +47,7 @@ source "$_LIBDIR/lib-addons.sh"
 # The gateway's launcher-exported compose env, as start and rebuild set it:
 # without it a forced restart renders the gateway differently and the next
 # plain start recreates it.
+export NOO_MIGRATIONS_ENVS=mesh
 addons_export_launcher_env
 # A retired key left in .env or the sops store is inert; say so (start and
 # rebuild do the same).
