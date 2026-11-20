@@ -230,7 +230,6 @@ func (r *retryState) nextDelay(connected bool, sessionLen time.Duration, err err
 		return jitter(c)
 	case connected && sessionLen > stableSession:
 		// A long, healthy session: start the backoff over.
-		r.bo.reset()
 		return r.bo.next()
 	case connected:
 		// Reached ready and dropped soon after. The handshake worked, so this is not a
