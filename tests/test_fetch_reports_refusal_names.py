@@ -19,6 +19,7 @@ The real functions are lifted out of the script and run under `sh`:
 
 from __future__ import annotations
 
+import gzip
 import hashlib
 import json
 import re
@@ -141,7 +142,8 @@ def keys(tmp_path_factory: pytest.TempPathFactory) -> dict[str, Path]:
     a_key, a_crt = _keypair(d, "a")
     b_key, _ = _keypair(d, "b")
     plain = d / "bundle.tar"
-    plain.write_bytes(b"signed tar stands here\n" * 50)
+    # A real bundle is gzip (a controller >= 0.6.5 gzips before encrypting).
+    plain.write_bytes(gzip.compress(b"signed tar stands here\n" * 50))
     blob = d / "blob"
     subprocess.run(["openssl", "smime", "-encrypt", "-binary", "-aes-256-cbc", "-outform", "DER",
                     "-in", str(plain), "-out", str(blob), str(a_crt)], check=True, capture_output=True)
@@ -149,7 +151,7 @@ def keys(tmp_path_factory: pytest.TempPathFactory) -> dict[str, Path]:
 
 
 def _decrypt(tmp_path: Path, key: Path, blob: Path, *, out_is_dir: bool = False,
-             sum_: str | None = None) -> tuple[int, dict[str, str], list[str]]:
+             sum_: str | None = None, shim: str = "") -> tuple[int, dict[str, str], list[str]]:
     tmp = tmp_path / "tmp"
     tmp.mkdir()
     (tmp / "blob").write_bytes(blob.read_bytes())
@@ -162,6 +164,8 @@ def _decrypt(tmp_path: Path, key: Path, blob: Path, *, out_is_dir: bool = False,
 set -eu
 TMP={tmp}; KEY={key}; LAST={last}; SUM={s}; NOO_REFUSAL=""
 report() {{ echo "rc=$1 name=$NOO_REFUSAL" >> {reports}; }}
+{_fn('plaintext_is_bundle')}
+{shim}
 {_fn('decrypt_bundle')}
 {_fn('decrypt_refused')}
 if decrypt_bundle; then echo DECRYPTED; else
@@ -210,6 +214,40 @@ def test_an_output_write_error_is_reported_and_not_recorded(tmp_path: Path, keys
     assert rc == 1, st
     assert rep == ["rc=73 name=bundle_decrypt_io"], (rep, st)
     assert st["last"] == "", "an I/O error says nothing about the bundle: the next tick must retry"
+
+
+# What OpenSSL does about 1 time in 256 with a wrong RSA key: its padding-
+# oracle defence carries on with a random key, AES-CBC's padding happens to
+# validate, and `smime -decrypt` exits 0 having written garbage. Forced here,
+# so the test does not depend on that chance (it once made this suite flaky).
+GARBAGE_DECRYPT = r"""
+openssl() {
+    if [ "$1" = smime ]; then
+        _o=""; _prev=""
+        for _a in "$@"; do [ "$_prev" = -out ] && _o="$_a"; _prev="$_a"; done
+        printf 'not a bundle at all, just bytes\n' > "$_o"
+        return 0
+    fi
+    command openssl "$@"
+}
+"""
+
+
+def test_a_wrong_key_that_decrypts_to_garbage_is_a_mismatch_not_a_bundle(tmp_path: Path, keys: dict[str, Path]) -> None:
+    rc, st, rep = _decrypt(tmp_path, keys["b"], keys["blob"], shim=GARBAGE_DECRYPT)
+    assert rc == 1 and "DECRYPTED" not in st["stdout"], st
+    assert rep == ["rc=65 name=bundle_decrypt_failed"], (rep, st)
+    assert st["last"] == hashlib.sha256(keys["blob"].read_bytes()).hexdigest(), "a mismatch must stop the retries"
+    assert not (tmp_path / "tmp/bundle.check").exists()
+
+
+def test_the_bundle_shape_is_gzip_or_tar(tmp_path: Path) -> None:
+    g = tmp_path / "g"; g.write_bytes(gzip.compress(b"x"))
+    t = tmp_path / "t"; t.write_bytes(b"\0" * 257 + b"ustar\0" + b"\0" * 250)
+    junk = tmp_path / "j"; junk.write_bytes(b"not a bundle at all, just bytes\n")
+    for f, ok in ((g, True), (t, True), (junk, False)):
+        r = _sh(f"{_fn('plaintext_is_bundle')}\nplaintext_is_bundle {f}")
+        assert (r.returncode == 0) is ok, (f.name, r)
 
 
 def test_a_blob_that_no_longer_hashes_to_its_sum_is_io_not_a_mismatch(tmp_path: Path, keys: dict[str, Path]) -> None:
