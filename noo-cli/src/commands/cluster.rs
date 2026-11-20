@@ -1254,11 +1254,26 @@ pub fn cluster_place(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             put_json(g, &place_path, &body, true, 10)
         }
     };
+    // "agent reconciles within 5 min" is FALSE for a backend the agent does
+    // not manage. A native backend (a Metal ollama on a Mac, say) is one the
+    // agent found, not one it starts: the reconciler skips it with a log
+    // line, so this placement is recorded and never converges.
+    //
+    // Saying so HERE is the point. The information existed — the agent
+    // returns 501 backend_runtime_unmanaged if you try to start it, and the
+    // reconciler logs the skip — but only to someone who already suspected
+    // something was wrong. A placement that will not happen should say so at
+    // the moment it is made, not to whoever goes looking later. Read before
+    // the --json answer, so a script is told too.
+    let native = fetch_node_opt(g, node)
+        .map(|n| n["backend_runtimes"][backend].as_str() == Some("native"))
+        .unwrap_or(false);
     if g.json {
         let mut resp = resp;
         if let Some(p) = &placed_on {
             resp["placed_on"] = p.to_json();
         }
+        place_json(&mut resp, node, backend, native);
         println!("{resp}");
         return Ok(0);
     }
@@ -1275,24 +1290,9 @@ pub fn cluster_place(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             println!("{}", ui::status_line(Glyph::Warn, w));
         }
     }
-    // "agent reconciles within 5 min" is FALSE for a backend the agent does
-    // not manage. A native backend (a Metal ollama on a Mac, say) is one the
-    // agent found, not one it starts: the reconciler skips it with a log
-    // line, so this placement is recorded and never converges.
-    //
-    // Saying so HERE is the point. The information existed — the agent
-    // returns 501 backend_runtime_unmanaged if you try to start it, and the
-    // reconciler logs the skip — but only to someone who already suspected
-    // something was wrong. A placement that will not happen should say so at
-    // the moment it is made, not to whoever goes looking later.
-    let native = fetch_node_opt(g, node)
-        .map(|n| n["backend_runtimes"][backend].as_str() == Some("native"))
-        .unwrap_or(false);
     if native {
         ui::done(&format!("{node}: {backend} → {model} recorded"));
-        println!("{}", ui::status_line(Glyph::Warn, &format!(
-            "{node} serves {backend} NATIVELY — this agent reports it but does not \
-             start, stop or converge it, so this placement will not be applied")));
+        println!("{}", ui::status_line(Glyph::Warn, &native_placement_warning(node, backend)));
         ui::guide(&[
             (&format!("noo cluster show {node}"), "shows which runtime serves each backend"),
             ("(on the node)", "start or change the model there — the agent will report it"),
@@ -1307,6 +1307,30 @@ pub fn cluster_place(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         println!("  {line}");
     }
     Ok(0)
+}
+
+/// What `place` says when the node serves `backend` natively: the agent
+/// reports it but never converges it. The text line and the --json `warning`.
+pub(crate) fn native_placement_warning(node: &str, backend: &str) -> String {
+    format!(
+        "{node} serves {backend} NATIVELY — this agent reports it but does not \
+         start, stop or converge it, so this placement will not be applied"
+    )
+}
+
+/// The fields `place --json` adds to the gateway's answer, as the text says
+/// them: `converges` (false for a native backend), the native `warning`, and
+/// `next` (verify the node once it converges; for a native backend, look at
+/// which runtime serves it). Pure.
+pub(crate) fn place_json(resp: &mut serde_json::Value, node: &str, backend: &str, native: bool) {
+    resp["converges"] = serde_json::json!(!native);
+    let next = if native {
+        resp["warning"] = serde_json::json!(native_placement_warning(node, backend));
+        format!("noo cluster show {node}")
+    } else {
+        format!("noo cluster verify {node} --wait")
+    };
+    resp["next"] = serde_json::json!([crate::output::next_cmd(&next, &[node])]);
 }
 
 /// `keep_warm` on the place body, only when a flag asked: absent, the
@@ -4102,5 +4126,36 @@ mod keep_warm_tests {
         assert!(keep_warm_line(Some(true), "gemma4:12b").unwrap().contains("warm (declared)"));
         assert!(keep_warm_line(Some(false), "gemma4:12b").unwrap().contains("cleared"));
         assert!(keep_warm_line(None, "gemma4:12b").is_none());
+    }
+}
+
+#[cfg(test)]
+mod place_json_tests {
+    use super::*;
+
+    /// A managed backend converges: `next` verifies the node, no warning.
+    /// A native one never does: `converges` false, the text's own warning.
+    #[test]
+    fn place_json_says_whether_the_placement_converges() {
+        let mut resp = serde_json::json!({ "ok": true, "warnings": ["tight"] });
+        place_json(&mut resp, "node_a", "vllm", false);
+        assert_eq!(resp["converges"], true);
+        assert_eq!(resp["next"], serde_json::json!([{ "kind": "command", "command": "noo cluster verify node_a --wait", "nodes": ["node_a"] }]));
+        assert!(resp.get("warning").is_none());
+        assert_eq!(resp["warnings"][0], "tight", "the gateway's fields stay");
+        let mut resp = serde_json::json!({ "ok": true });
+        place_json(&mut resp, "node_b", "ollama", true);
+        assert_eq!(resp["converges"], false);
+        assert_eq!(resp["warning"], native_placement_warning("node_b", "ollama").as_str());
+        assert_eq!(resp["next"], serde_json::json!([{ "kind": "command", "command": "noo cluster show node_b", "nodes": ["node_b"] }]));
+    }
+
+    /// One string for the human line and the --json `warning`.
+    #[test]
+    fn native_placement_warning_names_node_backend_and_the_consequence() {
+        assert_eq!(
+            native_placement_warning("node_b", "ollama"),
+            "node_b serves ollama NATIVELY — this agent reports it but does not start, stop or converge it, so this placement will not be applied"
+        );
     }
 }

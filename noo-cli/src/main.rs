@@ -15,7 +15,9 @@
 //! coordination needed.
 //!
 //! Agent contract (applies to every native command):
-//!   - `--json` prints the gateway's JSON to stdout, nothing else.
+//!   - `--json` prints the result as JSON on stdout, nothing else: the
+//!     gateway's body, plus `next` / `warnings` / `summary` fields wherever
+//!     the text prints guidance (`next` via `output::next_cmd`).
 //!   - Errors go to stderr — as JSON (`{"error","code","hint"}`) in json mode.
 //!   - Exit codes: 0 ok, 1 generic, 2 usage, 3 gateway unreachable,
 //!     4 auth failed, 5 gateway returned an error status,
@@ -1062,6 +1064,14 @@ const GROUP_SECTIONS: &[(&str, &[&str])] = &[
     ("Security", &["security", "auth"]),
 ];
 
+/// The first-run tip: the ways in for a box with no install. Every line is
+/// a form the verb accepts (`noo enroll` takes a `noo1.` blob, not a URL).
+pub(crate) const FIRST_RUN_HINTS: &[(&str, &str)] = &[
+    ("noo onboard", "set this machine up as a controller (the setup wizard)"),
+    ("noo onboard --ci --root-ok", "the same, unattended (scripts and agents; needs Docker and passwordless sudo)"),
+    ("noo enroll noo1.<blob>", "join a fleet: paste the line `noo cluster bootstrap-token create --node <name>` prints on the controller"),
+];
+
 fn print_native_help(g: &Globals) {
     // The wordmark carries the tagline + version itself; the one-line
     // title is the plain-mode (and --quiet/--json-less) equivalent.
@@ -1079,10 +1089,7 @@ fn print_native_help(g: &Globals) {
     // ways in, before the group list.
     let role = role::detect();
     if role.controller.is_none() && role.node.is_none() && !ui::quiet() {
-        ui::guide(&[
-            ("noo onboard", "set this machine up as a controller (the setup wizard)"),
-            ("noo enroll <controller-url>", "join an existing fleet as a worker node"),
-        ]);
+        ui::guide(FIRST_RUN_HINTS);
     }
     println!("{}", ui::section("usage"));
     println!("  noo <group> <command> [args]     noo <group> --help     noo <group> <command> --help");
@@ -1123,7 +1130,7 @@ fn print_native_help(g: &Globals) {
     print!(
         "{}",
         ui::kv(&[
-            ("--json", format!("raw gateway JSON on stdout  {}", ui::muted("scripts and agents"))),
+            ("--json", format!("the result as JSON on stdout (the gateway body, plus next / warnings / summary)  {}", ui::muted("scripts and agents"))),
             ("--quiet, -q", format!("captured values only  {}", ui::muted("ids, secrets, paths"))),
             ("--color MODE", format!("auto | always | never  {}", ui::muted("persist: noo config set cli '{\"color\":\"never\"}'"))),
             ("--watch [S]", format!("redraw a status command every S seconds  {}", ui::muted("stack status, cluster status, jobs list"))),
@@ -2612,5 +2619,29 @@ mod offboard_tagline_tests {
         let d = super::GROUP_DESC.iter().find(|(n, _)| *n == "offboard").map(|(_, d)| *d).unwrap();
         assert!(d.contains("standalone controller"), "{d}");
         assert!(!d.to_lowercase().contains("leave the fleet"), "{d}");
+    }
+}
+
+#[cfg(test)]
+mod first_run_hint_tests {
+    use super::{FIRST_RUN_HINTS, NATIVE};
+
+    fn is_native(words: &[&str]) -> bool {
+        NATIVE.iter().any(|(w, _)| *w == words)
+    }
+
+    /// Every first-run hint is a form its verb accepts: enroll takes a
+    /// `noo1.` blob (there is no `noo enroll <controller-url>`), the blob
+    /// comes from `cluster bootstrap-token create --node`, and the
+    /// unattended onboard names `--ci --root-ok`.
+    #[test]
+    fn first_run_hints_name_forms_that_exist() {
+        let cmds: Vec<&str> = FIRST_RUN_HINTS.iter().map(|(c, _)| *c).collect();
+        assert_eq!(cmds, ["noo onboard", "noo onboard --ci --root-ok", "noo enroll noo1.<blob>"]);
+        assert!(FIRST_RUN_HINTS.iter().all(|(c, _)| !c.contains("<controller-url>")));
+        let (_, why) = FIRST_RUN_HINTS[2];
+        assert!(why.contains("`noo cluster bootstrap-token create --node <name>`"), "{why}");
+        assert!(FIRST_RUN_HINTS[1].1.contains("passwordless sudo"));
+        assert!(is_native(&["enroll"]) && is_native(&["onboard"]) && is_native(&["cluster", "bootstrap-token", "create"]));
     }
 }
