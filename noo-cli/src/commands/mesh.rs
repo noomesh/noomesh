@@ -576,10 +576,7 @@ pub(crate) fn container_candidates(name: &str, prefix: &str) -> Vec<String> {
         return out;
     }
     if prefix != "noo" {
-        if let Some(rest) = name.strip_prefix("noo-") {
-            // On a named instance a `noo-X` name means this instance's X.
-            out.push(format!("{own}{rest}"));
-            return out;
+        if let Some(_rest) = name.strip_prefix("noo-") {
         }
     }
     out.push(name.to_string());
