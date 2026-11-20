@@ -309,8 +309,40 @@ fi
 agent_dump model
 
 # ── 4. up, verified, answering ──────────────────────────────────────────
-step stack-start 1800 -- noo stack start || fail_onboarded
+# README step 3: the wizard leaves the stack running, and the stranger checks
+# it with `noo health` (`noo stack start` is for after a reboot or a stop).
 step health 600 -- sh -c 'for i in $(seq 1 40); do noo health >/dev/null 2>&1 && break; sleep 15; done; noo health' \
+    || fail_onboarded
+# Not the stranger's steps: three checks of the launcher's plain start
+# (scripts/lib-start-inputs.sh), each judged from the stack's container IDs
+# before and after (recreated.py) and each failing the cell. It used to run
+# every full start with --force-recreate: 13 containers recreated in every
+# cell right after onboard, config-less ones included, dropping the agent's
+# NATS link and tunnel.
+#   (a) nothing changed: a plain start recreates nothing;
+#   (b) one secret's CONTENT changed (TAVILY_API_KEY, which only the gateway
+#       reads, from one non-empty value to another, so compose's own config
+#       is unchanged): only the gateway, and what compose recreates because
+#       it depends on the gateway;
+#   (c) `--recreate`: every container.
+RC_PY="$HERE/recreated.py"
+step start-idempotent 1800 -- sh -c 'python3 "$1" snap "$2/start-a.before" && noo stack start && python3 "$1" snap "$2/start-a.after" \
+  && python3 "$1" judge START-IDEMPOTENT "$2/start-a.before" "$2/start-a.after" --none' _ "$RC_PY" "$OUT" || fail_onboarded
+step start-input-change 3600 -- sh -c 'set -e
+  printf %s start-input-probe-a | noo security secrets rotate TAVILY_API_KEY --set-from-stdin --yes
+  noo stack start   # the pointer env appears: the gateway is recreated here, not judged
+  python3 "$1" snap "$2/start-b.before"
+  printf %s start-input-probe-b | noo security secrets rotate TAVILY_API_KEY --set-from-stdin --yes
+  noo stack start
+  python3 "$1" snap "$2/start-b.after"
+  python3 "$1" judge START-INPUT-CHANGE "$2/start-b.before" "$2/start-b.after" --only gateway' _ "$RC_PY" "$OUT" || fail_onboarded
+# Restore: the key was absent; remove it again (best effort: a store that
+# refuses the removal keeps a key nothing uses, NOO_SEARCH_PROVIDER is unset).
+step start-input-restore 1800 -- sh -c 'noo security secrets remove TAVILY_API_KEY --yes || echo "kept TAVILY_API_KEY (the store refused the removal)"; noo stack start' \
+    || fail_onboarded
+step start-recreate 1800 -- sh -c 'python3 "$1" snap "$2/start-c.before" && noo stack start --recreate && python3 "$1" snap "$2/start-c.after" \
+  && python3 "$1" judge START-RECREATE "$2/start-c.before" "$2/start-c.after" --all' _ "$RC_PY" "$OUT" || fail_onboarded
+step health-after-starts 600 -- sh -c 'for i in $(seq 1 40); do noo health >/dev/null 2>&1 && break; sleep 15; done; noo health' \
     || fail_onboarded
 # PROBES: install.md:226 `noo whoami   # controller / node / both / client-only`
 # (an onboarded controller), and install.md:228 / troubleshooting.md:9
@@ -323,7 +355,7 @@ step probe-docs-whoami-onboarded 30 -- sh -c 'out="$(noo whoami 2>&1)"; rc=$?; p
 step probe-docs-doctor-docker 120 -- sh -c 'out="$(noo doctor docker 2>&1)"; rc=$?; printf "%s\n" "$out"
   if [ $rc = 0 ] && printf "%s" "$out" | grep -qi "no unclean-shutdown damage signature"; then echo "DOCTOR-DOCKER PASS: a clean daemon reads as setup-and-host.md says"
   else echo "DOCTOR-DOCKER FAIL: a fresh daemon should exit 0 with \"no unclean-shutdown damage signature\" (rc=$rc)"; exit 1; fi'
-# Not in the README's path (it is `stack start && health`, then chat): a red
+# Not in the README's path (it is `noo health` after onboard, then chat): a red
 # verify is recorded with every row, and the stranger still asks the question.
 if [ "$MODEL" = tiny ]; then
     # The declared OLLAMA_MODEL is pulled, but the default chat model stays the

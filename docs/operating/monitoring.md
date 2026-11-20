@@ -909,7 +909,7 @@ as a node's does. promtail's streams (`container_name` / `node_name`, no
 `source` label) stop at the retention horizon; nothing writes them since
 phase 4. **After rolling to a stack without promtail**, an existing
 controller keeps a `noo-promtail` and a `noo-docker-socket-proxy`
-container *running*: the launcher's `up -d --force-recreate` never passes
+container *running*: the launcher's `up -d` never passes
 `--remove-orphans` (only `noo stack stop` does, and a running controller
 avoids that verb), so compose warns "Found orphan containers" and leaves
 them be — and promtail keeps shipping duplicates until you remove it.

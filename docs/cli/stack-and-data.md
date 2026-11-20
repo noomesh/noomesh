@@ -20,6 +20,7 @@ Does not cover: the fleet of nodes (`noo cluster`), or moving a controller betwe
 ```sh
 noo stack start                 # honours NOO_INSTALL_MODE: dev builds from source, dist runs released images
 noo stack start --dist --tag stack-v0.2.2   # run a specific release (implies --pull)
+noo stack start --recreate      # recreate every container, changed or not
 noo stack status --watch 5
 noo stack logs gateway --follow --tail 200
 noo stack stop
@@ -29,7 +30,22 @@ noo stack stop
 source run, `--build` rebuilds first, `--profile <p>` adds a compose
 profile (add-ons are not profiles you pass: the script reads the `addons:`
 map in `noomesh.yaml` and composes each enabled add-on's overlay and
-profile itself). `--dist` with `--dev` or `--build` is an error. `status`
+profile itself). `--dist` with `--dev` or `--build` is an error.
+
+A plain `start` recreates only the containers that changed and leaves
+the rest running: one whose compose config changed (image, `.env` value,
+mounts), or whose secret or mounted config FILE changed (a rotated
+secret, an edited `monitoring/prometheus.yml`, a new PKI leaf). Compose
+does not see file contents itself, so the launcher puts a keyed digest of
+each service's secret files and mounted config files (read-only config
+directories under the install root or the PKI directory included, data
+directories never) on the service as the label `noo.inputs`. It says
+what it did: `Containers: 13 running, 0 recreated`, or `recreated gateway:
+its inputs changed (secret noo_jwt_secret)`. `--recreate` recreates every
+container, changed or not (so does `noo upgrade`); a config directory
+over 16 MiB is not fingerprinted (the start says so), and a change there
+needs `--recreate`. The digest key is `~/.config/noo/start-inputs.key`
+(0600, made on first use). `status`
 is native `docker ps` — `service | state | since | image | ports` for
 every `noo-*` container, `N of M containers not running` when something
 is down, and `no containers` with a hint when nothing is. It exits 1 when a
@@ -211,7 +227,7 @@ skipped unless `--integration`. See [testing.md](../development/developer-guide.
 | `noo stack status` | `[-w\|--watch [<secs>]]` | Show stack container status (from docker ps) |
 | `noo stack logs` | `[<service>...] [-f\|--follow] [--tail <n>]` | Show container logs for one service or compose logs for many |
 | `noo stack restart` | `[--profile <p>] [--force] [<service>...]` | Restart services by status name or add-on key; --force recreates (reloads env, secrets) |
-| `noo stack start` | `[--profile <p>] [--pull] [--build] [--dist] [--dev] [--tag <tag>]` | Start the stack via scripts/noomesh-start.sh |
+| `noo stack start` | `[--profile <p>] [--pull] [--build] [--dist] [--dev] [--tag <tag>] [--recreate]` | Start the stack via scripts/noomesh-start.sh; recreates only changed containers, --recreate all |
 | `noo stack stop` | `[--volumes [-y\|--yes]]` | Stop the stack; --volumes deletes the database and every volume, after a typed confirm |
 | `noo stack rebuild` | `[<service>...] [-q\|--quick] [--no-cache] [--profile <p>] [--gateway-engine <e>] [--node-engine <e>] [-b\|--background]` | Rebuild stack images in the foreground, or queue it for noo-hostd with --background |
 | `noo stack rebuild-status` | `[--follow]` | Show the latest background stack-rebuild result and log |

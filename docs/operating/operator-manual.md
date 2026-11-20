@@ -101,7 +101,8 @@ prints nothing and looks exactly like "unset".)
 ## Start, stop, restart
 
 ```sh
-noo stack start                     # build if needed (dev) or pull (dist), then up -d --force-recreate
+noo stack start                     # build if needed (dev) or pull (dist), then up -d: recreates only what changed
+noo stack start --recreate          # the same, recreating every container
 noo stack stop                      # down --remove-orphans, plus any node-agent-started backends
 noo stack stop --volumes            # also remove volumes
 noo stack restart                   # compose restart
@@ -396,7 +397,7 @@ run, `cd ~/.noo && docker compose -f docker-compose.cluster.yml kill` —
 the compose file is in the standalone deploy slice; use the checkout
 root instead on a dev box).
 Crash recovery: check Docker is up, `noo doctor docker`, then
-`noo stack start` — a fresh start recreates every container.
+`noo stack start --recreate` — that start recreates every container.
 
 ## Reference: every `noo stack` verb
 

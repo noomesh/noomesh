@@ -211,7 +211,7 @@ pub const USAGE: &[(&[&str], &str, &str)] = &[
     (&["stack", "status"], "[-w|--watch [<secs>]]", "Show stack container status (from docker ps)"),
     (&["stack", "logs"], "[<service>...] [-f|--follow] [--tail <n>]", "Show container logs for one service or compose logs for many"),
     (&["stack", "restart"], "[--profile <p>] [--force] [<service>...]", "Restart services by status name or add-on key; --force recreates (reloads env, secrets)"),
-    (&["stack", "start"], "[--profile <p>] [--pull] [--build] [--dist] [--dev] [--tag <tag>]", "Start the stack via scripts/noomesh-start.sh"),
+    (&["stack", "start"], "[--profile <p>] [--pull] [--build] [--dist] [--dev] [--tag <tag>] [--recreate]", "Start the stack via scripts/noomesh-start.sh; recreates only changed containers, --recreate all"),
     (&["stack", "stop"], "[--volumes [-y|--yes]]", "Stop the stack; --volumes deletes the database and every volume, after a typed confirm"),
     (&["stack", "rebuild"], "[<service>...] [-q|--quick] [--no-cache] [--profile <p>] [--gateway-engine <e>] [--node-engine <e>] [-b|--background]", "Rebuild stack images in the foreground, or queue it for noo-hostd with --background"),
     (&["stack", "rebuild-status"], "[--follow]", "Show the latest background stack-rebuild result and log"),

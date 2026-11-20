@@ -114,7 +114,8 @@ def test_both_launchers_use_it_and_the_rust_code_agrees():
     for name in ("noomesh-start.sh", "noomesh-restart.sh"):
         t = (SCRIPTS / name).read_text()
         assert "lib-stuck-container.sh" in t, name
-        assert re.search(r"^\s*noo_compose_up_isolating_stuck compose .* up -d .*--force-recreate", t, re.M), name
+        # start forces only under --recreate ($START_UP_FORCE, lib-start-inputs.sh)
+        assert re.search(r"^\s*noo_compose_up_isolating_stuck compose .* up -d .*(--force-recreate|\$START_UP_FORCE)", t, re.M), name
         assert '"$NOO_EXIT_STACK_PARTIAL"' in t
     assert "NOO_EXIT_STACK_PARTIAL=75" in (SCRIPTS / "lib-stuck-container.sh").read_text()
     assert "lib-stuck-container.sh" in (REPO_ROOT / "noo-cli" / "build.rs").read_text()

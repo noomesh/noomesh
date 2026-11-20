@@ -23,6 +23,9 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib-dist.sh"
 # is called further down. Sourcing twice is harmless: lib-config.sh has no
 # top-level side effects outside its functions.
 . "$(dirname "${BASH_SOURCE[0]}")/lib-config.sh"
+# Which services' secret and config FILES changed (the `noo.inputs` label):
+# sourced before load_secrets, whose secret-file writer feeds it.
+. "$(dirname "${BASH_SOURCE[0]}")/lib-start-inputs.sh"
 acquire_compose_lock || exit 1
 
 
@@ -49,12 +52,21 @@ FORCE_DEV=false
 # install pulls and starts trellion (~4.5 GB, opt-out so on by default) four
 # steps before the question, and stops it again if they say no.
 CORE_ONLY=false
+# --recreate: recreate every container, changed or not. A plain full start
+# recreates only the services whose compose config or `noo.inputs` label
+# (secret and config file contents, lib-start-inputs.sh) changed.
+# NOO_START_RECREATE=1 is the same for programmatic callers (`noo upgrade`,
+# onboard): an older launcher ignores an unknown variable, where it would
+# read an unknown flag as a service name.
+START_RECREATE=false
+[ "${NOO_START_RECREATE:-}" = 1 ] && START_RECREATE=true
 _argv=()
 while [ $# -gt 0 ]; do
     case "$1" in
         --dist)      DIST=true; shift ;;
         --dev)       FORCE_DEV=true; shift ;;
         --core-only) CORE_ONLY=true; shift ;;
+        --recreate)  START_RECREATE=true; shift ;;
         --tag)       DIST_TAG="$2"; EXPLICIT_TAG=1; shift 2 ;;
         --tag=*)     DIST_TAG="${1#*=}"; EXPLICIT_TAG=1; shift ;;
         *)           _argv+=("$1"); shift ;;
@@ -965,15 +977,23 @@ require_compose_v2 || exit 1
     # BEFORE the up, so a failing up cannot leave them looping; a core
     # service found stopped afterwards fails the start.
     addons_stop_leftovers addons_stop_disabled || exit 1
+    # Start all services with profile(s). NOT --force-recreate: compose
+    # recreates a service whose config changed, and the `noo.inputs` label
+    # (start_inputs_prepare) makes a changed secret or mounted config file a
+    # config change. $START_UP_FORCE is --force-recreate only for --recreate
+    # or when the inputs could not be fingerprinted (lib-start-inputs.sh).
+    start_inputs_prepare || exit 1
+    _inputs_before="$(mktemp)"; _inputs_after="$(mktemp)"
+    start_inputs_snapshot "$_inputs_before"
     # shellcheck disable=SC2086
     check_bind_sources --no-deps $_bind_skip $ACTIVE_SVCS || exit 1
-    # Start all services with profile(s)
-    # --force-recreate handles re-provisioning where stale containers may exist
     # An unkillable leftover container (lib-stuck-container.sh) must not
     # abort the whole `up`: everything else is started and the launcher
     # exits $NOO_EXIT_STACK_PARTIAL (75) after the guard below has run.
-    noo_compose_up_isolating_stuck compose $COMPOSE_FILES $PROFILE_ARGS up -d --force-recreate $BUILD_FLAG $GPU_SCALE $AGENT_SCALE $ADDON_HOLD_SCALE || _up_rc=$?
-    if [ "${_up_rc:-0}" -ne 0 ] && [ "${_up_rc:-0}" -ne "$NOO_EXIT_STACK_PARTIAL" ]; then exit "$_up_rc"; fi
+    noo_compose_up_isolating_stuck compose $COMPOSE_FILES $PROFILE_ARGS up -d $START_UP_FORCE $BUILD_FLAG $GPU_SCALE $AGENT_SCALE $ADDON_HOLD_SCALE || _up_rc=$?
+    if [ "${_up_rc:-0}" -ne 0 ] && [ "${_up_rc:-0}" -ne "$NOO_EXIT_STACK_PARTIAL" ]; then rm -f "$_inputs_before" "$_inputs_after"; exit "$_up_rc"; fi
+    start_inputs_snapshot "$_inputs_after"
+    start_inputs_report "$_inputs_before" "$_inputs_after"
     # Report, never reap: a container no compose file of this install declares
     # (186b). Exit status unchanged; `--remove-orphans` is not passed to any `up`.
     compose_report_undeclared .
@@ -1048,8 +1068,15 @@ else
         noo_voice_model_dirs
     fi
     addon_refuse_held "${SERVICES[@]}" || exit 1
+    # The same `noo.inputs` labels as a full start, so naming a service does
+    # not drop its label (and recreate it again on the next full start).
+    start_inputs_prepare || exit 1
+    _inputs_before="$(mktemp)"; _inputs_after="$(mktemp)"
+    start_inputs_snapshot "$_inputs_before"
     check_bind_sources "${SERVICES[@]}" || exit 1
-    docker compose $COMPOSE_FILES $PROFILE_ARGS up -d "${SERVICES[@]}"
+    docker compose $COMPOSE_FILES $PROFILE_ARGS up -d $START_UP_FORCE "${SERVICES[@]}"
+    start_inputs_snapshot "$_inputs_after"
+    start_inputs_report "$_inputs_before" "$_inputs_after"
     NOO_CREATED_GUARD_SERVICES="${SERVICES[*]}" noo_created_guard $(docker compose $COMPOSE_FILES $PROFILE_ARGS ps -aq "${SERVICES[@]}")
 fi
 

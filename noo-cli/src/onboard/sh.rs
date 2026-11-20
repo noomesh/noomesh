@@ -918,13 +918,22 @@ pub fn ghcr_logged_in() -> bool {
 /// the script IS the launcher and exports that env itself. Dry-run prints
 /// and returns 0.
 pub fn run_script_streamed(ctx: &Ctx, script: &str, args: &[&str]) -> i32 {
+    run_script_streamed_env(ctx, script, args, &[])
+}
+
+/// [`run_script_streamed`] with extra environment for the script (e.g.
+/// `NOO_START_RECREATE=1`, which an older launcher ignores where it would
+/// read an unknown flag as a service name).
+pub fn run_script_streamed_env(ctx: &Ctx, script: &str, args: &[&str], envs: &[(&str, &str)]) -> i32 {
     if ctx.dry_run {
-        ctx.dry(&format!("bash scripts/{script} {}", args.join(" ")));
+        let pre: String = envs.iter().map(|(k, v)| format!("{k}={v} ")).collect();
+        ctx.dry(&format!("{pre}bash scripts/{script} {}", args.join(" ")));
         return 0;
     }
     let mut cmd = Command::new("bash");
     cmd.arg(ctx.repo_root.join("scripts").join(script))
         .args(args)
+        .envs(envs.iter().copied())
         .current_dir(&ctx.repo_root)
         .stdin(Stdio::null());
     // Same binary, not whatever's on PATH — see mesh.rs::run_script for why.
