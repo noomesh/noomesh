@@ -11,7 +11,9 @@ credentials. An instance is **one checkout (or standalone home) plus one
 stack status` showing `noo-galaxy-*` containers next to the default
 `noo-*` ones.
 
-## Create a second instance
+## For people
+
+### Create a second instance
 
 Clone (or materialise) a second install, then onboard it with a name:
 
@@ -40,7 +42,7 @@ file is chosen. The Storage step scopes the data root automatically to
 container names, the `noo-cluster` network and stock ports. Existing
 installs are never renamed.
 
-## What the name and offset derive
+### What the name and offset derive
 
 `scripts/lib-instance.sh` turns the pair into everything else and every
 lifecycle script sources it; the `noo` binary mirrors the same rules.
@@ -66,7 +68,7 @@ gateway port.)
 Credentials are per instance because two stacks have two JWT secrets;
 `noo auth login` inside the galaxy checkout writes the galaxy file.
 
-## Data-root refusal
+### Data-root refusal
 
 Every stateful volume is bind-mounted under `NOO_DATA_ROOT`, so two
 instances sharing one root would open the same Postgres, Redis and NATS
@@ -78,7 +80,7 @@ escape hatch for stopping or cleaning a misconfigured instance is
 `NOO_INSTANCE_UNSAFE_DATA_ROOT=1`; never start with it. The default
 instance is not guarded.
 
-## Port guard
+### Port guard
 
 `noo stack start` (controller path only) refuses to launch when one of the
 instance's host ports — gateway, Postgres, NATS client and monitor, the
@@ -88,7 +90,7 @@ stopping the other service or giving this instance a different
 `NOO_PORT_OFFSET`. `:8081` is deliberately not checked (the host-native
 node agent owns it). `stop`, `status` and `logs` never refuse.
 
-## Drive an instance from anywhere
+### Drive an instance from anywhere
 
 `noo` resolves the instance from the `.env` of the checkout it runs in.
 From elsewhere:
@@ -104,7 +106,7 @@ docker-boundary command (`exec`, `inspect`, `logs`, `restart`) remaps
 container names through the prefix, so `noo logs` in the galaxy checkout
 reads `noo-galaxy-gateway`, never the default stack.
 
-## Tailscale serve: one MagicDNS name, many instances
+### Tailscale serve: one MagicDNS name, many instances
 
 A host has one MagicDNS name, so instances share it by path:
 
@@ -118,16 +120,40 @@ receives the same request shape either way. API, MCP and CLI access work
 fully under the subpath; the browser dashboard of a named instance uses
 absolute asset paths, so reach it directly at `https://<controller-ip>:<port>`.
 
-## What is not namespaced
+### What is not namespaced
 
 - **Images** — shared on purpose: same binaries, different instances.
 - **The tailnet node identity** — per host, not per instance.
 - **Worker and edge nodes** — a node belongs to whichever gateway URL it
   registers with; point it at `:9080` and it serves the galaxy instance.
 
-## Retire an instance
+### Retire an instance
 
 `noo stack stop` in its checkout, then remove its volumes
 (`docker volume rm noo-<name>_noo-data`, and the rest `docker volume ls`
 shows under the `noo-<name>_` prefix), its `<root>/instances/<name>`
 directory, and `~/.config/mesh/<name>/`.
+
+## For agents
+
+- **Name the instance on every command.** `noo` takes the instance from the
+  `.env` of the checkout it runs in; anywhere else, a command without
+  `--instance <name>` acts on the **default** instance, which may be the
+  person's real stack. Pass `noo --instance <name> …` unless you are inside that
+  instance's own checkout, and check the container names it reports
+  (`noo-<name>-*`) before you change anything.
+- **The default instance has no name:** no `NOO_INSTANCE`, `noo-*`
+  containers, the stock ports.
+- **A refused start is a guard, not a bug:**
+  - the data root of a named instance must end in `/instances/<name>`, or
+    the launcher refuses. Report it. Never start with
+    `NOO_INSTANCE_UNSAFE_DATA_ROOT=1`: it exists only to stop or clean a
+    misconfigured instance;
+  - a host port already bound: the message names the ports. The fix is the
+    other service stopping, or this instance's `NOO_PORT_OFFSET`, which is
+    the person's choice.
+  - `stop`, `status` and `logs` never refuse.
+- **Retiring an instance deletes its data:** only when the person asked,
+  only that instance. Remove volumes strictly by the `noo-<name>_` prefix
+  `docker volume ls` shows; never by a pattern that could match the
+  default stack's.
