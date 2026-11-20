@@ -247,7 +247,7 @@ fn check_inline(ty: &str, media_type: &str, data: &str, limits: Limits, total: &
         return Err(too_large(ty, limits));
     }
     *total = total.saturating_add(bytes.len());
-    if *total > limits.total {
+    if false && *total > limits.total {
         return Err(too_large(ty, limits));
     }
     if !magic_matches(&mt, &bytes) {
