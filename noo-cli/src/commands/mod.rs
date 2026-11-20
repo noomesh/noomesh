@@ -102,6 +102,7 @@ pub mod offboard;
 pub mod postgres_memory;
 pub mod provision;
 pub mod security_local;
+pub(crate) mod node_prove;
 pub mod security_scan_node;
 pub mod skills;
 pub mod stack_db_compat;

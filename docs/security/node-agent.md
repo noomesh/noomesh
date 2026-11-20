@@ -437,9 +437,15 @@ enrolled without a tailnet address gets its leaf for the address the gateway
 saw at enrollment. Behind a reverse proxy, Docker Desktop's forwarder or a
 hairpin that is not the node's own, and every call to it then fails TLS.
 `noo cluster verify`'s `agent certificate` row:
-- **FAIL:** the leaf misses the dialled address. The remedy is
-  `noo security pki push-nodes <node>`, and the row says which address that
-  would certify.
+- **FAIL:** the leaf misses the dialled address. For a private address
+  (RFC 1918, CGNAT, link-local, IPv6 unique-local) the remedy is
+  `noo security pki push-nodes <node> --prove`: the controller first dials
+  that address and accepts only a TLS 1.3 server holding the node's own
+  current key (pinned to its leaf, never matched by name), checks again that
+  no other node has claimed the address meanwhile, and only then issues a
+  leaf, with a fresh key, for exactly that address. For a public address the
+  remedy is the explicit `noo security pki push-nodes <node>`. Either way the
+  row says which address it would certify.
 - **FAIL with no remedy:** that address is also another node's (registered,
   dialled, or in its leaf). Investigate first; `push-nodes` refuses it too,
   unless `--allow-shared-address <addr>` names it.

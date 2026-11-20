@@ -3454,12 +3454,131 @@ pub fn pki_issue_node(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     }
 }
 
-pub(crate) fn parse_push_nodes_with(a: &mut Args) -> Result<(Option<String>, i64, bool, Vec<String>), ArgError> {
+pub(crate) fn parse_push_nodes_with(a: &mut Args) -> Result<(Option<String>, i64, bool, Vec<String>, bool), ArgError> {
     let days = positive_days(a, &["--days"], crate::pki::DEFAULT_DAYS)?;
     let yes = a.flag(&["--yes", "--force", "-y"]);
     let allow = a.values(&["--allow-shared-address"])?;
+    let prove = a.flag(&["--prove"]);
     let only = a.maybe_one("<node>")?;
-    Ok((only, days, yes, allow))
+    Ok((only, days, yes, allow, prove))
+}
+
+/// The address and port `--prove` dials: the host and port of the node's
+/// `agent_url` in the registry, the address the gateway dials. Loopback is
+/// never proven (every leaf carries it). Pure.
+pub(crate) fn prove_target(node: &str, registry: &[serde_json::Value]) -> Result<(String, u16), String> {
+    let n = registry
+        .iter()
+        .find(|n| n["id"].as_str().is_some_and(|id| id.eq_ignore_ascii_case(node)))
+        .ok_or_else(|| format!("node '{node}' is not registered with this controller"))?;
+    let url = n["agent_url"].as_str().ok_or_else(|| format!("'{node}' has reported no agent_url yet: nothing to prove"))?;
+    let host = url_host_of(url).ok_or_else(|| format!("'{node}''s agent_url {url} has no host"))?;
+    if is_loopback_addr(&host) {
+        return Err(format!("'{node}''s agent_url {url} is a loopback address: there is nothing to prove there"));
+    }
+    let authority = url.split("//").nth(1).and_then(|r| r.split('/').next()).unwrap_or("");
+    // `[v6]:port` takes the port after `]:`; `host:port` after the last `:`.
+    let port_text = match authority.strip_prefix('[') {
+        Some(rest) => rest.split_once("]:").map(|(_, p)| p),
+        None => authority.rsplit_once(':').map(|(_, p)| p),
+    };
+    let port = match port_text {
+        Some(p) => p.parse::<u16>().map_err(|_| format!("'{node}''s agent_url {url} has no valid port"))?,
+        None => 443,
+    };
+    Ok((host, port))
+}
+
+/// `push-nodes <node> --prove` (i1074 A): re-issue the node's leaf for the
+/// address the gateway dials it at, only once that address is PROVEN to be
+/// served by this node (`node_prove::prove_node_at`: the node's current key,
+/// pinned by SPKI, signs a TLS 1.3 handshake there). In order: the address
+/// is refused if another node claims it; the dial-back; the claim checked
+/// AGAIN (a registration may have raced the dial); the mint, for exactly the
+/// dialled address (plus the controller's own view of its tailnet IP); the
+/// delivery over the birth-key rail. A fresh key pair every time.
+fn pki_push_node_prove(g: &Globals, node: &str, days: i64, yes: bool) -> Result<i32, Unhandled> {
+    use crate::output::{fail, ExitCode};
+    let ca = ClusterCa::new(pki_dir());
+    if !ca.ca_exists() {
+        fail(g.json, ExitCode::Generic, "no_ca", "no cluster CA found — run 'noo security pki init' (or 'noo onboard') first", None);
+    }
+    let local_hostname = Command::new("hostname").output().ok().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
+    if node.eq_ignore_ascii_case(&local_hostname) {
+        fail(g.json, ExitCode::Generic, "self_node",
+            &format!("'{node}' is this controller's own node: its cert rides its provision bundle, not this push"),
+            Some(&format!("noo cluster provision {node}")));
+    }
+    let registry = || -> Vec<serde_json::Value> {
+        crate::http::get_json_opt(g, "/api/cluster/nodes", true, 10).and_then(|b| b["nodes"].as_array().cloned()).unwrap_or_default()
+    };
+    let before = registry();
+    let (host, port) = match prove_target(node, &before) {
+        Ok(t) => t,
+        Err(e) => fail(g.json, ExitCode::Generic, "no_target", &e, Some("noo cluster status")),
+    };
+    // (a) Never an address another node holds.
+    if let Some(other) = address_claimed_by_other(node, &host, &node_address_claims(&before, &local_leaf_ips)) {
+        fail(g.json, ExitCode::Generic, "address_claimed",
+            &format!("{host} is also {other}'s (registered, dialed, or in its leaf): a certificate for it would let {node} answer as {other}. Investigate; nothing was issued"),
+            None);
+    }
+    let leaf = ca.dir.join("nodes").join(node).join("node.crt");
+    let leaf_pem = match std::fs::read(&leaf) {
+        Ok(b) => b,
+        Err(e) => fail(g.json, ExitCode::Generic, "no_leaf",
+            &format!("{}: {e}: there is no current leaf to prove with", leaf.display()),
+            Some(&format!("noo cluster provision {node}"))),
+    };
+    if ClusterCa::cert_names(&leaf).is_ok_and(|n| n.ips.iter().chain(n.dns.iter()).any(|a| a.eq_ignore_ascii_case(&host))) {
+        if g.json {
+            println!("{}", serde_json::json!({"ok": true, "node": node, "address": host, "changed": false}));
+        } else {
+            ui::close_done(&format!("{node}'s certificate already covers {host}: nothing to re-issue"));
+        }
+        return Ok(0);
+    }
+    if !g.json {
+        println!("{}", ui::phase("plan"));
+        println!("  {}", ui::muted(&format!("prove that {host}:{port} is served by {node}, then re-issue its certificate for {host}")));
+    }
+    super::confirm_destructive(g, yes, "prove and re-key", node);
+    // (b) The dial-back, pinned to the node's own current leaf.
+    let ca_pem = std::fs::read(ca.ca_cert_path()).unwrap_or_default();
+    if let Err(why) = super::node_prove::prove_node_at(&ca_pem, &leaf_pem, &host, port, std::time::Duration::from_secs(10)) {
+        fail(g.json, ExitCode::Generic, "not_proven",
+            &format!("{host}:{port} did not prove to be {node}: {why}. Nothing was issued"),
+            None);
+    }
+    if !g.json {
+        println!("{}", ui::sub(&ui::status_line(Glyph::Ok, &format!("{host}:{port} answered with {node}'s own key"))));
+    }
+    // (c) The claim again, at mint time: a registration may have raced the dial.
+    if let Some(other) = address_claimed_by_other(node, &host, &node_address_claims(&registry(), &local_leaf_ips)) {
+        fail(g.json, ExitCode::Generic, "address_claimed",
+            &format!("{host} was claimed by {other} while {node} was being proven. Nothing was issued"),
+            None);
+    }
+    // The mint: exactly the dialled address (and the controller's own view
+    // of the node's tailnet IP, as every issue carries), with a fresh key.
+    let ts_ip: Vec<String> = ClusterCa::tailscale_ip4(node).into_iter().collect();
+    if let Err(e) = ca.issue_node_cert(node, &host, days, &["node-agent".to_string()], &ts_ip, &crate::pki::NodeRole::Worker) {
+        fail(g.json, ExitCode::Generic, "issue_failed", &format!("cert issuance failed: {e}"), None);
+    }
+    // (d) Delivery over the birth-key rail, as every push.
+    let outcome = deliver_node_certs(g, &ca, node);
+    if g.json {
+        println!("{}", serde_json::json!({"ok": outcome.ok(), "node": node, "address": host, "changed": true, "proof": "dialback-leaf"}));
+    } else {
+        delivery_line(node, &outcome);
+        if outcome.ok() {
+            ui::close_done(&format!("{node} proven at {host} and re-keyed for it"));
+            ui::guide(&[("noo cluster verify", "the agent certificate row reads OK once the node applies its bundle")]);
+        } else {
+            ui::close_failed(&format!("{node}: the certificate was issued but not delivered"), Some(&format!("noo cluster provision {node}")));
+        }
+    }
+    Ok(if outcome.ok() { 0 } else { 1 })
 }
 
 /// The host of an `agent_url` (`https://HOST:PORT`): brackets and port off.
@@ -3535,7 +3654,17 @@ pub(crate) fn local_leaf_ips(node: &str) -> Vec<String> {
 /// node-agent (host unit or container, whichever the node runs) — nothing
 /// here reaches into the node to restart anything.
 pub fn pki_push_nodes(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
-    let (only, days, yes, allow) = parse_push_nodes_with(&mut Args::new(args))?;
+    let (only, days, yes, allow, prove) = parse_push_nodes_with(&mut Args::new(args))?;
+    if prove {
+        let Some(node) = only.as_deref() else {
+            crate::output::fail(g.json, crate::output::ExitCode::Usage, "usage", "--prove takes exactly one node: noo security pki push-nodes <node> --prove", None);
+        };
+        if !allow.is_empty() {
+            crate::output::fail(g.json, crate::output::ExitCode::Usage, "usage",
+                "--prove and --allow-shared-address do not go together: a proven address is never one another node holds", None);
+        }
+        return pki_push_node_prove(g, node, days, yes);
+    }
 
     let ca = ClusterCa::new(pki_dir());
     if !ca.ca_exists() {
@@ -6619,9 +6748,53 @@ mod address_claim_tests {
     }
 
     #[test]
+    fn prove_dials_the_agent_url_host_and_port_and_never_loopback() {
+        let reg = vec![
+            serde_json::json!({"id": "node-a", "agent_url": "https://192.0.2.30:8081"}),
+            serde_json::json!({"id": "node-b", "agent_url": "https://[fd00::5]:9081"}),
+            serde_json::json!({"id": "node-c", "agent_url": "https://127.0.0.1:8081"}),
+            serde_json::json!({"id": "node-d"}),
+            serde_json::json!({"id": "node-e", "agent_url": "https://node-e.example"}),
+        ];
+        assert_eq!(prove_target("node-a", &reg), Ok(("192.0.2.30".to_string(), 8081)));
+        assert_eq!(prove_target("NODE-A", &reg), Ok(("192.0.2.30".to_string(), 8081)), "ids match as registered, case-insensitively");
+        assert_eq!(prove_target("node-b", &reg), Ok(("fd00::5".to_string(), 9081)));
+        assert!(prove_target("node-c", &reg).unwrap_err().contains("loopback"));
+        assert!(prove_target("node-d", &reg).unwrap_err().contains("no agent_url"));
+        assert_eq!(prove_target("node-e", &reg), Ok(("node-e.example".to_string(), 443)));
+        assert!(prove_target("node-x", &reg).unwrap_err().contains("not registered"));
+    }
+
+    /// The order IS the guard: refuse a claimed address, prove, re-check the
+    /// claim, THEN mint. A refactor that mints before the proof, or drops
+    /// the re-check, must fail here.
+    #[test]
+    fn prove_refuses_a_claim_then_proves_then_rechecks_before_it_mints() {
+        let code = include_str!("security_local.rs");
+        let body = crate::test_src::fn_body(code, "fn pki_push_node_prove(");
+        let first = body.find("address_claimed_by_other(").expect("the first claim check");
+        let prove = body.find("node_prove::prove_node_at(").expect("the dial-back");
+        let recheck = body[prove..].find("address_claimed_by_other(").map(|i| i + prove).expect("the re-check after the proof");
+        let mint = body.find("issue_node_cert(").expect("the mint");
+        let deliver = body.find("deliver_node_certs(").expect("the delivery");
+        assert!(first < prove && prove < recheck && recheck < mint && mint < deliver, "order: claim, prove, re-check, mint, deliver");
+        assert!(body[mint..].contains("&host"), "the mint names the dialled address");
+    }
+
+    #[test]
+    fn prove_parses_and_stands_alone() {
+        let a: Vec<String> = ["node-b", "--prove"].iter().map(|s| s.to_string()).collect();
+        let (only, _, _, allow, prove) = parse_push_nodes_with(&mut Args::new(&a)).unwrap();
+        assert_eq!((only.as_deref(), allow.is_empty(), prove), (Some("node-b"), true, true));
+        let code = include_str!("security_local.rs");
+        let body = crate::test_src::fn_body(code, "pub fn pki_push_nodes(");
+        assert!(body.contains("--prove takes exactly one node") && body.contains("do not go together"), "--prove needs one node and refuses --allow-shared-address");
+    }
+
+    #[test]
     fn push_nodes_takes_the_shared_address_flag() {
         let args: Vec<String> = ["node-b", "--allow-shared-address", "192.0.2.30"].iter().map(|s| s.to_string()).collect();
-        let (only, _, _, allow) = parse_push_nodes_with(&mut Args::new(&args)).expect("parses");
+        let (only, _, _, allow, _) = parse_push_nodes_with(&mut Args::new(&args)).expect("parses");
         assert_eq!(only.as_deref(), Some("node-b"));
         assert_eq!(allow, vec!["192.0.2.30".to_string()]);
     }
