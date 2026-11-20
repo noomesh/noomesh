@@ -3752,8 +3752,15 @@ pub(crate) enum NooDataSeen {
     /// `labelled`: it carries this project's compose label, i.e. compose or
     /// this release's pre-create made it. The legacy volume the old prep
     /// made has the exact name and NO label.
-    Present { device: String, mountpoint: String, size: Option<String>, labelled: bool },
+    ///
+    /// `helper_missing`: the size was not read because the helper image is
+    /// not on this host (it is never pulled by a verify).
+    Present { device: String, mountpoint: String, size: Option<String>, labelled: bool, helper_missing: bool },
 }
+
+/// Said on the row when the size could not be read because the helper image
+/// is absent; a verify never pulls it.
+const HELPER_ABSENT: &str = "the helper image is not present on this host (`noo stack start` pulls it)";
 
 /// The `noo-data bound` row (i677). Compose binds noo-data to
 /// `${NOO_STATE_ROOT:-${NOO_DATA_ROOT}}/noo-data`. Until 0.6.24 the launcher's
@@ -3780,8 +3787,12 @@ pub(crate) fn noo_data_bound_check(seen: &NooDataSeen, want: Option<&str>) -> Ch
         NooDataSeen::Absent => warn(NAME, "no noo-data volume yet (the stack has not been started)", None),
         NooDataSeen::Unreadable(e) => warn(NAME, format!("docker volume inspect failed ({e}); not checked"), None),
         NooDataSeen::Present { device, .. } if device == want => ok(NAME, format!("bound to {want}")),
-        NooDataSeen::Present { device, mountpoint, size, labelled } => {
-            let size = size.as_deref().map(|s| format!(", {s}")).unwrap_or_default();
+        NooDataSeen::Present { device, mountpoint, size, labelled, helper_missing } => {
+            let size = match (size.as_deref(), helper_missing) {
+                (Some(s), _) => format!(", {s}"),
+                (None, true) => format!(", size not read: {HELPER_ABSENT}"),
+                (None, false) => String::new(),
+            };
             let what = if device.is_empty() {
                 "is NOT bound to the data root".to_string()
             } else {
@@ -3918,15 +3929,26 @@ pub(crate) fn noo_data_bound_row(root: &std::path::Path) -> Check {
             let labelled = !none(f.next().unwrap_or("")).is_empty();
             // The size only when it is in the wrong place: it is what the
             // operator needs to plan the move.
+            // `du` runs only when the volume is in the wrong place, and never
+            // pulls: an absent helper image is said so on the row.
+            let mut helper_missing = false;
             let size = if want.as_deref() != Some(device.as_str()) {
-                std::process::Command::new("docker")
-                    .args(["run", "--rm", "-v", &format!("{vol}:/d:ro"), "alpine", "du", "-sh", "/d"])
-                    .output().ok().filter(|o| o.status.success())
-                    .and_then(|o| String::from_utf8_lossy(&o.stdout).split_whitespace().next().map(str::to_string))
+                match crate::helper_image::helper_ref() {
+                    Ok(img) if crate::helper_image::present(&img) => {
+                        std::process::Command::new("docker")
+                            .args(crate::helper_image::run_argv(&img, &vol, &crate::helper_image::Job::Du))
+                            .output().ok().filter(|o| o.status.success())
+                            .and_then(|o| String::from_utf8_lossy(&o.stdout).split_whitespace().next().map(str::to_string))
+                    }
+                    _ => {
+                        helper_missing = true;
+                        None
+                    }
+                }
             } else {
                 None
             };
-            NooDataSeen::Present { device, mountpoint, size, labelled }
+            NooDataSeen::Present { device, mountpoint, size, labelled, helper_missing }
         }
     };
     noo_data_bound_check(&seen, want.as_deref())
@@ -16536,7 +16558,7 @@ mod noo_data_bound_tests {
     use super::*;
 
     fn present(device: &str, labelled: bool) -> NooDataSeen {
-        NooDataSeen::Present { device: device.into(), mountpoint: "/var/lib/docker/volumes/noomesh_noo-data/_data".into(), size: Some("3.1G".into()), labelled }
+        NooDataSeen::Present { device: device.into(), mountpoint: "/var/lib/docker/volumes/noomesh_noo-data/_data".into(), size: Some("3.1G".into()), labelled, helper_missing: false }
     }
 
     #[test]
@@ -16570,9 +16592,27 @@ mod noo_data_bound_tests {
         }
     }
 
+    /// A verify never reaches a registry for its `du`: the helper is checked
+    /// with `docker image inspect` first, and the run itself is `--pull never`.
+    #[test]
+    fn the_noo_data_du_never_pulls() {
+        let src = crate::test_src::own_code(include_str!("cluster_verify.rs"));
+        let probe = crate::test_src::fn_body(&src, "fn noo_data_bound_row(");
+        let inspect = probe.find("crate::helper_image::present(&img)").expect("the helper is inspected first");
+        let run = probe.find("Job::Du").expect("the du job");
+        assert!(inspect < run, "present() is checked before the run");
+        assert!(!probe.contains("ensure_present") && !probe.contains("\"pull\""), "a verify never pulls");
+        let helper = crate::test_src::own_code(include_str!("../helper_image.rs"));
+        assert!(crate::test_src::fn_body(&helper, "fn run_argv(").contains("\"--pull\", \"never\""));
+    }
+
     #[test]
     fn no_root_no_volume_or_no_answer_is_a_warning_never_a_pass() {
         assert_eq!(noo_data_bound_check(&present("", true), None).verdict, Verdict::Warn);
+        let mut missing = present("", false);
+        if let NooDataSeen::Present { size, helper_missing, .. } = &mut missing { *size = None; *helper_missing = true; }
+        let c = noo_data_bound_check(&missing, Some("/r/noo-data"));
+        assert!(c.detail.contains("the helper image is not present") && c.detail.contains("noo stack start"), "{}", c.detail);
         assert_eq!(noo_data_bound_check(&NooDataSeen::Absent, Some("/r/noo-data")).verdict, Verdict::Warn);
         assert_eq!(noo_data_bound_check(&NooDataSeen::Unreadable("x".into()), Some("/r/noo-data")).verdict, Verdict::Warn);
     }

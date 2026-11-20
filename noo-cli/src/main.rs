@@ -66,6 +66,7 @@ mod config_readers;
 mod entitlement;
 mod entitlement_terms;
 mod harness_kinds;
+mod helper_image;
 mod harness_profiles;
 mod model_set;
 mod registry;
