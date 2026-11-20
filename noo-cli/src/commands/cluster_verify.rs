@@ -8014,6 +8014,8 @@ fn shared_node_remedies(sections: &[(String, Vec<Check>)]) -> Vec<(String, Strin
 /// The `at_rest_dirs` rows. In the default output they print as one
 /// "data at rest" row that names only the ones that are not clean (the
 /// 0.6.12 roll printed nine near-identical rows).
+/// The one row the default table prints for every [`AT_REST_DIR_ROWS`] row.
+const AT_REST_FOLD_ROW: &str = "data at rest";
 const AT_REST_DIR_ROWS: [&str; 10] = [
     "loki at rest", "tempo at rest", "postgres at rest", "redis at rest", "nats at rest", "prometheus at rest",
     "grafana at rest", "noo-data at rest", "pki at rest", "age key at rest",
@@ -8100,7 +8102,7 @@ fn digest(checks: &[Check], verbose: bool) -> Digest {
         let names: Vec<&str> = at_rest.iter().map(|c| c.name.trim_end_matches(" at rest")).collect();
         let more = if at_rest.len() > 1 { "; --verbose lists each" } else { "" };
         rows.insert(slot, Check {
-            name: "data at rest",
+            name: AT_REST_FOLD_ROW,
             verdict: worst.verdict,
             detail: format!("{} — {}{more}", names.join(", "), worst.detail),
             remedy: worst.remedy.clone(),
@@ -9680,14 +9682,24 @@ pub(crate) fn stack_rows(lock: Option<&[LockImage]>, containers: Result<Vec<Stac
     }
 }
 
+/// One object per row, every row (the default table's fold is not applied:
+/// a program summing verdicts must not count a gap twice). A row the table
+/// shows inside another carries `shown_as`, the name it is printed under,
+/// so the same fact is found under both names.
 fn checks_json(checks: &[Check]) -> Value {
-    Value::Array(checks.iter().map(|c| serde_json::json!({
-        "name": c.name,
-        "verdict": match c.verdict { Verdict::Ok => "ok", Verdict::Warn => "warn", Verdict::Fail => "fail", Verdict::Starting => "starting", Verdict::Accepted => "accepted" },
-        "detail": c.detail,
-        "remedy": c.remedy,
-        "tier": tier_json(brief_tier(c)),
-    })).collect())
+    Value::Array(checks.iter().map(|c| {
+        let mut o = serde_json::json!({
+            "name": c.name,
+            "verdict": match c.verdict { Verdict::Ok => "ok", Verdict::Warn => "warn", Verdict::Fail => "fail", Verdict::Starting => "starting", Verdict::Accepted => "accepted" },
+            "detail": c.detail,
+            "remedy": c.remedy,
+            "tier": tier_json(brief_tier(c)),
+        });
+        if AT_REST_DIR_ROWS.contains(&c.name) {
+            o["shown_as"] = AT_REST_FOLD_ROW.into();
+        }
+        o
+    }).collect())
 }
 
 /// A row's brief tier as `--json` names it: where the onboard brief groups a
@@ -15566,6 +15578,17 @@ mod digest_tests {
         // All of them clean: one pass, not ten.
         let clean: Vec<Check> = AT_REST_DIR_ROWS.iter().map(|n| ok(n, "dm-crypt")).collect();
         assert_eq!(digest(&clean, false).counts, Counts { ok: 1, ..Counts::default() });
+    }
+
+    #[test]
+    fn json_lists_every_member_and_names_the_row_it_is_shown_as() {
+        let checks = vec![warn("postgres at rest", "in the clear", None), ok("redis at rest", "dm-crypt"), ok("bus", "up")];
+        let j = checks_json(&checks);
+        assert_eq!(j.as_array().unwrap().len(), 3, "no folded row is added: {j}");
+        assert_eq!(j[0]["shown_as"], "data at rest");
+        assert_eq!(j[1]["shown_as"], "data at rest");
+        assert!(j[2].get("shown_as").is_none(), "a row printed under its own name has none: {j}");
+        assert_eq!(digest(&checks, false).rows[0].name, AT_REST_FOLD_ROW);
     }
 
     #[test]
