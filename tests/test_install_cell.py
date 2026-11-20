@@ -959,3 +959,198 @@ def test_a_failed_start_check_is_the_cells_failure(tmp_path):
     (tmp_path / "meta.json").write_text("{}")
     out = C.summarize(tmp_path)
     assert out["result"] == "fail" and out["failed_step"] == "start-idempotent"
+
+
+# ── the upload scan: key=value judged on the line WITH its masks ───────────
+# 0.6.27 -> rc.1 upgrade cell, run 44709015537: the applier's summary
+# `applied: … node.key=unchanged …` was masked to `node.key=[REDACTED]`, the
+# scan stripped the mask, read `node.key= agent-env` and withheld the artifact.
+APPLIED = "applied: node.crt=unchanged node.key=unchanged agent-env"
+
+
+@pytest.mark.parametrize("line", ["key=abcd1234", "key= abcd1234", "token: wxyz5678",
+                                  "node.key=[REDACTED] token=wxyz5678",
+                                  "token=wxyz5678 node.key=[REDACTED]",
+                                  "a=[REDACTED] b: [REDACTED] password=hunter22"])
+def test_an_unmasked_key_value_is_a_hit(line):
+    assert C.secret_hits(line), line
+
+
+@pytest.mark.parametrize("line", ["node.key=[REDACTED] agent-env",
+                                  "node.key=[REDACTED]  token: [REDACTED]  agent-env",
+                                  'password: "[REDACTED]" next'])
+def test_a_masked_pair_is_clean(line):
+    assert not C.secret_hits(line), (line, C.secret_hits(line))
+
+
+def test_the_applier_summary_is_redacted_then_clean():
+    out = _redact(APPLIED + "\n")
+    assert out == "applied: node.crt=unchanged node.key=[REDACTED] agent-env\n", out
+    assert not C.secret_hits(out), C.secret_hits(out)
+
+
+# Every shape the scan detects, in lines a cell could print: the redactor
+# masks each, so its output always passes the scan (the release lead).
+SHAPE_CORPUS = SECRET_LINES + [
+    "key=abcd1234", "key= abcd1234", "token: wxyz5678", APPLIED,
+    "applied: a=b node.key=unchanged token=wxyz5678 secret: s3cr3tval",
+    'PASSWORD="hunter2222" api_key=ABCDEFGH private-key: zzzz9999',
+    "url?token=noo1.QUJDREVGR0hJSktM&x=1 and key=xyz-noo1.abcdef",
+    "Bearer " + JWT + " token=" + JWT,
+    "x ghp_abcdefghijklmnopqrstuvwxyz0123456789 GHO_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123",
+    "run QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVowMTIzNDU2Nzg5YWJjZGVmZ2hpams= end",
+    "-----BEGIN RSA PRIVATE KEY-----\nMIIEvQIBADANBg\n-----END RSA PRIVATE KEY-----",
+    "  NOO_ADMIN_PASSWORD\n  hunter2",
+    "secret=[REDACTED]tail key=[REDACTED]",
+]
+
+
+@pytest.mark.parametrize("raw", SHAPE_CORPUS)
+def test_redacted_output_always_passes_the_scan(raw):
+    assert C.secret_hits(raw), ("the corpus line must be secret-shaped", raw)
+    out = _redact(raw + "\n")
+    assert not C.secret_hits(out), (raw, out, C.secret_hits(out))
+
+
+def test_the_redactor_and_the_scan_share_one_shape_list():
+    src = CELL.read_text()
+    redact = src[src.index("def redact_line"):src.index("def secret_hits")]
+    scan = src[src.index("def secret_hits"):src.index("def cmd_run")]
+    for k in range(len(C.SECRET_SHAPES)):
+        assert f"SECRET_SHAPES[{k}]" in redact, k
+    assert "SECRET_SHAPES[:3]" in scan and "SECRET_SHAPES[3].finditer(line)" in scan
+    assert len(C.SECRET_SHAPES) == 4
+
+
+# ── (d) the plain start after a provision (START-AFTER-PROVISION) ──────────
+PROV_SNAP = {"noo-gateway": ("g1", "gateway", "nats:service_started:false"),
+             "noo-nats": ("n1", "nats", "-"),
+             "noo-postgres": ("p1", "postgres", "-")}
+PROV_OK = "  bundle carries this node's own NATS credential; 4 users rendered and noo-nats reloaded\n+ applied\n"
+START_0 = "  Containers          3 running, 0 recreated\n"
+START_NATS = ("  Containers          3 running, 2 recreated\n"
+              "    recreated gateway: its compose config or image changed\n"
+              "    recreated nats: its inputs changed (config monitoring/nats/users.conf)\n")
+NATS_MOVED = dict(PROV_SNAP, **{"noo-nats": ("n2", "nats", "-"), "noo-gateway": ("g2", "gateway", "nats:service_started:false")})
+
+
+def _after_prov(tmp_path, after, start_log, changed="yes", record="confirmed", start_rc="0", prov_rc="0", prov=PROV_OK):
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    b, a = _rc_files(tmp_path, PROV_SNAP, after)
+    (tmp_path / "start.log").write_text(start_log)
+    (tmp_path / "prov.log").write_text(prov)
+    r = subprocess.run([sys.executable, str(ROOT / "scripts/install-cell/recreated.py"), "after-provision",
+                        "START-AFTER-PROVISION", b, a, str(tmp_path / "start.log"), start_rc, changed, record,
+                        str(tmp_path / "prov.log"), prov_rc], capture_output=True, text=True)
+    return r.returncode, r.stdout.strip()
+
+
+def test_after_provision_passes_when_nats_is_not_recreated(tmp_path):
+    rc, out = _after_prov(tmp_path, dict(PROV_SNAP), START_0)
+    assert rc == 0 and out.startswith("START-AFTER-PROVISION PASS: nats not recreated"), out
+
+
+def test_after_provision_fails_naming_nats_and_its_reason(tmp_path):
+    rc, out = _after_prov(tmp_path, NATS_MOVED, START_NATS)
+    assert rc == 1 and out.startswith("START-AFTER-PROVISION FAIL: 2 recreated"), out
+    assert "noo-nats (recreated nats: its inputs changed (config monitoring/nats/users.conf))" in out, out
+    assert "noo-gateway (recreated gateway: its compose config or image changed)" in out, out
+    rc, out = _after_prov(tmp_path / "u", NATS_MOVED, START_NATS, record="unconfirmed")
+    assert rc == 1 and "(record: unconfirmed)" in out, out
+
+
+def test_after_provision_notes_an_unchanged_users_conf(tmp_path):
+    rc, out = _after_prov(tmp_path, dict(PROV_SNAP), START_0, changed="no")
+    assert (rc, out) == (0, "START-AFTER-PROVISION NOTE: users.conf unchanged by the provision; nothing to reload")
+    # nothing changed, yet nats moved: that is not a note
+    rc, out = _after_prov(tmp_path / "m", NATS_MOVED, START_NATS, changed="no")
+    assert rc == 1 and " FAIL: users.conf unchanged by the provision, yet nats was recreated" in out, out
+
+
+def test_after_provision_notes_a_build_that_records_no_reload(tmp_path):
+    rc, out = _after_prov(tmp_path, NATS_MOVED, START_NATS, record="none")
+    assert rc == 0 and out.startswith("START-AFTER-PROVISION NOTE: this build does not record nats reloads"), out
+
+
+def test_after_provision_fails_a_failed_start_or_an_unreadable_users_conf(tmp_path):
+    rc, out = _after_prov(tmp_path, dict(PROV_SNAP), "x the stack did not start\n", start_rc="1")
+    assert rc == 1 and "FAIL: noo stack start exited 1: x the stack did not start" in out, out
+    rc, out = _after_prov(tmp_path / "u", dict(PROV_SNAP), START_0, changed="unknown")
+    assert rc == 1 and "users.conf could not be read" in out, out
+
+
+def test_the_reload_record_is_read_from_the_start_inputs_state(tmp_path):
+    st = tmp_path / "state.json"
+    rec = lambda: subprocess.run([sys.executable, str(ROOT / "scripts/install-cell/recreated.py"), "reload-record",  # noqa: E731
+                                  str(st)], capture_output=True, text=True).stdout.strip()
+    assert rec() == "none"
+    st.write_text(json.dumps({"version": 1, "services": {}}))
+    assert rec() == "none"
+    st.write_text(json.dumps({"reloaded": {"nats": {"container": "n1", "paths": {"/i/monitoring/nats/users.conf": None}}}}))
+    assert rec() == "unconfirmed"
+    st.write_text(json.dumps({"reloaded": {"nats": {"container": "n1", "paths": {"/i/monitoring/nats/users.conf": "ab12"}}}}))
+    assert rec() == "confirmed"
+
+
+def _provision_step_body() -> str:
+    text = (ROOT / "scripts/install-cell/run.sh").read_text()
+    start = text.index("step start-after-provision ")
+    body = text[start:text.index("' _ \"$RC_PY\" \"$OUT\"", start)]
+    return body[body.index("bash -c '") + len("bash -c '"):]
+
+
+def test_the_provision_check_runs_after_the_three_start_checks_and_never_ends_the_cell():
+    text = (ROOT / "scripts/install-cell/run.sh").read_text()
+    order = [text.index(f"step {n} ") for n in ("start-recreate", "start-after-provision", "health-after-starts")]
+    assert order == sorted(order)
+    line_end = text.index("\n", text.index("' _ \"$RC_PY\" \"$OUT\"", order[1]))
+    assert not text[order[1]:line_end].rstrip().endswith("fail_onboarded")
+    body = _provision_step_body()
+    assert 'noo cluster provision "$(hostname)" --wait' in body and "noo stack start" in body
+    assert body.index("reload-record") < body.index("noo stack start"), "the record is read before the start rewrites it"
+
+
+def _fake_bin(d: Path, conf: Path, state: Path, nats_after: str, change: bool, record):
+    d.mkdir()
+    ids = d / "ids"
+    ids.write_text("g1 n1 p1")
+    (d / "docker").write_text(f"""#!/bin/sh
+case "$1" in
+  ps) echo "c1 c2 c3" ;;
+  inspect) set -- $(cat {ids}); echo "noo-gateway $1 gateway nats:service_started:false"; echo "noo-nats $2 nats <no value>"; echo "noo-postgres $3 postgres <no value>" ;;
+esac
+""")
+    rec = json.dumps({"reloaded": {"nats": {"container": "n1", "paths": {str(conf): "ab12"}}}}) if record else "{}"
+    (d / "noo").write_text(f"""#!/bin/sh
+case "$1 $2" in
+  "cluster provision") {"echo changed >> " + str(conf) + ";" if change else ""} echo '{rec}' > {state}; echo "4 users rendered and noo-nats reloaded" ;;
+  "stack start") echo "g1 {nats_after} p1" > {ids}; echo "  Containers          3 running, 1 recreated"; echo "    recreated nats: its inputs changed (config monitoring/nats/users.conf)" ;;
+esac
+""")
+    (d / "hostname").write_text("#!/bin/sh\necho node-a\n")
+    for f in ("docker", "noo", "hostname"):
+        (d / f).chmod(0o755)
+
+
+@pytest.mark.parametrize("nats_after,change,record,want_rc,want", [
+    ("n1", True, True, 0, "START-AFTER-PROVISION PASS: nats not recreated"),
+    ("n2", True, True, 1, "START-AFTER-PROVISION FAIL: 1 recreated"),
+    ("n2", True, False, 0, "START-AFTER-PROVISION NOTE: this build does not record nats reloads"),
+    ("n1", False, True, 0, "START-AFTER-PROVISION NOTE: users.conf unchanged by the provision"),
+])
+def test_the_provision_step_end_to_end_on_a_faked_cli(tmp_path, nats_after, change, record, want_rc, want):
+    home = tmp_path / "home"
+    inst = home / ".noo"
+    (inst / "monitoring" / "nats").mkdir(parents=True)
+    (inst / ".noo-standalone").write_text("")
+    conf = inst / "monitoring" / "nats" / "users.conf"
+    conf.write_text("accounts {}\n")
+    _fake_bin(tmp_path / "bin", conf, inst / ".noo-start-inputs.json", nats_after, change, record)
+    out = tmp_path / "out"
+    out.mkdir()
+    env = dict(os.environ, HOME=str(home), PATH=f"{tmp_path / 'bin'}:{os.environ['PATH']}")
+    r = subprocess.run(["bash", "-c", _provision_step_body(), "_", str(ROOT / "scripts/install-cell/recreated.py"), str(out)],
+                       capture_output=True, text=True, env=env, timeout=60)
+    last = r.stdout.strip().splitlines()[-1]
+    assert r.returncode == want_rc and last.startswith(want), (r.stdout, r.stderr)
+    assert f"users.conf changed by the provision: {'yes' if change else 'no'}" in r.stdout
