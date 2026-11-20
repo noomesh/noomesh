@@ -51,8 +51,17 @@ helper_image_ref() {
     # The compose model-cache line is the source of truth (its registry and
     # namespace included): it is found by its digest variable, never by a
     # typed-out namespace (tests/test_image_namespace_declarations.py).
-    line="$(grep -E '^[[:space:]]*image:[[:space:]]*[^$[:space:]]+/nginx:[^$[:space:]]+\$\{NOO_IMAGE_DIGEST_NGINX:-@sha256:[0-9a-f]{64}\}[[:space:]]*$' "$compose" 2>/dev/null | head -1)"
-    [ -n "$line" ] || { echo "helper: no pinned nginx image line (with \${NOO_IMAGE_DIGEST_NGINX:-@sha256:...}) in $compose" >&2; return 1; }
+    # EXACTLY one line, or a refusal with the reason: never the first of
+    # several (the source of truth must be unambiguous). A line without the
+    # digest default does not match, so a tag-only reference is refused too.
+    local lines n
+    lines="$(grep -E '^[[:space:]]*image:[[:space:]]*[^$[:space:]]+/nginx:[^$[:space:]]+\$\{NOO_IMAGE_DIGEST_NGINX:-@sha256:[0-9a-f]{64}\}[[:space:]]*$' "$compose" 2>/dev/null)"
+    n="$(printf '%s' "$lines" | grep -c . )"
+    if [ "$n" -ne 1 ]; then
+        echo "helper: expected exactly one pinned nginx image line (with \${NOO_IMAGE_DIGEST_NGINX:-@sha256:...}) in $compose, found $n" >&2
+        return 1
+    fi
+    line="$lines"
     line="${line#*image:}"; line="${line// /}"
     repo_tag="${line%%\$\{*}"
     def="${line#*NOO_IMAGE_DIGEST_NGINX:-}"; def="${def%\}}"

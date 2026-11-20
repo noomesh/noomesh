@@ -77,13 +77,19 @@ pub(crate) enum Job<'a> {
 
 /// `(<repo>:<tag>, default digest)` of the `model-cache` service's image line.
 fn compose_ref(compose: &str) -> Option<(String, String)> {
-    let line = compose.lines().find(|l| {
+    // EXACTLY one such line: never the first of several (the shell twin
+    // refuses the same way).
+    let mut found = compose.lines().filter(|l| {
         let t = l.trim_start();
         t.strip_prefix("image: ")
             .and_then(|i| i.strip_prefix(crate::registry::IMAGE_NAMESPACE))
             .is_some_and(|rest| rest.starts_with("/nginx:"))
             && t.contains("${NOO_IMAGE_DIGEST_NGINX:-")
-    })?;
+    });
+    let line = found.next()?;
+    if found.next().is_some() {
+        return None;
+    }
     let img = line.trim_start().strip_prefix("image:")?.trim();
     let (repo_tag, rest) = img.split_once("${NOO_IMAGE_DIGEST_NGINX:-")?;
     let digest = rest.strip_suffix('}')?;
@@ -193,6 +199,15 @@ mod tests {
     fn a_compose_without_a_pinned_digest_is_refused() {
         assert!(helper_ref_from("services:\n  model-cache:\n    image: nginx:1.30.7-alpine\n", None).is_err());
         assert!(helper_ref_from(&compose("abc"), None).is_err());
+    }
+
+    /// The compose line is the source of truth only while it is ONE line:
+    /// two matching lines are refused, never "the first of several".
+    #[test]
+    fn two_matching_compose_lines_are_refused() {
+        let two = format!("{}  other:\n    image: ghcr.io/noomesh/nginx:1.30.8-alpine${{NOO_IMAGE_DIGEST_NGINX:-@sha256:{}}}\n", compose(D), "c".repeat(64));
+        assert!(helper_ref_from(&two, None).is_err());
+        assert!(helper_ref_from(&compose(D), None).is_ok(), "one line still resolves");
     }
 
     const IMG: &str = "ghcr.io/noomesh/nginx:1.30.7-alpine@sha256:aa";
