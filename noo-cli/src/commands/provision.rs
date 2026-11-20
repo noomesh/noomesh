@@ -4858,7 +4858,7 @@ pub(crate) const REFUSALS: &[RefusalRow] = &[
 pub(crate) fn apply_refusal_for(rc: i64, refusal: Option<&str>) -> ApplyRefusal {
     let base = apply_refusal(rc);
     match refusal.and_then(|n| REFUSALS.iter().find(|r| r.name == n)) {
-        Some(row) if row.code == rc => ApplyRefusal { code: base.code, why: row.why, next: row.next, refusal: Some(row.name) },
+        Some(row) => ApplyRefusal { code: base.code, why: row.why, next: row.next, refusal: Some(row.name) },
         _ => base,
     }
 }
