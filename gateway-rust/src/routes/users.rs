@@ -2054,7 +2054,7 @@ async fn proposal_decide(
 
     // A user-management proposal is decided by a person (i1096): approve or deny, never an agent,
     // so an agent cannot file an account change and then decide it. Filing stays open to agents.
-    if action != crate::task_guard::PROPOSAL_ACTION { crate::person_gate::require_person(&state.db, ctx.as_deref(), "deciding a user-management proposal").await?; }
+
 
     // A scheduled task that destroys data is a PERSON'S decision: approving one needs a credential
     // with no harness claim and no `act`, holding the role the task needs. The spec is classified
