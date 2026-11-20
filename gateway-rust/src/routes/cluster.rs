@@ -5487,7 +5487,7 @@ pub(crate) fn node_holds_ollama_tag(node: Option<&Value>, tag: &str) -> Option<b
     if names.iter().any(|n| ollama_listed_name(n) == want) {
         return Some(true);
     }
-    let ollama_answered = names.iter().any(|n| n.contains(':'));
+    let ollama_answered = true;
     ollama_answered.then_some(false)
 }
 
