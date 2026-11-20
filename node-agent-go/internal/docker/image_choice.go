@@ -73,6 +73,9 @@ type backendImageChoice struct {
 	// Pin is the digest the controller pinned for one of OUR images
 	// (`sha256:…`, from the signed stack lock), "" when none.
 	Pin string
+	// Why is the reason an automatic CPU image was taken ("TEI embedding on
+	// CPU: no usable NVIDIA runtime on this node"), "" otherwise.
+	Why string
 }
 
 // pickBackendImage is the pure part of the choice: CPU/GPU image, then the
@@ -87,16 +90,86 @@ func pickBackendImage(spec BackendSpec, override string, cpuImage bool) string {
 	return resolveEnv(spec.Image)
 }
 
-// wantsCPUImage says which of a spec's two images a start takes: llamacpp
-// the CPU build unless the start runs on this node's GPU (llamacppOnGPU: the
-// placement's target and LlamacppGPUUsable); every other backend with a
-// CPUImage (TEI embedding/reranker) the CPU one on a node without an NVIDIA
-// GPU, as before.
-func wantsCPUImage(backend, target string, f GPUFacts) bool {
+// NoUsableGPUError: a start asked for the GPU (`--on gpu`) on a node with no
+// usable NVIDIA runtime. It is a refusal, never a silent CPU image: an
+// operator who asked for a GPU must not get a CPU server that looks placed.
+// It reaches the placement as a `backend_start` refusal (the reconciler
+// records err.Error()), the way ImageNotStagedError does.
+type NoUsableGPUError struct{ Backend string }
+
+func (e *NoUsableGPUError) Error() string {
+	return fmt.Sprintf("backend %s: placed --on gpu, but this node has no usable NVIDIA runtime "+
+		"(an NVIDIA GPU the agent sees AND the nvidia runtime registered with docker), so it will not start on the CPU instead. "+
+		"Install the NVIDIA container toolkit (nvidia-ctk runtime configure, then restart docker), or place it `--on cpu`", e.Backend)
+}
+
+// TEIRuntimeUnknownError (TEI and llamacpp): the node has an NVIDIA GPU but the agent has never
+// had an answer to "does docker list the nvidia runtime" (docker info failed
+// or was slow at boot). Unknown is not absent, so the start neither takes the
+// GPU image nor silently downgrades to the CPU one: it is refused for now and
+// the reconciler records it as a backend_start refusal, then asks again on its
+// next pass (RefreshGPUFacts runs first each tick).
+type TEIRuntimeUnknownError struct{ Backend, Detail string }
+
+func (e *TEIRuntimeUnknownError) Error() string {
+	return fmt.Sprintf("backend %s: cannot tell yet whether the NVIDIA runtime is registered: docker info failed: %s; retrying on the next pass",
+		e.Backend, e.Detail)
+}
+
+// teiGPUUsable is what "a usable NVIDIA runtime" means for the TEI GPU image:
+// an NVIDIA GPU is visible to the agent (GPUFacts.NvidiaGPU) AND the docker
+// daemon lists the nvidia runtime (GPUFacts.NvidiaRuntime, NvidiaRuntimeKnown;
+// unknown counts as absent). A device node alone is never proof: /dev/dxg
+// (WSL2's paravirtual device, which the GPU probe counts) or /dev/nvgpu exist
+// on boxes where docker cannot hand a GPU out. Unlike LlamacppGPUUsable there
+// is no compute-capability floor: TEI's CUDA image has none the agent knows.
+func teiGPUUsable(f GPUFacts) bool { return f.NvidiaGPU && f.NvidiaRuntime }
+
+// wantsCPUImage says which of a spec's two images a start takes, and why
+// when the answer is an automatic CPU. llamacpp: the CPU build unless the
+// start runs on this node's GPU (llamacppOnGPU). Every other backend with a
+// CPUImage (TEI embedding/reranker), by the placement's target:
+//
+//   - cpu: the CPU image, always;
+//   - a GPU present but the runtime never read: a retryable *TEIRuntimeUnknownError
+//     for gpu and auto (cpu is unaffected);
+//   - gpu: the GPU image on a usable NVIDIA runtime (teiGPUUsable), else a
+//     *NoUsableGPUError: never a silent CPU image;
+//   - unset/auto: the GPU image on a usable runtime, else the CPU image, with
+//     the reason ("TEI embedding on CPU: no usable NVIDIA runtime on this node").
+//
+// llamacpp keeps its own rule once the runtime is read (a compute-capability
+// floor; a `gpu` target on an unusable node is cpu, logged, not a refusal);
+// only the never-read case waits, as for TEI (llamacppWaitsOnRuntime).
+func wantsCPUImage(backend string, spec BackendSpec, target string, f GPUFacts) (cpu bool, why string, err error) {
 	if backend == "llamacpp" {
-		return !llamacppOnGPU(target, f)
+		if llamacppWaitsOnRuntime(target, f) {
+			return false, "", &TEIRuntimeUnknownError{Backend: backend, Detail: f.NvidiaRuntimeErr}
+		}
+		return !llamacppOnGPU(target, f), "", nil
 	}
-	return !hasNvidiaGPU()
+	if spec.CPUImage == "" {
+		return false, "", nil
+	}
+	if target == "cpu" {
+		return true, "", nil
+	}
+	// A GPU is there but the runtime was never read: not "absent" (see
+	// TEIRuntimeUnknownError). No GPU at all: the runtime is irrelevant.
+	if f.NvidiaGPU && !f.NvidiaRuntimeRead {
+		return false, "", &TEIRuntimeUnknownError{Backend: backend, Detail: f.NvidiaRuntimeErr}
+	}
+	switch target {
+	case "gpu":
+		if !teiGPUUsable(f) {
+			return false, "", &NoUsableGPUError{Backend: backend}
+		}
+		return false, "", nil
+	}
+	if teiGPUUsable(f) {
+		return false, "", nil
+	}
+	return true, fmt.Sprintf("TEI %s on CPU: no usable NVIDIA runtime on this node", backend), nil
 }
 
 // chooseBackendImage is chooseBackendImageFor on this node's current GPU facts.
@@ -106,9 +179,20 @@ func chooseBackendImage(backend string, spec BackendSpec, override, target strin
 
 // chooseBackendImageFor picks the backend's image and applies the policy
 // above. override is StartOverrides.Image (the controller's / the
-// placement's); target is the placement's hardware target.
+// placement's); target is the placement's hardware target. A refused `gpu`
+// target is an error here, so a start does not run and BackendImageRef (which
+// calls this) names no image, so nothing is prefetched.
 func chooseBackendImageFor(backend string, spec BackendSpec, override, target string, f GPUFacts) (backendImageChoice, error) {
-	cpuImage := wantsCPUImage(backend, target, f)
+	cpuImage, why, err := wantsCPUImage(backend, spec, target, f)
+	if err != nil {
+		return backendImageChoice{}, err
+	}
+	ch, err := chooseBackendImagePolicy(backend, spec, override, cpuImage)
+	ch.Why = why
+	return ch, err
+}
+
+func chooseBackendImagePolicy(backend string, spec BackendSpec, override string, cpuImage bool) (backendImageChoice, error) {
 	ref := pickBackendImage(spec, override, cpuImage)
 	// Nothing named an image: the default is OUR hardened build from this
 	// node's release (an image of ours, rail-only). There is NO upstream

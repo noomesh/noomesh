@@ -114,12 +114,15 @@ step before-roll 120 -- bash -c '
 # The Docker daemon's own record of the new version's roll: image + container
 # events from here to the end of the plain start after the upgrade (UPGRADE
 # NO-DOCKERHUB judges them: no Docker Hub pull, no Docker Hub container).
+# ONLY those six fields (time type action id image name), never `{{json .}}`:
+# a full event carries every container label and `KEY=value` string, which the
+# upload scan refuses (and then withholds ALL evidence, run 44798146312).
 # Started AFTER the previous final's onboard and start (which may pull
 # alpine), stopped by PID, never by pattern. When the operator is not in the
 # docker group yet, the watcher is sudo's, and so is its stop.
 DOCKER="docker"; docker info >/dev/null 2>&1 || DOCKER="sudo -n docker"
 mkdir -p "$OUT/logs"
-$DOCKER events --format '{{json .}}' --filter type=image --filter type=container \
+$DOCKER events --format '{"time":{{json .Time}},"type":{{json .Type}},"action":{{json .Action}},"id":{{json .Actor.ID}},"image":{{json (index .Actor.Attributes "image")}},"name":{{json (index .Actor.Attributes "name")}}}' --filter type=image --filter type=container \
     > "$OUT/logs/docker-events-upgrade.jsonl" 2> "$OUT/logs/docker-events-upgrade.err" < /dev/null &
 EVENTS_PID=$!
 echo "$EVENTS_PID" > "$J/docker-events.pid"
@@ -139,6 +142,19 @@ noo --json cluster verify > "$J/verify-after.json" 2>/dev/null
 # (only its `logger -t noo-apply` refusals land there): keep both.
 sudo -n journalctl --no-pager --since "@$ROLL_T0" 2>/dev/null | grep -E "noo-apply|noo-fetch|noo-node-agent" \
   | python3 "$CELL_PY" redact > "$J/roll-window.journal"
+
+# The node agent's own record of the roll (the fresh cells' agent-state-after-*
+# dump, run.sh agent_dump): its unit status, its journal from ROLL_T0 and the
+# self node as the controller sees it. A step, so it passes the redactor, lands
+# in logs/ (uploaded, then scanned) and a failure of it never fails the cell
+# (cell.py skips agent-state-after-*). Before the --stack's sleep + STACK_T0,
+# so its sudos are outside B3's window.
+step agent-state-after-roll 120 -- sh -c '
+  echo "== systemctl status noo-node-agent"; sudo -n systemctl status noo-node-agent --no-pager -l 2>&1 | head -40
+  echo "== journalctl -u noo-node-agent (since the roll, last 300)"
+  sudo -n journalctl -u noo-node-agent --no-pager --since "@$1" -n 300 2>&1
+  echo "== noo --json cluster show $2"
+  timeout 60 noo --json cluster show "$2" 2>&1 | head -c 20000; echo' _ "$ROLL_T0" "$SELF" || true
 
 # ── 4. the same-tag --stack (1b's Stage route on a node whose applier is new) ─
 # 0.6.26's onboard already installed noo-netns-restore.service (its own sudo
@@ -185,6 +201,11 @@ step chat-after 900 -- noo chat --message "Reply with the single word ok."
 
 # ── 6. the judges: one line per assert ─────────────────────────────────────
 noo --json cluster verify > "$J/verify-final.json" 2>/dev/null
+# G2 must not judge one snapshot (a node agent restarted moments before has no
+# ollama_verify for ~30-60 s): while the row is absent or "not yet checked",
+# verify again every 30 s up to 6 min. Each try is kept as verify-g2-<n>.json
+# in judge/ and logs/ (uploaded); the wait is in judge/g2.wait.
+python3 "$HERE/upgrade_judge.py" g2wait "$OUT" "$J" "$SELF" 30 360
 # Every journal goes through the cell's redactor before it is kept: the
 # artifacts are PUBLIC, and these files are not written by step().
 sudo -n journalctl -t noo-apply --no-pager --since "@$ROLL_T0" 2>/dev/null | python3 "$CELL_PY" redact > "$J/apply.journal"

@@ -146,11 +146,20 @@ noo cluster fit gpu-2 --with llamacpp gemma-3-27b-it-Q4_K_M.gguf --on cpu
 |---|---|
 | llamacpp | `N_GPU_LAYERS=0` in the placement env; the container gets no GPU device |
 | ollama | the container gets no GPU device (`CUDA_VISIBLE_DEVICES` emptied). One ollama serves every role on a node, so it runs on CPU only when every role asks for cpu |
+| TEI (`embedding`, the TEI `reranker`) | the CPU image (`cpu-1.9.4`), always |
 | vllm | refused: vLLM runs on a GPU only |
 
 With no `--on`, a placement keeps the target it already has; otherwise
 `N_GPU_LAYERS=0` means cpu, and a node with a GPU defaults to gpu. `--on
 gpu` on a node that reports no GPU is refused.
+
+TEI takes its GPU image only on a usable NVIDIA runtime: an NVIDIA GPU the
+agent sees and the `nvidia` runtime registered with docker (a `/dev/dxg`
+device alone, as on WSL2 without the toolkit, is not enough). `--on gpu`
+without one is refused at start, with the fix (install the NVIDIA container
+toolkit, or place it `--on cpu`), and shows as a start refusal; it never
+runs a CPU embedder that looks placed. With no `--on`, TEI takes the GPU
+image when a runtime is usable, else the CPU image.
 
 llamacpp on gpu runs the CUDA build of llama.cpp (`llamacpp-cuda`, CUDA
 12.9, amd64) with every layer on the GPU, on a node with an NVIDIA GPU of

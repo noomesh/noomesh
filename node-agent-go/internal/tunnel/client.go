@@ -17,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -157,33 +158,93 @@ func notOffered(status int) bool {
 }
 
 // Run keeps the tunnel up until ctx ends: dial, serve, and on any failure
-// back off with jitter and dial again.
+// wait (see nextDelay) and dial again.
 func (c *Client) Run(ctx context.Context) {
-	bo := backoff{min: c.opt.RetryMin, max: c.opt.RetryMax}
+	rs := &retryState{bo: backoff{min: c.opt.RetryMin, max: c.opt.RetryMax}, notOffered: c.opt.NotOfferedRetry}
 	for ctx.Err() == nil {
 		started := time.Now()
 		connected, err := c.session(ctx)
 		if ctx.Err() != nil {
 			return
 		}
-		var delay time.Duration
 		var ne *notOfferedError
-		switch {
-		case errors.As(err, &ne):
-			delay = jitter(c.opt.NotOfferedRetry)
-			c.logFailure(err, true)
-		default:
-			if connected && time.Since(started) > 30*time.Second {
-				bo.reset()
-			}
-			delay = bo.next()
-			c.logFailure(err, false)
-		}
+		c.logFailure(err, errors.As(err, &ne))
+		delay := rs.nextDelay(connected, time.Since(started), err)
 		select {
 		case <-ctx.Done():
 			return
 		case <-time.After(delay):
 		}
+	}
+}
+
+const (
+	// stableSession: a session that lived longer than this was healthy, so the backoff starts over.
+	stableSession = 30 * time.Second
+	// refusedRetryCap bounds the wait after a dial that reached nothing.
+	refusedRetryCap = 5 * time.Second
+)
+
+// dialError marks an error from the dial stage (nothing was reached or answered), so
+// the classifier does not mistake an EOF from a later handshake or session for one.
+type dialError struct{ err error }
+
+func (e *dialError) Error() string { return e.err.Error() }
+func (e *dialError) Unwrap() error { return e.err }
+
+// dialRefused reports whether err is a dial that was refused or reset before any
+// response: the gateway is down or restarting. Only the dial stage counts; an EOF
+// after the dial succeeded is a session failure.
+func dialRefused(err error) bool {
+	var de *dialError
+	if !errors.As(err, &de) {
+		return false
+	}
+	return errors.Is(de.err, syscall.ECONNREFUSED) || errors.Is(de.err, syscall.ECONNRESET) ||
+		errors.Is(de.err, io.EOF) || errors.Is(de.err, io.ErrUnexpectedEOF)
+}
+
+// retryState carries the reconnect backoff between sessions.
+type retryState struct {
+	bo         backoff
+	notOffered time.Duration
+}
+
+// nextDelay decides how long to wait before the next dial.
+func (r *retryState) nextDelay(connected bool, sessionLen time.Duration, err error) time.Duration {
+	var ne *notOfferedError
+	switch {
+	case errors.As(err, &ne):
+		// An answer that cannot change by retrying: the long interval, unchanged.
+		return jitter(r.notOffered)
+	case dialRefused(err):
+		// Nothing was reached: the gateway is down or restarting (a stack restart).
+		// Retrying a refused connect is cheap, and a long wait here is what left a node
+		// without its tunnel after several quick restarts. Capped however far the backoff
+		// has grown, and it does not grow it, so a later real failure starts from where
+		// it was.
+		c := refusedRetryCap
+		if r.bo.max < c {
+			c = r.bo.max
+		}
+		return jitter(c)
+	case connected && sessionLen > stableSession:
+		// A long, healthy session: start the backoff over.
+		r.bo.reset()
+		return r.bo.next()
+	case connected:
+		// Reached ready and dropped soon after. The handshake worked, so this is not a
+		// failure to punish with a longer wait: keep the current delay (min if none).
+		d := r.bo.cur
+		if d == 0 {
+			d = r.bo.min
+		}
+		return jitter(d)
+	default:
+		// Everything else (timeout, TLS or auth failure, a gateway that accepts and
+		// hangs, a handshake refusal): full exponential backoff, so a sick gateway is
+		// not hammered by every node at once.
+		return r.bo.next()
 	}
 }
 
@@ -265,7 +326,7 @@ func (c *Client) session(ctx context.Context) (connected bool, err error) {
 			_ = resp.Body.Close()
 			return false, &notOfferedError{status: resp.StatusCode, body: string(snippet)}
 		}
-		return false, fmt.Errorf("dial %s: %w", c.wsURL, err)
+		return false, &dialError{fmt.Errorf("dial %s: %w", c.wsURL, err)}
 	}
 	defer conn.Close()
 	ready, err := c.handshake(conn)

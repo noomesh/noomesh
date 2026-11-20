@@ -1,0 +1,320 @@
+{
+ "_rule": "noomesh-internal i1098, the matrix ratchet. Per fresh-install cell: the most WARN rows (verdict == \"warn\", controller + nodes + seats) its `noo --json cluster verify` may show, and the rows it may show them in, by the row's STABLE id from noo-cli cluster_verify/rows.rs (a reworded row keeps its id; \"label\" is only for people). The PR that removes a WARN lowers max_warn and drops the row. Raising is never allowed (tests/test_install_cell_ratchet.py compares this file with its version on dev); the one escape is a reviewed decision, in its own commit, adding to the cell \"raise\": {\"from_max\", \"to_max\", \"add_rows\" (ids), \"reason\"}. scripts/install-cell/ratchet.py judges it; a cell with \"measured\": null only prints a NOTE.",
+ "fail_rows_fail_the_cell": true,
+ "_fail_rule": "i1098: a FAIL row always fails the cell. ON since the release lead approved it after 0.6.29-rc.2 (0.6.28-rc.4, 0.6.28 and rc.2 fresh cells showed 0 FAIL rows). The one exemption: default_chat is NOT JUDGED after a registry 5xx at onboard whose retries were exhausted (scripts/install-cell/ratchet.py). Turning it off again is refused; fail_allowed only shrinks, and a row added to it needs a \"why\" and a reviewed \"decision\".",
+ "fail_allowed": {},
+ "row_status": {
+  "agent_protect": {
+   "label": "controller:agent protect",
+   "status": "awaiting operator decision",
+   "why": "i1098 row 10: onboard installs the self agent outside the applier, so no protect hold exists; DECIDE whether onboard installs the self node through the applier (i991; i1085 item 6)"
+  },
+  "last_backup": {
+   "label": "controller:last backup",
+   "status": "awaiting operator decision",
+   "why": "i1098 row 11: the daily backup runs at 03:30, a box minutes old has had none; DECIDE whether onboard runs the first backup (i1085 item 8)"
+  },
+  "host_telemetry": {
+   "label": "node:host telemetry",
+   "status": "accepted",
+   "why": "the windows-2025-wsl2 cell ONLY (release lead, 11-20): the runner image's Ubuntu has motd-news enabled (fetches from motd.ubuntu.com); the row and its remedy are right. Only that cell's ceiling lists it, so any other cell showing it fails as a new row"
+  },
+  "holds": {
+   "label": "node:holds",
+   "status": "awaiting operator decision",
+   "why": "i1098 row 12: the installer's Docker packages are not held; DECIDE whether onboard holds what it installed (the remedy text is fixed separately)"
+  },
+  "at_rest_tpm": {
+   "label": "controller:at-rest tpm",
+   "status": "awaiting operator decision",
+   "why": "i1098 row 14: the at-rest set, no TPM on a hosted VM; the operator decides at-rest"
+  },
+  "postgres_at_rest": {
+   "label": "controller:postgres at rest",
+   "status": "awaiting operator decision",
+   "why": "i1098 rows 15-21: the at-rest set, plaintext on the root disk without a TPM-backed volume; the operator decides at-rest"
+  },
+  "redis_at_rest": {
+   "label": "controller:redis at rest",
+   "status": "awaiting operator decision",
+   "why": "i1098 rows 15-21: the at-rest set; the operator decides at-rest"
+  },
+  "nats_at_rest": {
+   "label": "controller:nats at rest",
+   "status": "awaiting operator decision",
+   "why": "i1098 rows 15-21: the at-rest set; the operator decides at-rest"
+  },
+  "prometheus_at_rest": {
+   "label": "controller:prometheus at rest",
+   "status": "awaiting operator decision",
+   "why": "i1098 rows 15-21: the at-rest set; the operator decides at-rest"
+  },
+  "noo_data_at_rest": {
+   "label": "controller:noo-data at rest",
+   "status": "awaiting operator decision",
+   "why": "i1098 rows 15-21: the at-rest set; the operator decides at-rest"
+  },
+  "pki_at_rest": {
+   "label": "controller:pki at rest",
+   "status": "awaiting operator decision",
+   "why": "i1098 rows 15-21: the at-rest set; the operator decides at-rest"
+  },
+  "age_key_at_rest": {
+   "label": "controller:age key at rest",
+   "status": "awaiting operator decision",
+   "why": "i1098 rows 15-21: the at-rest set; the operator decides at-rest"
+  },
+  "at_rest_swap": {
+   "label": "controller:at-rest swap",
+   "status": "awaiting operator decision",
+   "why": "i1098 row 22: the at-rest set (a plain /swapfile; fixable without a TPM); the operator decides at-rest"
+  },
+  "at_rest_outside_the_set": {
+   "label": "controller:at-rest outside the set",
+   "status": "awaiting operator decision",
+   "why": "i1098 row 23: the at-rest set; the operator decides at-rest"
+  },
+  "at_rest_volume": {
+   "label": "controller:at-rest volume",
+   "status": "awaiting operator decision",
+   "why": "i1098 row 24: the at-rest set, no encrypted state volume without a TPM; the operator decides at-rest"
+  },
+  "docker_engine": {
+   "label": "node:docker engine",
+   "status": "awaiting operator decision",
+   "why": "i1058: the Docker Engine minimum (MIN_DOCKER_ENGINE_MAJOR) is the operator's decision"
+  },
+  "off_site_backup": {
+   "label": "controller:off-site backup",
+   "status": "accepted",
+   "why": "i1098 row 13: ACCEPT, nobody has chosen where backup copies go; honest on a fresh box"
+  },
+  "log_shipper": {
+   "label": "node:log shipper",
+   "status": "reported fixed",
+   "by": "#1433",
+   "why": "i1098 row 1: FIX (merged 11-20; must not WARN from 0.6.29-rc.2), a code-order bug (the by-choice loki_off reason is tested after enabled != true)"
+  },
+  "inbound": {
+   "label": "node:inbound",
+   "status": "reported fixed",
+   "by": "#1433",
+   "why": "i1098 row 2: FIX (merged 11-20; must not WARN from 0.6.29-rc.2), the first reachability probe runs after onboard's closing verify"
+  },
+  "node_agent_privilege": {
+   "label": "controller:node-agent privilege",
+   "status": "reported fixed",
+   "by": "#1433",
+   "why": "i1098 row 3: FIX (merged 11-20; must not WARN from 0.6.29-rc.2), the row inspects a container while the self agent is a host service"
+  },
+  "tailnet_policy": {
+   "label": "controller:tailnet policy",
+   "status": "reported fixed",
+   "by": "#1433",
+   "why": "i1098 row 4: FIX (merged 11-20; must not WARN from 0.6.29-rc.2), a LAN-only install has no tailnet to judge"
+  },
+  "tailscale_ssh": {
+   "label": "controller:tailscale ssh",
+   "status": "reported fixed",
+   "by": "#1433",
+   "why": "i1098 row 5: FIX (merged 11-20; must not WARN from 0.6.29-rc.2), Tailscale is not installed"
+  },
+  "loki_at_rest": {
+   "label": "controller:loki at rest",
+   "status": "reported fixed",
+   "by": "#1433",
+   "why": "i1098 row 6: FIX (merged 11-20; must not WARN from 0.6.29-rc.2), lean monitoring leaves an empty directory judged as plaintext data"
+  },
+  "tempo_at_rest": {
+   "label": "controller:tempo at rest",
+   "status": "reported fixed",
+   "by": "#1433",
+   "why": "i1098 row 7: FIX (merged 11-20; must not WARN from 0.6.29-rc.2), as loki at rest"
+  },
+  "grafana_at_rest": {
+   "label": "controller:grafana at rest",
+   "status": "reported fixed",
+   "by": "#1433",
+   "why": "i1098 row 8: FIX (merged 11-20; must not WARN from 0.6.29-rc.2), as loki at rest"
+  },
+  "default_chat": {
+   "label": "controller:default chat",
+   "status": "reported fixed",
+   "by": "#1458",
+   "why": "i1098 row 9: FIX (merged 11-20): a GPU-less or one-node fleet's default chat reads OK tiered later; must not WARN from 0.6.29-rc.2"
+  },
+  "streaming_over_tunnel": {
+   "label": "node:streaming over tunnel",
+   "status": "under triage",
+   "by": "i1128",
+   "why": "NOT CHECKED after gateway restarts: #1478 fixed the record lag (rc.3 fresh #1: gone in 4 cells), but the agent's tunnel reconnect backoff only resets after a >30 s session, so a few quick gateway restarts leave the tunnel down for 30-60 s (rc.3 fresh #1: new in ubuntu-22.04-amd64 and stranger-24.04-literal). The rc.4 backoff fix is the candidate; i1128 records it. Kept OUT of the cells that never showed it (release lead, 11-20): a FAIL there is the honest signal"
+  },
+  "ollama_slots": {
+   "label": "controller:ollama slots",
+   "status": "accepted",
+   "why": "the slots4 cell sets the shared Ollama to 4 slots on purpose (the i802 A/B); the row reports that choice"
+  }
+ },
+ "cells": {
+  "ubuntu-24.04-amd64-default": {
+   "max_warn": 16,
+   "rows": [
+    "age_key_at_rest",
+    "agent_protect",
+    "at_rest_outside_the_set",
+    "at_rest_swap",
+    "at_rest_tpm",
+    "at_rest_volume",
+    "holds",
+    "last_backup",
+    "nats_at_rest",
+    "noo_data_at_rest",
+    "off_site_backup",
+    "pki_at_rest",
+    "postgres_at_rest",
+    "prometheus_at_rest",
+    "redis_at_rest",
+    "streaming_over_tunnel"
+   ],
+   "measured": "0.6.29-rc.2 fresh runs 44727787931, 44738164701, 44747857452: WARN per run [15, 15, 16]",
+   "why": "max over the three runs, rows their union; run 1's registry-503 cells (default, stranger-literal) had no model at verify, so their outage-only `lanes` row is left out (release lead, 11-20)"
+  },
+  "ubuntu-24.04-amd64-slots4": {
+   "max_warn": 17,
+   "rows": [
+    "age_key_at_rest",
+    "agent_protect",
+    "at_rest_outside_the_set",
+    "at_rest_swap",
+    "at_rest_tpm",
+    "at_rest_volume",
+    "holds",
+    "last_backup",
+    "nats_at_rest",
+    "noo_data_at_rest",
+    "off_site_backup",
+    "ollama_slots",
+    "pki_at_rest",
+    "postgres_at_rest",
+    "prometheus_at_rest",
+    "redis_at_rest",
+    "streaming_over_tunnel"
+   ],
+   "measured": "0.6.29-rc.2 fresh runs 44727787931, 44738164701, 44747857452: WARN per run [17, 17, 17]",
+   "why": "max over the three runs, rows their union"
+  },
+  "ubuntu-22.04-amd64": {
+   "max_warn": 15,
+   "rows": [
+    "age_key_at_rest",
+    "agent_protect",
+    "at_rest_outside_the_set",
+    "at_rest_swap",
+    "at_rest_tpm",
+    "at_rest_volume",
+    "holds",
+    "last_backup",
+    "nats_at_rest",
+    "noo_data_at_rest",
+    "off_site_backup",
+    "pki_at_rest",
+    "postgres_at_rest",
+    "prometheus_at_rest",
+    "redis_at_rest"
+   ],
+   "measured": "0.6.29-rc.2 fresh runs 44727787931, 44738164701, 44747857452: WARN per run [15, 15, 15]",
+   "why": "max over the three runs, rows their union"
+  },
+  "ubuntu-22.04-amd64-docker.io": {
+   "max_warn": 16,
+   "rows": [
+    "age_key_at_rest",
+    "agent_protect",
+    "at_rest_outside_the_set",
+    "at_rest_swap",
+    "at_rest_tpm",
+    "at_rest_volume",
+    "holds",
+    "last_backup",
+    "nats_at_rest",
+    "noo_data_at_rest",
+    "off_site_backup",
+    "pki_at_rest",
+    "postgres_at_rest",
+    "prometheus_at_rest",
+    "redis_at_rest",
+    "streaming_over_tunnel"
+   ],
+   "measured": "0.6.29-rc.2 fresh runs 44727787931, 44738164701, 44747857452: WARN per run [16, 15, 16]",
+   "why": "max over the three runs, rows their union"
+  },
+  "stranger-24.04": {
+   "max_warn": 16,
+   "rows": [
+    "age_key_at_rest",
+    "agent_protect",
+    "at_rest_outside_the_set",
+    "at_rest_swap",
+    "at_rest_tpm",
+    "at_rest_volume",
+    "holds",
+    "last_backup",
+    "nats_at_rest",
+    "noo_data_at_rest",
+    "off_site_backup",
+    "pki_at_rest",
+    "postgres_at_rest",
+    "prometheus_at_rest",
+    "redis_at_rest",
+    "streaming_over_tunnel"
+   ],
+   "measured": "0.6.29-rc.2 fresh runs 44727787931, 44738164701, 44747857452: WARN per run [16, 15, 15]",
+   "why": "max over the three runs, rows their union"
+  },
+  "stranger-24.04-literal": {
+   "max_warn": 15,
+   "rows": [
+    "age_key_at_rest",
+    "agent_protect",
+    "at_rest_outside_the_set",
+    "at_rest_swap",
+    "at_rest_tpm",
+    "at_rest_volume",
+    "holds",
+    "last_backup",
+    "nats_at_rest",
+    "noo_data_at_rest",
+    "off_site_backup",
+    "pki_at_rest",
+    "postgres_at_rest",
+    "prometheus_at_rest",
+    "redis_at_rest"
+   ],
+   "measured": "0.6.29-rc.2 fresh runs 44727787931, 44738164701, 44747857452: WARN per run [15, 15, 15]",
+   "why": "max over the three runs, rows their union; run 1's registry-503 cells (default, stranger-literal) had no model at verify, so their outage-only `lanes` row is left out (release lead, 11-20)"
+  },
+  "windows-2025-wsl2": {
+   "max_warn": 16,
+   "rows": [
+    "age_key_at_rest",
+    "agent_protect",
+    "at_rest_outside_the_set",
+    "at_rest_swap",
+    "at_rest_tpm",
+    "at_rest_volume",
+    "holds",
+    "host_telemetry",
+    "last_backup",
+    "nats_at_rest",
+    "noo_data_at_rest",
+    "off_site_backup",
+    "pki_at_rest",
+    "postgres_at_rest",
+    "prometheus_at_rest",
+    "redis_at_rest"
+   ],
+   "measured": "0.6.29-rc.2 fresh runs 44727787931, 44738164701, 44747857452: WARN per run [16, 16, 16]",
+   "why": "max over the three runs, rows their union"
+  }
+ }
+}

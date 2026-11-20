@@ -113,6 +113,9 @@ jobs:
             docs/getting-started/install.md
             scripts/install-cell
             scripts/ci-free-disk.sh
+            # the verify row registry: ratchet.py maps a row name to its id
+            # when the installed CLI prints none (before #1411)
+            noo-cli/src/commands/cluster_verify/rows.rs
           sparse-checkout-cone-mode: false
       - name: Free disk (the runner's preinstalled toolchains; reported)
         if: runner.os == 'Linux'
@@ -174,6 +177,7 @@ jobs:
             docs/getting-started/first-chat.md
             docs/getting-started/install.md
             scripts/install-cell
+            noo-cli/src/commands/cluster_verify/rows.rs
           sparse-checkout-cone-mode: false
       - name: WSL2 + Ubuntu 24.04   # Vampire/setup-wsl v7.2.0
         # Run 1 (2026-11-12) never finished this step in 45 min: cap it so a
@@ -258,6 +262,9 @@ jobs:
             README.md
             scripts/install-cell
             scripts/ci-free-disk.sh
+            # the verify row registry: ratchet.py maps a row name to its id
+            # when the installed CLI prints none (before #1411)
+            noo-cli/src/commands/cluster_verify/rows.rs
           sparse-checkout-cone-mode: false
       - name: Free disk (the runner's preinstalled toolchains; reported)
         run: df -h / && bash scripts/ci-free-disk.sh && df -h /
@@ -319,6 +326,16 @@ jobs:
             --memory "ubuntu-24.04-amd64-default=$M/install-cell-ubuntu-24.04-amd64-default/memory.json" \
                      "ubuntu-22.04-amd64=$M/install-cell-ubuntu-22.04-amd64/memory.json" \
             | tee -a "$GITHUB_STEP_SUMMARY"
+      # The run's ratchet line: how many cells reported default chat NOT
+      # JUDGED (a registry outage at onboard), so a run of them is noticed.
+      - name: Every cell's report (the ratchet's NOT JUDGED count)   # actions/download-artifact@v8.0.2
+        continue-on-error: true
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          pattern: install-cell-*
+          path: ${{ runner.temp }}/cells
+      - name: Ratchet NOT JUDGED cells
+        run: python3 scripts/install-cell/ratchet.py run-summary "$RUNNER_TEMP/cells" | tee -a "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: release-size
