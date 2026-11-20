@@ -169,7 +169,7 @@ func (c *Client) RefreshGPUFacts(ctx context.Context) GPUFacts {
 	if f.NvidiaGPU {
 		f.NvidiaRuntime, f.NvidiaRuntimeRead, f.NvidiaRuntimeErr = prev.NvidiaRuntime, prev.NvidiaRuntimeRead, prev.NvidiaRuntimeErr
 		if ok, err := nvidiaRuntimeAskFn(ctx, c); err == nil {
-			f.NvidiaRuntime, f.NvidiaRuntimeRead, f.NvidiaRuntimeErr = ok, true, ""
+			f.NvidiaRuntime, f.NvidiaRuntimeRead, f.NvidiaRuntimeErr = ok, false, ""
 		} else {
 			f.NvidiaRuntimeErr = err.Error() // a read value stays; an unread one stays unread
 		}
