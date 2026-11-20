@@ -44,6 +44,7 @@ mod warmup;
 pub(crate) mod restart_loops;
 mod gpu_held;
 mod hf_hub;
+mod key_bindings;
 pub(crate) mod rows;
 
 /// One invariant, judged.
@@ -1591,6 +1592,112 @@ pub(crate) fn docker_engine_check(n: &Value) -> Option<Check> {
     }
 }
 
+/// The oldest Docker Compose the project tests: CI's `start-inputs` job
+/// (`.github/workflows/start-inputs.yml`) runs the launcher's real `up` path
+/// on the runner's Compose and on 2.24.6, Ubuntu 24.04's `docker-compose-v2`
+/// and the oldest Compose the documented install route gives (green on both
+/// in run 44668278238). The twin of [`MIN_DOCKER_ENGINE_MAJOR`], and the one
+/// declared minimum: the controller's `docker compose` verify row and `noo
+/// onboard`'s Docker probe read it, and docs/getting-started/install.md names
+/// it. The operator decides it; raise it here and nowhere else.
+pub(crate) const MIN_COMPOSE: (u32, u32, u32) = (2, 24, 6);
+
+/// What `docker compose version --short` said on this machine. Compose runs
+/// only on the controller (the stack launcher); workers use the node agent's
+/// Docker API, so no node reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ComposeVersion {
+    /// A version, and the text it was read from (`v2.29.1-desktop.1`).
+    Known((u32, u32, u32), String),
+    /// No Compose v2: `docker compose` is not a docker command here.
+    Missing(String),
+    /// The command failed otherwise, or said something that does not parse.
+    Unreadable(String),
+}
+
+/// `2.24.6`, `v2.38.2`, `2.29.1-desktop.1` -> the three numbers. Anything
+/// else (empty, garbage, two parts) is `None`.
+pub(crate) fn parse_compose_version(text: &str) -> Option<(u32, u32, u32)> {
+    let t = text.trim();
+    let t = t.strip_prefix('v').unwrap_or(t);
+    let core = t.split(['-', '+']).next().unwrap_or("");
+    let mut parts = core.split('.').map(|p| p.parse::<u32>().ok());
+    match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some(Some(a)), Some(Some(b)), Some(Some(c)), None) => Some((a, b, c)),
+        _ => None,
+    }
+}
+
+/// A Compose version text that is known to come from a working Compose v2
+/// (onboard's probe already answered): `Known`, or `Unreadable` when it does
+/// not parse.
+pub(crate) fn compose_version_from_text(text: &str) -> ComposeVersion {
+    match parse_compose_version(text) {
+        Some(v) => ComposeVersion::Known(v, text.trim().to_string()),
+        None => ComposeVersion::Unreadable(format!("version {:?} does not parse", text.trim())),
+    }
+}
+
+/// Classify one run of `docker compose version --short`. Pure, so the
+/// states are pinned: docker saying `compose` is not a command (Ubuntu's
+/// `docker.io` without `docker-compose-v2`) is `Missing`; any other failure is
+/// `Unreadable` with docker's last line.
+pub(crate) fn compose_version_from(success: bool, stdout: &str, stderr: &str) -> ComposeVersion {
+    if success {
+        return compose_version_from_text(stdout.lines().next().unwrap_or(""));
+    }
+    let last = stderr.lines().rev().map(str::trim).find(|l| !l.is_empty()).unwrap_or("no error output").to_string();
+    let l = stderr.to_ascii_lowercase();
+    if l.contains("is not a docker command") || l.contains("unknown command") || l.contains("unknown shorthand flag") {
+        ComposeVersion::Missing(last)
+    } else {
+        ComposeVersion::Unreadable(last)
+    }
+}
+
+/// Run `<docker> compose version --short` here. Takes the binary so a test
+/// can hand it a fake.
+pub(crate) fn read_compose_version(docker: &str) -> ComposeVersion {
+    match Command::new(docker).args(["compose", "version", "--short"]).output() {
+        Ok(o) => compose_version_from(o.status.success(), &String::from_utf8_lossy(&o.stdout), &String::from_utf8_lossy(&o.stderr)),
+        Err(e) => ComposeVersion::Unreadable(format!("could not run {docker}: {e}")),
+    }
+}
+
+/// The plain-sentence remedy for a Compose below [`MIN_COMPOSE`]: noomesh
+/// cannot install it for the operator.
+pub(crate) fn compose_upgrade_remedy() -> String {
+    "upgrade the docker-compose-v2 package (or docker-compose-plugin from Docker's apt repository, or Docker Desktop), then: docker compose version".to_string()
+}
+
+/// `"2.24.6"` from [`MIN_COMPOSE`].
+pub(crate) fn min_compose_text() -> String {
+    format!("{}.{}.{}", MIN_COMPOSE.0, MIN_COMPOSE.1, MIN_COMPOSE.2)
+}
+
+/// The controller's `docker compose` row. Below [`MIN_COMPOSE`]: WARN, a
+/// declared floor and not a known failure (2.24.x does run the launcher; it
+/// recreates more dependents on a secret change). `Unreadable`: WARN,
+/// `cannot be checked`. `Missing` (no Compose v2): FAIL, as onboard's probe and
+/// the launcher's `require_compose_v2` refuse, with `none_remedy` (the
+/// package to install, from onboard). At or above: OK.
+pub(crate) fn docker_compose_check(v: &ComposeVersion, none_remedy: &str) -> Check {
+    const NAME: &str = "docker compose";
+    let min = min_compose_text();
+    match v {
+        ComposeVersion::Known(ver, text) if *ver >= MIN_COMPOSE => ok(NAME, format!("Docker Compose {text} (minimum {min})")),
+        ComposeVersion::Known(_, text) => warn(NAME,
+            format!("Docker Compose {text} is older than the oldest version noomesh tests ({min})"),
+            Some(compose_upgrade_remedy())),
+        ComposeVersion::Unreadable(why) => warn(NAME,
+            format!("cannot be checked: the Docker Compose version could not be read ({why})"),
+            Some("docker compose version   # does the Compose v2 plugin answer?".to_string())),
+        ComposeVersion::Missing(why) => fail(NAME,
+            format!("MISSING: no Compose v2 plugin, and the stack launcher runs every service through it (`docker compose version`: {why})"),
+            none_remedy.to_string()),
+    }
+}
+
 /// The running vLLM placements of a node's desired config, as `<backend>
 /// <model>` (both vLLM backends run the one pinned image).
 pub(crate) fn vllm_placements(placements: &Value) -> Vec<String> {
@@ -2527,7 +2634,7 @@ pub(crate) fn host_checks(id: &str, host: &Value, hostd_alive: bool) -> Vec<Chec
         } else {
             out.push(warn("holds",
                 format!("platform package(s) not held — an ordinary `apt upgrade` moves them: {}", unheld.join(", ")),
-                Some(format!("the hold command in {runbook}"))));
+                Some(format!("on {id}: sudo apt-mark hold {}", unheld.join(" ")))));
         }
     }
 
@@ -3034,13 +3141,50 @@ pub(crate) fn model_classes_check(classes: Option<&Value>) -> Check {
     ok("model classes", format!("{} declared class(es), {total} candidate(s) all placed or available", declared.len()))
 }
 
+/// The `default chat` row on a fleet with no GPU node (i1098): CPU
+/// candidates are all there can be, so it is OK, "worth doing later"
+/// ([`OK_LATER_TIERS`]), and names no place command: placing another CPU
+/// model changes nothing.
+pub(crate) const CPU_ONLY_FLEET_CHAT_LATER: &str =
+    "only CPU candidates, as on any fleet with no GPU: a GPU node, when you add one, moves chat to a faster model";
+
+/// The `default chat` row on a one-node fleet (i1098): that node carries
+/// every unpinned request because there is no other. OK, "worth doing later".
+pub(crate) const ONE_NODE_FLEET_CHAT_LATER: &str =
+    "one node carries every unpinned request, as on any one-node fleet: a second node, when you add one, gives chat a fallback";
+
+/// Whether any node in `/api/cluster/nodes` reports GPU memory (`vram_gb`,
+/// in `capabilities` or at the top level; a unified-memory node reports its
+/// pool). `None` when the list is empty: an unread fleet is not a CPU-only one.
+pub(crate) fn fleet_has_gpu(fleet: &[Value]) -> Option<bool> {
+    if fleet.is_empty() {
+        return None;
+    }
+    Some(fleet.iter().any(|n| n["capabilities"]["vram_gb"].as_f64().or_else(|| n["vram_gb"].as_f64()).unwrap_or(0.0) > 0.0))
+}
+
+/// How many nodes `/api/cluster/nodes` lists. `None` when the list is
+/// empty: an unread fleet is not a one-node one.
+pub(crate) fn fleet_node_count(fleet: &[Value]) -> Option<usize> {
+    (!fleet.is_empty()).then_some(fleet.len())
+}
+
 /// The `default chat` row: where an unpinned request (`default`, `auto`, no
 /// model) goes right now — chat-default's live candidates in routing order
 /// (the gateway's `routing_order`), and who is left out. `x` when none; `!`
 /// when every candidate is CPU-only, when one node carries all of it (no
 /// fallback), or when only excluded nodes (thermal critical, quarantined)
 /// are left.
-pub(crate) fn default_chat_check(classes: Option<&Value>) -> Check {
+///
+/// The fleet's shape relaxes only those two warnings, and only when it is
+/// KNOWN (i1098: a fresh one-box install is healthy, not a warning):
+/// `has_gpu == Some(false)` ([`fleet_has_gpu`]) — CPU candidates are the
+/// only kind there can be; `fleet_nodes == Some(1)` ([`fleet_node_count`])
+/// — one node carries it all because there is no other. Each is then OK,
+/// with its "worth doing later" sentence in the detail (the brief tier,
+/// [`OK_LATER_TIERS`]). `None` keeps the warning. No candidate, a class
+/// that is not read, or only excluded nodes left are judged as ever.
+pub(crate) fn default_chat_check(classes: Option<&Value>, has_gpu: Option<bool>, fleet_nodes: Option<usize>) -> Check {
     const NAME: &str = "default chat";
     let Some(body) = classes else {
         return warn(NAME, "not read", Some("noo cluster class list".into()));
@@ -3102,13 +3246,22 @@ pub(crate) fn default_chat_check(classes: Option<&Value>) -> Check {
     if cd["last_resort"].as_bool() == Some(true) {
         return warn(NAME, format!("{detail} — only excluded nodes are left (thermal critical / quarantined)"), Some("noo cluster status".into()));
     }
-    if !order.iter().any(is_gpu) {
+    let cpu_only = !order.iter().any(is_gpu);
+    if cpu_only && has_gpu != Some(false) {
         return warn(NAME, format!("{detail} — only CPU candidates"), Some("noo cluster place <node> <backend> <model>".into()));
     }
-    if nodes.len() == 1 {
+    let one_node = nodes.len() == 1;
+    if one_node && fleet_nodes != Some(1) {
         return warn(NAME, format!("{detail} — one node carries every unpinned request (no fallback)"), Some("noo cluster place <node> <backend> <model>".into()));
     }
-    ok(NAME, detail)
+    let later: Vec<&str> = [cpu_only.then_some(CPU_ONLY_FLEET_CHAT_LATER), one_node.then_some(ONE_NODE_FLEET_CHAT_LATER)]
+        .into_iter()
+        .flatten()
+        .collect();
+    if later.is_empty() {
+        return ok(NAME, detail);
+    }
+    ok(NAME, format!("{detail} — {}", later.join("; ")))
 }
 
 /// The `embedding spaces` row (i145): each space, its one model and how many
@@ -3256,6 +3409,12 @@ pub(crate) fn agent_cert_check(id: &str, host: &str, covers: Option<bool>, other
     })
 }
 
+/// Where orphaned agent mail is read. No CLI command shows it (`noo agents
+/// inbox` reads the caller's own names only), so the remedy names the MCP
+/// tool as an MCP tool rather than as something to type in a shell.
+pub(crate) const AGENT_MAIL_ORPHANED_REMEDY: &str =
+    "read it with the MCP tool noo_agent_inbox (orphaned=true) from an agent session of that account; no noo command shows it";
+
 pub(crate) fn agent_mail_check(body: Option<&Value>) -> Check {
     const NAME: &str = "agent mail";
     let Some(body) = body else {
@@ -3283,7 +3442,7 @@ pub(crate) fn agent_mail_check(body: Option<&Value>) -> Check {
     warn(
         NAME,
         format!("{total} unread message(s) orphaned by retired mailboxes: {}", parts.join("; ")),
-        Some("read them with noo_agent_inbox orphaned=true through an MCP door (the account's own view)".into()),
+        Some(AGENT_MAIL_ORPHANED_REMEDY.into()),
     )
 }
 
@@ -5487,8 +5646,8 @@ pub(crate) fn at_rest_dirs(env: &dyn Fn(&str) -> Option<String>) -> Vec<AtRestDi
 /// LUKS2-volume plan. Both say what it protects (a drive in someone else's
 /// hands) and what it does not (root on the running machine). Planned, not
 /// built: no command is named. Rows with the same text print once.
-const AT_REST_REMEDY_KEYS: &str = "planned (i10a): seal these keys to this machine's TPM so they decrypt only into RAM at service start. Until then anyone holding the drive can read them; root on the running machine always can.";
-const AT_REST_REMEDY_DATA: &str = "planned (i10a): move the data root onto a LUKS2 volume on this disk (no reinstall), unlocked at boot by this machine's TPM. Until then anyone holding the drive can read these files; root on the running machine always can.";
+const AT_REST_REMEDY_KEYS: &str = "planned for a later release: seal these keys to this machine's TPM so they decrypt only into RAM at service start. Until then anyone holding the drive can read them; root on the running machine always can.";
+const AT_REST_REMEDY_DATA: &str = "planned for a later release: move the data root onto a LUKS2 volume on this disk (no reinstall), unlocked at boot by this machine's TPM. Until then anyone holding the drive can read these files; root on the running machine always can.";
 
 fn at_rest_remedy(name: &str) -> &'static str {
     match name {
@@ -5693,7 +5852,7 @@ pub(crate) fn at_rest_outside_check(
     warn(
         NAME,
         format!("in the clear, outside the ten rows above: {list}"),
-        Some("planned (i10a): claude-config and alertmanager-data ride the encrypted state volume; docker logs and journald need their own handling. Until then anyone holding the drive can read them.".into()),
+        Some("planned for a later release: claude-config and alertmanager-data ride the encrypted state volume; docker logs and journald need their own handling. Until then anyone holding the drive can read them.".into()),
     )
 }
 
@@ -6285,7 +6444,7 @@ pub(crate) fn agent_protect_check(nodes: &[(String, bool)], reports: &[(String, 
         return None;
     }
     let unheld: Vec<&str> = due.iter().copied().filter(|n| !held_nodes.contains(n)).collect();
-    if let Some(first) = unheld.first() {
+    if !unheld.is_empty() {
         let mut detail = format!(
             "no hold reported on {} (installed by onboard, or never applied): its node agent is not held to the paths it writes",
             unheld.join(", ")
@@ -6296,10 +6455,17 @@ pub(crate) fn agent_protect_check(nodes: &[(String, bool)], reports: &[(String, 
         return Some(warn(
             "agent protect",
             detail,
-            Some(format!("for each node listed: noo cluster provision {first} --wait")),
+            Some(provision_each(&unheld)),
         ));
     }
     Some(ok("agent protect", format!("the node agent writes only where it must on {}", held.join(", "))))
+}
+
+/// One `noo cluster provision <node> --wait` per node, in order:
+/// provision takes a single node, so a row that names several must give a
+/// command for each, not only the first.
+fn provision_each(nodes: &[&str]) -> String {
+    nodes.iter().map(|n| format!("noo cluster provision {n} --wait")).collect::<Vec<_>>().join("; ")
 }
 
 /// What a node's applier prints once it checks root code against the
@@ -8257,7 +8423,8 @@ fn verdict_line(t: &Tally) -> (Glyph, String) {
     (Glyph::Ok, format!("fleet healthy{}{seen}", t.context))
 }
 
-/// Where a WARN row goes in the brief rendering. A FAIL or STARTING row is
+/// Where a WARN row goes in the brief rendering, and the few OK rows that
+/// carry advice for later ([`OK_LATER_TIERS`]). A FAIL or STARTING row is
 /// never tiered: it always shows in full, first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Tier {
@@ -8285,7 +8452,22 @@ const BRIEF_TIERS: &[(&str, Option<&str>, Tier)] = &[
     ("inbound", Some("not yet checked"), Tier::NotHere),
 ];
 
+/// OK rows that still carry advice for later (i1098): the row name and the
+/// sentence its detail carries. Healthy for this fleet's shape, so not a
+/// warning; grouped under "Worth doing later" and `tier: "later"` all the
+/// same, so the advice is not lost.
+const OK_LATER_TIERS: &[(&str, &str)] = &[
+    ("default chat", CPU_ONLY_FLEET_CHAT_LATER),
+    ("default chat", ONE_NODE_FLEET_CHAT_LATER),
+];
+
 fn brief_tier(c: &Check) -> Option<Tier> {
+    if c.verdict == Verdict::Ok {
+        return OK_LATER_TIERS
+            .iter()
+            .any(|(name, sentence)| *name == c.name && c.detail.contains(*sentence))
+            .then_some(Tier::Later);
+    }
     if c.verdict != Verdict::Warn {
         return None;
     }
@@ -8312,9 +8494,9 @@ fn brief_split(checks: &[Check]) -> BriefSplit<'_> {
     let mut b = BriefSplit::default();
     for c in checks {
         match (c.verdict, brief_tier(c)) {
-            (Verdict::Ok, _) => b.passed += 1,
             (_, Some(Tier::Later)) => b.later.push(c),
             (_, Some(Tier::NotHere)) => b.not_here.push(c),
+            (Verdict::Ok, None) => b.passed += 1,
             _ => b.shown.push(c),
         }
     }
@@ -8641,6 +8823,7 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             &["security", "secrets", "audit"],
             &["security", "tailnet", "policy", "--merge"],
             &["security", "audit", "verify"],
+            &["security", "user", "list"],
         ];
         if licensed_on {
             reads.push(&["security", "entitlement", "show"]);
@@ -8648,13 +8831,14 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         let mut got = par_map(&reads, |w| self_json(g, w)).into_iter();
         let mut next = || got.next().unwrap_or((127, Value::Null, String::new()));
         let (_, posture, _) = next();
-        let (_, keys, _) = next();
+        let (kc, keys, ke) = next();
         let (sc, secrets, _) = next();
         let (_, exposure, _) = next();
         let (_, strangers, _) = next();
         let (ac, audit, _) = next();
         let (_, tailnet, _) = next();
         let (_, audit_verdict, _) = next();
+        let (uc, users, ue) = next();
         let entitlement_read = if licensed_on { Some(next()) } else { None };
         let audit_errors = if audit.is_null() { None } else {
             Some(audit["findings"].as_array().map(|f| f.iter().filter(|x| x["severity"] == "error" || x["severity"] == "ERROR").count() as u64)
@@ -8677,6 +8861,8 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             controller_from,
             &format!("{} security and doctor reads, side by side", reads.len()),
         );
+        // i1096: the keys that act as an admin, or mint agent tokens.
+        checks.push(key_bindings::row((kc, &keys, &ke), (uc, &users, &ue)));
         checks.push(system_credentials_check(crate::commands::systems::store_missing_credentials()));
         // Is there a recent backup, and is it anywhere but this machine? 2026-10-24:
         // the 03:30 run never happened and nothing said so; every dump sat on the
@@ -8811,7 +8997,7 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         let model_classes = get_json_opt(g, "/api/cluster/model-classes", true, 15);
         checks.push(model_classes_check(model_classes.as_ref()));
         // Where an unpinned chat goes: chat-default's live candidates.
-        checks.push(default_chat_check(model_classes.as_ref()));
+        checks.push(default_chat_check(model_classes.as_ref(), fleet_has_gpu(&fleet), fleet_node_count(&fleet)));
         let spaces = get_json_opt(g, "/api/cluster/embedding-spaces", true, 15);
         checks.push(embedding_spaces_check(spaces.as_ref()));
         // Finding 126: a loaded model measured over its estimate or pool.
@@ -8894,6 +9080,8 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             .collect();
         checks.push(pki_key_modes_check(&key_issues, &grant_lines, sso.list_keys().len()));
         checks.push(docker_userns_check(read_daemon_json()));
+        // Compose runs only here (the stack launcher); nodes never run it.
+        checks.push(docker_compose_check(&read_compose_version("docker"), &crate::onboard::steps::compose_remedy_here()));
         checks.push(tailscale_ssh_check(tailscale_status));
         let gw_mounts = std::fs::read_to_string(crate::envfile::repo_root().join("docker-compose.cluster.yml"))
             .ok()
@@ -9809,8 +9997,8 @@ fn checks_json(checks: &[Check]) -> Value {
 }
 
 /// A row's brief tier as `--json` names it: where the onboard brief groups a
-/// WARN ("later": worth doing later; "not_here": says nothing on this box),
-/// null for a row shown in full. Pure.
+/// WARN, or an OK row with advice for later ("later": worth doing later;
+/// "not_here": says nothing on this box), null otherwise. Pure.
 fn tier_json(t: Option<Tier>) -> Option<&'static str> {
     match t {
         Some(Tier::Later) => Some("later"),
@@ -10063,7 +10251,7 @@ mod tests {
                 {"node_id": "ctrl", "backend": "ollama", "model": "gemma4:e2b-it-qat", "gpu": false, "reason": "rank=cpu,params=2,load=0.05"},
             ],
             "skipped": [{"node_id": "node-a", "backend": "vllm", "reason": "thermal critical"}]}]});
-        let c = default_chat_check(Some(&two));
+        let c = default_chat_check(Some(&two), None, None);
         assert_eq!(c.verdict, super::Verdict::Ok, "{c:?}");
         assert!(c.detail.starts_with("dynamic: node-mac/ollama=gemma4:12b (rank=gpu,params=12,load=0.40) > ctrl/"), "{}", c.detail);
         assert!(c.detail.contains("skipped node-a/vllm: thermal critical"), "{}", c.detail);
@@ -10071,14 +10259,14 @@ mod tests {
         let cpu = serde_json::json!({"classes": [{"name": "chat-default", "dynamic": true, "routing_order": [
             {"node_id": "ctrl", "backend": "ollama", "model": "e2b", "gpu": false},
             {"node_id": "pi", "backend": "llamacpp", "model": "x", "gpu": false}]}]});
-        let c = default_chat_check(Some(&cpu));
+        let c = default_chat_check(Some(&cpu), None, None);
         assert_eq!(c.verdict, super::Verdict::Warn);
         assert!(c.detail.contains("only CPU"), "{}", c.detail);
 
         let one = serde_json::json!({"classes": [{"name": "chat-default", "dynamic": true, "routing_order": [
             {"node_id": "node-a", "backend": "vllm", "model": "HF", "gpu": true},
             {"node_id": "node-a", "backend": "ollama", "model": "m", "gpu": true}]}]});
-        let c = default_chat_check(Some(&one));
+        let c = default_chat_check(Some(&one), None, None);
         assert_eq!(c.verdict, super::Verdict::Warn);
         assert!(c.detail.contains("one node"), "{}", c.detail);
 
@@ -10087,17 +10275,17 @@ mod tests {
         let emb = serde_json::json!({"classes": [{"name": "chat-default", "dynamic": true, "routing_order": [
             {"node_id": "ctl", "backend": "ollama", "model": "harrier:latest", "gpu": true},
             {"node_id": "node-a", "backend": "vllm", "model": "HF", "gpu": true}]}]});
-        let c = default_chat_check(Some(&emb));
+        let c = default_chat_check(Some(&emb), None, None);
         assert!(!c.detail.contains("harrier"), "{}", c.detail);
         assert!(c.detail.contains("one node"), "only node-a is a chat node: {}", c.detail);
         let only_emb = serde_json::json!({"classes": [{"name": "chat-default", "dynamic": true, "routing_order": [
             {"node_id": "ctl", "backend": "ollama", "model": "harrier:latest", "gpu": true}]}]});
-        assert_eq!(default_chat_check(Some(&only_emb)).verdict, super::Verdict::Fail);
+        assert_eq!(default_chat_check(Some(&only_emb), None, None).verdict, super::Verdict::Fail);
 
         let none = serde_json::json!({"classes": [{"name": "chat-default", "dynamic": true, "routing_order": []}]});
-        assert_eq!(default_chat_check(Some(&none)).verdict, super::Verdict::Fail);
-        assert_eq!(default_chat_check(Some(&serde_json::json!({"classes": []}))).verdict, super::Verdict::Fail);
-        assert_eq!(default_chat_check(None).verdict, super::Verdict::Warn);
+        assert_eq!(default_chat_check(Some(&none), None, None).verdict, super::Verdict::Fail);
+        assert_eq!(default_chat_check(Some(&serde_json::json!({"classes": []})), None, None).verdict, super::Verdict::Fail);
+        assert_eq!(default_chat_check(None, None, None).verdict, super::Verdict::Warn);
     }
 
     use super::*;
@@ -14348,6 +14536,13 @@ mod tests {
         assert!(c.detail.contains(&format!("host5 refused its last bundle ({line}): a refused node refuses ALL bundles")), "{}", c.detail);
         let r = c.remedy.unwrap();
         assert!(r.contains("noo upgrade --stack") && !r.contains("published release"), "{r}");
+        // The applier's name line follows the ahead line (newlines are spaces
+        // in a report): it says neither REFUSED nor a bare `(75)`, so the
+        // quoted refusal is still the ahead line, cut at its own `(75)`.
+        let named = format!("noo-apply: {line} noo-apply: refusal=node_ahead_of_controller (exit 75) ");
+        let c = release_check_row(&[("node_a".into(), Some(75), named)]).unwrap();
+        assert!(c.detail.contains(&format!("node_a refused its last bundle ({line}): a refused node")), "{}", c.detail);
+        assert!(!c.detail.contains("refusal="), "{}", c.detail);
     }
 
     #[test]
@@ -16400,7 +16595,7 @@ mod default_chat_remedy_tests {
     /// verify and onboard's last line name the SAME one command (i677 #12).
     #[test]
     fn no_chat_default_names_the_first_model_command() {
-        let c = default_chat_check(Some(&serde_json::json!({"classes": []})));
+        let c = default_chat_check(Some(&serde_json::json!({"classes": []})), None, None);
         assert_eq!(c.verdict, Verdict::Fail);
         assert_eq!(c.remedy.as_deref(), Some(crate::onboard::FIRST_MODEL_CMD));
         assert!(crate::onboard::NO_CHAT_MODEL_YET.ends_with(c.remedy.as_deref().unwrap()));
@@ -17631,6 +17826,67 @@ mod docker_engine_tests {
 }
 
 #[cfg(test)]
+mod docker_compose_tests {
+    use super::*;
+
+    fn known(text: &str) -> ComposeVersion {
+        compose_version_from(true, &format!("{text}\n"), "")
+    }
+
+    #[test]
+    fn compose_versions_parse_with_a_prefix_or_a_suffix() {
+        assert_eq!(parse_compose_version("2.24.6"), Some((2, 24, 6)));
+        assert_eq!(parse_compose_version("v2.38.2"), Some((2, 38, 2)));
+        assert_eq!(parse_compose_version("2.29.1-desktop.1"), Some((2, 29, 1)));
+        for bad in ["", "   ", "garbage", "2.24", "v2", "2.x.6", "2.24.6.1"] {
+            assert_eq!(parse_compose_version(bad), None, "{bad:?}");
+            assert!(matches!(known(bad), ComposeVersion::Unreadable(_)), "{bad:?} -> {:?}", known(bad));
+        }
+        assert_eq!(known("v2.38.2"), ComposeVersion::Known((2, 38, 2), "v2.38.2".into()));
+    }
+
+    #[test]
+    fn a_failed_read_is_missing_or_unreadable() {
+        let gone = compose_version_from(false, "", "docker: 'compose' is not a docker command.\nSee 'docker --help'\n");
+        assert!(matches!(gone, ComposeVersion::Missing(_)), "{gone:?}");
+        let shim = compose_version_from(false, "", "unknown shorthand flag: 'f' in -f\n");
+        assert!(matches!(shim, ComposeVersion::Missing(_)), "{shim:?}");
+        let other = compose_version_from(false, "", "permission denied while trying to connect\n");
+        assert_eq!(other, ComposeVersion::Unreadable("permission denied while trying to connect".into()));
+    }
+
+    #[test]
+    fn a_compose_below_the_minimum_warns_with_the_upgrade() {
+        for v in ["2.24.5", "v2.20.2", "1.29.2"] {
+            let c = docker_compose_check(&known(v), "install it");
+            assert_eq!(c.verdict, Verdict::Warn, "{v}: {c:?}");
+            assert_eq!(c.detail, format!("Docker Compose {v} is older than the oldest version noomesh tests (2.24.6)"));
+            assert!(c.remedy.as_deref().unwrap_or("").starts_with("upgrade the docker-compose-v2 package"), "{:?}", c.remedy);
+        }
+    }
+
+    #[test]
+    fn a_compose_at_or_above_the_minimum_is_ok() {
+        for v in ["2.24.6", "v2.38.2", "2.29.1-desktop.1", "2.25.0", "3.0.0"] {
+            let c = docker_compose_check(&known(v), "install it");
+            assert_eq!(c.verdict, Verdict::Ok, "{v}: {c:?}");
+            assert!(c.detail.contains(v), "{}", c.detail);
+        }
+        assert_eq!(MIN_COMPOSE, (2, 24, 6), "the declared minimum is the operator's: the start-inputs job's oldest Compose");
+    }
+
+    #[test]
+    fn an_unreadable_compose_warns_and_a_missing_one_fails_with_the_package() {
+        let c = docker_compose_check(&ComposeVersion::Unreadable("exit 1".into()), "install it");
+        assert_eq!(c.verdict, Verdict::Warn, "{c:?}");
+        assert!(c.detail.starts_with("cannot be checked: the Docker Compose version could not be read (exit 1)"), "{}", c.detail);
+        let m = docker_compose_check(&ComposeVersion::Missing("not a docker command".into()), "install it with: sudo apt install docker-compose-v2");
+        assert_eq!(m.verdict, Verdict::Fail, "{m:?}");
+        assert_eq!(m.remedy.as_deref(), Some("install it with: sudo apt install docker-compose-v2"));
+    }
+}
+
+#[cfg(test)]
 mod agent_cert_tests {
     use super::*;
 
@@ -17739,5 +17995,213 @@ mod json_parity_tests {
         assert!(seats_json(false, Vec::new()).is_null());
         assert_eq!(seats_json(true, Vec::new()), serde_json::json!([]));
         assert_eq!(seats_json(true, vec![serde_json::json!({"seat": "s"})]).as_array().map(Vec::len), Some(1));
+    }
+}
+
+/// Every remedy below is a command the user can run, or says plainly that
+/// none is needed or where the thing is read: no runbook pointer, no
+/// internal tracking id, no node left out.
+#[cfg(test)]
+mod remedy_command_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// The `holds` row gives the hold command itself, on the node, for
+    /// exactly the packages not held — not a pointer into a runbook.
+    #[test]
+    fn the_holds_remedy_is_the_apt_mark_hold_command_on_the_node() {
+        let h = json!({
+            "os": "linux", "running_kernel": "7.0.11", "default_kernel": "7.0.11",
+            "platform": { "linux-system76": "7.1.5", "tailscale": "1.102.4", "docker-ce": "29.8.1" },
+            "held": ["linux-system76"],
+            "tailscale_state": "Running", "tailscale_online": true,
+        });
+        let c = host_checks("node_a", &h, true);
+        let holds = c.iter().find(|c| c.name == "holds").expect("a holds row");
+        assert_eq!(holds.verdict, Verdict::Warn);
+        assert_eq!(holds.remedy.as_deref(), Some("on node_a: sudo apt-mark hold docker-ce tailscale"));
+    }
+
+    /// The at-rest rows say what is planned without an internal id.
+    #[test]
+    fn the_at_rest_remedies_carry_no_internal_id() {
+        let item = |what: &str, path: &str| OutsideItem { what: what.into(), path: path.into(), encrypted: Some(false) };
+        let outside = at_rest_outside_check(&[item("docker volume claude-config", "/var/lib/docker/volumes/x_claude-config/_data")], None);
+        let outside = outside.remedy.expect("an exposed location has a remedy");
+        for r in [AT_REST_REMEDY_KEYS, AT_REST_REMEDY_DATA, outside.as_str()] {
+            assert!(!r.contains("i10a") && r.starts_with("planned for a later release: "), "{r}");
+        }
+    }
+
+    /// `noo cluster provision` takes one node, so the agent protect row
+    /// gives one command per unheld node, every one of them.
+    #[test]
+    fn the_agent_protect_remedy_provisions_every_unheld_node() {
+        let nodes = [("ctrl".to_string(), false), ("node_a".to_string(), false), ("node_b".to_string(), false)];
+        let reports = [("node_b".to_string(), Some(0), "applied: agent-protect=8".to_string())];
+        let c = agent_protect_check(&nodes, &reports).expect("a row");
+        assert_eq!(c.verdict, Verdict::Warn, "{}", c.detail);
+        assert_eq!(
+            c.remedy.as_deref(),
+            Some("noo cluster provision ctrl --wait; noo cluster provision node_a --wait"),
+        );
+    }
+
+    /// On a fleet with no GPU node, CPU candidates are all there can be: the
+    /// row is OK and names no place command. With a GPU node it keeps the
+    /// warning and the suggestion, and an unread fleet is not taken for a
+    /// CPU-only one.
+    #[test]
+    fn the_default_chat_cpu_only_remedy_depends_on_the_fleet_having_a_gpu() {
+        let cpu = json!({"classes": [{"name": "chat-default", "dynamic": true, "routing_order": [
+            {"node_id": "ctrl", "backend": "ollama", "model": "e2b", "gpu": false},
+            {"node_id": "node_a", "backend": "ollama", "model": "e2b", "gpu": false}]}]});
+        let c = default_chat_check(Some(&cpu), Some(false), None);
+        assert_eq!(c.verdict, Verdict::Ok, "{}", c.detail);
+        assert_eq!(c.remedy, None);
+        assert!(!CPU_ONLY_FLEET_CHAT_LATER.contains("noo cluster place"));
+        for has_gpu in [Some(true), None] {
+            let c = default_chat_check(Some(&cpu), has_gpu, None);
+            assert_eq!(c.verdict, Verdict::Warn, "{has_gpu:?}");
+            assert_eq!(c.remedy.as_deref(), Some("noo cluster place <node> <backend> <model>"), "{has_gpu:?}");
+        }
+        let cpu_fleet = [json!({"id": "ctrl", "capabilities": {"vram_gb": 0.0}}), json!({"id": "node_a"})];
+        assert_eq!(fleet_has_gpu(&cpu_fleet), Some(false));
+        let gpu_fleet = [json!({"id": "ctrl"}), json!({"id": "node_a", "capabilities": {"vram_gb": 24.0}})];
+        assert_eq!(fleet_has_gpu(&gpu_fleet), Some(true));
+        assert_eq!(fleet_has_gpu(&[json!({"id": "node_b", "vram_gb": 8.0})]), Some(true));
+        assert_eq!(fleet_has_gpu(&[]), None);
+    }
+
+    /// Orphaned agent mail is read through an MCP tool; the remedy names it
+    /// as one and does not pass it off as a shell command.
+    #[test]
+    fn the_agent_mail_remedy_names_the_mcp_tool_as_one() {
+        let body = json!({"accounts": [{"account": "owner", "orphaned": [{"name": "owner/w", "unread": 2}]}]});
+        let c = agent_mail_check(Some(&body));
+        let r = c.remedy.expect("a remedy");
+        assert_eq!(r, AGENT_MAIL_ORPHANED_REMEDY);
+        assert!(r.contains("the MCP tool noo_agent_inbox (orphaned=true)") && !r.starts_with("read them with"), "{r}");
+    }
+}
+
+#[cfg(test)]
+mod default_chat_fleet_shape_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn class(order: Value) -> Value {
+        json!({"classes": [{"name": "chat-default", "dynamic": true, "routing_order": order}]})
+    }
+
+    /// A fresh one-box install (i1098): one node, no GPU, one CPU chat model.
+    fn fresh_box() -> Value {
+        class(json!([{"node_id": "ctrl", "backend": "ollama", "model": "e2b", "gpu": false}]))
+    }
+
+    /// No GPU anywhere: CPU candidates are all there can be. OK, worth doing
+    /// later, with no remedy; `--json` and the brief both say "later".
+    #[test]
+    fn a_fleet_known_to_have_no_gpu_is_ok_later() {
+        let two_cpu = class(json!([
+            {"node_id": "ctrl", "backend": "ollama", "model": "e2b", "gpu": false},
+            {"node_id": "node_a", "backend": "llamacpp", "model": "x", "gpu": false}]));
+        let c = default_chat_check(Some(&two_cpu), Some(false), Some(2));
+        assert_eq!(c.verdict, Verdict::Ok, "{}", c.detail);
+        assert_eq!(c.remedy, None);
+        assert!(c.detail.ends_with(&format!(" — {CPU_ONLY_FLEET_CHAT_LATER}")), "{}", c.detail);
+        assert_eq!(brief_tier(&c), Some(Tier::Later));
+        assert_eq!(checks_json(std::slice::from_ref(&c))[0]["tier"], "later");
+        assert_eq!(checks_json(std::slice::from_ref(&c))[0]["verdict"], "ok");
+        let b = brief_split(std::slice::from_ref(&c));
+        assert_eq!((b.passed, b.shown.len(), b.later.len()), (0, 0, 1), "folded under Worth doing later");
+    }
+
+    /// One node: it carries every unpinned request because there is no
+    /// other. OK, worth doing later.
+    #[test]
+    fn a_fleet_known_to_be_one_node_is_ok_later() {
+        let gpu_one = class(json!([
+            {"node_id": "node_a", "backend": "vllm", "model": "HF", "gpu": true},
+            {"node_id": "node_a", "backend": "ollama", "model": "m", "gpu": true}]));
+        let c = default_chat_check(Some(&gpu_one), Some(true), Some(1));
+        assert_eq!(c.verdict, Verdict::Ok, "{}", c.detail);
+        assert_eq!(c.remedy, None);
+        assert!(c.detail.ends_with(&format!(" — {ONE_NODE_FLEET_CHAT_LATER}")), "{}", c.detail);
+        assert_eq!(brief_tier(&c), Some(Tier::Later));
+        // The literal stranger's box: both sentences, OK, later.
+        let c = default_chat_check(Some(&fresh_box()), Some(false), Some(1));
+        assert_eq!(c.verdict, Verdict::Ok, "{}", c.detail);
+        assert!(c.detail.contains(CPU_ONLY_FLEET_CHAT_LATER) && c.detail.contains(ONE_NODE_FLEET_CHAT_LATER), "{}", c.detail);
+        assert_eq!(checks_json(std::slice::from_ref(&c))[0]["tier"], "later");
+    }
+
+    /// An unread fleet (`None`) is neither GPU-less nor one node: today's
+    /// warnings, with today's remedy.
+    #[test]
+    fn an_unknown_fleet_shape_keeps_the_warning() {
+        let c = default_chat_check(Some(&fresh_box()), None, None);
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.ends_with(" — only CPU candidates"), "{}", c.detail);
+        assert_eq!(c.remedy.as_deref(), Some("noo cluster place <node> <backend> <model>"));
+        // A known one-node fleet does not excuse CPU chat when the GPU is unknown.
+        assert_eq!(default_chat_check(Some(&fresh_box()), None, Some(1)).verdict, Verdict::Warn);
+        let gpu_one = class(json!([{"node_id": "node_a", "backend": "vllm", "model": "HF", "gpu": true}]));
+        let c = default_chat_check(Some(&gpu_one), Some(true), None);
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.ends_with(" — one node carries every unpinned request (no fallback)"), "{}", c.detail);
+        assert_eq!(brief_tier(&c), None, "a warning stays in view");
+        // The GPU fleet with CPU-only chat: a GPU node could take it.
+        assert_eq!(default_chat_check(Some(&fresh_box()), Some(true), Some(1)).verdict, Verdict::Warn);
+    }
+
+    /// The fleet's shape relaxes only "nothing better can be placed": no
+    /// live candidate still fails, an unread class still warns, only
+    /// excluded nodes still warns, on a GPU-less one-node fleet too.
+    #[test]
+    fn a_dead_or_unread_default_chat_on_a_no_gpu_fleet_is_judged_as_before() {
+        let none = class(json!([]));
+        let c = default_chat_check(Some(&none), Some(false), Some(1));
+        assert_eq!(c.verdict, Verdict::Fail);
+        assert_eq!(c.remedy.as_deref(), Some("noo cluster class list"));
+        let declared_dead = json!({"classes": [{"name": "chat-default", "declared": true,
+            "candidates": [{"node_id": "ctrl", "backend": "ollama", "model": "e2b", "status": "unplaced"}]}]});
+        let c = default_chat_check(Some(&declared_dead), Some(false), Some(1));
+        assert_eq!(c.verdict, Verdict::Fail, "{}", c.detail);
+        assert!(c.detail.starts_with("chat-default (declared) has no live candidate"), "{}", c.detail);
+        assert_eq!(default_chat_check(Some(&json!({"classes": []})), Some(false), Some(1)).verdict, Verdict::Fail);
+        let c = default_chat_check(None, Some(false), Some(1));
+        assert_eq!((c.verdict, c.detail.as_str()), (Verdict::Warn, "not read"));
+        let excluded = json!({"classes": [{"name": "chat-default", "dynamic": true, "last_resort": true, "routing_order": [
+            {"node_id": "ctrl", "backend": "ollama", "model": "e2b", "gpu": false}]}]});
+        let c = default_chat_check(Some(&excluded), Some(false), Some(1));
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.contains("only excluded nodes are left"), "{}", c.detail);
+    }
+
+    /// A GPU fleet of several nodes with no GPU chat, or with chat on one
+    /// of them only, warns as ever; a GPU-less fleet of several nodes whose
+    /// chat sits on one of them still warns that nothing backs it up.
+    #[test]
+    fn a_gpu_or_multi_node_fleet_keeps_todays_verdict() {
+        let c = default_chat_check(Some(&fresh_box()), Some(true), Some(3));
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.ends_with(" — only CPU candidates"), "{}", c.detail);
+        let gpu_one = class(json!([{"node_id": "node_a", "backend": "vllm", "model": "HF", "gpu": true}]));
+        let c = default_chat_check(Some(&gpu_one), Some(true), Some(3));
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.contains("one node carries every unpinned request (no fallback)"), "{}", c.detail);
+        let c = default_chat_check(Some(&fresh_box()), Some(false), Some(3));
+        assert_eq!(c.verdict, Verdict::Warn, "no GPU excuses CPU chat, not the missing fallback: {}", c.detail);
+        assert!(c.detail.contains("one node carries every unpinned request (no fallback)"), "{}", c.detail);
+        let gpu_two = class(json!([
+            {"node_id": "node_a", "backend": "vllm", "model": "HF", "gpu": true},
+            {"node_id": "ctrl", "backend": "ollama", "model": "e2b", "gpu": false}]));
+        let c = default_chat_check(Some(&gpu_two), Some(true), Some(3));
+        assert_eq!(c.verdict, Verdict::Ok);
+        assert_eq!(brief_tier(&c), None, "a plain OK is passed, not later");
+        assert_eq!(brief_split(std::slice::from_ref(&c)).passed, 1);
+        assert_eq!(fleet_node_count(&[]), None);
+        assert_eq!(fleet_node_count(&[json!({"id": "ctrl"})]), Some(1));
     }
 }

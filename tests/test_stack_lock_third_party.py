@@ -113,7 +113,7 @@ def _rows(tmp_path, wf):
                    "--mirror-workflow", str(wf), "--only", "nginx"])
 
 
-def test_a_mirror_row_is_gated(mirrored_nginx, tmp_path, monkeypatch):
+def test_a_mirror_row_is_gated(mirrored_nginx, tmp_path, monkeypatch, capsys):
     seen = []
     monkeypatch.setattr(M, "resolve", lambda ref: seen.append(ref) or D)
     assert M.mirror_org("nginx") == ORG
@@ -121,6 +121,11 @@ def test_a_mirror_row_is_gated(mirrored_nginx, tmp_path, monkeypatch):
     assert seen == [NGX + ":9.9.9"], "resolved from OUR mirror"
     assert mirrored_nginx == [(NGX, D)], "the pinned digest was read anonymously"
     assert (tmp_path / "d" / "nginx").read_text() == f"nginx@{D}\n"
+    # the release log says each gate passed, before the row it vouches for
+    out = capsys.readouterr().out.splitlines()
+    assert out == [f"  provenance ok: nginx@{D} = mirror-images.yml lane source",
+                   f"  anonymous pull ok: {NGX}@{D}",
+                   f"nginx@{D}   ({NGX}:9.9.9)"], out
 
 
 def test_a_lane_without_dest_org_copies_to_the_namespace_org(mirrored_nginx, tmp_path, monkeypatch):
@@ -142,8 +147,10 @@ def test_a_lane_without_dest_org_copies_to_the_namespace_org(mirrored_nginx, tmp
 def test_rows_refuses_a_mirror_that_is_not_its_upstream(mirrored_nginx, tmp_path, monkeypatch, capsys, lanes, why):
     monkeypatch.setattr(M, "resolve", lambda ref: D)
     assert _rows(tmp_path, _mirror_wf(tmp_path, *lanes)) == 1
-    assert why in capsys.readouterr().err
+    cap = capsys.readouterr()
+    assert why in cap.err
     assert not (tmp_path / "d").exists(), "no row for a mirror whose provenance failed"
+    assert "provenance ok" not in cap.out and "anonymous pull ok" not in cap.out, cap.out
 
 
 @pytest.mark.parametrize("state, got", [("unreadable", ""), ("absent", ""), ("error:token HTTP 500", ""),
@@ -153,8 +160,11 @@ def test_rows_refuses_a_mirror_a_stranger_cannot_pull(mirrored_nginx, tmp_path, 
     monkeypatch.setattr(M, "resolve", lambda ref: D)
     monkeypatch.setattr(M, "anonymous_digest", lambda repo, d: (state, got))
     assert _rows(tmp_path, _mirror_wf(tmp_path, (f"nginx:9.9.9@{D}", "nginx:9.9.9", ORG))) == 1
-    assert "not pullable anonymously" in capsys.readouterr().err
+    cap = capsys.readouterr()
+    assert "not pullable anonymously" in cap.err
     assert not (tmp_path / "d").exists()
+    # provenance passed and says so; the anonymous gate refused and says no "ok"
+    assert cap.out.splitlines() == [f"  provenance ok: nginx@{D} = mirror-images.yml lane source"], cap.out
 
 
 def test_the_anonymous_read_sends_no_credentials(monkeypatch):

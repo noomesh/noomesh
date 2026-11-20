@@ -1536,6 +1536,14 @@ fn print_final_summary(ctx: &Ctx) {
             Some(_) => {}
         }
     }
+    // Every step that writes a container's inputs has run, and the posture
+    // restart (which labels what it recreates, noomesh-restart.sh) too: bring
+    // the stack in line with them NOW, with the operator's own plain start,
+    // so the first `noo stack start` after onboard recreates nothing. On a
+    // fresh install that is nats (users.conf), worker and trellion (the model
+    // step's noomesh.yaml, written after their service-key recreate); the
+    // gateway was recreated, labelled, by the posture restart above.
+    steps::converge_stack(ctx);
     // An install is not done until it verifies: the same
     // invariants `noo cluster verify --controller` asserts, printed here so
     // the last thing the operator reads is what still needs doing.
@@ -2066,6 +2074,34 @@ mod posture_tests {
         let own = crate::test_src::own_code(include_str!("mod.rs"));
         let body = crate::test_src::fn_body(&own, "fn print_final_summary(");
         assert!(body.contains(r#"sh::run_script_streamed(ctx, "noomesh-restart.sh", &["--force", "gateway", "--data-warning-shown"])"#), "{body}");
+    }
+
+    /// 0.6.29-rc.1 install matrix (every amd64 fresh cell): the first
+    /// `noo stack start` after onboard recreated gateway, nats, trellion and
+    /// worker, because onboard wrote their inputs after its own start. Onboard
+    /// now ends converged: `drive` runs every step that writes an input
+    /// (`run_all`: services, service keys, self node, model, add-ons) BEFORE
+    /// the summary, and the summary's plain start comes AFTER the posture
+    /// restart (the last recreate onboard does itself) and before the
+    /// closing verify (which reads the converged stack).
+    #[test]
+    fn onboard_ends_with_the_stack_in_line_with_what_it_wrote() {
+        let own = crate::test_src::own_code(include_str!("mod.rs"));
+        let drive = crate::test_src::fn_body(&own, "pub(crate) fn drive(");
+        let steps_run = drive.find("run_all(ctx);").expect("drive runs the steps");
+        let summary = drive.find("print_final_summary(ctx);").expect("drive prints the summary");
+        assert!(steps_run < summary, "the summary (and its last start) must follow every step");
+        let body = crate::test_src::fn_body(&own, "fn print_final_summary(");
+        let converge = body.find("steps::converge_stack(ctx);").expect("onboard does not end converged");
+        let posture = body.find(r#""noomesh-restart.sh", &["--force", "gateway""#).expect("posture restart");
+        let verify = body.find("FINAL_VERIFY_ARGS").expect("closing verify");
+        assert!(posture < converge, "the last start must follow onboard's own last recreate (the posture restart)");
+        assert!(converge < verify, "the closing verify must read the converged stack");
+        assert_eq!(body.matches("steps::converge_stack(ctx);").count(), 1, "ONE last start");
+        // No step that writes an input runs after it.
+        for writer in ["provision_service_keys(", "first_model(", "addons(ctx)", "services(ctx)", "pki_enrollment("] {
+            assert!(!body[converge..].contains(writer), "{writer} runs after the last start");
+        }
     }
     use std::io::{Read, Write};
 

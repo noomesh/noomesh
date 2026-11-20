@@ -71,7 +71,7 @@ start_inputs_secret_digests() {
 # were computed, appends the override to $COMPOSE_FILES. 1 = refused (the key
 # cannot be read); the caller exits before `up`.
 start_inputs_prepare() {
-    local _json _rc _dd _v
+    local _json _rc _dd _v _only _s
     START_UP_FORCE=""
     if [ "${START_RECREATE:-false}" = true ]; then
         START_UP_FORCE="--force-recreate"
@@ -93,11 +93,14 @@ start_inputs_prepare() {
         _v="$(_start_inputs_env "$_v")"
         [ -n "$_v" ] && _dd+=(--data-dir "$(_start_inputs_abs "$_v")")
     done
+    # A recreate outside a start records only the services it recreates.
+    _only=()
+    for _s in ${START_INPUTS_ONLY:-}; do _only+=(--only "$_s"); done
     _rc=0
     printf '%s' "$_json" | python3 "$_START_INPUTS_PY" fingerprint \
         --key-file "$(start_inputs_key_file)" --root "$PWD" \
         --pki-dir "$(_start_inputs_abs "$(_start_inputs_env NOO_PKI_DIR)")" \
-        "${_dd[@]+"${_dd[@]}"}" \
+        "${_dd[@]+"${_dd[@]}"}" "${_only[@]+"${_only[@]}"}" \
         --secret-digests "${NOO_SECRET_RUNDIR:-/nonexistent}/$START_INPUTS_SECRET_CACHE_NAME" \
         --old-state "$START_INPUTS_STATE" \
         --override-out "$START_INPUTS_OVERRIDE" --state-out "$START_INPUTS_STATE.new" || _rc=$?
@@ -155,6 +158,36 @@ start_inputs_report() {
         mv -f "$START_INPUTS_STATE.new" "$START_INPUTS_STATE" 2>/dev/null || true
     fi
     rm -f "$1" "$2" 2>/dev/null
+    return 0
+}
+
+# start_inputs_label_for_up [SERVICE...] — an `up` OUTSIDE a start
+# (noomesh-restart.sh --force, a created missing container, noomesh-rebuild.sh)
+# carries the same labels: without them the container is made with no
+# noo.inputs label and the next plain start recreates it whatever changed
+# (0.6.29-rc.1 install matrix: onboard's `restart --force worker trellion`
+# and `restart --force gateway` made the first `noo stack start` recreate
+# them). Appends the override to $COMPOSE_FILES; never forces (the caller's
+# `up` says what it recreates). SERVICEs named: only those are recorded in
+# the state; none: every service. The caller then runs
+# start_inputs_commit_state after a good `up`, start_inputs_discard_state
+# otherwise. 1 = refused (the key cannot be read): the caller exits.
+start_inputs_label_for_up() {
+    local _rc=0
+    START_RECREATE=false START_INPUTS_ONLY="$*" start_inputs_prepare || _rc=1
+    START_UP_FORCE=""
+    return "$_rc"
+}
+
+start_inputs_commit_state() {
+    if [ -f "$START_INPUTS_STATE.new" ]; then
+        mv -f "$START_INPUTS_STATE.new" "$START_INPUTS_STATE" 2>/dev/null || true
+    fi
+    return 0
+}
+
+start_inputs_discard_state() {
+    rm -f "$START_INPUTS_STATE.new" 2>/dev/null
     return 0
 }
 

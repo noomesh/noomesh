@@ -471,7 +471,22 @@ pub fn prerequisites(ctx: &mut Ctx) -> bool {
     // Skipped when docker itself is missing: that row already failed.
     if tool_version("docker").is_some() {
         match probe_compose("docker") {
-            Ok(v) => ctx.success(&format!("docker compose: {v}")),
+            // A working Compose below the oldest one CI tests: WARN, never
+            // refuse (a declared floor, not a known failure). Same verdict as
+            // the controller's `docker compose` verify row.
+            Ok(v) => {
+                use crate::commands::cluster_verify::{compose_version_from_text, docker_compose_check, Verdict};
+                let row = docker_compose_check(&compose_version_from_text(&v), "");
+                match row.verdict {
+                    Verdict::Ok => ctx.success(&format!("docker compose: {v}")),
+                    _ => {
+                        ctx.warn(&format!("docker compose: {}", row.detail));
+                        if let Some(r) = row.remedy {
+                            ctx.warn(&format!("  {r}"));
+                        }
+                    }
+                }
+            }
             Err(why) => {
                 ctx.error("docker compose: MISSING — the Compose v2 plugin runs every service");
                 ctx.error(&format!("  `docker compose version` failed: {why}"));
@@ -700,6 +715,12 @@ fn compose_remedy(os_release: &str, docker_ce: bool) -> String {
         Some(pkg) => format!("install it with: sudo apt install {pkg}  (Compose v2, not the old docker-compose)"),
         None => "install the Docker Compose v2 plugin (not the old docker-compose): https://docs.docker.com/compose/install/linux/".into(),
     }
+}
+
+/// The compose-v2 install remedy for this machine (the `docker compose`
+/// verify row's FAIL names the same package onboard does).
+pub(crate) fn compose_remedy_here() -> String {
+    compose_remedy(&os_release_text(), docker_ce_installed())
 }
 
 fn os_release_text() -> String {
@@ -9642,6 +9663,157 @@ pub fn provision_service_keys(ctx: &mut Ctx) {
     if sh::run_script_streamed(ctx, "noomesh-restart.sh", &argv) != 0 {
         ctx.warn(&format!(
             "Recreate failed — the keys ARE stored; run: noo stack restart --force {}", recreate.join(" ")));
+    }
+}
+
+/// Onboard's last start, after its last write: the same plain start
+/// `noo stack start` runs (no arguments: the launcher reads the install mode
+/// and profile from the install), which recreates exactly the containers
+/// whose `noo.inputs` label no longer matches their files
+/// (scripts/lib-start-inputs.sh).
+///
+/// Why it is needed (0.6.29-rc.1 install matrix, every amd64 fresh cell: the
+/// first `noo stack start` after onboard recreated 4 containers): onboard
+/// keeps writing inputs after its Service Setup start (the self node's
+/// certificate into pki/public/nodes, its NATS user into users.conf, the
+/// service keys, the model step's noomesh.yaml), and its own recreates
+/// (`noomesh-restart.sh --force`) carried no `noo.inputs` label (they do
+/// now). Without this start the operator's first `noo stack start` did
+/// onboard's recreates for it, and the worker and trellion ran on the
+/// noomesh.yaml they read before the model step until then.
+pub fn converge_stack(ctx: &Ctx) {
+    if ctx.dry_run {
+        ctx.dry("bring the stack in line with what onboard wrote: one plain start (recreates only the containers whose secrets or config changed)");
+        return;
+    }
+    if !ctx.state.services_started {
+        return;
+    }
+    // An older launcher on disk forces every full start: running it here
+    // would recreate every container for nothing.
+    if !sh::launcher_takes_recreate(&ctx.repo_root.join("scripts/noomesh-start.sh")) {
+        return;
+    }
+    ctx.progress("Bringing the stack in line with what onboard wrote (recreates only the containers whose secrets or config changed since they started)...");
+    let before = compose_container_ids(ctx);
+    let code = sh::run_script_streamed(ctx, "noomesh-start.sh", &[]);
+    if code != 0 {
+        ctx.warn("The stack could not be brought in line with what onboard wrote — run: noo stack start (it recreates only what changed)");
+        return;
+    }
+    let (recreated, created) = recreated_by(&before, &compose_container_ids(ctx));
+    ctx.success(&converge_line(&recreated, &created));
+    // The closing verify asks the gateway next.
+    if recreated.iter().chain(created.iter()).any(|s| s == "gateway")
+        && !sh::wait_for_http(ctx, "https://localhost:8080/health", 120)
+    {
+        ctx.warn("The gateway is not answering yet after its recreate — check: noo health");
+    }
+}
+
+/// "service container-id" for every compose container of this install
+/// (by its name prefix). Empty when docker cannot say.
+fn compose_container_ids(ctx: &Ctx) -> String {
+    let prefix = match ctx.read_env("NOO_CONTAINER_PREFIX") {
+        p if p.trim().is_empty() => "noo".to_string(),
+        p => p.trim().to_string(),
+    };
+    let name = format!("name=^{prefix}-");
+    let (code, out) = sh::docker(&[
+        "ps", "-a", "--filter", &name, "--filter", "label=com.docker.compose.service",
+        "--format", "{{.Label \"com.docker.compose.service\"}} {{.ID}}",
+    ]);
+    if code == 0 { out } else { String::new() }
+}
+
+/// (recreated, created) services between two `compose_container_ids`
+/// listings: recreated = the same service under a new container id; created
+/// = a service that had no container before. Nothing is called created when
+/// the first listing is empty (docker could not say). Pure.
+pub(crate) fn recreated_by(before: &str, after: &str) -> (Vec<String>, Vec<String>) {
+    let parse = |s: &str| -> std::collections::BTreeMap<String, String> {
+        s.lines()
+            .filter_map(|l| {
+                let mut it = l.split_whitespace();
+                let svc = it.next()?;
+                let id = it.next()?;
+                Some((svc.to_string(), id.to_string()))
+            })
+            .collect()
+    };
+    let (b, a) = (parse(before), parse(after));
+    let recreated: Vec<String> = a
+        .iter()
+        .filter(|(s, id)| b.get(*s).is_some_and(|old| old != *id))
+        .map(|(s, _)| s.clone())
+        .collect();
+    let created: Vec<String> = if b.is_empty() {
+        Vec::new()
+    } else {
+        a.keys().filter(|s| !b.contains_key(*s)).cloned().collect()
+    };
+    (recreated, created)
+}
+
+/// The wizard's line for `converge_stack`, naming what moved. Pure.
+pub(crate) fn converge_line(recreated: &[String], created: &[String]) -> String {
+    let mut line = format!("Stack in line with what onboard wrote: {} recreated", recreated.len());
+    if !recreated.is_empty() {
+        line.push_str(&format!(" ({})", recreated.join(", ")));
+    }
+    if !created.is_empty() {
+        line.push_str(&format!(", {} created ({})", created.len(), created.join(", ")));
+    }
+    line
+}
+
+#[cfg(test)]
+mod converge_tests {
+    use super::{converge_line, recreated_by};
+
+    /// The listings around onboard's last start: the services whose id
+    /// changed are named, the rest are not; a new service is "created".
+    #[test]
+    fn the_last_start_names_exactly_the_services_it_recreated() {
+        let before = "gateway aaa\nnats bbb\nworker ccc\ntrellion ddd\nredis eee\n";
+        let after = "gateway a2\nnats b2\nworker c2\ntrellion d2\nredis eee\nvoice fff\n";
+        let (recreated, created) = recreated_by(before, after);
+        assert_eq!(recreated, ["gateway", "nats", "trellion", "worker"]);
+        assert_eq!(created, ["voice"]);
+        assert_eq!(converge_line(&recreated, &created),
+            "Stack in line with what onboard wrote: 4 recreated (gateway, nats, trellion, worker), 1 created (voice)");
+    }
+
+    /// Nothing moved: "0 recreated", no list. Docker could not list the
+    /// containers before: nothing is called created.
+    #[test]
+    fn nothing_moved_says_zero_and_an_empty_listing_invents_nothing() {
+        let same = "gateway aaa\nredis eee\n";
+        let (recreated, created) = recreated_by(same, same);
+        assert!(recreated.is_empty() && created.is_empty());
+        assert_eq!(converge_line(&recreated, &created), "Stack in line with what onboard wrote: 0 recreated");
+        let (recreated, created) = recreated_by("", same);
+        assert!(recreated.is_empty() && created.is_empty(), "{recreated:?} {created:?}");
+        assert!(recreated_by("gateway aaa\n", "").0.is_empty(), "a container gone is not a recreate");
+    }
+
+    /// The last start is the PLAIN start `noo stack start` runs: no
+    /// `--recreate` (that would recreate all 13 again), no `--core-only`
+    /// (the add-ons are on by now), no arguments at all (the launcher reads
+    /// the install mode and profile itself, exactly as the operator's start
+    /// does, so both compute the same labels). Gated on a launcher that
+    /// labels (an older one forces every full start), and only after a start.
+    #[test]
+    fn the_last_start_is_the_plain_start_of_a_labelling_launcher() {
+        let own = crate::test_src::own_code(include_str!("steps.rs"));
+        let body = crate::test_src::fn_body(&own, "pub fn converge_stack(");
+        assert!(body.contains(r#"sh::run_script_streamed(ctx, "noomesh-start.sh", &[])"#), "{body}");
+        assert!(!body.contains("--recreate") && !body.contains("--core-only") && !body.contains("--force"), "{body}");
+        let gate = body.find("if !sh::launcher_takes_recreate(").expect("the labelling-launcher gate");
+        let started = body.find("if !ctx.state.services_started {").expect("the started gate");
+        let run = body.find("run_script_streamed(").unwrap();
+        assert!(gate < run && started < run, "{body}");
+        assert!(body.contains("ctx.success(&converge_line(&recreated, &created));"), "the wizard names what moved");
     }
 }
 

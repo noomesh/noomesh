@@ -1236,6 +1236,8 @@ async fn auth_logout_handler(
 ///
 /// Decodes the Authorization: Bearer <token> header, looks up the user
 /// in DB/env, and returns user info. Mirrors Python `auth_router.py::read_users_me()`.
+/// No token, a bad or expired one, one under the session floor, and one for
+/// a disabled or erased account are all the one 401 (`auth::unauthenticated`).
 async fn auth_me(
     State(state): State<Arc<AppState>>,
     headers: http::HeaderMap,
@@ -1264,8 +1266,7 @@ async fn auth_me(
     let token = match token {
         Some(t) => t,
         None => {
-            return (StatusCode::UNAUTHORIZED,
-                Json(json!({"detail": "Not authenticated"}))).into_response();
+            return crate::auth::unauthenticated();
         }
     };
 
@@ -1273,16 +1274,14 @@ async fn auth_me(
     let claims = match verify_token(&token, &secret) {
         Ok(c) => c,
         Err(_) => {
-            return (StatusCode::UNAUTHORIZED,
-                Json(json!({"detail": "Could not validate credentials"}))).into_response();
+            return crate::auth::unauthenticated();
         }
     };
 
     // Same floor `require_any_auth` applies: a token issued before the
     // account was disabled/demoted/logged out is not an identity.
     if crate::session_floor::refuses(&state, &claims.sub, &token).await {
-        return (StatusCode::UNAUTHORIZED,
-            Json(json!({"detail": "Session ended"}))).into_response();
+        return crate::auth::unauthenticated();
     }
 
     // Look up user for full details (scopes may have changed since token was
@@ -1314,17 +1313,12 @@ async fn auth_me(
             };
             Json(me_answer(&u, seen)).into_response()
         }
-        Some(_) => {
-            (StatusCode::UNAUTHORIZED,
-                Json(json!({"detail": "User is disabled"}))).into_response()
-        }
-        None => {
-            // The account no longer exists (deleted after the token was
-            // issued). The token's claims are not a live identity: answer
-            // 401 like the disabled branch instead of echoing them.
-            (StatusCode::UNAUTHORIZED,
-                Json(json!({"detail": "User no longer exists"}))).into_response()
-        }
+        // A disabled account, or one that no longer exists (deleted after
+        // the token was issued): the token's claims are not a live identity.
+        // Both are the one 401 (`auth::unauthenticated`), the same answer as
+        // no token or a bad one, so /auth/me cannot be asked which accounts
+        // exist or are disabled.
+        Some(_) | None => crate::auth::unauthenticated(),
     }
 }
 
@@ -1380,13 +1374,13 @@ async fn perspective_session(
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
     else {
-        return Err(unauthorized("Not authenticated"));
+        return Err(crate::auth::unauthenticated());
     };
     let Ok(claims) = verify_token(token, &secret) else {
-        return Err(unauthorized("Could not validate credentials"));
+        return Err(crate::auth::unauthenticated());
     };
     if crate::session_floor::refuses(state, &claims.sub, token).await {
-        return Err(unauthorized("Session ended"));
+        return Err(crate::auth::unauthenticated());
     }
     if let Err(r) = crate::perspective::plain_session(&claims) {
         return Err(r.into_response());
@@ -1396,7 +1390,7 @@ async fn perspective_session(
     // bootstrap env admin, a kiosk, a peer) has no session to narrow.
     let user = match lookup_user_db(&state.db, &claims.sub).await {
         Ok(Some(u)) if !u.disabled => u,
-        Ok(_) => return Err(unauthorized("User is disabled or no longer exists")),
+        Ok(_) => return Err(crate::auth::unauthenticated()),
         Err(e) => {
             tracing::error!(error = %e, "perspective_user_lookup_failed");
             return Err(unavailable());

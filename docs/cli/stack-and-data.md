@@ -49,7 +49,12 @@ name what changed: no previous record` (and recreates nothing for that). `--recr
 container, changed or not (so does `noo upgrade`); a config directory
 over 16 MiB is not fingerprinted (the start says so), and a change there
 needs `--recreate`. The digest key is `~/.config/noo/start-inputs.key`
-(0600, made on first use). `status`
+(0600, made on first use). `noo stack restart --force` and `noo stack
+rebuild` put the same labels on what they recreate, so the next plain
+start does not recreate it again. `noo onboard` ends with this same plain start
+(`Stack in line with what onboard wrote: N recreated (...)`), after its
+last write (self-node certificate, NATS user, service keys, model), so the
+first `noo stack start` after onboard recreates nothing. `status`
 is native `docker ps` — `service | state | since | image | ports` for
 every `noo-*` container, `N of M containers not running` when something
 is down, and `no containers` with a hint when nothing is. It exits 1 when a

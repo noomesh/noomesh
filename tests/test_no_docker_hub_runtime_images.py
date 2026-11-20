@@ -368,10 +368,19 @@ def test_the_lock_job_gates_both_mirror_rows_on_the_real_files(tmp_path, monkeyp
     assert anon == [(f"{NS}/{n}", SOURCE_DIGEST[n]) for n in sorted(MIRRORED)]
     for n in MIRRORED:
         assert (out / n).read_text() == f"{n}@{SOURCE_DIGEST[n]}\n"
+    # the log names both gates as passed, for each mirror row, before its row
+    log = capsys.readouterr().out.splitlines()
+    for n in sorted(MIRRORED):
+        d = SOURCE_DIGEST[n]
+        i = log.index(f"{n}@{d}   ({NS}/{MIRRORED[n]})")
+        assert log[i - 2:i] == [f"  provenance ok: {n}@{d} = mirror-images.yml lane source",
+                                f"  anonymous pull ok: {NS}/{n}@{d}"], log
     # the mirror at another digest than its lane copied: refused, no row
     monkeypatch.setattr(M, "resolve", lambda ref: B)
     assert M.main(["rows", "--out", str(tmp_path / "e"), "--only", "nats"]) == 1
-    assert "is not the upstream image" in capsys.readouterr().err
+    cap = capsys.readouterr()
+    assert "is not the upstream image" in cap.err
+    assert "provenance ok" not in cap.out and "anonymous pull ok" not in cap.out, cap.out
     assert not (tmp_path / "e").exists()
 
 

@@ -2,8 +2,13 @@
 # Copyright 2026 PersonifAI LLC
 """The UPGRADE cell's resolver and judge (scripts/install-cell/upgrade.sh).
 
-    upgrade_judge.py resolve OWNER/REPO CLI_TAG PREV_OUT TARGET_OUT
+    upgrade_judge.py resolve OWNER/REPO CLI_TAG PREV_OUT TARGET_OUT [PREV_TAG]
         The newest noo-cli-vX.Y.Z FINAL strictly below the release under test.
+        PREV_TAG (the dispatch input `prev_tag`; empty = that default) chooses
+        the start instead, strictly: exactly noo-cli-vX.Y.Z, strictly below the
+        release under test's X.Y.Z, and a published, non-prerelease, non-draft
+        release of OWNER/REPO. Anything else exits 1 naming the rule, before
+        anything installs.
     upgrade_judge.py before VERIFY_JSON SELF
         The self node's rows that say what the box was before the roll.
     upgrade_judge.py judge
@@ -19,33 +24,92 @@ import re
 import stat
 import subprocess
 import sys
+import urllib.error
 import urllib.request
 
 
-def resolve(repo, tag, prev_out, target_out):
-    req = urllib.request.Request("https://api.github.com/repos/%s/releases?per_page=100" % repo,
+# fullmatch (`$` lets a trailing newline through); [0-9], not \d (Unicode digits)
+FINAL = re.compile(r"noo-cli-v([0-9]+)\.([0-9]+)\.([0-9]+)")
+# The release under test (CLI_TAG, the dispatch input `cli_tag`): the same
+# rule as validate_tag.sh's CLI_TAG_RE, held equal by running both on one
+# corpus (tests/test_dispatch_inputs_never_reach_a_shell_raw.py).
+CLI_TAG = re.compile(r"latest|noo-cli-v([0-9]+)\.([0-9]+)\.([0-9]+)(?:-rc\.[0-9]+)?")
+
+
+def _api(repo, path, missing_ok=False):
+    """GET https://api.github.com/repos/<repo>/<path> (read-only GH_TOKEN when
+    set): the parsed JSON; None on a 404 when missing_ok, else it raises."""
+    req = urllib.request.Request("https://api.github.com/repos/%s/%s" % (repo, path),
                                  headers={"Accept": "application/vnd.github+json"})
     if os.environ.get("GH_TOKEN"):
         req.add_header("Authorization", "Bearer " + os.environ["GH_TOKEN"])
-    rel = json.load(urllib.request.urlopen(req, timeout=30))
-    fin = re.compile(r"^noo-cli-v(\d+)\.(\d+)\.(\d+)$")
+    try:
+        return json.load(urllib.request.urlopen(req, timeout=30))
+    except urllib.error.HTTPError as e:
+        if missing_ok and e.code == 404:
+            return None
+        raise
+
+
+def refuse_prev(chosen, rule, why):
+    sys.exit("PREV_TAG %r refused (%s): %s; nothing installed" % (chosen, rule, why))
+
+
+def prev_version(chosen):
+    """Rule 1 of a chosen start: exactly noo-cli-vX.Y.Z. Its (X, Y, Z)."""
+    m = FINAL.fullmatch(chosen)
+    if not m:
+        refuse_prev(chosen, "pattern", "not exactly noo-cli-vX.Y.Z (a final's tag: no rc or other suffix, "
+                    "no branch, ref or sha, no `latest`, three-part versions only)")
+    return tuple(map(int, m.groups()))
+
+
+def chosen_previous(repo, chosen, base, target, rel):
+    """The operator's chosen start (`prev_tag`), held to the strict rules:
+    pattern, strictly below the release under test, a published final."""
+    ver = prev_version(chosen)
+    if not ver < base:
+        refuse_prev(chosen, "not below the target", "%d.%d.%d is not strictly below %s's %d.%d.%d"
+                    % (ver + (target,) + base))
+    hit = [r for r in rel if r.get("tag_name") == chosen]
+    # not in the first page of the list: the tag's own release (the same API)
+    r = hit[0] if hit else _api(repo, "releases/tags/" + chosen, missing_ok=True)
+    if not r:
+        refuse_prev(chosen, "no release", "%s has no published release named %s" % (repo, chosen))
+    if r.get("draft"):
+        refuse_prev(chosen, "draft", "the %s release of %s is a draft, not a published final" % (chosen, repo))
+    if r.get("prerelease"):
+        refuse_prev(chosen, "prerelease", "the %s release of %s is marked prerelease, not a final" % (chosen, repo))
+    return chosen
+
+
+def resolve(repo, tag, prev_out, target_out, chosen=""):
+    m = CLI_TAG.fullmatch(tag)
+    if not m:
+        sys.exit("CLI_TAG %r refused: must be exactly latest or noo-cli-vX.Y.Z with an optional -rc.N" % tag)
+    if chosen:
+        prev_version(chosen)  # the pattern refuses before any network read
+    rel = _api(repo, "releases?per_page=100")
     finals = sorted({tuple(map(int, m.groups())) for r in rel
                      if not r.get("prerelease") and not r.get("draft")
-                     for m in [fin.match(r.get("tag_name", ""))] if m})
+                     for m in [FINAL.fullmatch(r.get("tag_name", ""))] if m})
     if tag == "latest":
-        if len(finals) < 2:
+        if not chosen and len(finals) < 2:
             sys.exit("fewer than two finals are published")
-        target, below = "noo-cli-v%d.%d.%d" % finals[-1], finals[:-1]
+        if not finals:
+            sys.exit("no final is published")
+        target, base = "noo-cli-v%d.%d.%d" % finals[-1], finals[-1]
     else:
-        m = re.match(r"^noo-cli-v(\d+)\.(\d+)\.(\d+)", tag)
-        if not m:
-            sys.exit("CLI_TAG %r is not noo-cli-vX.Y.Z[-rc.N]" % tag)
-        base = tuple(map(int, m.groups()))
-        target, below = tag, [f for f in finals if f < base]
-    if not below:
-        sys.exit("no final below %s" % target)
-    prev = "noo-cli-v%d.%d.%d" % below[-1]
-    print("previous final: %s; release under test: %s" % (prev, target))
+        target, base = tag, tuple(map(int, m.groups()))
+    if chosen:
+        prev = chosen_previous(repo, chosen, base, target, rel)
+        print("chosen start (prev_tag): %s; release under test: %s" % (prev, target))
+    else:
+        below = [f for f in finals if f < base]
+        if not below:
+            sys.exit("no final below %s" % target)
+        prev = "noo-cli-v%d.%d.%d" % below[-1]
+        print("previous final: %s; release under test: %s" % (prev, target))
     open(prev_out, "w").write(prev)
     open(target_out, "w").write(target)
 
@@ -195,7 +259,9 @@ def judge():
     else:
         s1 = "installing noo-netns-restore.service: staged to the self-node"
         s2 = "noo-netns-restore.service installed and enabled by the self-node's applier"
-        a, b = [l.strip() for l in stack.splitlines() if s1 in l and "whose applier installs it (no sudo)" in l], s2 in stack
+        # Case-insensitive: the CLI's ui::step capitalises a step's first
+        # letter ("> Installing …"), so rc.1's cell FAILed B1 on a pass.
+        a, b = [l.strip() for l in stack.splitlines() if s1 in l.lower() and "whose applier installs it (no sudo)" in l], s2 in stack.lower()
         if a and b:
             say("B1", "PASS", a[0] + " + " + s2)
         else:
@@ -285,11 +351,11 @@ def judge():
 
 if __name__ == "__main__":
     a = sys.argv[1:]
-    if a[:1] == ["resolve"] and len(a) == 5:
+    if a[:1] == ["resolve"] and len(a) in (5, 6):
         resolve(*a[1:])
     elif a[:1] == ["before"] and len(a) == 3:
         before(*a[1:])
     elif a[:1] == ["judge"]:
         sys.exit(judge())
     else:
-        sys.exit("usage: upgrade_judge.py resolve OWNER/REPO TAG PREV TARGET | before VERIFY SELF | judge")
+        sys.exit("usage: upgrade_judge.py resolve OWNER/REPO TAG PREV TARGET [PREV_TAG] | before VERIFY SELF | judge")

@@ -262,7 +262,10 @@ Declaring `chat-default` puts your list ahead of the dynamic pool; `class list`
 prints `chat-default: dynamic (all live chat nodes)` or `declared`, and
 `noo cluster verify --controller` has a `default chat` row listing the live
 candidates in order (`!` when only CPU candidates or one node remain, `x`
-when none).
+when none). A fleet with no GPU node, or of one node, can have nothing
+better: there the row is OK and listed under "Worth doing later" (`tier:
+"later"` in `--json`), saying what a GPU node or a second node would add.
+A fleet that could not be read keeps the `!`.
 
 **Purposes.** Stack services name a purpose instead of a model:
 trellion's answers and ingestion send `knowledge`, conversation
@@ -988,7 +991,7 @@ drain_started, drained_at}`, plus `workload` for a reservation and
 ### `noo inference` — Run prompts on the GPU cluster
 | Command | Arguments | What it does |
 |---|---|---|
-| `noo inference run` | `<prompt> [-m <model>] [-n <node> [--strict-node]] [--raw] [-u <user>] [--max-tokens <n>] [-t <temperature>]` | Run one prompt; --raw skips mesh context (RAG, memory, skills) |
+| `noo inference run` | `<prompt> [-m\|--model <model>] [-n\|--node <node> [--strict-node]] [--raw] [-u\|--user <user>] [--max-tokens <n>] [-t\|--temperature <temperature>]` | Run one prompt; --raw skips mesh context (RAG, memory, skills) |
 | `noo inference agent` | `<prompt>` | Run a prompt through the gateway agent runner and print the response |
 
 ### `noo jobs` — Job queue & scheduler management

@@ -212,3 +212,13 @@ def test_the_first_roll_bootstrap_refusal_still_fails_a3(tmp_path):
     j = JOURNAL_OK + "noo-apply[1]: REFUSED release check: applier — the bundle carries root code but no release-signed list (release-sums)\n"
     rc, got = cell(tmp_path, journal=j, roll=ROLL_OK + "! runner-a: the applier-only bundle reported exit 75 — staging the full bundle anyway\n")
     assert " FAIL: " in got["A3"] and "no release-signed list" in got["A3"], got["A3"]
+
+
+def test_b1_matches_the_cli_s_capitalised_step_line(tmp_path):
+    """0.6.29-rc.1's cell: ui::step capitalises a step's first letter, so the
+    same-tag --stack printed "> Installing …" and B1 FAILed on a pass."""
+    stack = ("> Installing noo-netns-restore.service: staged to the self-node runner-a, whose applier installs it (no sudo)\n"
+             "+ noo-netns-restore.service installed and enabled by the self-node's applier\n")
+    rc, got = cell(tmp_path, stack=stack)  # ONLY the capitalised line, as rc.1 printed it
+    assert " PASS: " in got["B1"], got["B1"]
+    assert "staged to the self-node runner-a" in got["B1"]

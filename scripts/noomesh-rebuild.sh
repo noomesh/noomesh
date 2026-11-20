@@ -199,6 +199,10 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 source "$SCRIPT_DIR/lib-bind-addr.sh"
 resolve_bind_addr
 resolve_location
+# The `noo.inputs` labels (lib-start-inputs.sh), on both `up`s below, so the
+# next plain `noo stack start` does not recreate what this rebuild made.
+# Sourced before load_secrets, whose secret-file writer feeds it.
+source "$SCRIPT_DIR/lib-start-inputs.sh"
 # Load secrets (no-op unless NOO_SECRETS_BACKEND=sops; fails closed on decrypt error).
 source "$SCRIPT_DIR/lib-secrets.sh"
 load_secrets || { echo "aborting: secrets load failed" >&2; exit 1; }
@@ -685,6 +689,8 @@ if [ "$START_STACK" = true ]; then
     # BEFORE the up, so a failing up cannot leave them looping; a core
     # service found stopped afterwards fails the start.
     addons_stop_leftovers addons_stop_disabled || exit 1
+    # Every service: the blanket `up` below applies the labels to all of them.
+    start_inputs_label_for_up || exit 1
     check_bind_sources ${RECREATE_SERVICES} || exit 1
     docker compose $COMPOSE_FILES $PROFILE_ARGS up -d --force-recreate ${RECREATE_SERVICES}
 
@@ -705,6 +711,7 @@ if [ "$START_STACK" = true ]; then
     echo "Ensuring all services are running..."
     check_bind_sources --skip node-agent || exit 1
     docker compose $COMPOSE_FILES $PROFILE_ARGS up -d --scale node-agent=0 $ADDON_HOLD_SCALE
+    start_inputs_commit_state
     # Report, never reap: a container no compose file of this install declares
     # (186b). Exit status unchanged; `--remove-orphans` is not passed to any `up`.
     compose_report_undeclared .

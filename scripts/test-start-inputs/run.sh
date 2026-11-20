@@ -172,6 +172,24 @@ start >/dev/null || true
 a6c="$(ids)"; start || true; a6d="$(ids)"
 expect 6 "" "$a6c" "$a6d" "b.conf readable again (settled)"
 
+# 9. a forced recreate OUTSIDE a start (noomesh-restart.sh --force b, after
+#    an edit of b.conf) carries the labels the start computes
+#    (start_inputs_label_for_up), so the next plain start moves nothing.
+#    Unlabelled, as before, that start recreated b a second time (0.6.29-rc.1
+#    install matrix: onboard's forced restarts, then `noo stack start`).
+same_size_edit b.conf 'b-config-0003
+'
+( COMPOSE_FILES="-f compose.yml"; PROFILE_ARGS=""
+  start_inputs_label_for_up b || exit 1
+  # shellcheck disable=SC2086
+  docker compose $COMPOSE_FILES $PROFILE_ARGS up -d --no-deps --force-recreate b || exit 1
+  start_inputs_commit_state ) > "$WORK/out" 2>&1 || fail 9 "the labelled forced recreate of b failed"
+a9="$(ids)"
+expect 9 "b" "$a6d" "$a9" "restart --force b"
+start || fail 9 "the start failed"
+a9b="$(ids)"
+expect 9 "" "$a9" "$a9b" "restart --force b (labelled), then a plain start"
+
 # 7. no container label carries a plain sha256 of an input, nor 16 hex of one.
 labels="$(docker ps -aq --filter "label=com.docker.compose.project=$COMPOSE_PROJECT_NAME" | xargs -r docker inspect -f '{{json .Config.Labels}}')"
 n_labelled="$(printf '%s\n' "$labels" | grep -c '"noo.inputs":"[0-9a-f]\{64\}"')"

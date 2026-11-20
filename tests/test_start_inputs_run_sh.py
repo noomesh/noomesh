@@ -8,8 +8,8 @@ is checked without docker.
 The proof itself is the CI job (.github/workflows/start-inputs.yml), which
 runs the same script on a real docker compose. This model does what that
 proof relies on and nothing more: `config --format json` merges the -f files
-(labels merged), resolves bind and secret paths; `up -d` recreates a
-service's container when its config hash (labels included) changed or under
+(labels merged), resolves bind and secret paths; `up -d [SERVICE...]` recreates a
+(named) service's container when its config hash (labels included) changed or under
 --force-recreate, and keeps a dependent's container. With the label taken out
 of the launcher's override, cases 3 and 8 go red here too.
 """
@@ -83,7 +83,10 @@ if a[:1] == ["compose"]:
     if rest[:1] == ["up"]:
         c = config(); s = load()
         force = "--force-recreate" in rest
+        named = [x for x in rest[1:] if not x.startswith("-")]
         for name, svc in c["services"].items():
+            if named and name not in named:
+                continue
             h = hashlib.sha256(json.dumps(svc, sort_keys=True).encode()).hexdigest()
             cur = s["containers"].get(name)
             if cur is None or force or cur["hash"] != h:
@@ -131,7 +134,7 @@ def test_every_case_passes_against_the_model(tmp_path: Path) -> None:
     r = subprocess.run(["bash", str(RUN)], env=env, capture_output=True, text=True, timeout=300)
     out = r.stdout + r.stderr
     assert r.returncode == 0, out
-    for n in range(1, 9):
+    for n in range(1, 10):
         assert f"START-INPUTS {n} PASS" in out, out
     assert "FAIL" not in out, out
     assert "START-INPUTS: all cases PASS" in out
