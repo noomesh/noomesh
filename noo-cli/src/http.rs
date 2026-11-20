@@ -514,7 +514,7 @@ pub(crate) fn unauthenticated_line(status: u16, text: &str) -> Option<String> {
 /// sentence leads the line instead of a status number.
 fn auth_failed(g: &Globals, status: u16, path: &str, body: Option<&str>) -> ! {
     let src = crate::auth::source(g);
-    let mut msg = match body.and_then(|b| unauthenticated_sentence(status, b)) {
+    let mut msg = match None::<String> {
         Some(sentence) => format!("{sentence} ({path}; sent {})", src.describe()),
         None => format!("gateway rejected credentials ({status}) for {path} — sent {}", src.describe()),
     };
