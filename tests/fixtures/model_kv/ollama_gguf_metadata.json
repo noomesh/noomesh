@@ -1,5 +1,5 @@
 {
- "_comment": "The attention fields of each Ollama model onboard can pick, read 2026-11-20 from the GGUF header of the model layer in the public registry: GET https://registry.ollama.ai/v2/library/<name>/manifests/<tag> (Accept: application/vnd.docker.distribution.manifest.v2+json), the layer with mediaType application/vnd.ollama.image.model, then a Range request on /v2/library/<name>/blobs/<digest> for the first 8-32 MiB and a read of the GGUF v3 key/value block. Only the keys config/model-capabilities.json rows are derived from (and the ones that bound the margin) are kept; `registry_plain_tags` is the plain size tags ollama.com/library/<family>/tags listed the same day (what onboard's live picker can offer, noo-cli/src/catalog.rs ollama_live_starters). tests/test_model_kv_rows.py recomputes every row from this file.",
+ "_comment": "The attention fields of each Ollama model onboard can pick, read 2026-11-20 from the GGUF header of the model layer in the public registry: GET https://registry.ollama.ai/v2/library/<name>/manifests/<tag> (Accept: application/vnd.docker.distribution.manifest.v2+json), the layer with mediaType application/vnd.ollama.image.model, then a Range request on /v2/library/<name>/blobs/<digest> for the first 8-32 MiB and a read of the GGUF v3 key/value block. Only the keys config/model-capabilities.json rows are derived from (and the ones that bound the margin) are kept; `registry_plain_tags` is the plain size tags ollama.com/library/<family>/tags listed the same day (what onboard's live picker can offer, noo-cli/src/catalog.rs ollama_live_starters). tests/test_model_kv_rows.py recomputes every row from this file. `<arch>.context_length` is kept to tell a window that limits the cache (gemma4: 512-1024 of 131072-262144) from one as long as the context (phi3: 131072 of 16384).",
  "registry_plain_tags": {
   "gemma4": [
    "e2b",
@@ -46,7 +46,8 @@
     "qwen2.block_count": 24,
     "qwen2.embedding_length": 896,
     "qwen2.attention.head_count": 14,
-    "qwen2.attention.head_count_kv": 2
+    "qwen2.attention.head_count_kv": 2,
+    "qwen2.context_length": 32768
    }
   },
   "gemma4:e2b": {
@@ -99,7 +100,8 @@
      false
     ],
     "gemma4.attention.key_length_swa": 256,
-    "gemma4.attention.value_length_swa": 256
+    "gemma4.attention.value_length_swa": 256,
+    "gemma4.context_length": 131072
    }
   },
   "gemma4:e4b": {
@@ -159,7 +161,8 @@
      false
     ],
     "gemma4.attention.key_length_swa": 256,
-    "gemma4.attention.value_length_swa": 256
+    "gemma4.attention.value_length_swa": 256,
+    "gemma4.context_length": 131072
    }
   },
   "gemma4:12b": {
@@ -274,7 +277,8 @@
      false
     ],
     "gemma4.attention.key_length_swa": 256,
-    "gemma4.attention.value_length_swa": 256
+    "gemma4.attention.value_length_swa": 256,
+    "gemma4.context_length": 262144
    }
   },
   "gemma4:26b": {
@@ -353,7 +357,8 @@
      false
     ],
     "gemma4.attention.key_length_swa": 256,
-    "gemma4.attention.value_length_swa": 256
+    "gemma4.attention.value_length_swa": 256,
+    "gemma4.context_length": 262144
    }
   },
   "gemma4:31b": {
@@ -492,7 +497,8 @@
      false
     ],
     "gemma4.attention.key_length_swa": 256,
-    "gemma4.attention.value_length_swa": 256
+    "gemma4.attention.value_length_swa": 256,
+    "gemma4.context_length": 262144
    }
   },
   "qwen3:0.6b": {
@@ -504,7 +510,8 @@
     "qwen3.attention.head_count": 16,
     "qwen3.attention.head_count_kv": 8,
     "qwen3.attention.key_length": 128,
-    "qwen3.attention.value_length": 128
+    "qwen3.attention.value_length": 128,
+    "qwen3.context_length": 40960
    }
   },
   "qwen3:1.7b": {
@@ -516,7 +523,8 @@
     "qwen3.attention.head_count": 16,
     "qwen3.attention.head_count_kv": 8,
     "qwen3.attention.key_length": 128,
-    "qwen3.attention.value_length": 128
+    "qwen3.attention.value_length": 128,
+    "qwen3.context_length": 40960
    }
   },
   "qwen3:4b": {
@@ -528,7 +536,8 @@
     "qwen3.attention.key_length": 128,
     "qwen3.attention.value_length": 128,
     "qwen3.block_count": 36,
-    "qwen3.embedding_length": 2560
+    "qwen3.embedding_length": 2560,
+    "qwen3.context_length": 262144
    }
   },
   "qwen3:8b": {
@@ -540,7 +549,8 @@
     "qwen3.attention.head_count": 32,
     "qwen3.attention.head_count_kv": 8,
     "qwen3.attention.key_length": 128,
-    "qwen3.attention.value_length": 128
+    "qwen3.attention.value_length": 128,
+    "qwen3.context_length": 40960
    }
   },
   "qwen3:14b": {
@@ -552,7 +562,8 @@
     "qwen3.attention.head_count": 40,
     "qwen3.attention.head_count_kv": 8,
     "qwen3.attention.key_length": 128,
-    "qwen3.attention.value_length": 128
+    "qwen3.attention.value_length": 128,
+    "qwen3.context_length": 40960
    }
   },
   "qwen3:30b": {
@@ -564,7 +575,8 @@
     "qwen3moe.attention.key_length": 128,
     "qwen3moe.attention.value_length": 128,
     "qwen3moe.block_count": 48,
-    "qwen3moe.embedding_length": 2048
+    "qwen3moe.embedding_length": 2048,
+    "qwen3moe.context_length": 262144
    }
   },
   "qwen3:32b": {
@@ -576,7 +588,8 @@
     "qwen3.attention.head_count": 64,
     "qwen3.attention.head_count_kv": 8,
     "qwen3.attention.key_length": 128,
-    "qwen3.attention.value_length": 128
+    "qwen3.attention.value_length": 128,
+    "qwen3.context_length": 40960
    }
   },
   "qwen3:235b": {
@@ -588,7 +601,8 @@
     "qwen3moe.attention.key_length": 128,
     "qwen3moe.attention.value_length": 128,
     "qwen3moe.block_count": 94,
-    "qwen3moe.embedding_length": 4096
+    "qwen3moe.embedding_length": 4096,
+    "qwen3moe.context_length": 262144
    }
   },
   "llama3.2:1b": {
@@ -600,7 +614,8 @@
     "llama.attention.head_count": 32,
     "llama.attention.head_count_kv": 8,
     "llama.attention.key_length": 64,
-    "llama.attention.value_length": 64
+    "llama.attention.value_length": 64,
+    "llama.context_length": 131072
    }
   },
   "llama3.2:3b": {
@@ -612,7 +627,8 @@
     "llama.attention.head_count": 24,
     "llama.attention.head_count_kv": 8,
     "llama.attention.key_length": 128,
-    "llama.attention.value_length": 128
+    "llama.attention.value_length": 128,
+    "llama.context_length": 131072
    }
   },
   "deepseek-r1:1.5b": {
@@ -622,7 +638,8 @@
     "qwen2.block_count": 28,
     "qwen2.embedding_length": 1536,
     "qwen2.attention.head_count": 12,
-    "qwen2.attention.head_count_kv": 2
+    "qwen2.attention.head_count_kv": 2,
+    "qwen2.context_length": 131072
    }
   },
   "deepseek-r1:7b": {
@@ -632,7 +649,8 @@
     "qwen2.block_count": 28,
     "qwen2.embedding_length": 3584,
     "qwen2.attention.head_count": 28,
-    "qwen2.attention.head_count_kv": 4
+    "qwen2.attention.head_count_kv": 4,
+    "qwen2.context_length": 131072
    }
   },
   "deepseek-r1:8b": {
@@ -644,7 +662,8 @@
     "qwen3.attention.head_count": 32,
     "qwen3.attention.head_count_kv": 8,
     "qwen3.attention.key_length": 128,
-    "qwen3.attention.value_length": 128
+    "qwen3.attention.value_length": 128,
+    "qwen3.context_length": 131072
    }
   },
   "deepseek-r1:14b": {
@@ -654,7 +673,8 @@
     "qwen2.block_count": 48,
     "qwen2.embedding_length": 5120,
     "qwen2.attention.head_count": 40,
-    "qwen2.attention.head_count_kv": 8
+    "qwen2.attention.head_count_kv": 8,
+    "qwen2.context_length": 131072
    }
   },
   "deepseek-r1:32b": {
@@ -664,7 +684,8 @@
     "qwen2.block_count": 64,
     "qwen2.embedding_length": 5120,
     "qwen2.attention.head_count": 40,
-    "qwen2.attention.head_count_kv": 8
+    "qwen2.attention.head_count_kv": 8,
+    "qwen2.context_length": 131072
    }
   },
   "deepseek-r1:70b": {
@@ -676,7 +697,8 @@
     "llama.attention.head_count": 64,
     "llama.attention.head_count_kv": 8,
     "llama.attention.key_length": 128,
-    "llama.attention.value_length": 128
+    "llama.attention.value_length": 128,
+    "llama.context_length": 131072
    }
   },
   "deepseek-r1:671b": {
@@ -689,7 +711,8 @@
     "deepseek2.attention.head_count_kv": 128,
     "deepseek2.attention.kv_lora_rank": 512,
     "deepseek2.attention.key_length": 192,
-    "deepseek2.attention.value_length": 128
+    "deepseek2.attention.value_length": 128,
+    "deepseek2.context_length": 163840
    }
   },
   "mistral:7b": {
@@ -699,7 +722,8 @@
     "llama.block_count": 32,
     "llama.embedding_length": 4096,
     "llama.attention.head_count": 32,
-    "llama.attention.head_count_kv": 8
+    "llama.attention.head_count_kv": 8,
+    "llama.context_length": 32768
    }
   },
   "phi4:14b": {
@@ -710,7 +734,8 @@
     "phi3.block_count": 40,
     "phi3.attention.head_count": 40,
     "phi3.attention.head_count_kv": 10,
-    "phi3.attention.sliding_window": 131072
+    "phi3.attention.sliding_window": 131072,
+    "phi3.context_length": 16384
    }
   }
  }
