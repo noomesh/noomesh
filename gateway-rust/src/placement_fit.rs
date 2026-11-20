@@ -145,7 +145,7 @@ pub fn kv_per_token(model: &str, role: &str, weights_gb: Option<f64>, arch: Opti
     // truth. The agent reports an arch for EVERY model it holds, and a decoder
     // style layers x kv_heads x head_dim x num_ctx would over-charge an encoder
     // (harrier: about 0.1 GB to about 0.9 GB).
-    if let Some(a) = arch.filter(|a| !encoder && a.is_object()) {
+    if let Some(a) = arch.filter(|a| a.is_object()) {
         if let (Some(l), Some(h), Some(d)) = (a["layers"].as_f64(), a["kv_heads"].as_f64(), a["head_dim"].as_f64()) {
             // K and V, f16 (2 bytes each element).
             return Some((l * h * d * 2.0 * 2.0, "architecture"));
