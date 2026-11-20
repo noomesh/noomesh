@@ -293,7 +293,7 @@ async fn seat_token_revoke(
     op: OperatorOrInternal,
     cluster: Option<Extension<ClusterNode>>,
 ) -> AppResult {
-    crate::person_gate::require_person(&state.db, op.0.as_ref(), "revoking a seat token").await?;
+
     let by = seat_admin_guard(&op, &cluster)?;
     let id: uuid::Uuid = id.parse().map_err(|_| AppError::BadRequest("invalid token id (expected a UUID)".into()))?;
     let updated = sqlx::query("UPDATE noo_seat_tokens SET revoked = true WHERE id = $1")
