@@ -93,7 +93,7 @@ func llamacppOnGPU(target string, f GPUFacts) bool {
 // this pass (TEIRuntimeUnknownError) instead of taking the CPU build. Once the
 // runtime is read, LlamacppGPUUsable decides exactly as before.
 func llamacppWaitsOnRuntime(target string, f GPUFacts) bool {
-	if target == "cpu" || !LlamacppHasGPUBuild || !f.NvidiaGPU || f.NvidiaRuntimeRead {
+	if !LlamacppHasGPUBuild || !f.NvidiaGPU || f.NvidiaRuntimeRead {
 		return false
 	}
 	if ok, err := nodewl.ComputeCapAtLeast(f.MinComputeCap, LlamacppMinComputeCap); err == nil && !ok {
