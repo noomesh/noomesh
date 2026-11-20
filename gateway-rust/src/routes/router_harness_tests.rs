@@ -709,6 +709,99 @@ async fn assert_measured(c: &Client, admin: &str) -> Vec<String> {
     failures
 }
 
+/// Contract (the one 401). Every request no credential class accepts gets the ONE 401
+/// (`auth::unauthenticated`): same status, same body bytes, same headers, so
+/// a prober cannot tell no credential from a malformed one, a wrong key, a
+/// bad signature, an expired token, or the token of a logged-out or erased
+/// account. Headers that vary per REQUEST, not per case (`date`, the trace
+/// id, a rate-limit count), are left out of the comparison; headers are
+/// compared within one path, the body across all of them.
+async fn assert_one_401(c: &Client, state: &AppState) -> Vec<String> {
+    const VOLATILE: [&str; 3] = ["date", "traceparent", "x-ratelimit-remaining"];
+    let mut failures = Vec::new();
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).expect("clock").as_secs();
+    let other_key = "router-harness-some-other-signing-key-0002";
+    let foreign = crate::auth::sign_hs256(
+        &crate::auth::scoped_claims("harness-admin", "admin", Role::Admin.legacy_scopes(), 600, other_key).expect("claims"),
+        other_key,
+    )
+    .expect("sign");
+    let mut old = crate::auth::scoped_claims("harness-admin", "admin", Role::Admin.legacy_scopes(), 600, JWT_SECRET).expect("claims");
+    old["iat"] = json!(now - 7200);
+    old["exp"] = json!(now - 3600);
+    let expired = crate::auth::sign_hs256(&old, JWT_SECRET).expect("sign");
+    // Minted, then the account's sessions end (a disable or a logout raises
+    // the floor): the token still verifies and is refused by the floor.
+    let floored = token_for("harness-floored", Role::Admin);
+    let _ = crate::session_floor::raise(state, "harness-floored", crate::session_floor::Reason::AccountChange).await;
+    // A well-signed token for an account that does not exist (erased).
+    let erased = token_for("harness-erased-account", Role::User);
+    let bad_v1 = format!("node_a:{now}:{}", "0".repeat(64));
+    let cases: Vec<(&str, &str, Option<String>)> = vec![
+        ("/api/cache/stats", "no credential", None),
+        ("/api/cache/stats", "a non-bearer scheme", Some("Basic dXNlcjpwYXNz".into())),
+        ("/api/cache/stats", "a malformed bearer", Some("Bearer not-a-token".into())),
+        ("/api/cache/stats", "a JWT under another key", Some(format!("Bearer {foreign}"))),
+        ("/api/cache/stats", "an expired JWT", Some(format!("Bearer {expired}"))),
+        ("/api/cache/stats", "a token under the session floor", Some(format!("Bearer {floored}"))),
+        ("/api/cache/stats", "a v1-shaped fleet token with a wrong HMAC", Some(format!("Bearer {bad_v1}"))),
+        ("/api/cache/stats", "a v2-shaped token that does not verify", Some("Bearer v2:garbage".into())),
+        ("/api/cache/stats", "an unknown service key", Some("Bearer nsk_harness_unknown_0001".into())),
+        ("/v1/models", "no credential", None),
+        ("/v1/models", "an unknown service key", Some("Bearer nsk_harness_unknown_0001".into())),
+        ("/v1/models", "a malformed bearer", Some("Bearer not-a-token".into())),
+        ("/auth/me", "no credential", None),
+        ("/auth/me", "a malformed bearer", Some("Bearer not-a-token".into())),
+        ("/auth/me", "an expired JWT", Some(format!("Bearer {expired}"))),
+        ("/auth/me", "a token under the session floor", Some(format!("Bearer {floored}"))),
+        ("/auth/me", "a token for an erased account", Some(format!("Bearer {erased}"))),
+    ];
+    let mut first_body: Option<Vec<u8>> = None;
+    let mut first_headers: std::collections::HashMap<&str, Vec<(String, String)>> = std::collections::HashMap::new();
+    for (path, case, auth) in &cases {
+        let n = c.seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut req = c
+            .http
+            .get(format!("{}{}", c.base, path))
+            .header("x-forwarded-for", format!("198.51.{}.{}", (n / 250) % 250, n % 250 + 1));
+        if let Some(a) = auth {
+            req = req.header("authorization", a.as_str());
+        }
+        let resp = req.send().await.unwrap_or_else(|e| panic!("GET {path}: {e}"));
+        let status = resp.status().as_u16();
+        let mut headers: Vec<(String, String)> = resp
+            .headers()
+            .iter()
+            .filter(|(k, _)| !VOLATILE.contains(&k.as_str()))
+            .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("<binary>").to_string()))
+            .collect();
+        headers.sort();
+        let body = resp.bytes().await.map(|b| b.to_vec()).unwrap_or_default();
+        if status != 401 {
+            failures.push(format!("{path} with {case}: want 401, got {status} {:?}", String::from_utf8_lossy(&body)));
+            continue;
+        }
+        let parsed: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+        if parsed["code"] != crate::auth::UNAUTHENTICATED_CODE {
+            failures.push(format!("{path} with {case}: want code unauthenticated, got {:?}", String::from_utf8_lossy(&body)));
+        }
+        let want_body = first_body.get_or_insert_with(|| body.clone()).clone();
+        if want_body != body {
+            failures.push(format!(
+                "{path} with {case}: the 401 body differs from the first case's: {:?} vs {:?}",
+                String::from_utf8_lossy(&body),
+                String::from_utf8_lossy(&want_body)
+            ));
+        }
+        let want_headers = first_headers.entry(*path).or_insert_with(|| headers.clone()).clone();
+        if want_headers != headers {
+            failures.push(format!("{path} with {case}: the 401 headers differ from this path's first case: {headers:?} vs {want_headers:?}"));
+        }
+    }
+    eprintln!("router_harness: the one 401 — {} cases across 3 paths", cases.len());
+    failures
+}
+
 // ───────────────────────────── the test ─────────────────────────────
 
 #[tokio::test(flavor = "multi_thread")]
@@ -789,6 +882,7 @@ async fn the_real_router_holds_authz_redis_and_measured_contracts() {
         failures.extend(assert_bus_down(&c, &admin).await);
         failures.extend(assert_session_origin(&c).await);
         failures.extend(assert_addon_front_door(&c).await);
+        failures.extend(assert_one_401(&c, &state).await);
     }
 
     server.abort();

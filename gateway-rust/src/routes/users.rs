@@ -5938,7 +5938,10 @@ mod session_end_tests {
         let me = handler(core, "async fn auth_me(");
         assert!(me.contains("session_floor::refuses("));
         assert!(!me.contains("still return from token claims"), "a deleted account must not be echoed as live identity");
-        assert!(me.contains("User no longer exists"));
+        // A deleted (or disabled) account is the one 401, never a sentence
+        // that says which: whether the subject exists is never told.
+        assert!(me.contains("Some(_) | None => crate::auth::unauthenticated(),"));
+        assert!(!me.contains("User no longer exists") && !me.contains("User is disabled"));
     }
 
     #[test]

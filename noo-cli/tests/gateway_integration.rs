@@ -3164,6 +3164,33 @@ fn tools_export_auth_failure_maps_to_exit_4() {
     assert!(!target.exists(), "no file may be written on auth failure");
 }
 
+/// The gateway's one 401 (`code: "unauthenticated"`): the CLI prints its
+/// sentence and `noo auth login`, never the raw `HTTP 401:` prefix, and
+/// still exits AuthFailed(4).
+#[test]
+fn the_gateways_one_401_prints_its_sentence_and_the_next_step() {
+    let target = std::env::temp_dir().join(format!(
+        "noo-cli-tools-export-unauth-{}.json",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&target);
+    let sentence = "not signed in, or the credential was not accepted: sign in with `noo auth login`; a key or token may have expired or been revoked";
+    let body = serde_json::json!({"error": sentence, "code": "unauthenticated"}).to_string();
+    let mock = Mock::start(401, "Unauthorized", "application/json", &body, 1);
+    let out = run(
+        &["--gateway", &gw(mock.port), "tools", "export",
+          "-o", target.to_str().unwrap()],
+        &[],
+    );
+    let _ = mock.requests();
+    assert_eq!(out.status.code(), Some(4), "401 must map to AuthFailed(4)");
+    let said = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(said.contains(sentence), "the gateway's sentence: {said}");
+    assert!(said.contains("noo auth login"), "the next step: {said}");
+    assert!(!said.contains("HTTP 401"), "no raw status prefix: {said}");
+    assert!(!target.exists(), "no file may be written on auth failure");
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // WP-R: models refresh — HF-mocked catalog rebuild (TTL bypass), the shared
 // model_cache.json shape (round-trip compatible with the Python CLI), and
