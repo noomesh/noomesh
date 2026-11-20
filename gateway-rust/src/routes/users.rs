@@ -1690,7 +1690,7 @@ async fn team_space_link(
     ctx: Option<Extension<RequesterCtx>>,
     Json(body): Json<SpaceLinkBody>,
 ) -> AppResult {
-    crate::person_gate::require_person(&state.db, ctx.as_deref(), "linking a space to a team").await?;
+
     let team = team.trim();
     let channel = body.channel.trim();
     let space_id = body.space_id.trim();
