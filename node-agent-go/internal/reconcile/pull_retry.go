@@ -36,7 +36,6 @@ var pullPermanentMarkers = []string{
 	"unauthorized",
 	"pull access denied",
 	"denied",
-	"forbidden",
 }
 
 // pullPermanentStatuses are the HTTP statuses that fail at once.
