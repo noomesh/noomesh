@@ -554,7 +554,6 @@ const NATIVE: &[(&[&str], Handler)] = &[
     (&["security", "admin-password", "reset"], commands::security_admin_password_reset),
     // Auth scopes, not the KB roles that `grant-role` handles — admin-only.
     (&["security", "user", "set-scopes"], commands::security_user_set_scopes),
-    (&["security", "user", "set-role"], commands::security_user_set_role),
     (&["security", "user", "super-admin"], commands::security_user_super_admin),
     (&["security", "user", "allowance"], commands::security_user_allowance),
     (&["security", "user", "set-org"], commands::security_user_set_org),

@@ -219,7 +219,7 @@ pub use security::{
     security_user_links, security_user_list, security_user_list_roles, security_user_proposals,
     security_user_revoke_role, security_user_set_org, security_user_set_password,
     security_admin_password_reset,
-    security_user_allowance, security_user_set_role, security_user_set_scopes, security_user_super_admin, security_user_unlink,
+    security_user_allowance, security_user_set_scopes, security_user_super_admin, security_user_unlink,
 };
 pub use secrets::{secrets_audit, secrets_resync, secrets_rotate, secrets_tidy};
 pub use secrets_remove::secrets_remove;

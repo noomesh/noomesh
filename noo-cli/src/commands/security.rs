@@ -391,57 +391,6 @@ pub fn security_user_set_scopes(g: &Globals, args: &[String]) -> Result<i32, Unh
     Ok(0)
 }
 
-/// The three permission tiers `POST /api/security/users/{u}/role` accepts
-/// (gateway `Role::from_str`: exactly these names).
-pub(crate) const ROLE_TIERS: [&str; 3] = ["user", "operator", "admin"];
-
-/// `<username> <user|operator|admin>`.
-pub(crate) fn parse_set_role_with(a: &mut Args) -> Result<(String, String), ArgError> {
-    let mut p = a.positionals()?;
-    if p.len() != 2 {
-        return Err(ArgError::new("usage: <username> <user|operator|admin>"));
-    }
-    let role = p.pop().unwrap_or_default().to_ascii_lowercase();
-    if !ROLE_TIERS.contains(&role.as_str()) {
-        return Err(ArgError::new(format!("the role is user, operator or admin (got `{role}`)")));
-    }
-    Ok((p.remove(0), role))
-}
-
-/// The request body `user_set_role` reads: `{role}`.
-pub(crate) fn set_role_body(role: &str) -> Value {
-    json!({"role": role})
-}
-
-/// `noo security user set-role <username> <user|operator|admin>`
-/// POST /api/security/users/{u}/role. **Admin-only** (gateway
-/// `scope_mutation_guard`). Sets the permission tier and keeps the account's
-/// non-tier scopes (ingest, graph, peer), unlike `set-scopes`, which replaces
-/// the whole set. The gateway refuses demoting yourself and demoting the last
-/// enabled admin; the change ends the account's sessions.
-pub fn security_user_set_role(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
-    crate::args::refuse_lone_dash(args)?;
-    let (username, role) = parse_set_role_with(&mut Args::new(args))?;
-    let body = post_json(
-        g,
-        &format!("/api/security/users/{}/role", super::urlencode(&username)),
-        &set_role_body(&role),
-        true,
-        TIMEOUT,
-    );
-    if g.json {
-        println!("{body}");
-        return Ok(0);
-    }
-    let now = body["role"].as_str().unwrap_or(role.as_str()).to_string();
-    ui::close_done(&format!("{username} is now {now}"));
-    ui::guide(&[
-        ("noo security user list", "shows the role per user"),
-        ("noo auth login", "as that user: the change ended their sessions"),
-    ]);
-    Ok(0)
-}
-
 /// `<username> on|off --reason <text> [--password-stdin] [-y|--yes]`.
 pub(crate) fn parse_super_admin_with(a: &mut Args) -> Result<(String, bool, String, bool, bool), ArgError> {
     let reason = a.value(&["--reason"])?.unwrap_or_default();
@@ -3498,24 +3447,6 @@ mod clifix_security_tests {
         assert_eq!(b.as_object().unwrap().len(), 2);
         let src = body_of(include_str!("security.rs"), "pub fn security_user_enable(");
         assert!(src.contains("\"/api/users/disable\""), "the per-user /disable route only disables");
-    }
-
-    /// `POST /api/security/users/{u}/role` reads `{role}` (`SetRoleBody`)
-    /// and accepts exactly user, operator and admin (`Role::from_str`).
-    #[test]
-    fn set_role_posts_the_tier_to_the_role_route() {
-        let p = |v: &[&str]| parse_set_role_with(&mut Args::new(&v.iter().map(|s| s.to_string()).collect::<Vec<_>>())).ok();
-        assert_eq!(p(&["alice", "admin"]), Some(("alice".into(), "admin".into())));
-        assert_eq!(p(&["alice", "Operator"]), Some(("alice".into(), "operator".into())), "lower-cased: the gateway takes only lower case");
-        assert_eq!(p(&["alice", "user"]), Some(("alice".into(), "user".into())));
-        assert_eq!(p(&["alice", "root"]), None, "not a tier");
-        assert_eq!(p(&["alice"]), None);
-        assert_eq!(p(&["alice", "admin", "bob"]), None);
-        let b = set_role_body("admin");
-        assert_eq!(b, json!({"role": "admin"}));
-        let src = body_of(include_str!("security.rs"), "pub fn security_user_set_role(");
-        assert!(src.contains("\"/api/security/users/{}/role\""), "{src}");
-        assert!(src.contains("set_role_body(&role)"), "{src}");
     }
 
     #[test]
