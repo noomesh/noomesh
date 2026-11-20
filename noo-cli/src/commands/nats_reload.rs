@@ -221,7 +221,7 @@ pub fn hup_and_record(ctl: &dyn NatsCtl, p: &Paths, polls: u32, pause: Duration)
     };
     let after = file_sha(&p.conf);
     let loaded = match (outcome, before, after) {
-        (Outcome::Confirmed, Some(b), Some(a)) if a == b => Some(b),
+        (_, Some(b), Some(a)) if a == b => Some(b),
         _ => None,
     };
     record(p, &id, loaded.as_deref());
