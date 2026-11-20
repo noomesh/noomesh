@@ -12,7 +12,7 @@ On the **controller**, mint a one-time token for the new node:
 noo cluster bootstrap-token create --node <node>
 ```
 
-It prints one line that starts with `noo enroll`. On the **new machine**, install `noo` the same way you did on the controller ([install.md](install.md)), then paste that line as that machine's own user. It asks once for that machine's sudo password.
+It prints two steps for the new machine: install `noo` (skip it if `noo --version` already works there), then a `noo enroll noo1.…` line. Run both on the **new machine** as your own user; enroll asks for your sudo password.
 
 Back on the **controller**, hand the node its configuration and wait until it has applied it (this can take up to half an hour the first time):
 
@@ -31,9 +31,10 @@ The node is ready when `verify` shows no FAIL. Each row that fails names the com
   - Options: `[--ttl <1h|30m|24h|secs>] [--cidr <cidr>] [--role <role>]`,
     `[--with-tailscale|--no-tailscale]`.
   - The token is single-use and bound to `<node>`.
-  - It prints the enrollment line (`noo enroll <noo1.blob>`). Treat the line as a
-    secret: never write it to a file or a log, and never pass it in argv to
-    another tool.
+  - It prints two steps for the node: install `noo` (skip it if `noo --version`
+    works), then the enrollment line (`noo enroll noo1.…`).
+  - The line holds a single-use token: don't paste it into chats, issues or
+    logs. It is spent on first use, and an unused one expires (`--ttl`).
 - **Refusals at mint:**
   - `node_name` must be ≤ 64 characters of `[a-zA-Z0-9._-]`;
   - `localhost` and `node-agent` are refused (every node certificate carries
@@ -43,13 +44,14 @@ The node is ready when `verify` shows no FAIL. Each row that fails names the com
 - **Enroll** on the node: `noo enroll <noo1.blob>`, the exact line mint printed.
   There is no `noo enroll <controller-url>` form.
   - Without Tailscale: `--skip-tailscale`.
-  - It runs as the node's own user and asks for a sudo password once, unless that
-    machine has passwordless sudo. Otherwise a person runs it. Never run `sudo` on
-    a remote node yourself.
+  - Run it on the node AS ITS OWN USER, not under sudo. It calls `sudo` itself,
+    several times (`tailscale up`, reading the root-owned PKI anchor, host prep),
+    and a person types the password unless that machine has passwordless sudo.
+    Never wrap it in sudo yourself.
 - **Provision** on the controller: `noo cluster provision <node> --wait [<secs>]`.
-  It stages the node's signed bundle and blocks until the node has enrolled and
-  applied it, which can take up to 30 minutes on a first install. Run it in the
-  background, or stage it and poll `noo --json cluster verify <node>`.
+  It stages the node's signed bundle, waits for the node's first heartbeat, then
+  waits until it has applied its bundle (up to 1800 s by default). Run it in the
+  background, pass a smaller number, or poll `noo --json cluster verify <node>`.
 - **Check (the one "done" test):** `noo --json cluster verify <node> --wait`.
   Exit 0 means done; exit 1 means run each failing row's remedy.
   - Any `"verdict": "fail"` row is a blocker; its `remedy` is the command to run.
