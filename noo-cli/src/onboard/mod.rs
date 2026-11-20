@@ -1554,7 +1554,6 @@ fn print_final_summary(ctx: &Ctx) {
     // (i677 #13: "You're all set" printed under "2 problems need you").
     let mut closing_verify_failed = false;
     if !ctx.dry_run {
-        wait_for_self_node_tunnel(ctx);
         let args: Vec<String> = FINAL_VERIFY_ARGS.iter().map(|a| a.to_string()).collect();
         match crate::commands::cluster_verify(ctx.g, &args) {
             Ok(0) => ctx.success(closing_verify_ok_line(crate::commands::cluster_verify::last_run_note_rows())),
