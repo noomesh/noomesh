@@ -569,14 +569,18 @@ _secret_chown_files() {
     # none of it, only the way to reach the daemon.
     # The helper (lib-helper-image.sh, job `secrets-chown` = CHOWN +
     # DAC_READ_SEARCH, only the secrets dir mounted); NOO_SECRET_CHOWN_IMAGE
-    # stays an operator override of the image, nothing else.
-    HELPER_IMAGE_OVERRIDE="${NOO_SECRET_CHOWN_IMAGE:-}" helper_ensure_present || return 1
+    # stays an operator override of the image, nothing else. Its docker calls
+    # (the presence check and pull as well as the run) get the same minimal
+    # environment: a stale pin from the store must not reach any docker call.
+    local -a _denv=(env -i PATH="$PATH" HOME="${HOME:-/}" ${DOCKER_HOST:+DOCKER_HOST="$DOCKER_HOST"} ${DOCKER_CONFIG:+DOCKER_CONFIG="$DOCKER_CONFIG"}
+        ${DOCKER_CONTEXT:+DOCKER_CONTEXT="$DOCKER_CONTEXT"} ${DOCKER_TLS_VERIFY:+DOCKER_TLS_VERIFY="$DOCKER_TLS_VERIFY"}
+        ${DOCKER_CERT_PATH:+DOCKER_CERT_PATH="$DOCKER_CERT_PATH"} ${XDG_RUNTIME_DIR:+XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR"}
+        ${NOO_STACK_LOCK:+NOO_STACK_LOCK="$NOO_STACK_LOCK"} ${NOO_HELPER_COMPOSE:+NOO_HELPER_COMPOSE="$NOO_HELPER_COMPOSE"}
+        ${NOO_SECRET_CHOWN_IMAGE:+HELPER_IMAGE_OVERRIDE="$NOO_SECRET_CHOWN_IMAGE"})
+    "${_denv[@]}" bash -c '. "$1/lib-helper-image.sh" && helper_ensure_present' _ "$_NOO_HELPER_LIB" || return 1
     HELPER_IMAGE_OVERRIDE="${NOO_SECRET_CHOWN_IMAGE:-}" helper_argv secrets-chown sh "$d":/d || return 1
     # shellcheck disable=SC2016  # expands inside the container
-    env -i PATH="$PATH" HOME="${HOME:-/}" ${DOCKER_HOST:+DOCKER_HOST="$DOCKER_HOST"} ${DOCKER_CONFIG:+DOCKER_CONFIG="$DOCKER_CONFIG"} \
-        ${DOCKER_CONTEXT:+DOCKER_CONTEXT="$DOCKER_CONTEXT"} ${DOCKER_TLS_VERIFY:+DOCKER_TLS_VERIFY="$DOCKER_TLS_VERIFY"} \
-        ${DOCKER_CERT_PATH:+DOCKER_CERT_PATH="$DOCKER_CERT_PATH"} ${XDG_RUNTIME_DIR:+XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR"} \
-        docker "${HELPER_ARGV[@]}" \
+    "${_denv[@]}" docker "${HELPER_ARGV[@]}" \
         -c 'cd /d && while read -r u f; do chown "$u:$u" -- "$f" || exit 1; done < "$1"' sh "$m" >/dev/null
 }
 
