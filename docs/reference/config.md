@@ -85,8 +85,12 @@ If it could not (the launcher says so, and `noo config set` answers a 500 that
 names the command), run:
 
 ```bash
-docker run --rm -v "$PWD/noomesh.yaml":/f alpine sh -c 'chgrp 65532 /f && chmod 660 /f'
+sudo chgrp 65532 noomesh.yaml && sudo chmod 660 noomesh.yaml
 ```
+
+(The launcher does the same through its throwaway helper container: the
+stack's own nginx image by digest, no network, only that one file mounted. It
+never uses Docker Hub.)
 
 **The write is not crash-atomic on a dist install, and this is deliberate.**
 The gateway prefers a temp file plus `rename`, but `rename(2)` onto a *file*

@@ -287,8 +287,10 @@ noo_prepare_gateway_data_dirs() {
     # Never let the mount below create the volume (see noo_ensure_data_volume).
     # "$@": --already-warned, passed through from noomesh-restart.sh.
     noo_ensure_data_volume "$@" || return 1
-    if ! out="$(docker run --rm -v "$vol":/d alpine \
-        sh -c 'mkdir -p /d/ingest/working /d/ingest/archive /d/audit-archive && chown -R 65532:65532 /d/ingest /d/audit-archive' \
+    # Job `data-dirs` (CHOWN + DAC_OVERRIDE), the one volume mounted: the
+    # gateway's own noo-data, since mkdir needs its root.
+    if ! out="$({ helper_ensure_present && helper_run data-dirs sh "$vol":/d \
+        -c 'mkdir -p /d/ingest/working /d/ingest/archive /d/audit-archive && chown -R 65532:65532 /d/ingest /d/audit-archive'; } \
         2>&1)"; then
         echo "WARNING: could not prepare the gateway's data dirs on volume '$vol'" >&2
         echo "         (the gateway may fail with 'Permission denied' on /data/audit-archive):" >&2
@@ -296,5 +298,8 @@ noo_prepare_gateway_data_dirs() {
     fi
     return 0
 }
+
+# shellcheck source=lib-helper-image.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib-helper-image.sh"
 
 noo_instance_env
