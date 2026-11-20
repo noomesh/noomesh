@@ -4551,7 +4551,9 @@ fn health_degraded_exits_nonzero_and_names_dependency() {
     let row = stdout.lines().find(|l| l.contains("postgresql")).unwrap_or_default();
     assert!(row.trim_start().starts_with("x ") && row.contains("Down"), "stdout: {stdout}");
     assert!(stdout.contains("> noo stack status"), "stdout: {stdout}");
-    assert!(stdout.contains("> noo stack logs postgresql"), "stdout: {stdout}");
+    // The dependency is `postgresql`; its container is `postgres`, which is
+    // what `noo stack logs` takes.
+    assert!(stdout.contains("> noo stack logs postgres") && !stdout.contains("stack logs postgresql"), "stdout: {stdout}");
 }
 
 /// `--quiet` keeps only the captured value (CLI_STYLE_GUIDE rev 2 §7): for
