@@ -15,7 +15,8 @@ This helper makes compose's OWN hash see those contents. For every service it
 computes ONE keyed value over the service's file inputs and the launcher puts
 it on the service as the label `noo.inputs` (a small generated override,
 lib-start-inputs.sh). Compose then recreates exactly the services whose
-inputs changed and leaves the rest running. No state is needed for that.
+inputs changed and leaves the rest running. No state is needed for that,
+except for a file a service reloads live (below).
 
 Inputs of a service (classification, see classify_mount):
   * every `secrets:` source file (`file:` under NOO_SECRET_RUNDIR, and any
@@ -45,10 +46,23 @@ over, and `fingerprint` reads those keyed values (--secret-digests).
 A file input that can be read neither way gets a fresh random value: that
 service is recreated on every start (the old, safe behaviour) and it is said.
 
+A service that RELOADS a file live (nats re-reads users.conf on SIGHUP) is not
+recreated for it once the reload is recorded. `noo` writes the record when a
+HUP is CONFIRMED (nats_users.rs hup_nats: the server logged "Reloaded server
+configuration" and the file did not move meanwhile) into this state file:
+  "reloaded": {SERVICE: {"container": ID, "paths": {REALPATH: VALUE|null}}}
+VALUE = HMAC(key, "reloaded" || realpath || content-sha256); null = a HUP was
+delivered but not confirmed. fingerprint (--containers: who is running now)
+then labels that input with the value the running container was MADE on, as
+long as the file still holds what the container has loaded (apply_reloads).
+A record for another container id (a recreated nats) is not used, and a later
+hand edit with no reload does not match it: both recreate, as before.
+
 Subcommands (exit 0 ok, 2 usage/input error, 3 key refused):
   secret-digests --key-file K --dir D --out F NAME=TMPNAME...
   fingerprint    --key-file K --root R [--pki-dir P] [--data-dir X]...
                  [--secret-digests F] [--cap BYTES] [--old-state S] [--only SVC]...
+                 [--containers SNAPSHOT]
                  --override-out O --state-out S2      < compose-config.json
   report         --before B --after A [--old-state S] --new-state S2 [--root R]
 """
@@ -129,6 +143,20 @@ def file_value(key: bytes, path: str, content_sha: str) -> str:
 def service_label(key: bytes, inputs: dict[str, str]) -> str:
     body = "\n".join(f"{p}\t{v}" for p, v in sorted(inputs.items()))
     return keyed(key, f"service\0{body}")
+
+
+def reload_value(key: bytes, real: str, content_sha: str) -> str:
+    """What `noo` records for a file a running container has re-read
+    (nats_users.rs reload_value): keyed, never the raw digest."""
+    return keyed(key, f"reloaded\0{real}\0{content_sha}")
+
+
+def stale_value(key: bytes, value: str) -> str:
+    """The label value for a file whose content equals what the container was
+    made on while the container has since loaded something else (a reload,
+    then a hand revert with no reload): differs from the made-on value, so the
+    container is recreated, and stays stable for the container that results."""
+    return keyed(key, f"reload-stale\0{value}")
 
 
 # ── contents ───────────────────────────────────────────────────────────────
@@ -320,6 +348,53 @@ def key_id(key: bytes) -> str:
     return keyed(key, "key-id")[:16]
 
 
+_STALE = object()  # the running container has loaded something this file does not hold
+
+
+def apply_reloads(key: bytes, inputs: dict[str, str], old_svc: dict | None, record: dict | None,
+                  running_id: str | None) -> tuple[dict[str, str], dict[str, str]]:
+    """The values one service is LABELLED with, and what its container has
+    loaded (kept in the state as "loaded"), given:
+      inputs      this start's value of every file input (service_inputs);
+      old_svc     the state's entry: "inputs" = what the running container was
+                  labelled with (its label basis), "loaded" = what it has
+                  re-read since, when that differs;
+      record      the reload record `noo` wrote for this service, used only
+                  when its container id is the one running now;
+    For each input whose content the container has loaded (a recorded
+    confirmed reload of exactly this content, or the state's "loaded"), the
+    label keeps the basis: compose leaves the container alone. Otherwise the
+    normal value, except that a file put back to the basis content after the
+    container loaded something else gets stale_value (so it IS recreated)."""
+    old_svc = old_svc if isinstance(old_svc, dict) else {}
+    basis_all = old_svc.get("inputs") if isinstance(old_svc.get("inputs"), dict) else {}
+    carried = old_svc.get("loaded") if isinstance(old_svc.get("loaded"), dict) else {}
+    rec_paths: dict = {}
+    if isinstance(record, dict) and running_id and record.get("container") == running_id:
+        rec_paths = record.get("paths") if isinstance(record.get("paths"), dict) else {}
+    out, loaded = dict(inputs), {}
+    for p, cur in inputs.items():
+        basis = basis_all.get(p)
+        if not isinstance(basis, str) or cur.startswith("unreadable:") or cur == "oversize":
+            continue
+        real = os.path.realpath(p)
+        have: object = carried.get(p)
+        if real in rec_paths:
+            rv = rec_paths[real]
+            try:
+                now = reload_value(key, real, sha256_file(p))
+            except OSError:
+                now = ""
+            have = cur if isinstance(rv, str) and now and hmac.compare_digest(rv, now) else _STALE
+        if have == cur:
+            out[p], loaded[p] = basis, cur
+        elif have is not None and basis == cur:
+            out[p] = stale_value(key, cur)
+        elif basis == stale_value(key, cur):
+            out[p] = basis
+    return out, loaded
+
+
 def cmd_fingerprint(a) -> int:
     new_key = not os.path.lexists(a.key_file)
     key = load_key(a.key_file)
@@ -336,10 +411,16 @@ def cmd_fingerprint(a) -> int:
     a.root = os.path.abspath(a.root)
     a.data_dir = [os.path.normpath(d) for d in (a.data_dir or []) if d]
     said: set = set()
+    old = _load_state(a.old_state)
+    same_key = old.get("key_id") == key_id(key)
+    old_services = (old.get("services") or {}) if same_key else {}
+    reloaded = old.get("reloaded") if same_key and isinstance(old.get("reloaded"), dict) else {}
+    running = {s: cid for s, (cid, _) in _read_snapshot(a.containers).items()} if a.containers else {}
     new: dict[str, dict] = {}
     for name in sorted(services):
         inputs = service_inputs(name, services[name] or {}, cfg, key, a, cached, said)
-        new[name] = {"label": service_label(key, inputs), "inputs": inputs}
+        inputs, loaded = apply_reloads(key, inputs, old_services.get(name), reloaded.get(name), running.get(name))
+        new[name] = {"label": service_label(key, inputs), "inputs": inputs, "loaded": loaded}
     # The override compose merges over the stack: one label per service.
     lines = ["# Generated by scripts/noo-start-inputs.py at every start; do not edit.",
              "# noo.inputs is a keyed digest of each service's file inputs (secrets,",
@@ -348,21 +429,33 @@ def cmd_fingerprint(a) -> int:
     for name in sorted(new):
         lines += [f"  {json.dumps(name)}:", "    labels:", f"      {LABEL}: {json.dumps(new[name]['label'])}"]
     write_private(a.override_out, "\n".join(lines) + "\n")
-    # The state for the message: this start's services replace theirs; a
+    # The state (the message, and the label basis apply_reloads keeps for a
+    # reloaded file): this start's services replace theirs; a
     # targeted start keeps every other service's entry. --only (a recreate
     # outside a start, noomesh-restart.sh): only the services it recreates
     # are recorded, the others keep the inputs their containers were made on.
-    old = _load_state(a.old_state)
+    def entry(rec: dict) -> dict:
+        e = {"inputs": dict(rec["inputs"])}
+        if rec["loaded"]:
+            e["loaded"] = dict(rec["loaded"])
+        return e
+
     merged = dict(old.get("services") or {})
     for name, rec in new.items():
         if a.only and name not in a.only:
             continue
-        merged[name] = {"inputs": {p: v for p, v in rec["inputs"].items()}}
+        merged[name] = entry(rec)
     if old.get("key_id") not in (None, key_id(key)):
         # Values made with another key compare as "everything changed".
-        merged = {name: {"inputs": rec["inputs"]} for name, rec in new.items()}
-    write_private(a.state_out, json.dumps({"version": STATE_VERSION, "key_id": key_id(key), "services": merged},
-                                          indent=1, sort_keys=True) + "\n")
+        merged = {name: entry(rec) for name, rec in new.items()}
+    # Reload records stay until their container is replaced (a record for a
+    # container that is no longer the service's is never used again).
+    kept = {s: r for s, r in reloaded.items()
+            if isinstance(r, dict) and (s not in running or r.get("container") == running[s])}
+    out = {"version": STATE_VERSION, "key_id": key_id(key), "services": merged}
+    if kept:
+        out["reloaded"] = kept
+    write_private(a.state_out, json.dumps(out, indent=1, sort_keys=True) + "\n")
     return 0
 
 
@@ -457,6 +550,7 @@ def main(argv: list[str]) -> int:
     f.add_argument("--cap", type=int, default=DEFAULT_CAP)
     f.add_argument("--old-state", default="")
     f.add_argument("--only", action="append", default=[])
+    f.add_argument("--containers", default="")
     f.add_argument("--override-out", required=True)
     f.add_argument("--state-out", required=True)
     r = sub.add_parser("report", allow_abbrev=False)
