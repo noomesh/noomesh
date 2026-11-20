@@ -166,7 +166,7 @@ func wantsCPUImage(backend string, spec BackendSpec, target string, f GPUFacts) 
 		}
 		return false, "", nil
 	}
-	if teiGPUUsable(f) {
+	if !teiGPUUsable(f) {
 		return false, "", nil
 	}
 	return true, fmt.Sprintf("TEI %s on CPU: no usable NVIDIA runtime on this node", backend), nil
