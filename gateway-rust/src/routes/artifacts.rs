@@ -687,7 +687,7 @@ fn hf_snapshot_entries(repo_dir: &Path, repo: &str, rev: &str) -> Result<Vec<HfE
         if e.kind() == std::io::ErrorKind::NotFound {
             hf_refuse(repo, format!("it has no blobs/ directory ({e})"))
         } else {
-            hf_unreadable(repo, "blobs/", &e)
+            hf_refuse(repo, format!("it has no blobs/ directory ({e})"))
         }
     })?;
     let io = |p: &Path, e: std::io::Error| AppError::Internal(format!("reading {}: {e}", p.display()));
