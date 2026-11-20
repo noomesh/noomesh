@@ -434,6 +434,7 @@ async fn bootstrap_token_create(
     perspective: Option<axum::Extension<crate::perspective::RequesterPerspective>>,
     body: Option<Json<Value>>,
 ) -> AppResult {
+    crate::person_gate::require_person_or_agent(&state.db, op.0.as_ref(), &crate::person_gate::NODE_ENROLMENT_AGENTS, "minting a node bootstrap token").await?;
     // i538: a bootstrap token enrols a node; never under a perspective.
     crate::perspective::refuse_mint(perspective.as_ref(), "bootstrap token")?;
     let by = op.actor("cluster-cli");
