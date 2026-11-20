@@ -12,6 +12,8 @@ Checks:
       ships — a public reader gets a dead link; write the OSS version into
       docs/ or drop the citation)
   (d) scripts/gen-cli-docs.py --check passes (generated CLI blocks are fresh)
+      and scripts/gen-verify-rows.py --check (the verify-row registry matches
+      the rows the CLI builds; docs/reference/verify-rows.md is fresh)
   (g) the agent-facing texts (AGENTS.md, prompts/*.md, the shipped core
       skills under prompts/skills/core/): every `noo …` they name resolves
       as in (f), and every `noo_*` tool they name is one the doors declare
@@ -177,6 +179,13 @@ def check_generated(errors: list[str]) -> None:
     )
     if r.returncode != 0:
         errors.append("scripts/gen-cli-docs.py --check failed:\n" + (r.stderr or r.stdout).rstrip())
+    r = subprocess.run(
+        [sys.executable, str(REPO / "scripts" / "gen-verify-rows.py"), "--check"],
+        capture_output=True,
+        text=True,
+    )
+    if r.returncode != 0:
+        errors.append("scripts/gen-verify-rows.py --check failed:\n" + (r.stderr or r.stdout).rstrip())
 
 
 def check_forbidden(errors: list[str]) -> None:

@@ -651,7 +651,7 @@ pub(crate) struct AgeKeyFacts {
 }
 
 fn check(name: &'static str, verdict: Verdict, detail: String, remedy: Option<String>) -> Check {
-    Check { name, verdict, detail, remedy }
+    Check { name, verdict, detail, remedy }.checked()
 }
 
 /// The `age key at rest` row on a box whose manifest says sealed. Pure.

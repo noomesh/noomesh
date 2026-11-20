@@ -132,6 +132,7 @@ the binary's own usage table by `scripts/gen-cli-docs.py`.
 | [reference/api.md](reference/api.md) | Every gateway route by area, the auth model, the WebSocket event format, and the two MCP doors |
 | [reference/harness-protocol.md](reference/harness-protocol.md) | The contract between the gateway and any harness: bus subjects, the per-turn token, the `/api/harness/call` operation table, the events a harness publishes, and what a foreign runner must implement |
 | [reference/node-workloads.md](reference/node-workloads.md) | The model-set and add-on node-workload contract: both schemas, the desired-config `node_workloads` entry, its heartbeat keys, the refusal and reason codes, and which component validates what |
+| [reference/verify-rows.md](reference/verify-rows.md) | Every row `noo cluster verify` can print: its stable `id` (what a program keys on), scope, the verdicts it can give, what it means and what clears it. Generated from the code |
 
 Outside `docs/`: `scripts/setup-dev.sh` prepares a Linux, WSL2 or macOS box
 for development on this repo (toolchains, Docker, the venv, hooks and `noo`;

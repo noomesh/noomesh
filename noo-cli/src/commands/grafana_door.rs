@@ -560,7 +560,7 @@ pub const VIEWER_GRANT_ENV: &str = "NOO_GRAFANA_DS_VIA_GATEWAY";
 /// is off, Grafana has a login of its own, or its port is published wider
 /// than loopback or the tailnet.
 pub fn door_check(f: &Facts) -> Check {
-    let fail = |detail: String, remedy: &str| Check { name: ROW, verdict: Verdict::Fail, detail, remedy: Some(remedy.to_string()) };
+    let fail = |detail: String, remedy: &str| Check { name: ROW, verdict: Verdict::Fail, detail, remedy: Some(remedy.to_string()) }.checked();
     let root = f.root_url.trim().trim_end_matches('/');
     if root.is_empty() {
         return fail(
@@ -591,7 +591,7 @@ pub fn door_check(f: &Facts) -> Check {
             verdict: Verdict::Warn,
             detail: format!("SSO URL {root}; could not read configs/grafana/grafana.ini to confirm Grafana has no login of its own"),
             remedy: None,
-        };
+        }.checked();
     };
     let findings = login_findings(ini);
     if !findings.is_empty() {
@@ -642,7 +642,7 @@ pub fn door_check(f: &Facts) -> Check {
                     "SSO URL {root}; could not read configs/grafana/datasources/ to confirm Grafana's data sources dial the gateway"
                 ),
                 remedy: None,
-            };
+            }.checked();
         }
     }
     if let Some(addrs) = &f.published {
@@ -664,7 +664,7 @@ pub fn door_check(f: &Facts) -> Check {
                  tailscaled down), so whether {root} reaches Grafana cannot be checked"
             ),
             remedy: Some("noo upgrade --stack   # once tailscaled is up: fronts Grafana's port with tailscale serve".to_string()),
-        };
+        }.checked();
     }
     if let Some((port, serve)) = &f.fronting {
         use crate::tailnet_serve::GrafanaServe;
@@ -719,7 +719,7 @@ pub fn door_check(f: &Facts) -> Check {
                         "SSO URL {root}; could not read tailscale serve to confirm it fronts :{port} ({e}); {path}. By hand: {manual}"
                     ),
                     remedy: Some("noo upgrade --stack   # once tailscaled is up".to_string()),
-                };
+                }.checked();
             }
         }
     }
@@ -752,7 +752,7 @@ pub fn door_check(f: &Facts) -> Check {
                      (Diagnostics → Observe → Open Grafana) works meanwhile"
                 ),
                 remedy: Some("noo upgrade --stack   # maps /login on Grafana's port to the console and recreates Grafana".to_string()),
-            };
+            }.checked();
         }
     }
     if f.viewer_grant == Some(false) {
@@ -764,7 +764,7 @@ pub fn door_check(f: &Facts) -> Check {
                  {VIEWER_GRANT_ENV}=1, so read-only users get no Grafana (an older CLI release rendered it)"
             ),
             remedy: Some("noo upgrade --all   # run it from the current CLI release".to_string()),
-        };
+        }.checked();
     }
     let on = match &f.published {
         Some(a) if !a.is_empty() => format!(", published on {} only", a.join(", ")),
@@ -788,7 +788,7 @@ pub fn door_check(f: &Facts) -> Check {
             "SSO on at {root}; noomesh accounts are the only login; Prometheus and Loki through the gateway{on}{fronted}{local}"
         ),
         remedy: None,
-    }
+    }.checked()
 }
 
 fn docker_inspect(name: &str, template: &str) -> Option<String> {

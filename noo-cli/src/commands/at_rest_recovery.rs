@@ -311,7 +311,7 @@ pub(crate) const BINDING_ROW: &str = "at-rest volume binding";
 /// volume has its own token, so its own row.) No row without a volume.
 pub(crate) fn volume_binding_check(v: Option<&Volume>, secure_boot: Option<bool>) -> Option<Check> {
     let v = v?;
-    let c = |verdict, detail: String, remedy: Option<&str>| Check { name: BINDING_ROW, verdict, detail, remedy: remedy.map(str::to_string) };
+    let c = |verdict, detail: String, remedy: Option<&str>| Check { name: BINDING_ROW, verdict, detail, remedy: remedy.map(str::to_string) }.checked();
     Some(match (v.pcrs.as_str(), secure_boot) {
         ("7", Some(true)) => c(Verdict::Ok, "the volume's TPM token is bound to PCR 7 and Secure Boot is on".into(), None),
         ("7", _) => c(
@@ -344,7 +344,7 @@ pub(crate) struct Preflight<'a> {
 }
 
 fn pc(name: &'static str, verdict: Verdict, detail: impl Into<String>, remedy: Option<&str>) -> Check {
-    Check { name, verdict, detail: detail.into(), remedy: remedy.map(str::to_string) }
+    Check { name, verdict, detail: detail.into(), remedy: remedy.map(str::to_string) }.checked()
 }
 
 /// The checks. A volume that does not exist means there is nothing for a
