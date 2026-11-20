@@ -2791,7 +2791,7 @@ pub(crate) fn upgrade_seats(g: &Globals) -> i32 {
                 ui::say(&ui::item(&format!("seat {n}")));
                 match &end {
                     super::provision::ApplyEnd::Applied { rc: 0, .. } => {}
-                    super::provision::ApplyEnd::Applied { rc: _, msg } => ui::say_err(&ui::sub(&ui::status_line(Glyph::Err,
+                    super::provision::ApplyEnd::Applied { msg, .. } => ui::say_err(&ui::sub(&ui::status_line(Glyph::Err,
                         &format!("apply failed: {}", msg.trim_start_matches("apply failed: ").chars().take(300).collect::<String>())))),
                     other => ui::say_err(&ui::sub(&ui::status_line(Glyph::Err, &format!("{other:?} within 10m")))),
                 }

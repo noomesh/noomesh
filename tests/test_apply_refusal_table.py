@@ -212,3 +212,19 @@ def test_the_trap_removes_nothing_before_mktemp():
     assert '[ -z "$WORK" ] || rm -rf "$WORK"' in body and '[ -z "$KEYS" ] || rm -rf "$KEYS"' in body
     head = APPLIER[:APPLIER.index("trap noo_apply_on_exit EXIT")]
     assert '\nWORK=""\n' in head and '\nKEYS=""\n' in head, "an inherited WORK would be removed as root"
+
+
+def rust_refusals() -> dict[str, int]:
+    start = PROVISION.index("pub(crate) const REFUSALS: &[RefusalRow] = &[")
+    body = PROVISION[start:PROVISION.index("\n];\n", start)]
+    rows = re.findall(r'^\s*RefusalRow \{ name: "([a-z][a-z0-9_]*)", code: (\d+), why: "[^"]+", next: ', body, re.M)
+    table = {n: int(c) for n, c in rows}
+    assert len(table) == len(rows), "a name is listed twice in REFUSALS"
+    assert len(rows) == body.count("RefusalRow {"), "a REFUSALS row this guard cannot read"
+    return table
+
+
+def test_the_cli_names_every_refusal_with_the_appliers_code():
+    """The CLI's words for a name are found only when its row carries the
+    same name AND code as the applier's table (apply_refusal_for)."""
+    assert rust_refusals() == sh_refusal_table()
