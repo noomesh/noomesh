@@ -3792,7 +3792,7 @@ async fn api_users_disable(
     ctx: Option<Extension<RequesterCtx>>,
     Json(body): Json<Value>,
 ) -> AppResult {
-    crate::person_gate::require_person(&state.db, ctx.as_deref(), "disabling or re-enabling an account").await?;
+
     let by = users_admin_mutation_guard(&ctx)?.sub.clone();
     let username = body_str(&body, "username");
     let disabled = body.get("disabled").and_then(Value::as_bool);
