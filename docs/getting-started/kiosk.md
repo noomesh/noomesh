@@ -217,14 +217,19 @@ any bundle staged for the old one.
   step run at that box, by a person. From the controller you may mint a
   token when asked: `noo kiosk seat-token <name>` prints one
   `noo kiosk enroll noo-seat1.<blob>` line. The blob is a single-use
-  credential (one hour by default): hand it to the person, never log it.
-- **State:** `noo cluster verify` has a Seats section, and `--json` lists
-  each seat with its rows (`seat online`, `seat cli`, `kiosk-serve`,
-  `display`, `seat bundle`, …; each row's `id` and what clears it are in
-  [reference/verify-rows.md](../reference/verify-rows.md)).
+  credential (one hour by default, `--ttl` up to 24 hours): hand it to the
+  person, never log it.
+- **State:** `noo cluster verify` has a Seats section. In `--json`,
+  `seats` is a list of `{"seat", "ok", "checks"}` (rows `seat online`,
+  `seat cli`, `kiosk-serve`, `display`, `seat bundle`, …; each row's `id`
+  and what clears it are in
+  [reference/verify-rows.md](../reference/verify-rows.md)). `seats` is `[]`
+  when no seat is enrolled and `null` when the gateway did not answer the
+  list: `null` is unknown, not none.
 - **Updates reach the displays:** `noo upgrade --seats` (and `--all`,
-  `--nodes` unless `--no-seats`) stages a bundle every seat applies within a
-  minute, which may restart the display. Run it only when the person asked.
+  `--nodes` unless `--no-seats`) stages a bundle every seat applies on its
+  next sync tick (the timer runs once a minute), which may restart the
+  display. Run it only when the person asked.
 - **Paths a seat's own sync writes:** `~/.local/bin/noo`,
   `~/.local/libexec/noo-seat/noo` and its kiosk scripts, as the seat user;
   units, the watchdog and `signing.pub` are root-owned and change only by
