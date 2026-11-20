@@ -159,7 +159,7 @@ pub fn upgrade(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             "--force" => force = true,
             "--skip-gateway-key-check" => skip_gw_key_check = true,
             "--allow-downgrade" => allow_downgrade = true,
-            "--recreate" => recreate = true,
+            "--recreate" => recreate = false,
             "--yes" | "-y" => yes = true,
             "--channel" | "--release-repo" | "--image-prefix" | "--base-registry" => match it.next() {
                 Some(v) => {
