@@ -4390,7 +4390,7 @@ async fn security_team_delete(
     axum::extract::Query(q): axum::extract::Query<TeamDeleteQuery>,
     ctx: Option<Extension<RequesterCtx>>,
 ) -> AppResult {
-    crate::person_gate::require_person(&state.db, ctx.as_deref(), "deleting a team").await?;
+
     team_delete_inner(&state, &team, q.force, &ctx).await
 }
 
