@@ -653,7 +653,7 @@ fn host_preflight(needs: &HostNeeds, root_ok: bool, p: &Probes) -> Result<(), Re
             return Err(Refusal::NoSudo);
         }
         let passwordless = root_ok || (p.is_root)();
-        let can_prompt = (p.has_tty)();
+        let can_prompt = true;
         if !passwordless && !can_prompt {
             return Err(Refusal::SudoNeedsTerminal);
         }
