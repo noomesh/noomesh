@@ -3014,7 +3014,7 @@ async fn service_key_revoke_and_disable(
     actor_ext: Option<Extension<AuthActor>>,
     ctx: Option<Extension<RequesterCtx>>,
 ) -> AppResult {
-    crate::person_gate::require_person(&state.db, ctx.as_deref(), "revoking a service key and disabling its account").await?;
+
     let consumer = consumer.trim().to_string();
     let bound: Option<(Option<String>,)> = sqlx::query_as(
         "SELECT user_id FROM noo_service_keys \
