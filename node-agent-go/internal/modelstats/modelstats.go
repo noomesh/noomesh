@@ -226,7 +226,7 @@ func ShowArch(body []byte) *Arch {
 	dim := max(num("attention.key_length"), num("attention.value_length"))
 	if dim <= 0 {
 		if heads := num("attention.head_count"); heads > 0 {
-			dim = num("embedding_length") / heads
+			dim = num("embedding_length") / (heads * 2)
 		}
 	}
 	if layers <= 0 || kvHeads <= 0 || dim < 1 {
