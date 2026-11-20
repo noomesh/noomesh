@@ -1337,11 +1337,11 @@ async fn provision_bundle_status(
         return Err(AppError::BadRequest("invalid node name".into()));
     }
     type StatusRow = (jiff_sqlx::Timestamp, Option<jiff_sqlx::Timestamp>, i64,
-                      Option<jiff_sqlx::Timestamp>, Option<String>, Option<i32>, Option<String>);
+                      Option<jiff_sqlx::Timestamp>, Option<String>, Option<i32>, Option<String>, Option<String>);
     let row: Option<StatusRow> =
         sqlx::query_as(
             "SELECT created_at, fetched_at, octet_length(blob)::bigint, \
-                    applied_at, applied_sha, apply_rc, apply_msg \
+                    applied_at, applied_sha, apply_rc, apply_msg, apply_refusal \
              FROM noo_provision_bundles WHERE node_name = $1",
         )
         .bind(&node)
@@ -1351,7 +1351,7 @@ async fn provision_bundle_status(
     // `sha256(blob)` in SQL on every poll of a provision wait loop.
     let sha = staged_sha(&state.db, &node).await?.unwrap_or_default();
     match row {
-        Some((staged_at, fetched_at, bytes, applied_at, applied_sha, apply_rc, apply_msg)) => Ok(Json(json!({
+        Some((staged_at, fetched_at, bytes, applied_at, applied_sha, apply_rc, apply_msg, apply_refusal)) => Ok(Json(json!({
             "node": node,
             "staged_at": crate::wire_time::rfc3339_offset(staged_at.to_jiff()),
             "fetched_at": fetched_at.map(|t| crate::wire_time::rfc3339_offset(t.to_jiff())),
@@ -1365,6 +1365,10 @@ async fn provision_bundle_status(
             "applied_sha": applied_sha,
             "apply_rc": apply_rc,
             "apply_msg": apply_msg,
+            // The refusal's NAME as the node reported it (noo-apply.sh
+            // `refusal_table`): which remedy the code needs. Null when the
+            // node sent none (an older fetcher) or the apply succeeded.
+            "apply_refusal": apply_refusal,
         }))),
         None => Err(AppError::NotFound("no bundle staged".into())),
     }
@@ -1501,6 +1505,9 @@ async fn bundle_apply_report(
     let sha = body.get("sha").and_then(|v| v.as_str()).unwrap_or("").trim().to_lowercase();
     let rc = body.get("rc").and_then(|v| v.as_i64()).unwrap_or(-1) as i32;
     let msg: String = body.get("msg").and_then(|v| v.as_str()).unwrap_or("").chars().take(2000).collect();
+    // A refusal name only in its own shape and only with a refusal; anything
+    // else is no name (NULL), never an error: an older fetcher sends none.
+    let refusal = crate::repo::bundle_apply_reports::refusal_token(rc, body.get("refusal").and_then(|v| v.as_str()));
     if sha.len() != 64 || !sha.chars().all(|c| c.is_ascii_hexdigit()) {
         return Err(AppError::BadRequest("sha must be 64 hex chars".into()));
     }
@@ -1541,23 +1548,14 @@ async fn bundle_apply_report(
         }
     };
     let birth_signed = status == ProofStatus::Signed;
-    sqlx::query(
-        "UPDATE noo_provision_bundles SET applied_at = now(), applied_sha = $2, apply_rc = $3, apply_msg = $4 \
-         WHERE node_name = $1",
-    )
-    .bind(&node)
-    .bind(&sha)
-    .bind(rc)
-    .bind(&msg)
-    .execute(&state.db)
-    .await?;
+    crate::repo::bundle_apply_reports::record(&state.db, &node, &sha, rc, &msg, refusal.as_deref()).await?;
     crate::audit::record(
         &state.db,
         AuditEvent::new(AuditKind::BundleApplyReported, &format!("node:{node}"), &format!("provision-bundle:{node}"))
             .outcome(if rc == 0 { crate::audit::Outcome::Ok } else { crate::audit::Outcome::custom("failed") })
             .severity(if rc == 0 { crate::audit::Severity::Info } else { crate::audit::Severity::Warning })
             .details(json!({ "node": node, "rc": rc, "sha": sha, "msg": msg,
-                "proved_by": proved_by })),
+                "refusal": refusal, "proved_by": proved_by })),
     )
     .await;
     Ok(Json(json!({ "recorded": true, "node": node, "rc": rc, "signed": birth_signed })))
