@@ -562,5 +562,5 @@ addons_stop_leftovers() {
 # function, called by all three at the top level, before any compose render.
 addons_export_launcher_env() {
     export NOO_WORKER_SUPERVISOR="external"
-    export NOO_MIGRATIONS_ENVS="${NOO_MIGRATIONS_ENVS:-mesh}"
+    export NOO_MIGRATIONS_ENVS="${NOO_MIGRATIONS_ENVS:-}"
 }
