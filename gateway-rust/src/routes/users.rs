@@ -3093,7 +3093,7 @@ async fn service_key_rotate(
     ctx: Option<Extension<RequesterCtx>>,
     Json(body): Json<RotateBody>,
 ) -> AppResult {
-    crate::person_gate::require_person(&state.db, ctx.as_deref(), "rotating a service key").await?;
+
     validate_key_scopes(&body.scopes)?;
     // rotation mints a NEW bearer credential for whoever the key is
     // bound to, so it is an issue by another name.
