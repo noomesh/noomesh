@@ -13,7 +13,9 @@ variable. Some are free, some need a licence.
 | Intelligent tier | graph-guided retrieval on top of the knowledge pack | licensed | `addons.trellion_intel` (off) |
 | Evolve | self-tuning of the agent from its own runs; provides `noo loop` and `noo ga` | licensed | `addons.evolve` (off) |
 
-## Turn one on or off
+## For people
+
+### Turn one on or off
 
 Edit the map in `noomesh.yaml`, then restart the stack:
 
@@ -40,7 +42,7 @@ add-on the flag is not enough: it also needs an entitlement (below).
 From the command line, `noo addons enable <name>` mints what the add-on needs
 and declares it on; `noo addons list` shows the state of each.
 
-## Voice models are staged by the controller
+### Voice models are staged by the controller
 
 The voice containers never download anything. The controller fetches the
 models, verifies them and stores them in its model store (`MODELS_DIR`,
@@ -81,7 +83,7 @@ internet keeps a working voice only once you copy the files into
 `noomesh_piper-voices` volume (`docker volume rm noomesh_piper-voices`) and the
 `<data root>/hf-cache/hub/models--Systran--faster-whisper-*` directories.
 
-## What a disabled add-on does
+### What a disabled add-on does
 
 Nothing else breaks. The gateway keeps serving; only the add-on's own surface
 answers **HTTP 503** with `{"error": "<why>", "addon": "<name>"}`, and the
@@ -89,7 +91,7 @@ answers **HTTP 503** with `{"error": "<why>", "addon": "<name>"}`, and the
 and reports each add-on as `enabled`, `disabled` or `unlicensed` (flag on,
 no valid entitlement).
 
-## Who can use an add-on's routes
+### Who can use an add-on's routes
 
 An add-on's HTTP routes are scoped by role like the core's. Each route in the
 add-on's manifest names the lowest role that may call it; a route that names
@@ -98,7 +100,7 @@ vouch for. The evolve add-on's loop, GA, RL-policy and meta-loop reads
 describe the whole installation and are Operator and Admin only. Add-on authors:
 [development/addons.md](../development/addons.md#who-may-call-a-route).
 
-## Licensed add-ons
+### Licensed add-ons
 
 A licensed add-on needs an entitlement token from PersonifAI. Register at
 <https://noomesh.ai/add-ons>; the terms are at
@@ -115,7 +117,7 @@ In a non-interactive run, pass `--accept-terms <version>` naming the terms
 version the install prints. If `install` refuses a token,
 `noo security entitlement verify <token>` says why.
 
-## Enable a third-party add-on
+### Enable a third-party add-on
 
 An add-on you did not get with the stack (a voice assistant from another
 vendor, say) is switched on the same way as a built-in one, with one extra
@@ -202,16 +204,42 @@ that does not declare delegation does nothing, and the gateway log says so. The
 key is admin-only to change through the API. Upgrading noomesh keeps the
 add-ons you already run working on the first start.
 
-## Build your own
+### Build your own
 
 An add-on is anything that speaks one of the core's extension seams (an MCP
 server, a plugin shim, a model backend, a worker container). The author guide
 is [development/addons.md](../development/addons.md); the Apache-2.0 client
 for calling the gateway is `packages/noo-gateway-client`.
 
-## Licensing
+### Licensing in one paragraph
 
 The core is AGPL-3.0-only (see `LICENSE`). Trellion is AGPL-3.0-only with a
 commercial licence available from PersonifAI LLC. The licensed add-ons are
 proprietary, live in separate repositories and talk to the core over the same
 network seams you can use.
+
+## For agents
+
+- **State:** `noo health --json` carries an `addons` object (`enabled`,
+  `disabled` or `unlicensed` per add-on); `noo addons list` shows each
+  add-on's state, a development key with its expiry, and whether a registry
+  credential is set (never its value).
+- **A free add-on:** `noo addons enable <name>`, then
+  `noo stack restart --force`, then confirm it reads `enabled` in
+  `noo health --json`. Voice models come from the controller only:
+  `noo models pull whisper:<size>` or `noo models pull piper:<voice>`; a
+  404 from voice names the exact pull line.
+- **A disabled add-on is not a fault:** its routes answer HTTP 503 with
+  `{"error": "<why>", "addon": "<name>"}` and its `noo` commands exit 5 with
+  the reason. Branch on that; do not retry, and nothing else is affected.
+- **A person's decisions, never yours:**
+  - accepting a licence's terms: `noo security entitlement install` asks
+    for them; pass `--accept-terms <version>` only when the person has
+    accepted that version;
+  - trusting a third-party signing key (`noo addons trust-key`), which
+    comes from the vendor over a channel the person trusts;
+  - letting an add-on create and steer the person's tasks
+    (`noo addons set <name> --delegate tasks`).
+- **Secrets never go in argv:** a registry token goes through stdin or a
+  file (`noo addons registry-login <name> --registry <root> < token.txt`),
+  an entitlement token is the person's to paste.
