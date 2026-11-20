@@ -1420,9 +1420,10 @@ and the node retries on its next poll.
   to both, never a new exit code.
 - A name counts only under its own code (`apply_refusal_for`). An unknown
   name, or one of another code, falls back to the code's row.
-- The status route returns `apply_refusal` beside `apply_rc` and
-  `apply_msg`. `--json` keeps `code` per exit code and adds `refusal`
-  (null when the node named none).
+- The controller stores no separate field: the name travels as the last
+  line of `apply_msg` (noo-fetch also sends a `refusal` field, which the
+  gateway does not store), and the CLI reads it from there. `--json` keeps
+  `code` per exit code and adds `refusal` (null when the node named none).
 - The name line never contains `REFUSED` and never a bare `(NN)`. The
   rehearsal counts `REFUSED` lines, and `cluster_verify` cuts the release
   line at `(75)`.
