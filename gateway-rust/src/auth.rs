@@ -3846,7 +3846,7 @@ pub async fn require_any_auth(
     if defers_to_ws_handler(&request) {
         return Ok(next.run(request).await);
     }
-    Ok(unauthenticated())
+    Err(StatusCode::UNAUTHORIZED)
 }
 
 /// The stable `code` of the one 401 a request gets when no credential class
