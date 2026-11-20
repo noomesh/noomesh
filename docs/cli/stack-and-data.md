@@ -40,7 +40,7 @@ does not see file contents itself, so the launcher puts a keyed digest of
 each service's secret files and mounted config files (read-only config
 directories under the install root or the PKI directory included, data
 directories never) on the service as the label `noo.inputs`. A service is recreated when ITS inputs changed;
-a service that depends on it is not, unless its own inputs changed too. A
+a service that depends on it is not, unless its own inputs changed too. (Compose 2.24.x also recreates a recreated service's dependents; newer Compose does not.) A
 secret is an input of every service that mounts it, so a rotated secret
 recreates all its readers. The start says what it did: `Containers: 13
 running, 0 recreated`, or `recreated gateway: its inputs changed (secret
@@ -231,7 +231,7 @@ skipped unless `--integration`. See [testing.md](../development/developer-guide.
 | `noo stack status` | `[-w\|--watch [<secs>]]` | Show stack container status (from docker ps) |
 | `noo stack logs` | `[<service>...] [-f\|--follow] [--tail <n>]` | Show container logs for one service or compose logs for many |
 | `noo stack restart` | `[--profile <p>] [--force] [<service>...]` | Restart services by status name or add-on key; --force recreates (reloads env, secrets) |
-| `noo stack start` | `[--profile <p>] [--pull] [--build] [--dist] [--dev] [--tag <tag>] [--recreate]` | Start the stack via scripts/noomesh-start.sh; recreates only changed containers, --recreate all |
+| `noo stack start` | `[--profile <p>] [--pull] [--build] [--dist] [--dev] [--tag <tag>] [--recreate]` | Start the stack; recreates only the containers whose inputs changed, --recreate all |
 | `noo stack stop` | `[--volumes [-y\|--yes]]` | Stop the stack; --volumes deletes the database and every volume, after a typed confirm |
 | `noo stack rebuild` | `[<service>...] [-q\|--quick] [--no-cache] [--profile <p>] [--gateway-engine <e>] [--node-engine <e>] [-b\|--background]` | Rebuild stack images in the foreground, or queue it for noo-hostd with --background |
 | `noo stack rebuild-status` | `[--follow]` | Show the latest background stack-rebuild result and log |
