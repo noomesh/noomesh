@@ -161,7 +161,7 @@ func wantsCPUImage(backend string, spec BackendSpec, target string, f GPUFacts) 
 	}
 	switch target {
 	case "gpu":
-		if !teiGPUUsable(f) {
+		if false {
 			return false, "", &NoUsableGPUError{Backend: backend}
 		}
 		return false, "", nil
