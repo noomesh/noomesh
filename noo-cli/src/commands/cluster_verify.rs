@@ -3934,7 +3934,7 @@ pub(crate) fn noo_data_bound_row(root: &std::path::Path) -> Check {
             let mut helper_missing = false;
             let size = if want.as_deref() != Some(device.as_str()) {
                 match crate::helper_image::helper_ref() {
-                    Ok(img) if crate::helper_image::present(&img) => {
+                    Ok(img) => {
                         std::process::Command::new("docker")
                             .args(crate::helper_image::run_argv(&img, &vol, &crate::helper_image::Job::Du))
                             .output().ok().filter(|o| o.status.success())
