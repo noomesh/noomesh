@@ -1541,6 +1541,20 @@ pub(crate) const ROWS: &[Row] = &[
         doc: None,
     },
     Row {
+        id: "service_key_bindings",
+        name: "service key bindings",
+        scope: Scope::Controller,
+        verdicts: &[Verdict::Warn],
+        meaning: "Whether any active service key acts as an admin account or carries the `identity` scope (mints agent tokens): the widest standing credentials on an install. Also warns when the keys or accounts cannot be read.",
+        clears: "Remedy depends on the finding (printed with the row); an unread list clears when an admin's sign-in (`noo auth login <admin>`) reads it.",
+        findings: &[
+            Finding { code: "bound_to_admin", clears: "Sign in as an admin, re-issue the key under a new consumer bound to an account with only the access it needs (`noo security service-key issue <new-consumer> --user <name> --scopes <scope>`), then `noo security service-key revoke <consumer>`.", needs_human: true },
+            Finding { code: "identity_scope", clears: "Keep it only if you use the identity add-on; otherwise, as an admin, `noo security service-key revoke <consumer>`.", needs_human: true },
+        ],
+        shown_as: None,
+        doc: None,
+    },
+    Row {
         id: "service_key_grants",
         name: "service-key grants",
         scope: Scope::Controller,
