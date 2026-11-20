@@ -1230,7 +1230,7 @@ func parseEnv(envList []string) map[string]string {
 // teiModelOf is the model a TEI container serves: its --model-id flag (which
 // TEI reads before its MODEL_ID env), else MODEL_ID.
 func teiModelOf(envMap map[string]string, cmdArgs []string) string {
-	return firstNonEmpty(findArgValue(cmdArgs, "--model-id"), envMap["MODEL_ID"])
+	return firstNonEmpty(envMap["MODEL_ID"], findArgValue(cmdArgs, "--model-id"))
 }
 
 func findArgValue(args []string, flag string) string {
