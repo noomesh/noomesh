@@ -1,7 +1,46 @@
 # noomesh
 
 **Noomesh turns the machines you already own into one local-first AI
-cluster.** A GPU workstation, a few Linux boxes, an edge board, a phone —
+cluster.**
+
+## Quick start
+
+```bash
+# 1. Install the noo CLI (static binary, checksum-verified, lands in ~/.local/bin)
+curl -fsSL https://github.com/noomesh/noomesh/releases/latest/download/install.sh -o install.sh && sh install.sh
+# 2. The wizard, run from any directory that is NOT a source checkout: it installs
+#    into ~/.noo, pulls the released images, and walks prerequisites, secrets,
+#    storage, the Docker stack, a first model, channels, add-ons
+noo onboard
+# 3. Check it (the wizard leaves the stack running)
+noo health
+# after a reboot or `noo stack stop`: noo stack start
+```
+
+One Linux box (or WSL2) with Docker and the Compose v2 plugin; on Ubuntu/Debian
+the wizard offers to install Docker (get.docker.com, uses sudo). An NVIDIA GPU is
+optional. Full walkthrough:
+[docs/getting-started/install.md](./docs/getting-started/install.md).
+
+Is it right? `noo cluster verify`: no FAIL means ready; `!` rows are notes.
+
+When the wizard finishes: dashboard at `https://localhost:8080` (and on
+your tailnet name, if you joined one). The certificate is issued by the
+install's own CA, so a browser warns until it trusts that CA. Grafana,
+Loki and Tempo run only if you answer yes in the wizard; a non-interactive
+install is lean (Prometheus, Alertmanager, node-exporter). See
+[monitoring](./docs/operating/monitoring.md).
+Then: [your first chat](./docs/getting-started/first-chat.md) ·
+[add-ons](./docs/getting-started/add-ons.md) ·
+[standalone controller](./docs/getting-started/standalone-controller.md).
+
+Working on the code itself? Clone the repo and run `noo onboard` inside the
+checkout — [install.md § Contributors](./docs/getting-started/install.md#contributors-run-from-a-checkout).
+
+## What it is
+
+Noomesh turns the machines you already own into one local-first AI
+cluster. A GPU workstation, a few Linux boxes, an edge board, a phone —
 one self-managing assistant: multi-node inference,
 knowledge-graph memory, scheduled and self-healing automation, and
 messaging channels, all behind one gateway on your own network. No cloud
@@ -16,36 +55,6 @@ the intelligence.
 [![Python 3.12](https://img.shields.io/badge/python-3.12-blue.svg)](https://www.python.org/downloads/)
 
 [Quick start](#quick-start) • [Architecture](#architecture) • [Documentation](./docs/README.md) • [Contributing](./CONTRIBUTING.md)
-
-## Quick start
-
-One Linux box (or WSL2) with Docker and the compose plugin. An NVIDIA GPU is
-optional. Full walkthrough:
-[docs/getting-started/install.md](./docs/getting-started/install.md).
-
-```bash
-# 1. Install the noo CLI (static binary, checksum-verified, lands in ~/.local/bin)
-curl -fsSL https://github.com/noomesh/noomesh/releases/latest/download/install.sh -o install.sh && sh install.sh
-# 2. The wizard, run from any directory that is NOT a source checkout: it installs
-#    into ~/.noo, pulls the released images, and walks prerequisites, secrets,
-#    storage, the Docker stack, a first model, channels, add-ons
-noo onboard
-# 3. Day to day
-noo stack start && noo health
-```
-
-When the wizard finishes: dashboard at `https://localhost:8080` (and on
-your tailnet name, if you joined one). The certificate is issued by the
-install's own CA, so a browser warns until it trusts that CA. Grafana,
-Loki and Tempo run only if you answer yes in the wizard; a non-interactive
-install is lean (Prometheus, Alertmanager, node-exporter). See
-[monitoring](./docs/operating/monitoring.md).
-Then: [your first chat](./docs/getting-started/first-chat.md) ·
-[add-ons](./docs/getting-started/add-ons.md) ·
-[standalone controller](./docs/getting-started/standalone-controller.md).
-
-Working on the code itself? Clone the repo and run `noo onboard` inside the
-checkout — [install.md § Contributors](./docs/getting-started/install.md#contributors-run-from-a-checkout).
 
 ## Architecture
 
