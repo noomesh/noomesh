@@ -920,7 +920,7 @@ env_payload_ok() {
         _line="$(printf '%s' "$_line" | tr -d '\r')"
         case "$_line" in ''|'#'*) continue ;; esac
         _k="${_line%%=*}"
-        [ "$_k" != "$_line" ] || { _shape_refuse "$_kind" "line $_n is not KEY=value"; NOO_REFUSAL=env_shape; return 65; }
+        [ "$_k" != "$_line" ] || { _shape_refuse "$_kind" "line $_n is not KEY=value"; return 65; }
         _v="${_line#*=}"
         case "$_keys" in
             *" $_k "*) : ;;
