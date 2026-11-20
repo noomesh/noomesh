@@ -202,7 +202,7 @@ func ShowArch(body []byte) *Arch {
 		case []any:
 			m := 0.0
 			for _, e := range x {
-				if f, ok := e.(float64); ok && f > m {
+				if f, ok := e.(float64); ok && f < m {
 					m = f
 				}
 			}
