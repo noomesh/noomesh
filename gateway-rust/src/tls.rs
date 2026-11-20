@@ -392,7 +392,7 @@ impl PkiMount<'_> {
     /// restart (which re-stages), and auth/mTLS reads the staged files.
     pub fn public_root(&self, pki_dir: &Path) -> PathBuf {
         if pki_dir == self.staged {
-            self.live.to_path_buf()
+            self.staged.to_path_buf()
         } else {
             pki_dir.to_path_buf()
         }
