@@ -287,7 +287,7 @@ def is_hub_container(ref, pulled_repos):
     host, repo = image_parts(ref)
     if host != "docker.io":
         return False
-    return repo in pulled_repos or repo in HUB_KNOWN
+    return repo in HUB_KNOWN
 
 
 def judge_dockerhub(lines):
