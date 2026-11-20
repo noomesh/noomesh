@@ -107,7 +107,7 @@ pub(crate) fn helper_ref_from(compose: &str, lock: Option<&str>) -> Result<Strin
     let digest = lock
         .and_then(|l| crate::commands::image_stage::parse_lock(l).into_iter().find(|r| r.name == HELPER_LOCK_ROW))
         .map(|r| format!("@{}", r.digest))
-        .unwrap_or(default_digest);
+        .unwrap_or_default();
     Ok(format!("{repo_tag}{digest}"))
 }
 
