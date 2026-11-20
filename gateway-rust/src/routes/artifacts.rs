@@ -719,7 +719,7 @@ fn hf_snapshot_entries(repo_dir: &Path, repo: &str, rev: &str) -> Result<Vec<HfE
                 if e.kind() == std::io::ErrorKind::NotFound {
                     hf_refuse(repo, format!("{rel} is a dangling link ({e})"))
                 } else {
-                    hf_unreadable(repo, &rel, &e)
+                    hf_refuse(repo, format!("{rel} is a dangling link ({e})"))
                 }
             })?;
             if target.parent() != Some(blobs.as_path()) || !target.is_file() {
