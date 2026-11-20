@@ -201,7 +201,7 @@ async fn seat_token_create(
     perspective: Option<axum::Extension<crate::perspective::RequesterPerspective>>,
     Json(body): Json<CreateSeatTokenBody>,
 ) -> AppResult {
-    crate::person_gate::require_person(&state.db, op.0.as_ref(), "minting a seat token").await?;
+
     // i538: a seat enrolment token is a credential; never under a perspective.
     crate::perspective::refuse_mint(perspective.as_ref(), "seat token")?;
     let by = seat_admin_guard(&op, &cluster)?;
