@@ -259,7 +259,7 @@ pub const USAGE: &[(&[&str], &str, &str)] = &[
     (&["doctor", "secrets"], "", "Report containers running a secret value that .env has moved past"),
     (&["doctor", "exposure"], "", "Report which published ports are reachable from outside the tailnet"),
     (&["doctor", "strangers"], "[--minutes N]", "Gateway callers the tailnet does not account for, and any caller in a refusal storm"),
-    (&["enroll"], "<noo1.blob> | --url <u> --token <t> | --via-tailnet <u> [--ca-sha256 <hex>] [--ts-authkey <k>] [--node <name>] [--skip-tailscale] [--skip-prep] [--data-root <dir>] [--controller-approvals] [--resume]", "Enroll this machine as a worker of the given controller"),
+    (&["enroll"], "<noo1.blob> | --url <u> --token <t> | --via-tailnet <u> [--ca-sha256 <hex>] [--ts-authkey <k>] [--node <name>] [--skip-tailscale] [--skip-prep] [--data-root <dir>] [--controller-approvals] [--root-ok] [--resume]", "Enroll this machine as a worker of the given controller"),
     (&["db", "verify-plane"], "[<db>]", "Run scripts/verify-privilege-plane.sh against a database (default noo)"),
     (&["db", "current"], "", "Show the migration stamp of each system (mesh runner, trellion alembic, evolve)"),
     (&["db", "history"], "", "List the mesh runner's ported chain with applied/pending markers, plus other stamps"),

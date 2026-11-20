@@ -309,7 +309,7 @@ the other nodes first: [Start over](../getting-started/start-over.md).
 ### `noo enroll` — Join this machine to a noomesh fleet as a worker
 | Command | Arguments | What it does |
 |---|---|---|
-| `noo enroll` | `<noo1.blob> \| --url <u> --token <t> \| --via-tailnet <u> [--ca-sha256 <hex>] [--ts-authkey <k>] [--node <name>] [--skip-tailscale] [--skip-prep] [--data-root <dir>] [--controller-approvals] [--root-ok] [--resume]` | Enroll this machine as a worker of the given controller; checks sudo, disk and the controller before it spends the token |
+| `noo enroll` | `<noo1.blob> \| --url <u> --token <t> \| --via-tailnet <u> [--ca-sha256 <hex>] [--ts-authkey <k>] [--node <name>] [--skip-tailscale] [--skip-prep] [--data-root <dir>] [--controller-approvals] [--root-ok] [--resume]` | Enroll this machine as a worker of the given controller |
 
 ### `noo offboard` — Tear a standalone controller down to bare machine prep (confirms each step)
 | Command | Arguments | What it does |
