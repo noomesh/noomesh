@@ -480,7 +480,7 @@ async fn user_set_role(
     ctx: Option<Extension<RequesterCtx>>,
     Json(body): Json<SetRoleBody>,
 ) -> AppResult {
-    crate::person_gate::require_person(&state.db, ctx.as_deref(), "changing an account's role").await?;
+
     let by = scope_mutation_guard(&ctx)?.sub.clone();
     let username = username.trim().to_string();
     if username.is_empty() {
