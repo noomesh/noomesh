@@ -109,8 +109,8 @@ pub fn cluster_import_model(g: &Globals, args: &[String]) -> Result<i32, Unhandl
     let name = name.as_str();
     if !staged && !mf.is_file() {
         // Not published yet: a model that ships as an OCI artifact under the
-        // release namespace (<prefix>/<name>:v1 — harrier does) can be
-        // staged from the registry the stack already logs into. On
+        // release namespace (harrier, pinned by digest in the signed stack
+        // lock) can be staged from the registry the stack already logs into. On
         // 2026-09-09 this was done by hand with docker create + docker cp;
         // the verb does it now, and says so.
         match stage_artifact_into_store(name, &store) {
@@ -205,19 +205,23 @@ pub fn cluster_import_model(g: &Globals, args: &[String]) -> Result<i32, Unhandl
 }
 
 /// Stage `<name>.Modelfile` + its weight into the store from the OCI
-/// artifact `<NOO_IMAGE_PREFIX>/<name>:v1` (three files under /<name>/ —
-/// the shape publish-harrier.yml produces). The Modelfile's `FROM ./x.gguf`
-/// is rewritten to the bare filename the agent's importer requires.
-/// Returns the file names written.
+/// artifact the release pins by digest (three files under /<name>/ — the
+/// shape publish-harrier.yml produces). Only harrier ships this way, and
+/// only by the signed stack lock's `harrier@sha256:` row
+/// ([`crate::onboard::steps::harrier_artifact_ref`]): never by tag. The
+/// unpacked files must pass the image's own `<name>.sha256` before anything
+/// reaches the store ([`store_unpacked_artifact`]). Returns the file names
+/// written.
 fn stage_artifact_into_store(name: &str, store: &std::path::Path) -> Result<Vec<String>, String> {
-    if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
-        return Err("model name must be a single path component".into());
+    if name != "harrier" {
+        return Err(format!("{name} is not an artifact the release pins (only harrier ships as one)"));
     }
-    let prefix = {
-        let p = super::provision::release_var("NOO_IMAGE_PREFIX");
-        if p.is_empty() { crate::registry::IMAGE_NAMESPACE.to_string() } else { p.trim_end_matches('/').to_string() }
-    };
-    let artifact = format!("{prefix}/{name}:v1");
+    let (artifact, from_env) = crate::onboard::steps::harrier_artifact_ref()?;
+    if from_env {
+        ui::warned(&format!(
+            "{} is set and no signed stack lock pins harrier: staging {artifact} by a digest from the ENVIRONMENT, not the release (a dev path)",
+            crate::onboard::steps::HARRIER_DIGEST_ENV));
+    }
     std::fs::create_dir_all(store).map_err(|e| format!("create {}: {e}", store.display()))?;
     let tmp = store.join(format!(".{name}.staging"));
     let _ = std::fs::remove_dir_all(&tmp);
@@ -233,8 +237,22 @@ fn stage_artifact_into_store(name: &str, store: &std::path::Path) -> Result<Vec<
         let _ = std::fs::remove_dir_all(&tmp);
         return Err(format!("could not pull or unpack {artifact}"));
     }
+    let r = store_unpacked_artifact(name, &tmp, store);
+    let _ = std::fs::remove_dir_all(&tmp);
+    r.map_err(|e| format!("{artifact}: {e}"))
+}
+
+/// Move an unpacked artifact from `tmp` into `store`, after the same
+/// `sha256sum -c <name>.sha256` onboard runs on it: a file that does not
+/// match (or a missing sum file) refuses, and nothing reaches the store. The
+/// Modelfile's `FROM ./x.gguf` is rewritten to the bare filename the agent's
+/// importer requires.
+fn store_unpacked_artifact(name: &str, tmp: &std::path::Path, store: &std::path::Path) -> Result<Vec<String>, String> {
+    if !crate::onboard::steps::artifact_sha256_ok(tmp, name) {
+        return Err(format!("the unpacked files do not match its {name}.sha256 — refusing to stage them"));
+    }
     let mut written = Vec::new();
-    for entry in std::fs::read_dir(&tmp).map_err(|e| e.to_string())? {
+    for entry in std::fs::read_dir(tmp).map_err(|e| e.to_string())? {
         let entry = entry.map_err(|e| e.to_string())?;
         let fname = entry.file_name().to_string_lossy().into_owned();
         let dest = store.join(&fname);
@@ -249,7 +267,6 @@ fn stage_artifact_into_store(name: &str, store: &std::path::Path) -> Result<Vec<
         }
         written.push(fname);
     }
-    let _ = std::fs::remove_dir_all(&tmp);
     written.sort();
     Ok(written)
 }
@@ -1997,5 +2014,56 @@ mod applier_payload_tests {
         assert!(line.contains("noo upgrade --all") && line.contains("noo cluster provision host6"), "{line}");
         let (rest, macs) = super::split_mac_nodes(vec!["host6".into()], &|_| true);
         assert!(rest.is_empty() && macs.len() == 1, "an all-Mac request has nothing left to roll");
+    }
+}
+
+#[cfg(test)]
+mod stage_artifact_tests {
+    use super::store_unpacked_artifact;
+
+    /// `(unpacked dir, empty store)` under a fresh scratch directory.
+    fn unpacked(tag: &str, tamper: bool) -> (std::path::PathBuf, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!("noo-stage-artifact-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (tmp, store) = (root.join("tmp"), root.join("store"));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::create_dir_all(&store).unwrap();
+        let gguf = b"weights";
+        std::fs::write(tmp.join("harrier-Q4_K_M.gguf"), gguf).unwrap();
+        std::fs::write(tmp.join("harrier.Modelfile"), "FROM ./harrier-Q4_K_M.gguf\n").unwrap();
+        let sum = crate::addons::pins::sha256_hex(gguf);
+        std::fs::write(tmp.join("harrier.sha256"), format!("{sum}  harrier-Q4_K_M.gguf\n")).unwrap();
+        if tamper {
+            std::fs::write(tmp.join("harrier-Q4_K_M.gguf"), b"other weights").unwrap();
+        }
+        (tmp, store)
+    }
+
+    /// The staged pair passes the image's own sha256 file first; the
+    /// Modelfile is rewritten to the bare weight name.
+    #[test]
+    fn a_matching_artifact_is_staged() {
+        let (tmp, store) = unpacked("ok", false);
+        let got = store_unpacked_artifact("harrier", &tmp, &store).unwrap();
+        assert_eq!(got, ["harrier-Q4_K_M.gguf", "harrier.Modelfile", "harrier.sha256"]);
+        assert_eq!(std::fs::read_to_string(store.join("harrier.Modelfile")).unwrap(), "FROM harrier-Q4_K_M.gguf\n");
+        let _ = std::fs::remove_dir_all(store.parent().unwrap());
+    }
+
+    /// B: weights that do not match `harrier.sha256` are refused, and
+    /// nothing reaches the controller store.
+    #[test]
+    fn a_sha_mismatch_is_refused_and_nothing_is_staged() {
+        let (tmp, store) = unpacked("bad", true);
+        let e = store_unpacked_artifact("harrier", &tmp, &store).unwrap_err();
+        assert!(e.contains("do not match its harrier.sha256"), "{e}");
+        assert_eq!(std::fs::read_dir(&store).unwrap().count(), 0, "nothing staged");
+        let _ = std::fs::remove_dir_all(store.parent().unwrap());
+        // A missing sum file is no proof either.
+        let (tmp, store) = unpacked("nosum", false);
+        std::fs::remove_file(tmp.join("harrier.sha256")).unwrap();
+        assert!(store_unpacked_artifact("harrier", &tmp, &store).is_err());
+        assert_eq!(std::fs::read_dir(&store).unwrap().count(), 0, "nothing staged");
+        let _ = std::fs::remove_dir_all(store.parent().unwrap());
     }
 }

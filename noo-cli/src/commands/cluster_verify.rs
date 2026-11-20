@@ -872,6 +872,15 @@ pub(crate) fn model_stores_check(id: &str, n: &Value) -> Option<Check> {
 /// lists every model it holds on every report (i1067), so the row's model
 /// set does not move between reports.
 ///
+/// harrier is also held to the RELEASE: when the controller's signed stack
+/// lock pins it (`release_harrier`, injected by `with_harness_wanted`), a
+/// harrier row whose model layer (the sha256 of the GGUF `ollama create`
+/// imported) is not the lock's `harrier-gguf-sha256` FAILs, naming the
+/// node's weights, the pinned image digest and the pinned GGUF. The controller
+/// store can itself hold a non-release harrier (staged by tag before the pin),
+/// so matching the controller is not enough. Equal: the verified entry says
+/// it is the release's. No layer reported, or no pin: not compared.
+///
 /// The stack lane (the controller's own node checking the stack's Ollama,
 /// `lane: "stack"`) is report-only: compose manages that Ollama, so a
 /// mismatch names the re-pull, not "not repaired here". A store file the
@@ -914,16 +923,37 @@ pub(crate) fn ollama_models_check(id: &str, n: &Value) -> Option<Check> {
     let mut remedies: Vec<String> = Vec::new();
     // Remedies that are not a re-pull (an unreadable store): their own line.
     let mut read_fixes: Vec<String> = Vec::new();
+    // harrier weights that are not the release's (the signed lock's GGUF).
+    let mut not_release: Vec<String> = Vec::new();
+    let release_gguf = n["release_harrier"]["gguf"].as_str().filter(|s| !s.is_empty());
+    let release_image = n["release_harrier"]["image"].as_str().unwrap_or("");
     for r in rows {
         let model = r["model"].as_str().unwrap_or("?");
         let anchor = r["anchor"].as_str().unwrap_or("");
-        let layer = short(r["model_layer"].as_str().unwrap_or(""));
+        let raw_layer = r["model_layer"].as_str().unwrap_or("");
+        let layer = short(raw_layer);
         let reason = r["reason"].as_str().unwrap_or("");
         let pull = || ollama_remedy(id, n, model);
+        // Compared only for harrier, with a reported layer and a release pin.
+        let release_gguf = release_gguf.filter(|_| model.split(':').next() == Some("harrier") && !raw_layer.is_empty());
+        if let Some(want) = release_gguf {
+            if !raw_layer.eq_ignore_ascii_case(want) {
+                not_release.push(format!(
+                    "{model}: weights {layer} are NOT the release's harrier (the signed stack lock pins image {}, whose harrier-Q4_K_M.gguf is {})",
+                    short(release_image), short(want)));
+                remedies.push(if n["self_node"].as_bool() == Some(true) {
+                    "ollama rm harrier in the embed container, then noo models pull harrier (re-fetches the pinned artifact)".to_string()
+                } else {
+                    format!("remove harrier.Modelfile and harrier-Q4_K_M.gguf from the controller's model store, then noo cluster import-model {id} harrier (re-stages the pinned artifact)")
+                });
+                continue;
+            }
+        }
         match r["state"].as_str().unwrap_or("") {
-            "verified" | "rebuilt" => good.push(format!("{model} ({}{}{})",
+            "verified" | "rebuilt" => good.push(format!("{model} ({}{}{}{})",
                 if anchor == "mirror" { "matches the controller's record of its pull".to_string() } else { format!("{anchor} anchor") },
                 if layer.is_empty() { String::new() } else { format!(", weights {layer}") },
+                if release_gguf.is_some() { ", the release's harrier" } else { "" },
                 if r["state"] == "rebuilt" { ", repaired from the controller" } else { "" })),
             "refused" => { fails.push(format!("{model}: {reason}")); remedies.push(pull()); }
             "pending" => pending.push(format!("{model}: not yet checked")),
@@ -970,8 +1000,12 @@ pub(crate) fn ollama_models_check(id: &str, n: &Value) -> Option<Check> {
     }
     let remedy = (!lines.is_empty()).then(|| lines.join("\n"));
     let not_yet = if pending.is_empty() { String::new() } else { format!("; {}", pending.join("; ")) };
-    if !fails.is_empty() {
-        let mut d = format!("refused (does not match the controller, and the repair failed): {}", fails.join("; "));
+    if !fails.is_empty() || !not_release.is_empty() {
+        let mut parts = not_release;
+        if !fails.is_empty() {
+            parts.push(format!("refused (does not match the controller, and the repair failed): {}", fails.join("; ")));
+        }
+        let mut d = parts.join("; ");
         if !warns.is_empty() { d.push_str(&format!("; also {}", warns.join("; "))); }
         d.push_str(&not_yet);
         return Some(fail(NAME, d, remedy.unwrap_or_default()));
@@ -2287,6 +2321,12 @@ fn with_harness_wanted(g: &Globals, n: &Value) -> Value {
     };
     // The refs this host's release lock pins: their remedies restage by digest.
     let release_pinned = crate::commands::image_stage::lock_pinned_refs_here();
+    // What the release pins harrier to (the `ollama models` row compares a
+    // node's harrier weights against its GGUF): read from this host's lock.
+    let release_harrier = match crate::commands::image_stage::controller_lock_opt() {
+        Ok(Some((l, _, _))) => crate::commands::image_stage::harrier_pin_in(&l),
+        _ => None,
+    };
     // i545 45/46: placements on a gpu target this node cannot run on its GPU.
     let cpu_built = desired
         .as_ref()
@@ -2326,6 +2366,9 @@ fn with_harness_wanted(g: &Globals, n: &Value) -> Value {
         }
         if !release_pinned.is_empty() {
             obj.insert("release_pinned_images".into(), serde_json::json!(release_pinned));
+        }
+        if let Some((image, gguf)) = release_harrier {
+            obj.insert("release_harrier".into(), serde_json::json!({"image": image, "gguf": gguf}));
         }
         if !cpu_built.is_empty() {
             obj.insert("gpu_targets_on_cpu_builds".into(), serde_json::json!(cpu_built));
@@ -16870,6 +16913,47 @@ mod ollama_models_tests {
         let r = c.remedy.unwrap_or_default();
         assert!(!r.contains("noo models pull"), "another node's Ollama is not the gateway's: {r}");
         assert_eq!(r, "on node-a: noo models fetch ollama:gemma4:e2b && noo cluster import-model node-a ollama:gemma4:e2b");
+    }
+
+    const REL_IMG: &str = "sha256:2fe41964a009bda0c55f299b632b122bcb4561ca4a833e3293c9f3cc685bab79";
+    const REL_GGUF: &str = "sha256:5f26506ab57fd817ce4a8b9d24946a60d40bc76d82a2defa7cd754ae01e9de80";
+
+    /// C3: a harrier whose weights are not the GGUF the signed lock pins
+    /// FAILs even though it matches the controller (whose store may hold a
+    /// harrier staged by tag), naming the node's weights and both pins.
+    #[test]
+    fn harrier_that_is_not_the_releases_fails_naming_both_values() {
+        let other = format!("sha256:{}", "c".repeat(64));
+        let n = json!({"release_harrier": {"image": REL_IMG, "gguf": REL_GGUF},
+            "ollama_verify": [{"model": "harrier", "state": "verified", "anchor": "gguf", "model_layer": other}]});
+        let c = ollama_models_check("node-a", &n).unwrap();
+        assert_eq!(c.verdict, Verdict::Fail, "{}", c.detail);
+        assert!(c.detail.contains("harrier: weights sha256:cccccccccccc… are NOT the release's harrier"), "{}", c.detail);
+        assert!(c.detail.contains("image sha256:2fe41964a009…") && c.detail.contains("harrier-Q4_K_M.gguf is sha256:5f26506ab57f…"), "{}", c.detail);
+        assert!(c.remedy.unwrap_or_default().contains("noo cluster import-model node-a harrier"));
+    }
+
+    /// Equal to the pinned GGUF: OK, and the row says it is the release's.
+    #[test]
+    fn harrier_that_is_the_releases_is_ok_and_says_so() {
+        let n = json!({"self_node": true, "release_harrier": {"image": REL_IMG, "gguf": REL_GGUF},
+            "ollama_verify": [{"model": "harrier", "state": "verified", "anchor": "gguf", "model_layer": REL_GGUF}]});
+        let c = ollama_models_check("ctrl", &n).unwrap();
+        assert_eq!(c.verdict, Verdict::Ok, "{}", c.detail);
+        assert!(c.detail.contains("harrier (gguf anchor, weights sha256:5f26506ab57f…, the release's harrier)"), "{}", c.detail);
+        // No pin (a lock before harrier was locked): not compared, not claimed.
+        let n = json!({"ollama_verify": [{"model": "harrier", "state": "verified", "anchor": "gguf", "model_layer": format!("sha256:{}", "c".repeat(64))}]});
+        let c = ollama_models_check("ctrl", &n).unwrap();
+        assert_eq!(c.verdict, Verdict::Ok);
+        assert!(!c.detail.contains("release"), "{}", c.detail);
+    }
+
+    /// The pin reaches the row from this host's lock.
+    #[test]
+    fn the_release_harrier_pin_is_injected_from_the_controller_lock() {
+        let own = crate::test_src::own_code(include_str!("cluster_verify.rs"));
+        let inject = crate::test_src::fn_body(&own, "fn with_harness_wanted(");
+        assert!(inject.contains("harrier_pin_in(&l)") && inject.contains("\"release_harrier\""), "fed from the controller's stack lock");
     }
 
     /// harrier is an artifact, not a registry tag: on another node it is

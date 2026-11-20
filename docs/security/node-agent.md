@@ -1043,6 +1043,39 @@ controller's own node), which has Ollama rewrite the blobs and the manifest
 with its own modes; if the files stay unreadable: `sudo chmod -R o+rX
 <store>`.
 
+### The harrier embedder artifact
+
+harrier, the default embedder, is not in any Ollama registry: it ships as an
+OCI image of three files (`harrier-Q4_K_M.gguf`, `harrier.Modelfile`,
+`harrier.sha256`), published once per tag by `publish-harrier.yml`, which
+refuses to overwrite a tag that exists and pushes no `:latest`. The release
+pins it **by digest** (`scripts/harrier-artifact.json`), and the lock job
+writes two lines into the signed stack lock:
+
+| Lock line | Value (0.6.28's harrier, `models-harrier-v1`) |
+|---|---|
+| `harrier@sha256:…` (the image) | `sha256:2fe41964a009bda0c55f299b632b122bcb4561ca4a833e3293c9f3cc685bab79` |
+| `# harrier-gguf-sha256 …` (the GGUF inside it) | `5f26506ab57fd817ce4a8b9d24946a60d40bc76d82a2defa7cd754ae01e9de80` |
+
+The lock job pulls that digest, runs `sha256sum -c harrier.sha256` on its files
+and checks that the file names the pinned GGUF sha before it signs. Every
+fetch on an install is `<prefix>/harrier@<the lock's digest>`: onboard (and
+`noo migrate import`, which is onboard), `noo models pull harrier`, the
+embedder check after `noo upgrade --stack`, and `noo cluster import-model
+<node> harrier` when it stages the pair into the controller store (which runs
+the same `sha256sum -c` first and stages nothing on a mismatch). A host whose
+`stack.lock` pins no harrier refuses the pull rather than take the mutable
+tag; the only way past is the dev variable `NOO_HARRIER_ARTIFACT_DIGEST`
+([env.md](../reference/env.md)). The lock row is never staged to nodes and no
+compose service runs it: nodes import the weights from the controller store.
+
+`noo cluster verify`'s `ollama models` row holds harrier to the release, not
+only to the controller: a node's (or the controller's own embed container's)
+harrier model layer is the sha256 of the GGUF `ollama create` imported, so it
+is compared with the lock's `harrier-gguf-sha256`. A different value FAILs,
+naming the node's weights, the pinned image and the pinned GGUF; an equal one
+says "the release's harrier". With no pin in the lock it is not compared.
+
 ## Backend door leaves
 
 Every backend the agent starts serves through a door that requires a

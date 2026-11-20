@@ -150,7 +150,9 @@ bare `docker compose up` bakes empty secrets into the containers.
 checkout; `--dev` forces a source run on a dist install. The tag ladder is
 `--tag` → `NOO_IMAGE_TAG` in the environment → `.env` → the newest local
 `stack-v*` git tag; an explicit `--tag` is persisted into `noomesh.yaml`.
-A `stack.lock` beside the compose file pins image digests for that tag.
+A `stack.lock` beside the compose file pins image digests for that tag,
+including the harrier embedder artifact, which the CLI pulls only by that
+digest ([node-agent.md](../security/node-agent.md#the-harrier-embedder-artifact)).
 
 ## Rebuild after a code change (dev mode)
 

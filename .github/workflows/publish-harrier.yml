@@ -2,19 +2,24 @@
 # Copyright 2026 PersonifAI LLC
 
 # Publish the harrier embedder artifact as an OCI image:
-#   ghcr.io/noomesh/harrier:v1  (+ :latest)
-# Three files from the `models-harrier-v1` release (GGUF, Modelfile,
-# sha256), FROM scratch, no runtime. `noo onboard` / `noo migrate import`
-# `docker create` + `docker cp` them out — the registry the stack already
-# logs into, so a fresh host needs no `gh` and no second credential.
+#   ghcr.io/noomesh/harrier:<image_tag>   (v1 today; never :latest)
+# Three files from the `models-harrier-v<N>` release (GGUF, Modelfile,
+# sha256), FROM scratch, no runtime. `noo onboard`, `noo models pull
+# harrier`, `noo upgrade` and `noo cluster import-model` `docker create` +
+# `docker cp` them out, BY DIGEST: the release pins the image digest in
+# scripts/harrier-artifact.json and writes it into the signed stack lock
+# (images-release.yml); nothing pulls the tag.
 #
-# One-time, not per release: harrier is versioned by its own tag (:v1), not
-# the stack tag, so it is in no images-release matrix and no lock row. The
-# release lane only CHECKS that :v1 is publicly pullable. Bootstrap:
-#   1. create the `models-harrier-v1` release in THIS repo with the three
+# A tag is published ONCE: this workflow refuses a tag that already exists
+# (an overwrite would change what the tag names under every install that
+# trusted it), and it no longer pushes `:latest` (nothing pulls it). A new
+# harrier is a new tag and a bump of the pinned digest, printed at the end.
+# Bootstrap:
+#   1. create the `models-harrier-v<N>` release in THIS repo with the three
 #      assets (harrier-Q4_K_M.gguf, harrier.Modelfile, harrier.sha256);
-#   2. dispatch this workflow;
-#   3. make the new ghcr package public (org packages start private).
+#   2. dispatch this workflow with a NEW image_tag;
+#   3. make the ghcr package public (org packages start private);
+#   4. set `digest` (and `gguf_sha256`) in scripts/harrier-artifact.json.
 name: publish harrier artifact
 
 on:
@@ -25,7 +30,7 @@ on:
         default: models-harrier-v1
         required: true
       image_tag:
-        description: "image tag to publish"
+        description: "image tag to publish: a NEW one (an existing tag is refused; v1 exists)"
         default: v1
         required: true
 
@@ -45,10 +50,11 @@ jobs:
       - name: Fetch the release assets
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE: ${{ github.event.inputs.release }}
         run: |
           set -eu
           rm -rf harrier && mkdir harrier && cd harrier
-          gh release download "${{ github.event.inputs.release }}" -R "${{ github.repository }}" \
+          gh release download "$RELEASE" -R "${{ github.repository }}" \
             -p harrier-Q4_K_M.gguf -p harrier.Modelfile -p harrier.sha256
           sha256sum -c harrier.sha256
           cat > Dockerfile <<'DF'
@@ -60,14 +66,44 @@ jobs:
         env:
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: echo "$GHCR_TOKEN" | docker login "$REGISTRY" -u "${{ github.actor }}" --password-stdin
+      # Never overwrite a tag. `docker manifest inspect` succeeding means the
+      # tag exists: refuse. Only the registry's "not found" answer means it
+      # is free; any other failure (auth, network) is not proof of absence,
+      # so it refuses too.
+      - name: The tag is new
+        env:
+          IMAGE_TAG: ${{ github.event.inputs.image_tag }}
+        run: |
+          set -eu
+          case "$IMAGE_TAG" in
+            latest) echo "::error::harrier is never published as :latest (nothing pulls it; installs pull the pinned digest)"; exit 1 ;;
+            v[0-9]*) : ;;
+            *) echo "::error::image_tag must be v<N> (got '$IMAGE_TAG')"; exit 1 ;;
+          esac
+          case "$IMAGE_TAG" in *[!A-Za-z0-9._-]*) echo "::error::image_tag '$IMAGE_TAG' has characters a tag cannot carry"; exit 1 ;; esac
+          ref="$REGISTRY/$OWNER/harrier:$IMAGE_TAG"
+          if out="$(docker manifest inspect "$ref" 2>&1)"; then
+            echo "::error::$ref already exists: a published harrier tag is never overwritten (installs pin its digest). Publish a NEW tag (v2, ...) and bump scripts/harrier-artifact.json."
+            exit 1
+          fi
+          case "$out" in
+            *"manifest unknown"*|*"no such manifest"*|*"not found"*|*"NotFound"*) echo "$ref does not exist yet: publishing it" ;;
+            *) echo "::error::could not tell whether $ref exists ($out): refusing to push over a tag that might"; exit 1 ;;
+          esac
+          echo "REF=$ref" >> "$GITHUB_ENV"
       - name: Build + push
         run: |
           set -eux
           cd harrier
-          docker build -t "$REGISTRY/$OWNER/harrier:${{ github.event.inputs.image_tag }}" -t "$REGISTRY/$OWNER/harrier:latest" .
-          docker push "$REGISTRY/$OWNER/harrier:${{ github.event.inputs.image_tag }}"
-          docker push "$REGISTRY/$OWNER/harrier:latest"
-          docker manifest inspect "$REGISTRY/$OWNER/harrier:${{ github.event.inputs.image_tag }}" >/dev/null
+          docker build -t "$REF" .
+          docker push "$REF"
+          digest="$(docker buildx imagetools inspect "$REF" --format '{{json .Manifest.Digest}}' | tr -d '"')"
+          printf '%s' "$digest" | grep -Eq '^sha256:[0-9a-f]{64}$' || { echo "::error::could not read the pushed digest of $REF"; exit 1; }
+          gguf="$(awk '$2 == "harrier-Q4_K_M.gguf" || $2 == "*harrier-Q4_K_M.gguf" {print $1}' harrier.sha256)"
+          echo "Published $REF"
+          echo "  digest:      $digest"
+          echo "  gguf_sha256: $gguf"
+          echo "::notice::bump the pinned harrier digest in scripts/harrier-artifact.json to this: digest=$digest gguf_sha256=$gguf (installs pull only the pinned digest)"
       - name: Clean up
         if: always()
         run: rm -rf harrier
