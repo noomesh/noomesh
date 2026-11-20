@@ -382,7 +382,7 @@ async fn user_disable(
     Path(username): Path<String>,
     ctx: Option<Extension<RequesterCtx>>,
 ) -> AppResult {
-    crate::person_gate::require_person(&state.db, ctx.as_deref(), "disabling an account").await?;
+
     let by = security_users_mutation_guard(&ctx)?.sub.clone();
     require_may_manage(&state.db, &ctx, &username).await?;
     require_not_last_admin(&state.db, &username, "disable").await?;
