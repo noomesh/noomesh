@@ -7,16 +7,17 @@ The model cache is the one nginx we ship (compose `model-cache`). It ran
 nginx 1.27.5 (an EOL line) when the 2026-11-18 advisories landed; it now pins
 the patched stable line. Two guards keep it that way:
 
-- the pinned version's line must be one nginx still fixes, with a review
-  date: when the next stable line ships (nginx releases one each spring),
-  the old one stops getting fixes and this test fails until someone moves
-  the pin or re-dates the entry on the evidence of nginx.org;
+- the pinned version's line must be the supported line declared in
+  scripts/third-party-lines.json (one source for every pinned upstream).
+  Its re-check date is NOT a CI check: the weekly third-party-scan job opens
+  an issue once the date passes, so a new nginx stable line is noticed
+  without failing unrelated merges;
 - the directives each reachable-class bug needs stay out of our two conf
   files. The reasons are written beside the list in model-cache.nginx.conf.
 """
 from __future__ import annotations
 
-import datetime
+import json
 import re
 from pathlib import Path
 
@@ -26,13 +27,9 @@ ROOT = Path(__file__).resolve().parents[1]
 COMPOSE = ROOT / "docker-compose.cluster.yml"
 CONFS = [ROOT / "docker/model-cache.nginx.conf", ROOT / "docker/model-cache.locations.conf"]
 
-# nginx lines that still receive security fixes, each until the date we must
-# re-check it (nginx.org/en/download.html: "Stable version" / "Mainline").
-# 1.30 is the stable line since 2026-04-14; 1.32 is expected spring 2027.
-SUPPORTED_LINES = {
-    "1.30": datetime.date(2027, 4, 30),
-    "1.31": datetime.date(2027, 4, 30),
-}
+# The supported nginx line, as declared for the third-party scan job (its
+# policy URL and re-check date live there too).
+LINES = ROOT / "scripts/third-party-lines.json"
 
 # Directives (or listen parameters) whose presence is the trigger of a
 # shipped nginx CVE class; see the header of model-cache.nginx.conf.
@@ -68,13 +65,11 @@ def _nginx_pin() -> tuple[str, str]:
 def test_the_pinned_nginx_is_on_a_line_that_still_gets_fixes():
     version, _digest = _nginx_pin()
     line = ".".join(version.split(".")[:2])
-    assert line in SUPPORTED_LINES, (
-        f"nginx {version}: the {line} line gets no fixes (1.27 was EOL when the "
-        f"2026-11-18 advisories landed); pin a line in {sorted(SUPPORTED_LINES)}")
-    until = SUPPORTED_LINES[line]
-    assert datetime.date.today() <= until, (
-        f"nginx {line}: re-check by {until} whether it still gets fixes "
-        "(a newer stable line ends the old one); move the pin, or re-date this entry")
+    declared = json.loads(LINES.read_text())["rows"]["nginx"]["line"]
+    assert line == declared, (
+        f"nginx {version}: the {line} line is not the supported line declared in "
+        f"{LINES.name} ({declared}); 1.27 was EOL when the 2026-11-18 advisories "
+        "landed. Move the pin, or update the declared line on nginx.org's evidence")
 
 
 def test_the_pin_is_not_the_eol_build_it_replaced():
