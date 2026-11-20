@@ -149,8 +149,7 @@ addons_report_licensed
 #                               host MCP port
 #   NOO_MIGRATIONS_ENVS       → memory alembic runs in noo-trellion; the
 #                               gateway applies mesh only
-export NOO_WORKER_SUPERVISOR="external"
-export NOO_MIGRATIONS_ENVS="${NOO_MIGRATIONS_ENVS:-mesh}"
+addons_export_launcher_env   # NOO_WORKER_SUPERVISOR, NOO_MIGRATIONS_ENVS (lib-addons.sh, shared with restart and rebuild)
 # ── Trellion add-on switch ─────────────────────────────────────────────
 # The switch is `addons.trellion` in noomesh.yaml (read by addon_on in
 # lib-addons.sh). The old NOO_TRELLION_ENABLED env flag is retired and

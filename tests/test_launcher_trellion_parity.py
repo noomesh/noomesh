@@ -52,32 +52,37 @@ def _indentation_of_export(body: str, var: str) -> list[str]:
     return re.findall(rf"^([ \t]*)export {var}=", body, re.MULTILINE)
 
 
-@pytest.mark.parametrize("launcher", LAUNCHERS)
+# The knobs live in ONE function (lib-addons.sh addons_export_launcher_env);
+# every launcher that renders the gateway's compose config calls it, at the
+# top level. restart.sh is in this set though it has no trellion switch of its
+# own: it did not export them, so a forced restart recreated the gateway with
+# NOO_MIGRATIONS_ENVS empty and the next plain start recreated it again.
+KNOB_LAUNCHERS = LAUNCHERS + ("noomesh-restart.sh",)
+
+
 @pytest.mark.parametrize("var,value", sorted(REQUIRED_EXPORTS.items()))
-def test_launcher_exports_trellion_knob(launcher: str, var: str, value: str) -> None:
+def test_shared_function_exports_trellion_knob(var: str, value: str) -> None:
+    body = _body("lib-addons.sh")
+    fn = body.split("\naddons_export_launcher_env() {\n", 1)[1].split("\n}\n", 1)[0]
+    assert re.search(rf"^    export {var}=.*{value}", fn, re.MULTILINE), (
+        f"addons_export_launcher_env must export {var} with {value!r}, unconditionally"
+    )
+
+
+@pytest.mark.parametrize("launcher", KNOB_LAUNCHERS)
+def test_launcher_calls_the_shared_knob_function_at_top_level(launcher: str) -> None:
+    """Top-level, so it fires regardless of the add-on map; no private copy.
+
+    An indented call is the exact shape of the old bug: present in the file,
+    inside a branch a default install never reaches."""
     body = _body(launcher)
-    assert f"export {var}=" in body, (
-        f"{launcher} never exports {var}. Both launchers must set it — see "
-        "the 'Trellion worker pool (always on)' block."
+    assert re.search(r"^addons_export_launcher_env\b", body, re.MULTILINE), (
+        f"{launcher} does not call addons_export_launcher_env at the top level"
     )
-    assert value in body, f"{launcher} exports {var} but not with the value {value!r}"
-
-
-@pytest.mark.parametrize("launcher", LAUNCHERS)
-@pytest.mark.parametrize("var", sorted(REQUIRED_EXPORTS))
-def test_trellion_knob_is_not_nested_in_a_conditional(launcher: str, var: str) -> None:
-    """Top-level, so it fires regardless of NOO_TRELLION_ENABLED.
-
-    An indented export is the exact shape of the bug: present in the file,
-    inside a `case` arm that a default .env never reaches.
-    """
-    indents = _indentation_of_export(_body(launcher), var)
-    assert indents, f"{launcher} does not export {var}"
-    assert any(i == "" for i in indents), (
-        f"{launcher} only exports {var} from an indented (conditional) block. "
-        "The trellion container is mandatory since an earlier change — export it "
-        "unconditionally at the top level."
-    )
+    for var in REQUIRED_EXPORTS:
+        assert not re.search(rf"^[ \t]*export {var}=", body, re.MULTILINE), (
+            f"{launcher} carries its own export of {var}: the shared function is the one home"
+        )
 
 
 @pytest.mark.parametrize("launcher", LAUNCHERS)

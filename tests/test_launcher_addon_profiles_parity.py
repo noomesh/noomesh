@@ -319,3 +319,30 @@ def test_gateway_feature_addons_mirror_the_cli_rows() -> None:
     free = {k for k, lic in parsed if lic == "None"}
     assert "identity" in free
     assert decl("GATEWAY_FEATURE_ADDONS") == free - decl("CORE_OVERLAY_ADDONS")
+
+
+def test_start_and_restart_export_the_same_gateway_compose_env(install: Path) -> None:
+    """`noo cluster nats-creds rotate --restart` runs `restart --force`; the
+    plain `noo stack start` after it recreated ONLY the gateway ("its compose
+    config or image changed", 0.6.29-rc.2 install matrix). The gateway
+    interpolates NOO_WORKER_SUPERVISOR and NOO_MIGRATIONS_ENVS; start exported
+    them and restart did not, so the two rendered different config hashes.
+    The launchers now get them from one lib-addons.sh function; for an install
+    with identity on, evolve/trellion_intel off and trellion on, it yields the
+    values start has always used, and every launcher that renders the gateway
+    calls it before its compose file list is built."""
+    m = "trellion=1\\nidentity=1\\nevolve=0\\ntrellion_intel=0"
+    out = _run_helper(
+        m, 'addons_export_launcher_env; echo "S=$NOO_WORKER_SUPERVISOR M=$NOO_MIGRATIONS_ENVS"',
+        root=install, env={"NOO_MIGRATIONS_ENVS": ""},
+    )
+    assert out.stdout.strip() == "S=external M=mesh", out.stdout
+    # an operator-set value still wins, as start always allowed
+    out = _run_helper(m, 'addons_export_launcher_env; echo "M=$NOO_MIGRATIONS_ENVS"',
+                      root=install, env={"NOO_MIGRATIONS_ENVS": "all"})
+    assert out.stdout.strip() == "M=all", out.stdout
+    for launcher in ("noomesh-start.sh", "noomesh-restart.sh", "noomesh-rebuild.sh"):
+        body = _body(launcher)
+        call = body.index("\naddons_export_launcher_env")
+        assert call < body.index("compose_file_args") if "compose_file_args" in body else True, launcher
+        assert call > body.index("lib-addons.sh"), f"{launcher}: calls it before sourcing lib-addons.sh"

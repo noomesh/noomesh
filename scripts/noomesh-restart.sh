@@ -44,6 +44,10 @@ source "$_LIBDIR/lib-config.sh"
 # the add-on profiles recreates every core consumer and leaves the add-ons
 # on the old secrets (noo-trellion-intel, 2026-09-14 → 18).
 source "$_LIBDIR/lib-addons.sh"
+# The gateway's launcher-exported compose env, as start and rebuild set it:
+# without it a forced restart renders the gateway differently and the next
+# plain start recreates it.
+addons_export_launcher_env
 # A retired key left in .env or the sops store is inert; say so (start and
 # rebuild do the same).
 warn_retired_env_keys
