@@ -99,7 +99,7 @@ def built_rows() -> tuple[dict[str, set[str]], list[str]]:
     for rel, b in files.items():
         for m in re.finditer(r"fn (\w+)\(\s*\w+: &'static str", b):
             head = b[m.end(): b.find("{", m.end())]
-            if re.search(r"->\s*(?:Option<)?Check\b", head):
+            if re.search(r"->\s*(?:Option<|Vec<)?(?:[\w:]+::)?Check\b", head):
                 helpers[rel].add(m.group(1))
     all_consts = {m.group(1): m.group(2) for b in files.values() for m in CONST.finditer(b)}
     rows: dict[str, set[str]] = defaultdict(set)
