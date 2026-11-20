@@ -12,7 +12,7 @@ On the **controller**, mint a one-time token for the new node:
 noo cluster bootstrap-token create --node <node>
 ```
 
-It prints two steps for the new machine: install `noo` (skip it if `noo --version` already works there), then a `noo enroll noo1.…` line. Run both on the **new machine** as your own user; enroll asks for your sudo password.
+It prints two steps for the new machine: install `noo` (skip it if `noo --version` already works there), then a `noo enroll noo1.…` line. Run both on the **new machine** as your own user; enroll asks for your sudo password (a person types it, unless that machine has passwordless sudo).
 
 Back on the **controller**, hand the node its configuration and wait until it has applied it (this can take up to half an hour the first time):
 
