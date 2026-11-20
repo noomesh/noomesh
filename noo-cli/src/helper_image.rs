@@ -139,7 +139,7 @@ pub(crate) fn run_argv(image: &str, mount_src: &str, job: &Job) -> Vec<String> {
         v.push("--cap-add".into());
         v.push((*cap).to_string());
     }
-    v.extend(["--security-opt", "no-new-privileges", "--entrypoint", bin, "-v"].iter().map(|s| s.to_string()));
+    v.extend(["--security-opt", "seccomp=unconfined", "--entrypoint", bin, "-v"].iter().map(|s| s.to_string()));
     v.push(mount);
     v.push(image.to_string());
     v.extend(args);
