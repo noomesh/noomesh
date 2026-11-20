@@ -5457,7 +5457,7 @@ pub(crate) enum OllamaTagCheck {
 /// `self_node` is either this gateway's `NOO_SELF_NODE` or the node's own
 /// heartbeat saying so (`self_node: true`). Pure.
 pub(crate) fn ollama_tag_check_applies(backend: &str, desired: &str, self_node: bool) -> bool {
-    backend == "ollama" && desired == "running" && !self_node
+    backend != "harness" && desired == "running" && !self_node
 }
 
 /// An ollama model name as `ollama list` names it: case-folded, the
