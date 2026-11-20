@@ -109,6 +109,11 @@ alternative is `noo cluster invite`, which prints
 
 On a node other than the controller's own, stage an Ollama tag first: the
 node refuses a tag the controller has not staged (`ollama_registry_pull_refused`).
+`noo cluster place` refuses such a tag up front (409, with
+`noo models fetch ollama:<tag>` as its next step) when the store does not
+hold it, the node does not hold it, and the node does not declare
+`NOO_ALLOW_OLLAMA_REGISTRY_PULL`; when one of those is unknown it places
+with a warning. `--force` places it anyway.
 
 ```sh
 noo models fetch ollama:qwen2.5:7b-instruct

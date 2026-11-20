@@ -5439,6 +5439,95 @@ async fn placement_staging_refusal(state: &AppState, node_id: &str, backend: &st
     Some((art::not_staged_refusal(node_id, &image, &arch), true))
 }
 
+/// What the place-time ollama tag check concluded ([`ollama_tag_check`]).
+#[derive(Debug, PartialEq)]
+pub(crate) enum OllamaTagCheck {
+    /// Nothing to say: the store or the node holds the tag, or the node may
+    /// pull it from the registry itself.
+    Fine,
+    /// Something it needs is unknown: placed, with this warning.
+    Warn(String),
+    /// Known not deliverable: a 409 unless `force`.
+    Refuse(String),
+}
+
+/// Does the place-time ollama tag check apply? A running ollama placement on
+/// a node that is not the controller's own: the controller's own agent is
+/// unplaced (no store URL) and pulls from the registry as it always did.
+/// `self_node` is either this gateway's `NOO_SELF_NODE` or the node's own
+/// heartbeat saying so (`self_node: true`). Pure.
+pub(crate) fn ollama_tag_check_applies(backend: &str, desired: &str, self_node: bool) -> bool {
+    backend == "ollama" && desired == "running" && !self_node
+}
+
+/// An ollama model name as `ollama list` names it: case-folded, the
+/// registry host and `library/` dropped, `:latest` explicit. Pure.
+fn ollama_listed_name(m: &str) -> String {
+    let m = m.trim().to_ascii_lowercase();
+    let m = m.strip_prefix("ollama:").unwrap_or(&m);
+    let m = m.strip_prefix("registry.ollama.ai/").unwrap_or(m);
+    let m = m.strip_prefix("library/").unwrap_or(m);
+    let tagged = m.rfind(':').is_some_and(|i| !m[i..].contains('/'));
+    if tagged { m.to_string() } else { format!("{m}:latest") }
+}
+
+/// Does the node already hold `tag`? From its heartbeat's
+/// `available_models` (the tags its ollama lists, as strings or `{name}`).
+/// None when the record or the list is absent: unknown, never "no". Pure.
+pub(crate) fn node_holds_ollama_tag(node: Option<&Value>, tag: &str) -> Option<bool> {
+    let want = ollama_listed_name(tag);
+    let list = node?["available_models"].as_array()?;
+    Some(list.iter().any(|v| {
+        v.as_str().or_else(|| v.get("name").and_then(Value::as_str)).is_some_and(|n| ollama_listed_name(n) == want)
+    }))
+}
+
+/// May the node's agent pull an ollama tag from the public registry
+/// (`NOO_ALLOW_OLLAMA_REGISTRY_PULL`, node-agent-go/internal/preseed)? From
+/// its `node_local` report: the key in `declared` = it may (the report names
+/// the key, not its value, and the key exists to say 1); a report without it
+/// = it may not. None when the node sends no report (an older agent, or no
+/// record): unknown. Pure.
+pub(crate) fn node_may_pull_ollama_registry(node: Option<&Value>) -> Option<bool> {
+    let report = node?.get("node_local").filter(|r| r.is_object())?;
+    Some(report["declared"].as_array().is_some_and(|d| d.iter().any(|k| k["key"].as_str() == Some("NOO_ALLOW_OLLAMA_REGISTRY_PULL"))))
+}
+
+/// The refusal for an ollama tag a node cannot get.
+pub(crate) fn ollama_tag_refusal(node_id: &str, tag: &str) -> String {
+    format!(
+        "{node_id} cannot pull {tag} from the public registry (nodes pull models only from the controller's store); \
+         stage it first: `noo models fetch ollama:{tag}`, then place again; --force places it anyway"
+    )
+}
+
+/// The place-time ollama tag check: refuse ONLY on known facts (the store
+/// does not hold the tag, the node does not hold it, and the node may not
+/// pull from the registry); anything unknown is a warning. Pure.
+pub(crate) fn ollama_tag_check(node_id: &str, tag: &str, store_holds: Option<bool>, node_holds: Option<bool>, may_pull: Option<bool>) -> OllamaTagCheck {
+    if store_holds == Some(true) || node_holds == Some(true) || may_pull == Some(true) {
+        return OllamaTagCheck::Fine;
+    }
+    if store_holds == Some(false) && node_holds == Some(false) && may_pull == Some(false) {
+        return OllamaTagCheck::Refuse(ollama_tag_refusal(node_id, tag));
+    }
+    let mut unknown: Vec<String> = Vec::new();
+    if store_holds.is_none() {
+        unknown.push("whether the controller's store holds it".into());
+    }
+    if node_holds.is_none() {
+        unknown.push(format!("whether {node_id} holds it"));
+    }
+    if may_pull.is_none() {
+        unknown.push("whether the node may pull from the registry (NOO_ALLOW_OLLAMA_REGISTRY_PULL)".into());
+    }
+    OllamaTagCheck::Warn(format!(
+        "could not confirm {node_id} can get {tag} (unknown: {}): a node pulls ollama models only from the controller's store; \
+         if it is not staged there, stage it: `noo models fetch ollama:{tag}`",
+        unknown.join("; ")
+    ))
+}
+
 /// PUT /api/cluster/nodes/{node_id}/placements/{backend} — upsert.
 ///
 /// Keyed (node, backend, ROLE). The role comes from the body (`role`); the
@@ -5621,6 +5710,30 @@ async fn placement_put(
             // A node still on NOO_IMAGE_SOURCE=legacy (the rollout default)
             // takes images the pre-rail way: say it, do not refuse.
             fit_warnings.push(if rail { format!("forced past an unstaged image: {msg}") } else { format!("legacy image source on this node: {msg}") });
+        }
+    }
+
+    // An ollama tag the node cannot get: a node other than the controller's
+    // own pulls ollama models only from the controller's store
+    // (`ollama_registry_pull_refused` on the node), so a tag nobody staged
+    // was accepted here and then never arrived. Refused on known facts only;
+    // unknown is a warning.
+    if let Some(tag) = body.model.as_deref().map(str::trim).filter(|m| !m.is_empty()) {
+        let record = if backend == "ollama" { node_record(&state, &node_id).await } else { None };
+        let self_node = crate::self_node::is_self_node(&node_id) || record.as_ref().is_some_and(|r| r["self_node"].as_bool() == Some(true));
+        if ollama_tag_check_applies(&backend, &desired, self_node) {
+            let store = crate::routes::artifacts::ollama_tag_in_store(&crate::routes::artifacts::gguf_dir(), tag);
+            let check = ollama_tag_check(&node_id, tag, store, node_holds_ollama_tag(record.as_ref(), tag), node_may_pull_ollama_registry(record.as_ref()));
+            match check {
+                OllamaTagCheck::Fine => {}
+                OllamaTagCheck::Warn(w) => fit_warnings.push(w),
+                OllamaTagCheck::Refuse(msg) if !body.force => {
+                    tracing::warn!(node = %node_id, tag = %tag, "placement.ollama_tag_not_staged");
+                    let fetch = format!("noo models fetch ollama:{tag}");
+                    return Err(AppError::ConflictNext { msg, next: json!([super::bootstrap::next_cmd(&fetch, &[])]) });
+                }
+                OllamaTagCheck::Refuse(msg) => fit_warnings.push(format!("forced past an unstaged ollama tag: {msg}")),
+            }
         }
     }
 
@@ -10837,5 +10950,127 @@ mod register_keeps_lanes_tests {
         assert_eq!(first_beat_wait(&table(&beaten, 1005.0), Some("fast"), None), None);
         // A record no registration wrote (no `registered_at`).
         assert_eq!(first_beat_wait(&table(&json!({"id": "node_a", "ts": 1000.0}), 1005.0), Some("fast"), None), None);
+    }
+}
+
+#[cfg(test)]
+mod ollama_tag_check_tests {
+    use super::*;
+
+    /// Unknown store, unknown node, unknown pull: every way a fact can be
+    /// missing; each is a warning, never a refusal.
+    const UNKNOWNS: [(Option<bool>, Option<bool>, Option<bool>); 3] =
+        [(None, Some(false), Some(false)), (Some(false), None, Some(false)), (Some(false), Some(false), None)];
+
+    /// Known not in the store, not on the node, and the node may not pull:
+    /// a refusal naming the node, the tag and the command.
+    #[test]
+    fn an_unstaged_tag_the_node_cannot_get_is_refused() {
+        match ollama_tag_check("node_a", "gemma4:12b", Some(false), Some(false), Some(false)) {
+            OllamaTagCheck::Refuse(m) => {
+                assert!(m.starts_with("node_a cannot pull gemma4:12b from the public registry (nodes pull models only from the controller's store)"), "{m}");
+                assert!(m.contains("stage it first: `noo models fetch ollama:gemma4:12b`, then place again"), "{m}");
+                assert!(m.contains("--force"), "{m}");
+            }
+            other => panic!("known facts refuse, got {other:?}"),
+        }
+    }
+
+    /// The route turns the refusal into a 409 with the agreed `next` unless
+    /// `--force`, which places it with the refusal kept as a warning.
+    #[test]
+    fn the_route_refuses_with_next_unless_forced() {
+        let own = crate::test_src::own_code(include_str!("cluster.rs"));
+        let put = crate::test_src::fn_body(&own, "async fn placement_put(");
+        assert!(put.contains("OllamaTagCheck::Refuse(msg) if !body.force => {"), "a 409 without --force");
+        assert!(put.contains("let fetch = format!(\"noo models fetch ollama:{tag}\");"), "the fetch command");
+        assert!(put.contains("return Err(AppError::ConflictNext { msg, next: json!([super::bootstrap::next_cmd(&fetch, &[])]) });"), "next in the agreed shape");
+        assert!(put.contains("OllamaTagCheck::Refuse(msg) => fit_warnings.push(format!(\"forced past an unstaged ollama tag: {msg}\")),"), "--force: a warning");
+        assert!(put.contains("OllamaTagCheck::Warn(w) => fit_warnings.push(w),"), "unknown: a warning in the answer");
+        let next = json!([super::super::bootstrap::next_cmd("noo models fetch ollama:gemma4:12b", &[])]);
+        assert_eq!(next, json!([{"kind": "command", "command": "noo models fetch ollama:gemma4:12b"}]));
+    }
+
+    /// The 409 body carries `next` beside `error`.
+    #[tokio::test]
+    async fn conflict_next_answers_409_with_next() {
+        use axum::response::IntoResponse;
+        let r = AppError::ConflictNext { msg: "m".into(), next: json!([{"kind": "command", "command": "c"}]) }.into_response();
+        assert_eq!(r.status(), axum::http::StatusCode::CONFLICT);
+        let bytes = axum::body::to_bytes(r.into_body(), usize::MAX).await.expect("the body reads");
+        let body: Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(body, json!({"error": "m", "next": [{"kind": "command", "command": "c"}]}));
+        assert_eq!(AppError::ConflictNext { msg: "m".into(), next: Value::Null }.to_string(), "m");
+    }
+
+    #[test]
+    fn an_unknown_fact_warns_never_refuses() {
+        for (store, node, pull) in UNKNOWNS {
+            match ollama_tag_check("node_a", "gemma4:12b", store, node, pull) {
+                OllamaTagCheck::Warn(w) => {
+                    assert!(w.contains("could not confirm node_a can get gemma4:12b"), "{w}");
+                    assert!(w.contains("noo models fetch ollama:gemma4:12b"), "{w}");
+                }
+                other => panic!("{store:?}/{node:?}/{pull:?}: unknown warns, got {other:?}"),
+            }
+        }
+        match ollama_tag_check("node_a", "t", None, Some(false), Some(false)) {
+            OllamaTagCheck::Warn(w) => assert!(w.contains("unknown: whether the controller's store holds it)"), "{w}"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// The store or the node holding the tag, or a node allowed to pull it
+    /// itself: nothing to say, whatever else is unknown.
+    #[test]
+    fn a_tag_that_can_arrive_is_fine() {
+        assert_eq!(ollama_tag_check("n", "t", Some(true), Some(false), Some(false)), OllamaTagCheck::Fine, "staged");
+        assert_eq!(ollama_tag_check("n", "t", Some(false), Some(true), Some(false)), OllamaTagCheck::Fine, "the node holds it");
+        assert_eq!(ollama_tag_check("n", "t", None, Some(true), None), OllamaTagCheck::Fine, "the node holds it, the rest unknown");
+        assert_eq!(ollama_tag_check("n", "t", Some(false), Some(false), Some(true)), OllamaTagCheck::Fine, "registry pull allowed");
+    }
+
+    /// The node holds it when its ollama lists it (`available_models`);
+    /// `library/` and `:latest` do not matter.
+    #[test]
+    fn the_node_holds_a_tag_its_heartbeat_lists() {
+        let n = json!({"available_models": ["gemma4:12b", {"name": "someone/m:latest"}, "harrier.gguf"]});
+        assert_eq!(node_holds_ollama_tag(Some(&n), "gemma4:12b"), Some(true));
+        assert_eq!(node_holds_ollama_tag(Some(&n), "library/Gemma4:12b"), Some(true));
+        assert_eq!(node_holds_ollama_tag(Some(&n), "someone/m"), Some(true));
+        assert_eq!(node_holds_ollama_tag(Some(&n), "gemma4:27b"), Some(false));
+        assert_eq!(node_holds_ollama_tag(Some(&json!({"available_models": []})), "gemma4"), Some(false), "an empty list is a fact");
+        assert_eq!(node_holds_ollama_tag(Some(&json!({})), "gemma4"), None, "no list: unknown");
+        assert_eq!(node_holds_ollama_tag(None, "gemma4"), None, "no record: unknown");
+    }
+
+    /// `NOO_ALLOW_OLLAMA_REGISTRY_PULL` in the node's `node_local` report:
+    /// declared = may pull; a report without it = may not; no report = unknown.
+    #[test]
+    fn the_registry_pull_comes_from_the_node_local_report() {
+        let allowed = json!({"node_local": {"state": "read", "declared": [{"key": "NOO_ALLOW_OLLAMA_REGISTRY_PULL", "source": "local file", "trust": true}]}});
+        assert_eq!(node_may_pull_ollama_registry(Some(&allowed)), Some(true));
+        let other = json!({"node_local": {"state": "read", "declared": [{"key": "NOO_GPU_YIELD", "source": "local file", "trust": false}]}});
+        assert_eq!(node_may_pull_ollama_registry(Some(&other)), Some(false));
+        let absent = json!({"node_local": {"state": "absent", "declared": []}});
+        assert_eq!(node_may_pull_ollama_registry(Some(&absent)), Some(false));
+        assert_eq!(node_may_pull_ollama_registry(Some(&json!({}))), None, "an older agent sends no report");
+        assert_eq!(node_may_pull_ollama_registry(None), None);
+    }
+
+    /// Only a running ollama placement on a node other than the controller's
+    /// own is checked.
+    #[test]
+    fn only_a_running_ollama_placement_off_the_controller_is_checked() {
+        assert!(ollama_tag_check_applies("ollama", "running", false));
+        assert!(!ollama_tag_check_applies("ollama", "running", true), "the controller's own node pulls from the registry");
+        assert!(!ollama_tag_check_applies("llamacpp", "running", false), "not an ollama tag");
+        assert!(!ollama_tag_check_applies("vllm", "running", false), "not an ollama tag");
+        assert!(!ollama_tag_check_applies("ollama", "stopped", false), "a stopped placement pulls nothing");
+        let own = crate::test_src::own_code(include_str!("cluster.rs"));
+        let put = crate::test_src::fn_body(&own, "async fn placement_put(");
+        assert!(put.contains("let self_node = crate::self_node::is_self_node(&node_id) || record.as_ref().is_some_and(|r| r[\"self_node\"].as_bool() == Some(true));"),
+            "self is this gateway's NOO_SELF_NODE or the node's own heartbeat");
+        assert!(put.contains("if ollama_tag_check_applies(&backend, &desired, self_node) {"), "the route asks");
     }
 }
