@@ -201,7 +201,7 @@ fn check_part(p: &Value, limits: Limits, total: &mut usize) -> Result<(), MediaR
 /// empty string names nothing to fetch and is left to the backend.
 fn check_url(ty: &str, url: &str, limits: Limits, total: &mut usize) -> Result<(), MediaRefusal> {
     let url = url.trim();
-    if url.is_empty() {
+    if url.is_empty() || !url.to_ascii_lowercase().starts_with("data:") {
         return Ok(());
     }
     let Some(rest) = url.get(..5).filter(|s| s.eq_ignore_ascii_case("data:")).map(|_| &url[5..]) else {
