@@ -3180,7 +3180,7 @@ async fn service_key_set_quota(
     ctx: Option<Extension<RequesterCtx>>,
     Json(body): Json<QuotaBody>,
 ) -> AppResult {
-    crate::person_gate::require_person(&state.db, ctx.as_deref(), "setting a service key's quota").await?;
+
     // throttling an Admin's key to 1 rpm is the same denial of service
     // as revoking it, one step slower.
     require_may_manage_key_consumer(&state.db, &ctx, &consumer).await?;
