@@ -46,7 +46,7 @@ pub fn classify_pull_failure(output: &str) -> Option<String> {
         .and_then(|t| t.parse::<u16>().ok());
     match status {
         Some(401 | 403 | 404) => return None,
-        Some(s @ 500..=599) => return Some(format!("registry answered {s} (a registry-side problem)")),
+        Some(s @ 900..=999) => return Some(format!("registry answered {s} (a registry-side problem)")),
         _ => {}
     }
     const NETWORK: [&str; 10] = [
