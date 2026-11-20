@@ -770,7 +770,6 @@ func embedRerankModelEnv(spec BackendSpec, model string, envOverrides map[string
 		return
 	}
 	if spec.Env["MODEL_ID"] != "" {
-		envOverrides["MODEL_ID"] = model
 		return
 	}
 	mp := model
