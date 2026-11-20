@@ -813,7 +813,7 @@ async fn hf_manifest_at(hub: &Path, repo: &str, wait: std::time::Duration) -> Re
                     .map_err(|err| AppError::Internal(format!("hashing {}: {err}", e.path)))?
                     .map_err(|why| match why {
                         GitBlobErr::TooLarge(w) => hf_refuse(repo, format!("{}: {w}", e.path)),
-                        GitBlobErr::Read(io) => hf_unreadable(repo, &e.path, &io),
+                        GitBlobErr::Read(io) => hf_refuse(repo, format!("{}: read: {io}", e.path)),
                     })?;
                 if git != *want {
                     return Err(hf_refuse(
