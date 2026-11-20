@@ -353,28 +353,50 @@ def test_the_viewer_grant_ships_in_the_same_compose_as_the_configs(services: dic
     assert _rust_const(AUTH_RS.read_text(), "GRAFANA_JWT_HEADER") == ini.get("auth.jwt", "header_name")
 
 
-def test_a_stack_roll_recreates_grafana() -> None:
+def test_a_stack_roll_recreates_grafana_when_its_config_changed(tmp_path) -> None:
     """New grafana.ini / provisioning only load when the container is
     recreated: grafana.ini is a FILE bind mount, pinned to the inode it was
-    created with, and Grafana reads data-source provisioning at start. The
-    roll (`noo upgrade --stack`) runs the launcher with no service names
-    and --recreate, so that path force-recreates every service,
-    grafana included. A plain start recreates grafana too when grafana.ini or
-    its provisioning changed: both are inputs of its `noo.inputs` label
-    (scripts/noo-start-inputs.py: a file bind mount, a read-only config dir
-    under the install root)."""
+    created with, and Grafana reads data-source provisioning at start. Since
+    0.6.30 the roll (`noo upgrade --stack`) is label-driven: it runs the same
+    launcher start as `noo stack start`, which recreates a service whose
+    `noo.inputs` label changed. So grafana is recreated on a roll exactly
+    when grafana.ini or its provisioning changed, because both are inputs of
+    its label (scripts/noo-start-inputs.py classify_mount: a file bind mount,
+    and a read-only config dir under the install root).
+    `noo upgrade --recreate` still forces every service."""
+    import importlib.util
     upgrade = (ROOT / "noo-cli" / "src" / "commands" / "upgrade.rs").read_text()
-    # The launcher invocation lives in the launch phase of the roll.
     body = upgrade.split("fn launch_stack(", 1)[1].split("\n}\n", 1)[0]
-    assert '.arg(root.join("scripts/noomesh-start.sh")).arg("--dist").arg("--recreate")\n' in body, "the roll names no services"
+    assert '.arg(root.join("scripts/noomesh-start.sh")).args(launcher_args(roll.force_recreate))' in body, \
+        "the roll runs the launcher's label-driven start (or the forced one only when asked)"
     start = (ROOT / "scripts" / "noomesh-start.sh").read_text()
     full = start.split('if [ ${#SERVICES[@]} -eq 0 ]', 1)
     assert len(full) == 2, "the launcher's all-services branch moved — re-read it"
     all_branch = full[1].split("\nelse\n", 1)[0]
-    assert "start_inputs_full_up $BUILD_FLAG" in all_branch, "the all-services `up` takes the force from the lib"
-    assert '.arg("--dist").arg("--recreate")' in body, "the roll asks the launcher to recreate every service"
+    assert "start_inputs_full_up $BUILD_FLAG" in all_branch, "the all-services `up` goes through the labelling lib"
     lib = (ROOT / "scripts" / "lib-start-inputs.sh").read_text()
     assert 'if [ "${START_RECREATE:-false}" = true ]; then\n        START_UP_FORCE="--force-recreate"' in lib
+    # grafana's three config mounts, as compose declares them, read-only.
+    compose = (ROOT / "docker-compose.cluster.yml").read_text()
+    for m in ("./configs/grafana/grafana.ini:/etc/grafana/grafana.ini:ro",
+              "./configs/grafana/dashboards:/etc/grafana/provisioning/dashboards:ro",
+              "./configs/grafana/datasources:/etc/grafana/provisioning/datasources:ro"):
+        assert m in compose, f"grafana's mount moved — re-check its label coverage: {m}"
+    # ...and each is an INPUT of grafana's label (the real classifier, on a
+    # tree laid out like an install root).
+    spec = importlib.util.spec_from_file_location("noo_start_inputs", ROOT / "scripts" / "noo-start-inputs.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    root = tmp_path / "install"
+    (root / "configs" / "grafana" / "dashboards").mkdir(parents=True)
+    (root / "configs" / "grafana" / "datasources").mkdir()
+    (root / "configs" / "grafana" / "grafana.ini").write_text("[server]\n")
+    got = {
+        name: mod.classify_mount({"type": "bind", "source": str(root / "configs" / "grafana" / name), "read_only": True},
+                                 str(root), str(tmp_path / "pki"), [])
+        for name in ("grafana.ini", "dashboards", "datasources")
+    }
+    assert got == {"grafana.ini": "file", "dashboards": "dir", "datasources": "dir"}, got
 
 
 # Grafana's calls home, each turned off (PR #692). Grafana 12.4
