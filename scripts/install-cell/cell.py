@@ -236,7 +236,8 @@ def summarize(d: Path) -> dict:
     if failed:
         md += ["", f"**First error** ({failed['step']}): `{failed['first_error']}`"]
     if verify is not None and verify["rc"] != 0:
-        md += ["", f"**cluster verify is RED** (recorded, not fatal): `{verify['first_error']}`"]
+        md += ["", f"**cluster verify is RED** (this step is recorded, not fatal; its FAIL rows are judged by "
+               f"verify-ratchet): `{verify['first_error']}`"]
     for s in probes:
         md += ["", f"**Probe `{s['step']}`: {'PASS' if s['rc'] == 0 else 'FAIL'}**"
                + ("" if s["rc"] == 0 else f" `{s['first_error']}`")]

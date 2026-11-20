@@ -1,0 +1,160 @@
+{
+ "_rule": "noomesh-internal i1098, the matrix ratchet. Per fresh-install cell: the most WARN rows (verdict == \"warn\", controller + nodes + seats) its `noo --json cluster verify` may show, and the rows it may show them in (\"<controller|node|seat>:<row name>\"). The PR that removes a WARN lowers max_warn and drops the row. Raising is never allowed (tests/test_install_cell_ratchet.py compares this file with its version on dev); the one escape is a reviewed decision, in its own commit, adding to the cell \"raise\": {\"from_max\", \"to_max\", \"add_rows\", \"reason\"}. scripts/install-cell/ratchet.py judges it; a cell with \"measured\": null only prints a NOTE.",
+ "fail_rows_fail_the_cell": false,
+ "_fail_rule": "i1098: a FAIL row always fails the cell. OFF until the release lead approves fail_allowed (0.6.28-rc.4 and 0.6.28 fresh cells showed 0 FAIL rows; 0.6.29-rc.1's cells never reached verify). Turning it on is one-way; fail_allowed only shrinks, and a row added to it needs a \"why\" and a reviewed \"decision\".",
+ "fail_allowed": {},
+ "row_status": {
+  "controller:agent protect": {
+   "status": "awaiting operator decision",
+   "why": "i1098 row 10: onboard installs the self agent outside the applier, so no protect hold exists; DECIDE whether onboard installs the self node through the applier (i991; i1085 item 6)"
+  },
+  "controller:last backup": {
+   "status": "awaiting operator decision",
+   "why": "i1098 row 11: the daily backup runs at 03:30, a box minutes old has had none; DECIDE whether onboard runs the first backup (i1085 item 8)"
+  },
+  "node:holds": {
+   "status": "awaiting operator decision",
+   "why": "i1098 row 12: the installer's Docker packages are not held; DECIDE whether onboard holds what it installed (the remedy text is fixed separately)"
+  },
+  "controller:at-rest tpm": {
+   "status": "awaiting operator decision",
+   "why": "i1098 row 14: the at-rest set, no TPM on a hosted VM; the operator decides at-rest"
+  },
+  "controller:postgres at rest": {
+   "status": "awaiting operator decision",
+   "why": "i1098 rows 15-21: the at-rest set, plaintext on the root disk without a TPM-backed volume; the operator decides at-rest"
+  },
+  "controller:redis at rest": {
+   "status": "awaiting operator decision",
+   "why": "i1098 rows 15-21: the at-rest set; the operator decides at-rest"
+  },
+  "controller:nats at rest": {
+   "status": "awaiting operator decision",
+   "why": "i1098 rows 15-21: the at-rest set; the operator decides at-rest"
+  },
+  "controller:prometheus at rest": {
+   "status": "awaiting operator decision",
+   "why": "i1098 rows 15-21: the at-rest set; the operator decides at-rest"
+  },
+  "controller:noo-data at rest": {
+   "status": "awaiting operator decision",
+   "why": "i1098 rows 15-21: the at-rest set; the operator decides at-rest"
+  },
+  "controller:pki at rest": {
+   "status": "awaiting operator decision",
+   "why": "i1098 rows 15-21: the at-rest set; the operator decides at-rest"
+  },
+  "controller:age key at rest": {
+   "status": "awaiting operator decision",
+   "why": "i1098 rows 15-21: the at-rest set; the operator decides at-rest"
+  },
+  "controller:at-rest swap": {
+   "status": "awaiting operator decision",
+   "why": "i1098 row 22: the at-rest set (a plain /swapfile; fixable without a TPM); the operator decides at-rest"
+  },
+  "controller:at-rest outside the set": {
+   "status": "awaiting operator decision",
+   "why": "i1098 row 23: the at-rest set; the operator decides at-rest"
+  },
+  "controller:at-rest volume": {
+   "status": "awaiting operator decision",
+   "why": "i1098 row 24: the at-rest set, no encrypted state volume without a TPM; the operator decides at-rest"
+  },
+  "node:docker engine": {
+   "status": "awaiting operator decision",
+   "why": "i1058: the Docker Engine minimum (MIN_DOCKER_ENGINE_MAJOR) is the operator's decision"
+  },
+  "controller:off-site backup": {
+   "status": "accepted",
+   "why": "i1098 row 13: ACCEPT, nobody has chosen where backup copies go; honest on a fresh box"
+  },
+  "node:log shipper": {
+   "status": "fix in flight",
+   "why": "i1098 row 1: FIX, a code-order bug (the by-choice loki_off reason is tested after enabled != true)"
+  },
+  "node:inbound": {
+   "status": "fix in flight",
+   "why": "i1098 row 2: FIX, the first reachability probe runs after onboard's closing verify"
+  },
+  "controller:node-agent privilege": {
+   "status": "fix in flight",
+   "why": "i1098 row 3: FIX, the row inspects a container while the self agent is a host service"
+  },
+  "controller:tailnet policy": {
+   "status": "fix in flight",
+   "why": "i1098 row 4: FIX, a LAN-only install has no tailnet to judge"
+  },
+  "controller:tailscale ssh": {
+   "status": "fix in flight",
+   "why": "i1098 row 5: FIX, Tailscale is not installed"
+  },
+  "controller:loki at rest": {
+   "status": "fix in flight",
+   "why": "i1098 row 6: FIX, lean monitoring leaves an empty directory judged as plaintext data"
+  },
+  "controller:tempo at rest": {
+   "status": "fix in flight",
+   "why": "i1098 row 7: FIX, as loki at rest"
+  },
+  "controller:grafana at rest": {
+   "status": "fix in flight",
+   "why": "i1098 row 8: FIX, as loki at rest"
+  },
+  "controller:default chat": {
+   "status": "fix in flight",
+   "why": "i1098 row 9: FIX, a GPU-less fleet's default chat; #1458 makes it an OK row tiered later"
+  },
+  "node:streaming over tunnel": {
+   "status": "under triage",
+   "why": "i1098: warns during a tunnel reconnect on the --ci default cell; a candidate for the next triage"
+  },
+  "controller:ollama slots": {
+   "status": "accepted",
+   "why": "the slots4 cell sets the shared Ollama to 4 slots on purpose (the i802 A/B); the row reports that choice"
+  }
+ },
+ "cells": {
+  "ubuntu-24.04-amd64-default": {
+   "max_warn": null,
+   "rows": null,
+   "measured": null,
+   "why": "placeholder: the baseline is taken from 0.6.29-rc.2's fresh runs (logs/probe-verify-json.log)"
+  },
+  "ubuntu-24.04-amd64-slots4": {
+   "max_warn": null,
+   "rows": null,
+   "measured": null,
+   "why": "placeholder: the baseline is taken from 0.6.29-rc.2's fresh runs (logs/probe-verify-json.log)"
+  },
+  "ubuntu-22.04-amd64": {
+   "max_warn": null,
+   "rows": null,
+   "measured": null,
+   "why": "placeholder: the baseline is taken from 0.6.29-rc.2's fresh runs (logs/probe-verify-json.log)"
+  },
+  "ubuntu-22.04-amd64-docker.io": {
+   "max_warn": null,
+   "rows": null,
+   "measured": null,
+   "why": "placeholder: the baseline is taken from 0.6.29-rc.2's fresh runs (logs/probe-verify-json.log)"
+  },
+  "stranger-24.04": {
+   "max_warn": null,
+   "rows": null,
+   "measured": null,
+   "why": "placeholder: the baseline is taken from 0.6.29-rc.2's fresh runs (logs/probe-verify-json.log)"
+  },
+  "stranger-24.04-literal": {
+   "max_warn": null,
+   "rows": null,
+   "measured": null,
+   "why": "placeholder: the baseline is taken from 0.6.29-rc.2's fresh runs (logs/probe-verify-json.log)"
+  },
+  "windows-2025-wsl2": {
+   "max_warn": null,
+   "rows": null,
+   "measured": null,
+   "why": "placeholder: the baseline is taken from 0.6.29-rc.2's fresh runs (logs/probe-verify-json.log)"
+  }
+ }
+}
