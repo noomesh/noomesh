@@ -3185,7 +3185,8 @@ fn the_gateways_one_401_prints_its_sentence_and_the_next_step() {
     let _ = mock.requests();
     assert_eq!(out.status.code(), Some(4), "401 must map to AuthFailed(4)");
     let said = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
-    assert!(said.contains(sentence), "the gateway's sentence: {said}");
+    // The UI capitalises a line's first letter; the words are the gateway's.
+    assert!(said.to_lowercase().contains(&sentence.to_lowercase()), "the gateway's sentence: {said}");
     assert!(said.contains("noo auth login"), "the next step: {said}");
     assert!(!said.contains("HTTP 401"), "no raw status prefix: {said}");
     assert!(!target.exists(), "no file may be written on auth failure");
