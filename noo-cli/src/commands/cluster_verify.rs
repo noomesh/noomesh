@@ -3246,7 +3246,7 @@ pub(crate) fn default_chat_check(classes: Option<&Value>, has_gpu: Option<bool>,
         return warn(NAME, format!("{detail} — only excluded nodes are left (thermal critical / quarantined)"), Some("noo cluster status".into()));
     }
     let cpu_only = !order.iter().any(is_gpu);
-    if cpu_only && has_gpu != Some(false) {
+    if cpu_only && has_gpu == Some(true) {
         return warn(NAME, format!("{detail} — only CPU candidates"), Some("noo cluster place <node> <backend> <model>".into()));
     }
     let one_node = nodes.len() == 1;
