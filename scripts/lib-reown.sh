@@ -25,10 +25,13 @@
 #   4. VERIFY: probe again; anything left refuses the start, naming the paths
 #      and the manual command, instead of starting a service that cannot read
 #      its own data.
-# The work runs in a throwaway alpine container (no sudo), the same pattern
+# The work runs in a throwaway helper container (lib-helper-image.sh) (no sudo), the same pattern
 # as the ingest dir. NOO_REOWN_CMD replaces that runner (tests): it is called
 # as `$NOO_REOWN_CMD <host dir> <sh snippet>` and must run the snippet with
 # $D set to the directory. The caller may define `reown_stop_service <svc>`.
+
+# shellcheck source=lib-helper-image.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib-helper-image.sh"
 
 NOO_REOWN_UID=65532
 
@@ -42,7 +45,9 @@ _reown_run() {  # <host dir> <snippet>
         # shellcheck disable=SC2086  # a command line, split on purpose
         $NOO_REOWN_CMD "$1" "$2"
     else
-        docker run --rm -e D=/d -v "$1":/d alpine sh -c "$2"
+        # Job `reown` (CHOWN + DAC_OVERRIDE), only the one dir mounted. $D is
+        # set inside the snippet itself (no `-e`).
+        helper_ensure_present && helper_run reown sh "$1":/d -c "D=/d; $2"
     fi
 }
 
@@ -60,7 +65,7 @@ _reown_host_paths() {  # <host dir>  (stdin: paths)
 reown_nonroot_path() {
     local dir="$1" svc="$2" found n left
     if ! found="$(_reown_run "$dir" "$_REOWN_PROBE" 2>/dev/null)"; then
-        echo "NOTE: could not inspect ownership under $dir (throwaway alpine container failed); $svc runs as uid $NOO_REOWN_UID and \
+        echo "NOTE: could not inspect ownership under $dir (throwaway helper container failed); $svc runs as uid $NOO_REOWN_UID and \
 may fail with 'permission denied'. To fix: sudo chown -R $NOO_REOWN_UID:$NOO_REOWN_UID $dir" >&2
         return 0
     fi
@@ -94,7 +99,7 @@ reown_nonroot_dirs() {
         dir="$root/$svc"
         [ -d "$dir" ] || continue
         if ! found="$(_reown_run "$dir" "$_REOWN_PROBE" 2>/dev/null)"; then
-            echo "NOTE: could not inspect ownership under $dir (throwaway alpine container failed); $svc runs as uid $NOO_REOWN_UID (i64) and \
+            echo "NOTE: could not inspect ownership under $dir (throwaway helper container failed); $svc runs as uid $NOO_REOWN_UID (i64) and \
 may fail with 'permission denied'. To fix: sudo chown -R $NOO_REOWN_UID:$NOO_REOWN_UID $dir" >&2
             continue
         fi

@@ -68,7 +68,9 @@ def test_prep_mounts_the_noo_data_volume_in_a_throwaway_root_container(tmp_path:
     argv, _ = _captured_script(tmp_path)
     assert argv[:2] == ["run", "--rm"], argv
     assert "proj_noo-data:/d" in argv, argv
-    assert "alpine" in argv, argv
+    assert any(a.startswith("ghcr.io/noomesh/nginx:") and "@sha256:" in a for a in argv), argv
+    assert "alpine" not in argv, argv
+    assert argv[argv.index("--entrypoint") + 1] == "sh", argv
     assert "--user" not in argv and "-u" not in argv, "the chown needs root in the throwaway container"
 
 

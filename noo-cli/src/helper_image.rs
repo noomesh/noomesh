@@ -26,6 +26,43 @@ pub(crate) const HELPER_LOCK_ROW: &str = "nginx";
 /// tag and default digest are read from its `model-cache` service.
 const COMPOSE: &str = include_str!("../../docker-compose.cluster.yml");
 
+/// The ONE job -> capability table. Every helper container drops ALL
+/// capabilities and adds back exactly the ones listed for its job; nothing
+/// is ever `--privileged`. scripts/lib-helper-image.sh `helper_job_caps`
+/// mirrors this table row for row (tests/test_helper_image_shell.py parses
+/// both and compares). Jobs: the first three are noo-cli's own, the rest are
+/// the launcher scripts'.
+///
+/// Where a row has a DAC_* or FOWNER cap beside CHOWN, WHY: the helper runs
+/// as root inside the container, but root WITHOUT these capabilities is an
+/// ordinary uid against file modes. The data dirs belong to service uids
+/// (postgres 70, redis/prometheus/gateway 65532) or to the wizard's user and
+/// are mode 0700/0755, so reading, entering or writing them is a DAC check.
+pub(crate) const JOB_CAPS: &[(&str, &[&str], &str)] = &[
+    // touch in a dir owned by the wizard's user: creating the file is a write-permission (DAC) check.
+    ("touch", &["DAC_OVERRIDE"], "create a file in a dir owned by another uid"),
+    // chown of the mount point only needs CHOWN: no file is read or written.
+    ("chown", &["CHOWN"], "chown the mounted (empty) dir"),
+    // du walks service-owned 0700 subdirs, read-only mount: search+read only.
+    ("du", &["DAC_READ_SEARCH"], "read-only walk of a service-owned tree"),
+    // secrets: chown each file to its container's uid, reading the manifest.
+    ("secrets-chown", &["CHOWN", "DAC_READ_SEARCH"], "chown files, read the manifest they are listed in"),
+    // chgrp then chmod the one noomesh.yaml: chmod on a file we do not own is FOWNER.
+    ("chgrp-file", &["CHOWN", "FOWNER"], "chgrp + chmod one file owned by another uid"),
+    // mkdir in the volume root (DAC write) + chown -R through 0700 dirs.
+    ("data-dirs", &["CHOWN", "DAC_OVERRIDE"], "mkdir and chown -R in a volume owned by another uid"),
+    // probe (find through 0700 dirs) and chown -R.
+    ("reown", &["CHOWN", "DAC_OVERRIDE"], "find and chown -R through service-owned 0700 dirs"),
+    // rm -rf of files in service-owned dirs, then chown the dir.
+    ("wipe", &["CHOWN", "DAC_OVERRIDE"], "delete files in service-owned dirs, then chown the dir"),
+];
+
+/// The capabilities the table gives `job`. Panics on a name that is not in
+/// the table: a job with no row has no business running.
+fn caps_for(job: &str) -> &'static [&'static str] {
+    JOB_CAPS.iter().find(|(n, ..)| *n == job).unwrap_or_else(|| panic!("no capability row for helper job {job}")).1
+}
+
 /// What the helper is asked to do. One variant per job, each with the
 /// narrowest capability set that job needs.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,24 +115,22 @@ pub(crate) fn helper_ref() -> Result<String, String> {
 /// privilege escalation, ALL capabilities dropped and only the one the job
 /// needs added back, and the entrypoint replaced by the job's binary so the
 /// image's own server never starts.
-///   touch  DAC_OVERRIDE: root without it cannot create a file in a dir
-///          owned by another uid (the wizard's user owns noo-data).
-///   chown  CHOWN: the only thing the job does.
-///   du     DAC_READ_SEARCH: read a volume whose subdirs are 0700 for
-///          service uids (postgres 70, redis/prometheus 65532); read-only mount.
+/// The capability set is [`JOB_CAPS`]'s row for the job.
 pub(crate) fn run_argv(image: &str, mount_src: &str, job: &Job) -> Vec<String> {
-    let (cap, mount, bin, args): (&str, String, &str, Vec<String>) = match job {
-        Job::Touch { marker } => ("DAC_OVERRIDE", format!("{mount_src}:/test"), "touch", vec![format!("/test/{marker}")]),
-        Job::Chown { owner } => ("CHOWN", format!("{mount_src}:/d"), "chown", vec![(*owner).to_string(), "/d".to_string()]),
-        Job::Du => ("DAC_READ_SEARCH", format!("{mount_src}:/d:ro"), "du", vec!["-sh".to_string(), "/d".to_string()]),
+    let (name, mount, bin, args): (&str, String, &str, Vec<String>) = match job {
+        Job::Touch { marker } => ("touch", format!("{mount_src}:/test"), "touch", vec![format!("/test/{marker}")]),
+        Job::Chown { owner } => ("chown", format!("{mount_src}:/d"), "chown", vec![(*owner).to_string(), "/d".to_string()]),
+        Job::Du => ("du", format!("{mount_src}:/d:ro"), "du", vec!["-sh".to_string(), "/d".to_string()]),
     };
-    let mut v: Vec<String> = [
-        "run", "--rm", "--pull", "never", "--network", "none", "--read-only", "--cap-drop", "ALL", "--cap-add", cap,
-        "--security-opt", "no-new-privileges", "--entrypoint", bin, "-v",
-    ]
-    .iter()
-    .map(|s| s.to_string())
-    .collect();
+    let mut v: Vec<String> = ["run", "--rm", "--pull", "never", "--network", "none", "--read-only", "--cap-drop", "ALL"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    for cap in caps_for(name) {
+        v.push("--cap-add".into());
+        v.push((*cap).to_string());
+    }
+    v.extend(["--security-opt", "no-new-privileges", "--entrypoint", bin, "-v"].iter().map(|s| s.to_string()));
     v.push(mount);
     v.push(image.to_string());
     v.extend(args);
@@ -185,11 +220,25 @@ mod tests {
     }
 
     #[test]
+    fn every_job_has_a_row_and_every_row_a_reason() {
+        for (n, caps, why) in JOB_CAPS {
+            assert!(!caps.is_empty() && !why.is_empty(), "{n}");
+            assert!(caps.iter().all(|c| c.bytes().all(|b| b.is_ascii_uppercase() || b == b'_')), "{n}: {caps:?}");
+            assert!(!caps.contains(&"ALL") && !caps.contains(&"SYS_ADMIN"), "{n}: never a blanket cap");
+        }
+        let names: Vec<_> = JOB_CAPS.iter().map(|r| r.0).collect();
+        let mut d = names.clone();
+        d.dedup();
+        assert_eq!(names, d);
+    }
+
+    #[test]
     fn no_job_is_privileged_or_has_a_network() {
         for job in [Job::Touch { marker: "m" }, Job::Chown { owner: "1:1" }, Job::Du] {
             let a = run_argv(IMG, "/x", &job);
             assert!(!a.iter().any(|x| x == "--privileged" || x == "host"), "{a:?}");
-            assert_eq!(a.iter().filter(|x| *x == "--cap-add").count(), 1, "{a:?}");
+            assert!(a.iter().any(|x| x == "--cap-add"), "{a:?}");
+            assert!(a.windows(2).any(|w| w == ["--cap-drop", "ALL"]), "{a:?}");
         }
     }
 
