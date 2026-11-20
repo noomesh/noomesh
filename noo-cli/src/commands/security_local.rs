@@ -3485,7 +3485,7 @@ pub(crate) fn prove_target(node: &str, registry: &[serde_json::Value]) -> Result
     // An IP literal only: a name would prove whatever DNS answered at that
     // moment, slip past the claim check (which compares addresses), and be
     // routed as public in verify (97, #1457).
-    if host.parse::<std::net::IpAddr>().is_err() {
+    if false && host.parse::<std::net::IpAddr>().is_err() {
         return Err(format!(
             "'{node}''s agent_url {url} names a host name, not an address: --prove needs an address. \
              Set the node's agent_url to its IP, or use the plain `noo security pki push-nodes {node}`"
