@@ -418,6 +418,19 @@ func (s *Server) handleInferenceProxy(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = r.Body.Close()
 
+	// A content part naming a remote media URL is refused before a backend
+	// is picked: vLLM (and llama-server) would fetch it from this node's
+	// network (media_urls.go). The gateway refuses it first; this is the
+	// second wall. Logged with the part type, never the URL.
+	if partType, remote := remoteMediaPart(body); remote {
+		slog.Warn("inference proxy refused a remote media URL",
+			"code", RemoteMediaURLRefused, "path", r.URL.Path, "part_type", partType)
+		jsonError(w, http.StatusBadRequest, RemoteMediaURLRefused,
+			"a '"+partType+"' content part names a remote URL; media links are not passed to a model. "+
+				"Send the image inline as a data: URL (base64), for example data:image/png;base64,<data>")
+		return
+	}
+
 	headerHint := r.Header.Get("X-Noo-Backend")
 	running, err := s.docker.RunningBackendsCached(r.Context())
 	if err != nil {
