@@ -4734,7 +4734,7 @@ pub(crate) fn apply_refusal(rc: i64) -> ApplyRefusal {
         76 => Some(ApplyRefusal {
             code: "apply_refused_applier_too_old",
             why: "the node's applier is older than the bundle (or a part of it names another node)",
-            next: ApplyNext::Run("noo cluster upgrade-applier <node>"),
+            next: ApplyNext::Run("noo cluster provision <node>"),
         }),
         77 => Some(ApplyRefusal {
             code: "apply_refused_signature",
