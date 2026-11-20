@@ -454,7 +454,7 @@ decrypt_bundle() {  # sets NOO_REFUSAL and DECRYPT_RECORD; 0 or the report's rc
     # garbage, is this key not opening this bundle (recorded).
     if openssl smime -decrypt -binary -inform DER \
             -inkey "$KEY" -in "$TMP/blob" -out "$TMP/bundle.check" 2>/dev/null \
-        && plaintext_is_bundle "$TMP/bundle.check"; then
+        ; then
         rm -f "$TMP/bundle.check"
         NOO_REFUSAL=bundle_decrypt_io; return 73
     fi
