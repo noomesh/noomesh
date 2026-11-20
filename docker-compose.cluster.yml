@@ -2060,9 +2060,13 @@ services:
   # Runs on controller so embeddings work out of the box without a GPU.
   # Optional engine; nothing defaults to it anymore — point
   # PAGEINDEX_EMBEDDING_URL at it explicitly to use it.
+  # The TEI pins (CPU here and in the agent; GPU in tei-gpu, reranker and
+  # the agent) move per flavour, after a review of the new release's flags,
+  # env and request fields: tests/test_tei_image_contract.py holds the
+  # reviewed release of each.
   tei:
     logging: *default-logging
-    image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.6${NOO_IMAGE_DIGEST_TEI_CPU:-@sha256:66db77d7856c9319bbfaf2c5b80a6d0e0ac9ff128ade09eaca1d9c20213617a4}
+    image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.9.4${NOO_IMAGE_DIGEST_TEI_CPU:-@sha256:2538ea1c9640d3763b15af668039d24172d063b42337b0c27796fc2be180c78d}
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-tei
     # The agent's backend floor (node-agent-go StartBackendSDK; i301): no kernel
     # capability beyond the start-as-root, chown, drop-to-a-user entrypoint
@@ -2097,6 +2101,9 @@ services:
   # Use this on nodes with a GPU for faster embedding throughput.
   tei-gpu:
     logging: *default-logging
+    # held at 1.6: TEI 1.9.4's CUDA image requires cuda>=12.9 with no GeForce
+    # exemption (driver >= ~575, inferred from the image config); move after a
+    # GPU node proves it (#1444)
     image: ghcr.io/huggingface/text-embeddings-inference:1.6${NOO_IMAGE_DIGEST_TEI:-@sha256:25e35b0b266241a543c5ee305083eced4b6ac0772eb969c3fdaae2d4c2ef7266}
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-tei-gpu
     # The agent's backend floor (node-agent-go StartBackendSDK; i301): no kernel
@@ -2234,6 +2241,9 @@ services:
   # opt-in `tei-compose` profile; removing them is separate cleanup.
   reranker:
     logging: *default-logging
+    # held at 1.6: TEI 1.9.4's CUDA image requires cuda>=12.9 with no GeForce
+    # exemption (driver >= ~575, inferred from the image config); move after a
+    # GPU node proves it (#1444)
     image: ghcr.io/huggingface/text-embeddings-inference:1.6${NOO_IMAGE_DIGEST_TEI:-@sha256:25e35b0b266241a543c5ee305083eced4b6ac0772eb969c3fdaae2d4c2ef7266}
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-reranker
     # The agent's backend floor (node-agent-go StartBackendSDK; i301): no kernel

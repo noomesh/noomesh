@@ -157,7 +157,7 @@ type BackendSpec struct {
 	Image string
 	// CPUImage, when set, is used instead of Image on nodes WITHOUT an
 	// NVIDIA GPU. Lets a single backend type (e.g. embedding/reranker, which
-	// ship distinct CUDA `:1.6` and `:cpu-1.6` TEI images) auto-select the
+	// ship distinct CUDA `:1.6` and `:cpu-1.9.4` TEI images) auto-select the
 	// right image per node — GPU where available, CPU otherwise. The GPU
 	// device reservation is independently guarded by hasNvidiaGPU(), so the
 	// two stay in sync. Empty → Image is used on every node (LLM backends).
@@ -448,13 +448,16 @@ var backendSpecs = map[string]BackendSpec{
 		MemoryLimit: 16 * 1024 * 1024 * 1024, // 16GB
 	},
 	// Embedding — TEI serving a sentence embedder (POST /embed). GPU where
-	// available (CUDA :1.6), CPU otherwise (:cpu-1.6) — auto-selected per
+	// available (CUDA :1.6), CPU otherwise (:cpu-1.9.4) — auto-selected per
 	// node via CPUImage + hasNvidiaGPU(). GPUCount "1" is a no-op on CPU
 	// nodes (the reservation is GPU-guarded). Start with:
 	//   noo cluster up embedding BAAI/bge-base-en-v1.5 --node <node>
 	"embedding": {
+		// held at 1.6: TEI 1.9.4's CUDA image requires cuda>=12.9 with no GeForce
+		// exemption (driver >= ~575, inferred from the image config); move after a
+		// GPU node proves it (#1444)
 		Image:         "${TEI_GPU_IMAGE:-ghcr.io/huggingface/text-embeddings-inference:1.6}",
-		CPUImage:      "${TEI_CPU_IMAGE:-ghcr.io/huggingface/text-embeddings-inference:cpu-1.6}",
+		CPUImage:      "${TEI_CPU_IMAGE:-ghcr.io/huggingface/text-embeddings-inference:cpu-1.9.4}",
 		ContainerName: "noo-tei",
 		Env: map[string]string{
 			"HUGGING_FACE_HUB_TOKEN": "${HF_TOKEN:-}",
@@ -520,8 +523,11 @@ func rerankerSpec() BackendSpec {
 //	RERANK_ENGINE=tei; noo cluster up reranker BAAI/bge-reranker-base --node <node>
 func rerankerSpecTEI() BackendSpec {
 	return BackendSpec{
+		// held at 1.6: TEI 1.9.4's CUDA image requires cuda>=12.9 with no GeForce
+		// exemption (driver >= ~575, inferred from the image config); move after a
+		// GPU node proves it (#1444)
 		Image:         "${TEI_GPU_IMAGE:-ghcr.io/huggingface/text-embeddings-inference:1.6}",
-		CPUImage:      "${TEI_CPU_IMAGE:-ghcr.io/huggingface/text-embeddings-inference:cpu-1.6}",
+		CPUImage:      "${TEI_CPU_IMAGE:-ghcr.io/huggingface/text-embeddings-inference:cpu-1.9.4}",
 		ContainerName: "noo-reranker",
 		Env: map[string]string{
 			"HUGGING_FACE_HUB_TOKEN": "${HF_TOKEN:-}",
@@ -1531,8 +1537,8 @@ func resolveEnvSlice(ss []string) []string {
 // node's HF_CACHE_DIR (mounted at /data).
 //
 // The TEI images (ghcr.io/huggingface/text-embeddings-inference:1.6 and
-// :cpu-1.6, the digests docker-compose.cluster.yml pins) set
-// HUGGINGFACE_HUB_CACHE=/data in their config, and TEI 1.6 hands that
+// :cpu-1.9.4, the digests docker-compose.cluster.yml pins) set
+// HUGGINGFACE_HUB_CACHE=/data in their config, and TEI (1.6 and 1.9.4 alike) hands that
 // straight to hf-hub (router/src/lib.rs: ApiBuilder::with_cache_dir), whose
 // layout is <cache>/models--org--name. The agent stages and VERIFIES a placed
 // model at HF_CACHE_DIR/hub/models--org--name (stageHFModel, i675 F13), the

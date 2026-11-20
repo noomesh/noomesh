@@ -86,6 +86,15 @@ capability cannot be read (an agent older than 0.6.18, no heartbeat yet, or
 nvidia-smi failed), the place goes ahead with a warning, the verify row
 warns, and onboarding offers vLLM without recommending it.
 
+Text Embeddings Inference (TEI: the opt-in `embedding` backend and the
+`RERANK_ENGINE=tei` reranker) runs one image on CPU nodes and another on GPU
+nodes. CPU nodes run `cpu-1.9.4`, which needs no driver. GPU nodes stay on
+the CUDA `1.6` image for now. TEI 1.9.4's CUDA image will need an NVIDIA
+driver that reports CUDA 12.9 or newer (about driver 575 and up): the image
+requires `cuda>=12.9` and exempts no GeForce driver. That floor is
+**inferred from the image, to be confirmed** on a GPU node before GPU TEI
+moves to 1.9.4.
+
 ### Check a machine before you enroll it
 
 `noo enroll` runs a preflight before it spends the token. It prints
