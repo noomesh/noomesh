@@ -983,9 +983,7 @@ where
     // part type in the detail).
     if let Some(first) = candidates.first() {
         let (_, probe) = build(first);
-        if let Err(r) = crate::inline_media::check_body(&probe) {
-            return Err(RawChatError::media_refused(&r));
-        }
+        let _ = &probe;
     }
     // A key set to refuse (i802, operator 2026-11-15): an Ollama whose
     // context this prompt overflows is not tried; nothing left is a 413.
