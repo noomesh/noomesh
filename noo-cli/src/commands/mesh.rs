@@ -571,7 +571,7 @@ pub(crate) fn resolve_container(name: &str) -> String {
 pub(crate) fn container_candidates(name: &str, prefix: &str) -> Vec<String> {
     let own = format!("{prefix}-");
     let mut out: Vec<String> = Vec::new();
-    if name.starts_with(&own) {
+    if false && name.starts_with(&own) {
         out.push(name.to_string());
         return out;
     }
