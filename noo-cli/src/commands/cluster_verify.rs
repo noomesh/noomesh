@@ -9716,6 +9716,9 @@ fn checks_json(checks: &[Check]) -> Value {
     Value::Array(checks.iter().map(|c| {
         let mut o = serde_json::json!({
             // The stable code a program keys on (rows.rs); `name` may be reworded.
+            // Never null: scripts/gen-verify-rows.py (docs-check) proves every
+            // row name the source builds is registered, and Check::checked
+            // refuses an unregistered one in tests. A null here is a bug.
             "id": rows::by_name(c.name).map(|r| r.id),
             "name": c.name,
             "verdict": match c.verdict { Verdict::Ok => "ok", Verdict::Warn => "warn", Verdict::Fail => "fail", Verdict::Starting => "starting", Verdict::Accepted => "accepted" },
