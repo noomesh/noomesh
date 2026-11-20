@@ -337,6 +337,49 @@ pub(crate) fn carry_reported(data: &mut Value, body: &Value, key: &str) {
     }
 }
 
+/// The routing fields a registration body does not carry but selection reads
+/// (`classes::node_facts_from_kv`): `lanes` (i403; a node that reports them
+/// is routed on them alone), `running_backends` (the fallback for an agent
+/// that predates lanes) and `available_models` (a declared candidate whose
+/// model the node holds but has not loaded is `available`). Registration
+/// rebuilds the record from scratch, so without these every agent restart
+/// left the node unroutable until its first beat: an instant 503 for every
+/// chat to a class only it serves (~30 s on every roll and upgrade).
+pub(crate) const REGISTER_KEEPS_FROM_STORED: &[&str] = &["lanes", "running_backends", "available_models"];
+
+/// How old the stored record's last beat (or registration) may be for a
+/// registration to keep its routing fields: an agent restart, not a node
+/// that was away. The `mesh_nodes` bucket's own TTL (120 s) usually removed
+/// an older record already; this does not depend on that TTL being set.
+pub(crate) const STORED_CARRY_MAX_AGE_SECS: f64 = 4.0 * crate::coordinator::classes::HEARTBEAT_INTERVAL_SECS;
+
+/// Carry one field from the node's STORED record onto a registration's
+/// rebuilt one, when the registration body does not carry it: what the node
+/// offered a second ago, kept until its next beat replaces it (a beat sets
+/// `lanes` and `running_backends` every time; a lane that turned out gone
+/// fails over as any dead lane does). `stored` is `None` when there is no
+/// record (first registration, or `noo cluster forget` purged it) or it is
+/// too old ([`stored_for_carry`]): then nothing is carried.
+pub(crate) fn carry_stored(data: &mut Value, stored: Option<&Value>, body: &Value, key: &str) {
+    if body.get(key).is_some_and(|v| !v.is_null()) {
+        return;
+    }
+    if let Some(v) = stored.and_then(|s| s.get(key)).filter(|v| !v.is_null()) {
+        data[key] = v.clone();
+    }
+}
+
+/// The stored record a registration may carry from: present, for the same
+/// node id, and beaten (or registered) within [`STORED_CARRY_MAX_AGE_SECS`].
+pub(crate) fn stored_for_carry<'a>(stored: Option<&'a Value>, node_id: &str, now: f64) -> Option<&'a Value> {
+    let s = stored?;
+    if s.get("id").and_then(Value::as_str).is_some_and(|id| id != node_id) {
+        return None;
+    }
+    let last = s.get("last_heartbeat").or_else(|| s.get("ts")).and_then(Value::as_f64)?;
+    (now - last <= STORED_CARRY_MAX_AGE_SECS).then_some(s)
+}
+
 /// The agent's `lanes` (proposal i403), stored on every beat so the class
 /// table reads them (`node_facts_from_kv`). An agent that reports lanes
 /// sends the key on EVERY beat (`[]` included: "no lanes"; the agent's
@@ -1295,6 +1338,10 @@ async fn node_register_body(
 
     // Flatten capabilities into top-level fields for dashboard compatibility
     let caps = body.get("capabilities").cloned().unwrap_or(json!({}));
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64();
     let data = json!({
         "id": node_id,
         "hostname": body.get("hostname").and_then(|h| h.as_str()).unwrap_or(node_id),
@@ -1321,10 +1368,12 @@ async fn node_register_body(
         "capabilities": caps,
         "status": "online",
         "running_backends": {},
-        "ts": std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs_f64(),
+        // When this registration was written. With no `last_heartbeat`
+        // after it, the node has not beaten since its (re)start: selection
+        // holds a request for it briefly instead of refusing at once
+        // (`classes::first_beat_wait`).
+        "registered_at": now,
+        "ts": now,
     });
 
     // No VRAM → no GPU (drops a stale/copied GPU_MODEL at registration too).
@@ -1362,13 +1411,24 @@ async fn node_register_body(
     data[crate::node_link::TRANSPORTS_FIELD] = crate::node_link::reported_transports(&body);
     crate::node_agent_auth::note(node_id, &data);
 
-    // Write full registration to NATS KV
+    // Write full registration to NATS KV, keeping the routing fields the
+    // node offered a second ago (`carry_stored`). A forgotten node's record
+    // was purged (`node_forget`), so a re-enrolled one inherits nothing.
+    let mut kept: Vec<&str> = Vec::new();
     if let Ok(kv) = state.js.get_key_value("mesh_nodes").await {
+        let stored = kv.get(node_id).await.ok().flatten().and_then(|v| serde_json::from_slice::<Value>(&v).ok());
+        let from = stored_for_carry(stored.as_ref(), node_id, now);
+        for &key in REGISTER_KEEPS_FROM_STORED {
+            carry_stored(&mut data, from, &body, key);
+            if body.get(key).is_none_or(Value::is_null) && from.is_some_and(|s| s.get(key).is_some_and(|v| !v.is_null())) {
+                kept.push(key);
+            }
+        }
         let payload = serde_json::to_vec(&data).unwrap_or_default();
         let _ = kv.put(node_id, payload.into()).await;
     }
 
-    tracing::info!(node_id = %node_id, "node registered");
+    tracing::info!(node_id = %node_id, kept_from_stored = ?kept, "node registered");
     Ok(Json(json!({"status": "registered", "node_id": node_id})))
 }
 
@@ -10663,5 +10723,115 @@ mod image_space_tests {
         let put = crate::test_src::fn_body(&own, "async fn placement_put(");
         assert!(put.contains("Err(msg) if !body.force => return Err(AppError::Conflict(msg)),"), "a 409 without --force");
         assert!(put.contains("Err(msg) => fit_warnings.push(format!(\"forced past a disk shortfall: {msg}\")),"), "a warning with it");
+    }
+}
+
+#[cfg(test)]
+mod register_keeps_lanes_tests {
+    //! An agent restart re-registers the node; the registration must keep the
+    //! routing fields the node offered a second ago, or every chat to a class
+    //! only it serves gets an instant 503 until its first beat.
+    use super::{carry_stored, stored_for_carry, REGISTER_KEEPS_FROM_STORED};
+    use crate::coordinator::classes::{
+        build_table, first_beat_wait, node_facts_from_kv, select_with, DeclaredCandidate, DeclaredClass, Declarations, Refusal, Selection,
+        FIRST_BEAT_MARGIN,
+    };
+    use serde_json::{json, Value};
+    use std::time::Duration;
+
+    fn decl() -> Declarations {
+        Declarations {
+            classes: vec![DeclaredClass {
+                name: "fast".into(),
+                candidates: vec![DeclaredCandidate { node_id: "node_a".into(), backend: "ollama".into(), model: Some("gemma4:12b".into()), degraded: false }],
+                pool: false,
+            }],
+            aliases: vec![],
+        }
+    }
+
+    /// The node's record as its last beat left it.
+    fn stored(last: f64) -> Value {
+        json!({
+            "id": "node_a", "ip_address": "100.64.0.2", "status": "online", "last_heartbeat": last, "ts": last,
+            "running_backends": {"ollama": "gemma4:12b"},
+            "available_models": ["gemma4:12b"],
+            "lanes": [{"backend": "ollama", "model": "gemma4:12b", "role": "chat", "state": "serving", "reason": ""}],
+        })
+    }
+
+    /// The routing part of what `node_register_body` writes for `body`.
+    fn registered(stored: Option<&Value>, body: &Value, now: f64) -> Value {
+        let mut data = json!({"id": "node_a", "ip_address": "100.64.0.2", "status": "online", "running_backends": {}, "registered_at": now, "ts": now});
+        let from = stored_for_carry(stored, "node_a", now);
+        for &key in REGISTER_KEEPS_FROM_STORED {
+            carry_stored(&mut data, from, body, key);
+        }
+        data
+    }
+
+    fn body() -> Value {
+        json!({"node_id": "node_a", "hostname": "node_a"})
+    }
+
+    fn table(data: &Value, now: f64) -> crate::coordinator::classes::ClassTable {
+        build_table(&[node_facts_from_kv("node_a", data, &[], now)], &[], &decl())
+    }
+
+    fn select_fast(data: &Value, now: f64) -> Result<Selection, Refusal> {
+        select_with(&table(data, now), Some("fast"), None, false, &|_| false, &|_| 0, &|_| false)
+    }
+
+    #[test]
+    fn a_re_registration_keeps_the_lanes_and_the_class_resolves_to_the_node() {
+        let data = registered(Some(&stored(1000.0)), &body(), 1010.0);
+        assert_eq!(data["lanes"], stored(1000.0)["lanes"], "the lanes the node offered a second ago");
+        assert_eq!(data["running_backends"], json!({"ollama": "gemma4:12b"}));
+        let sel = select_fast(&data, 1011.0).expect("a chat right after the re-registration is served");
+        assert_eq!(sel.candidates[0].node_id, "node_a");
+    }
+
+    #[test]
+    fn a_registration_with_no_stored_record_carries_nothing() {
+        let data = registered(None, &body(), 1010.0);
+        assert!(data.get("lanes").is_none(), "{data}");
+        assert_eq!(data["running_backends"], json!({}));
+        assert!(data.get("available_models").is_none(), "{data}");
+        assert!(matches!(select_fast(&data, 1011.0), Err(Refusal::NoCandidates(_))));
+    }
+
+    #[test]
+    fn an_old_or_foreign_stored_record_is_not_carried_and_the_body_wins() {
+        // A node away longer than the carry window (not a restart).
+        let data = registered(Some(&stored(1000.0)), &body(), 1000.0 + super::STORED_CARRY_MAX_AGE_SECS + 1.0);
+        assert!(data.get("lanes").is_none(), "{data}");
+        // A record under another id.
+        let mut other = stored(1000.0);
+        other["id"] = json!("node_b");
+        assert!(registered(Some(&other), &body(), 1010.0).get("lanes").is_none());
+        // What the registration itself says is never replaced.
+        let b = json!({"node_id": "node_a", "lanes": []});
+        assert_eq!(registered(Some(&stored(1000.0)), &b, 1010.0)["lanes"], json!([]));
+    }
+
+    #[test]
+    fn a_just_registered_node_is_waited_for_and_an_old_one_is_not() {
+        // Registered at 1000 with nothing to carry, no beat since: the
+        // refusal is the registration's gap, held to the expected beat.
+        let data = registered(None, &body(), 1000.0);
+        let t = table(&data, 1005.0);
+        assert_eq!(first_beat_wait(&t, Some("fast"), None), Some(Duration::from_secs(25) + FIRST_BEAT_MARGIN));
+        assert_eq!(first_beat_wait(&t, Some("fast"), Some("node_a")), Some(Duration::from_secs(25) + FIRST_BEAT_MARGIN));
+        // Never past the restart wait's cap.
+        let t = table(&data, 1000.0);
+        assert!(first_beat_wait(&t, Some("fast"), None).unwrap() <= crate::node_restart::MAX_WAIT);
+        // Registered long ago: refused at once, as before.
+        assert_eq!(first_beat_wait(&table(&data, 1000.0 + 31.0), Some("fast"), None), None);
+        // Beaten since the registration: refused at once.
+        let mut beaten = data.clone();
+        beaten["last_heartbeat"] = json!(1001.0);
+        assert_eq!(first_beat_wait(&table(&beaten, 1005.0), Some("fast"), None), None);
+        // A record no registration wrote (no `registered_at`).
+        assert_eq!(first_beat_wait(&table(&json!({"id": "node_a", "ts": 1000.0}), 1005.0), Some("fast"), None), None);
     }
 }
