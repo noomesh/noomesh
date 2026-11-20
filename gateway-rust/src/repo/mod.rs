@@ -85,7 +85,6 @@ pub mod agent_recipients;
 pub mod approval_requests;
 pub mod autonomy;
 pub mod audit;
-pub mod bundle_apply_reports;
 pub mod caller_verifiers;
 pub mod cluster;
 pub mod connections;
@@ -233,7 +232,7 @@ mod ratchet {
     ("role_provision.rs", 7),
     ("routes/admin.rs", 10),
     ("routes/agents.rs", 5),
-    ("routes/bootstrap.rs", 14),
+    ("routes/bootstrap.rs", 15),
     ("routes/cluster.rs", 39),
     ("routes/communication.rs", 11),
     ("routes/core.rs", 3),
