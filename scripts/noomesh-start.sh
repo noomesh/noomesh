@@ -1076,7 +1076,8 @@ if [ -n "$OLLAMA_CTR" ]; then
             | grep -vE "^(${PAGEINDEX_EMBEDDING_MODEL:-}|${EMBEDDING_MODEL:-})$|embed|harrier|minilm|bge" | grep -q .; then
             OLLAMA_MODEL="gemma4:e2b"
             ui_note "no OLLAMA_MODEL declared — using the default (gemma4:e2b); set it in .env to change"
-        else
+        elif [ "${NOO_ONBOARD:-}" != 1 ]; then
+            # Under `noo onboard` its model step picks and pulls one next.
             ui_note "no chat model installed — skipping the default pull; pick one: noo models recommended / noo models pull <model>"
         fi
     fi
@@ -1120,6 +1121,9 @@ if [ -n "${OLLAMA_PULL_PID:-}" ]; then
     fi
 fi
 
+# The endpoint and verb guide is for a person who ran the launcher; under
+# `noo onboard` (NOO_ONBOARD=1) its own summary says where things are.
+if [ "${NOO_ONBOARD:-}" != 1 ]; then
 ui_phase "Endpoints"
 print_service_urls
 
@@ -1129,3 +1133,4 @@ ui_guide_cmd "noo stack status" "containers, health and ports in one table"
 ui_guide_cmd "noo stack logs -f [service]" "follow logs; omit the service for all of them"
 ui_guide_cmd "noo stack restart [service]" "restart one service or the whole stack"
 ui_guide_cmd "noo stack stop" "stop everything, data volumes kept"
+fi

@@ -256,6 +256,12 @@ pub(crate) struct State {
     pub ts_dnsname: String,
     pub ts_ip: String,
     pub ts_serve_applied: bool,
+    /// The person answered n to installing or joining Tailscale (a LAN-only
+    /// install by choice): the gateway certificate's missing tailnet names
+    /// are then expected, said as information.
+    pub tailscale_declined: bool,
+    /// `NOO_BIND_MODE` as the bind step wrote or kept it; empty = not run.
+    pub bind_mode: String,
     /// Whether the enrollment step set up multinode: None = not asked (`--ci`, dry run), Some(false) = declined.
     pub multinode: Option<bool>,
     /// Converged flow (`--from-archive`): extracted archive dir + the DB
@@ -272,6 +278,16 @@ pub(crate) struct State {
     /// instance = default; offset 0 = stock ports.
     pub instance: String,
     pub port_offset: u32,
+}
+
+/// The summary's Tailscale line on a box with no tailnet, from the bind
+/// mode: `local` is this machine only (loopback), not the LAN. Pure.
+pub(crate) fn tailscale_absent_line(bind_mode: &str) -> String {
+    match bind_mode {
+        "local" => "Tailscale: not configured — this machine only (bind: local)".to_string(),
+        "all" => "Tailscale: not configured — every network this machine is on (bind: all)".to_string(),
+        _ => "Tailscale: not configured — LAN-only access".to_string(),
+    }
 }
 
 /// What a `--skip-*` flag left UNAPPLIED, for the closing summary. A skipped
@@ -316,7 +332,7 @@ impl State {
             let serve = if self.ts_serve_applied { "serve mapping applied" } else { "serve mapping NOT applied" };
             lines.push(format!("Tailscale: {} ({serve})", self.ts_dnsname));
         } else {
-            lines.push("Tailscale: not configured — LAN-only access".to_string());
+            lines.push(tailscale_absent_line(&self.bind_mode));
         }
         if self.security_configured {
             if self.tls_enabled {
@@ -788,13 +804,20 @@ pub fn onboard(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             standalone = true;
         } else if !root.join("docker-compose.cluster.yml").exists() {
             println!("{}", crate::ui::status_line(crate::ui::Glyph::Bullet, "no repo checkout found — onboarding in STANDALONE mode (embedded deploy slice)"));
-            eprintln!("  (run from a checkout, or set NOO_REPO_ROOT, for a repo-based install)");
+            if let Some(hint) = contributor_hint(g.verbose) {
+                eprintln!("  {hint}");
+            }
             standalone = true;
         }
     }
     if from_archive.is_some() {
         standalone = true; // the converged flow targets the state home
     }
+
+    // Every script and child this run starts knows onboard is its caller
+    // (NOO_ONBOARD, docs/reference/env.md): the how-to notes they print for
+    // a person running them by hand are skipped under it.
+    std::env::set_var(ONBOARD_ENV, "1");
 
     // `standalone` is now settled (explicit or auto-detected), so this guard
     // must run AFTER the auto-detect block above — otherwise a bare
@@ -946,6 +969,26 @@ pub fn onboard(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         let _ = std::fs::remove_dir_all(&stage);
     }
     Ok(code)
+}
+
+/// Internal: set by `noo onboard` on its own process, so every script and
+/// child it runs inherits it. Under it, the notes meant for a person running
+/// a script by hand (the SOPS switch-over how-to, the launcher's endpoint
+/// guide, "pick a model", the per-backend first-issue leaf lines) are not
+/// printed: onboard does those steps itself. Lines that report an error are
+/// never gated. Not a user-facing switch.
+pub(crate) const ONBOARD_ENV: &str = "NOO_ONBOARD";
+
+/// This process runs under `noo onboard` ([`ONBOARD_ENV`] is `1`).
+pub(crate) fn onboard_is_caller() -> bool {
+    std::env::var(ONBOARD_ENV).as_deref() == Ok("1")
+}
+
+/// The contributor's way to a repo-based install, said under the
+/// standalone notice only with `--verbose`: a stranger has no checkout and
+/// no use for it. Pure.
+pub(crate) fn contributor_hint(verbose: bool) -> Option<&'static str> {
+    verbose.then_some("(run from a checkout, or set NOO_REPO_ROOT, for a repo-based install)")
 }
 
 /// Why the wizard stopped early. Which variant is the whole point: a missing
@@ -1503,7 +1546,7 @@ fn print_final_summary(ctx: &Ctx) {
     if !ctx.dry_run {
         let args: Vec<String> = FINAL_VERIFY_ARGS.iter().map(|a| a.to_string()).collect();
         match crate::commands::cluster_verify(ctx.g, &args) {
-            Ok(0) => ctx.success("cluster verify: every controller invariant holds"),
+            Ok(0) => ctx.success(closing_verify_ok_line(crate::commands::cluster_verify::last_run_note_rows())),
             Ok(_) => {
                 closing_verify_failed = true;
                 ctx.warn("cluster verify: an invariant does not hold — the remedy is beside each failing row above");
@@ -1548,14 +1591,7 @@ fn print_final_summary(ctx: &Ctx) {
         }
     }
     ctx.raw("");
-    for (cmd, desc) in [
-        ("noo stack start", "start all Docker services"),
-        ("noo stack status", "show service status"),
-        ("noo cluster status", "show cluster node status"),
-        ("noo models pull <model>", "pull a model"),
-        ("noo rag query \"...\"", "query the knowledge base"),
-        ("noo security pki status", "inspect cluster certificates"),
-    ] {
+    for (cmd, desc) in next_steps(ctx.state.services_started) {
         ctx.info(&format!("{cmd} — {desc}"));
     }
     if ctx.state.services_started {
@@ -1628,6 +1664,38 @@ fn print_final_summary(ctx: &Ctx) {
         for line in first_chat_lines(false) {
             ctx.raw(&format!("  {line}"));
         }
+    }
+}
+
+/// The summary's "what next" commands. A run that started the services
+/// points at `noo health`, never `noo stack start`: run after onboard, that
+/// recreates every container (a stranger's 0.6.28 run). `noo cluster verify`
+/// is listed either way. Pure.
+pub(crate) fn next_steps(services_started: bool) -> Vec<(&'static str, &'static str)> {
+    let first = if services_started {
+        ("noo health", "check the stack answers")
+    } else {
+        ("noo stack start", "start all Docker services")
+    };
+    vec![
+        first,
+        ("noo cluster verify", "is everything right"),
+        ("noo stack status", "show service status"),
+        ("noo cluster status", "show cluster node status"),
+        ("noo models pull <model>", "pull a model"),
+        ("noo rag query \"...\"", "query the knowledge base"),
+        ("noo security pki status", "inspect cluster certificates"),
+    ]
+}
+
+/// The closing verify passed (no FAIL row). Its WARN rows were printed just
+/// above; "every invariant holds" under "! 21" read as a contradiction, so a
+/// pass with notes says what the notes are. Pure.
+pub(crate) fn closing_verify_ok_line(note_rows: usize) -> &'static str {
+    if note_rows == 0 {
+        "cluster verify: every controller invariant holds"
+    } else {
+        "cluster verify: no failures — the rows above are notes, not errors"
     }
 }
 
@@ -2198,5 +2266,52 @@ mod summary_audit_tests {
             "the deferral is not tied to the stack never starting");
         assert!(body.contains("secrets_audit_stack_down(ctx.g, &stack_minted)"), "the summary audit does not defer");
         assert!(body.contains("that is the one thing to fix"), "the summary does not point at the services failure");
+    }
+}
+
+/// The closing summary a first-time user reads (a stranger's literal 0.6.28
+/// run): what to run next, the verify verdict, the Tailscale fact.
+#[cfg(test)]
+mod quiet_truthful_summary_tests {
+    use super::*;
+
+    #[test]
+    fn a_started_stack_is_checked_not_started_again() {
+        let started = next_steps(true);
+        assert_eq!(started[0], ("noo health", "check the stack answers"));
+        assert!(!started.iter().any(|(c, _)| *c == "noo stack start"), "noo stack start after onboard recreates every container");
+        assert!(started.contains(&("noo cluster verify", "is everything right")));
+        let not_started = next_steps(false);
+        assert_eq!(not_started[0], ("noo stack start", "start all Docker services"));
+        assert!(not_started.contains(&("noo cluster verify", "is everything right")));
+    }
+
+    #[test]
+    fn a_pass_with_notes_does_not_say_every_invariant_holds() {
+        assert_eq!(closing_verify_ok_line(0), "cluster verify: every controller invariant holds");
+        assert_eq!(closing_verify_ok_line(21), "cluster verify: no failures — the rows above are notes, not errors");
+        let own = crate::test_src::own_code(include_str!("mod.rs"));
+        assert!(own.contains("Ok(0) => ctx.success(closing_verify_ok_line(crate::commands::cluster_verify::last_run_note_rows())),"));
+    }
+
+    #[test]
+    fn no_tailnet_on_a_loopback_bind_is_this_machine_only() {
+        assert_eq!(tailscale_absent_line("local"), "Tailscale: not configured — this machine only (bind: local)");
+        assert!(!tailscale_absent_line("local").contains("LAN"));
+        assert!(tailscale_absent_line("all").contains("(bind: all)"));
+        assert_eq!(tailscale_absent_line(""), "Tailscale: not configured — LAN-only access");
+        let state = State { bind_mode: "local".into(), ..Default::default() };
+        assert!(state.summary_lines().iter().any(|l| l == "Tailscale: not configured — this machine only (bind: local)"));
+    }
+
+    #[test]
+    fn the_checkout_hint_is_verbose_only_and_the_marker_is_onboards() {
+        assert_eq!(contributor_hint(false), None);
+        assert!(contributor_hint(true).is_some_and(|h| h.contains("NOO_REPO_ROOT")));
+        assert_eq!(ONBOARD_ENV, "NOO_ONBOARD");
+        let own = crate::test_src::own_code(include_str!("mod.rs"));
+        let set = own.find("std::env::set_var(ONBOARD_ENV, \"1\");").expect("onboard marks its children");
+        let drive = own.find("let code = drive(&mut ctx, reconfigure);").expect("the plain drive");
+        assert!(set < drive, "set before any step runs a script");
     }
 }

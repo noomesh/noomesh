@@ -144,13 +144,27 @@ pub(crate) const TAILSCALE_YES: &str =
 pub(crate) const TAILSCALE_JOIN_YES: &str =
     "put this machine on your tailnet (other devices reach it by name; a login link follows)";
 pub(crate) const TAILSCALE_NO: &str =
-    "LAN-only: the dashboard is on https://localhost:8080 here and on your local network; add Tailscale any time later";
+    "this machine only: the dashboard is on https://localhost:8080; the next question can open it to your local network; add Tailscale any time later";
 pub(crate) const LAN_ONLY_CHOSEN: &str =
     "LAN-only install, as chosen. To add Tailscale later: install it, run `tailscale up`, then `noo onboard --reconfigure`.";
 
 pub(crate) const NON_INTERACTIVE_LAN_ONLY: &str =
     "No Tailscale here: continuing as a LAN-only install. --skip-tailscale says so explicitly; \
      to join a tailnet instead, install Tailscale and run `tailscale up` before onboarding.";
+
+/// The gateway certificate was issued with no tailnet name: (a warning?,
+/// the line). After a typed n to Tailscale that is the install asked for,
+/// said as information; otherwise (a join that failed) tailnet HTTPS will
+/// fail against it and the warning stays. Pure.
+pub(crate) fn gateway_cert_without_tailnet_line(tailscale_declined: bool) -> (bool, &'static str) {
+    if tailscale_declined {
+        (false, "Gateway certificate covers localhost and this machine's IP; joining a tailnet later re-issues it (noo onboard --reconfigure)")
+    } else {
+        (true, "Gateway TLS certificate generated WITHOUT tailnet SANs — \
+                tailnet HTTPS (tailscale serve) will fail against this cert. \
+                Join the tailnet and re-run 'noo onboard --reconfigure' to fix.")
+    }
+}
 
 /// y/yes -> true, n/no -> false, anything else (Enter included) -> None. Pure.
 pub(crate) fn parse_yes_no(answer: &str) -> Option<bool> {
@@ -174,6 +188,99 @@ fn ask_yes_no_no_default(ctx: &mut Ctx, question: &str, yes: &str, no: &str) -> 
             None => ctx.warn("Type y or n (there is no default here)."),
         }
     }
+}
+
+/// Where the prerequisites step writes an installer's output:
+/// `$NOO_HOME/logs/<name>` (the state home, `~/.noo` by default).
+pub(crate) fn install_log_path(name: &str) -> PathBuf {
+    crate::envfile::state_home_dir().join("logs").join(name)
+}
+
+/// Run an installer with its stdout and stderr in `log` (created fresh).
+/// A log that cannot be opened leaves the output on the terminal, as before;
+/// sudo still asks for its password on the terminal either way.
+fn run_logged(cmd: &mut Command, log: &Path) -> bool {
+    if let Some(dir) = log.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(out) = std::fs::File::create(log) {
+        if let Ok(err) = out.try_clone() {
+            cmd.stdout(out).stderr(err);
+        }
+    }
+    cmd.status().map(|s| s.success()).unwrap_or(false)
+}
+
+/// How many of a failed installer's last log lines are shown.
+pub(crate) const INSTALL_LOG_TAIL: usize = 20;
+
+/// The lines a finished installer prints: one ✓ line naming the log, or the
+/// ✗ line, the log path and its last [`INSTALL_LOG_TAIL`] lines. Pure.
+pub(crate) fn install_result_lines(ok: bool, done: &str, failed: &str, log: &str, log_text: &str) -> Vec<String> {
+    if ok {
+        return vec![format!("{done} (log: {log})")];
+    }
+    let lines: Vec<&str> = log_text.lines().collect();
+    let tail = &lines[lines.len().saturating_sub(INSTALL_LOG_TAIL)..];
+    let mut out = vec![format!("{failed} — the last {} lines of {log}:", tail.len())];
+    out.extend(tail.iter().map(|l| format!("    {l}")));
+    out
+}
+
+fn say_install_result(ctx: &Ctx, ok: bool, done: &str, failed: &str, log: &Path) {
+    let text = if ok { String::new() } else { std::fs::read_to_string(log).unwrap_or_default() };
+    let lines = install_result_lines(ok, done, failed, &log.display().to_string(), &text);
+    let mut it = lines.into_iter();
+    if let Some(head) = it.next() {
+        if ok { ctx.success(&head) } else { ctx.error(&head) }
+    }
+    for l in it {
+        ctx.raw(&l);
+    }
+}
+
+/// Whether the prerequisites offer installs this optional tool when it is
+/// missing. curl, yes (docker's installer needs it). ffmpeg, no: nothing on
+/// the controller host runs it — the images that use it (the gateway's and
+/// the sandbox's among them) carry their own — and with it apt pulled 99
+/// packages beside docker. nvidia-smi comes with a driver, never from here. Pure.
+pub(crate) fn auto_installed(tool: &str) -> bool {
+    tool == "curl"
+}
+
+/// A numbered question with exactly one option is not asked: that option
+/// is the answer (1). `None` = several options, ask. Pure.
+pub(crate) fn only_choice(options: usize) -> Option<usize> {
+    (options == 1).then_some(1)
+}
+
+/// The model step's backend line when Ollama is the only backend offered.
+pub(crate) const ONLY_BACKEND_LINE: &str = "Backend: Ollama — local inference, GGUF (the one backend for this machine)";
+
+/// The Docker Hub line when no login exists and base images come from the
+/// ghcr mirrors: two compose images still pull from Docker Hub itself
+/// (docker-compose.cluster.yml `nats:…`, `nginx:…`), anonymously.
+pub(crate) const DOCKER_HUB_OPTIONAL: &str =
+    "Docker Hub: not logged in — optional; two base images (nats, nginx) pull anonymously from Docker Hub";
+
+/// This run installs a standalone controller: no checkout, released images
+/// only (`standalone::finish_prepare` sets NOO_STANDALONE; a re-onboard finds
+/// the `.noo-standalone` marker).
+pub(crate) fn standalone_run(ctx: &Ctx) -> bool {
+    std::env::var("NOO_STANDALONE").as_deref() == Ok("1") || ctx.repo_root.join(".noo-standalone").exists()
+}
+
+/// Whether the prerequisites step offers `docker login`: never on a
+/// standalone install, which can only run released images. Pure.
+pub(crate) fn offer_docker_hub_login(standalone: bool) -> bool {
+    !standalone
+}
+
+/// The install mode a run takes without asking: `dist` on a standalone
+/// install (it has no source to build — `dev` cannot work there); `None`
+/// asks the dist-or-dev question. Pure.
+pub(crate) fn install_mode_without_asking(standalone: bool) -> Option<&'static str> {
+    standalone.then_some("dist")
 }
 
 fn required_tools(in_checkout: bool) -> Vec<(&'static str, &'static str)> {
@@ -211,9 +318,12 @@ pub fn prerequisites(ctx: &mut Ctx) -> bool {
             // A present optional tool is a pass — same ✓ as the required
             // ones instead of a bare info line (finding #69).
             Some(v) => ctx.success(&format!("{tool}: {v}")),
+            None if !auto_installed(tool) && tool != "nvidia-smi" => {
+                ctx.info(&format!("{tool}: not installed — an optional extra; nothing on this host needs it (the services carry their own)"));
+            }
             None => {
                 ctx.warn(&format!("{tool}: missing (optional — {purpose})"));
-                if tool != "nvidia-smi" { missing_apt.push(tool); }
+                if auto_installed(tool) { missing_apt.push(tool); }
             }
         }
     }
@@ -259,12 +369,17 @@ pub fn prerequisites(ctx: &mut Ctx) -> bool {
             }
             if !apt_pkgs.is_empty() {
                 ctx.progress(&format!("Installing via apt: {} ...", apt_pkgs.join(" ")));
-                let ok = ctx_sudo(ctx)
-                    .args(["sh", "-c",
-                        &format!("apt-get update -q && apt-get install -y -q {}", apt_pkgs.join(" "))])
-                    .status().map(|s| s.success()).unwrap_or(false);
-                if ok { ctx.success("apt packages installed"); }
-                else { ctx.warn("apt install failed — install manually and re-run"); }
+                // Hundreds of apt lines are noise to the person at the
+                // terminal: they go to a log, and the step is one line (the
+                // tail of the log when it fails). noninteractive: a package
+                // prompt in a hidden log would wait forever.
+                let log = install_log_path("onboard-apt.log");
+                let ok = run_logged(
+                    ctx_sudo(ctx).args(["sh", "-c",
+                        &format!("apt-get update -q && DEBIAN_FRONTEND=noninteractive apt-get install -y -q {}", apt_pkgs.join(" "))]),
+                    &log,
+                );
+                say_install_result(ctx, ok, "apt packages installed", "apt install failed — install manually and re-run", &log);
             }
             if docker_missing {
                 // The official script over Ubuntu's docker.io package,
@@ -274,13 +389,12 @@ pub fn prerequisites(ctx: &mut Ctx) -> bool {
                 // Downloaded to a file, checked, digest printed, then run —
                 // never piped into a shell. See crate::vendor.
                 let docker_cmd = crate::vendor::install_script_cmd(crate::vendor::DOCKER_INSTALL_URL);
-                let ok = ctx_sudo(ctx)
-                    .args(["sh", "-c", &docker_cmd])
-                    .status().map(|s| s.success()).unwrap_or(false);
+                let log = install_log_path("onboard-docker.log");
+                let ok = run_logged(ctx_sudo(ctx).args(["sh", "-c", &docker_cmd]), &log);
                 if ok {
                     let user = std::env::var("USER").unwrap_or_default();
                     let _ = ctx_sudo(ctx).args(["usermod", "-aG", "docker", &user]).status();
-                    ctx.success("Docker installed; your user was added to the docker group");
+                    ctx.success(&format!("Docker installed; your user was added to the docker group (log: {})", log.display()));
                     // The running shell can't pick up new group membership —
                     // but `sg docker` reads /etc/group directly (usermod just
                     // updated it), so the wizard RELAUNCHES ITSELF through it
@@ -329,6 +443,7 @@ pub fn prerequisites(ctx: &mut Ctx) -> bool {
                         }
                     }
                 }
+                say_install_result(ctx, false, "", "get.docker.com installer failed", &log);
                 ctx.warn("Docker install failed — see https://docs.docker.com/engine/install/");
             }
             // Re-check the required pair after installs.
@@ -396,14 +511,16 @@ pub fn prerequisites(ctx: &mut Ctx) -> bool {
         let mirrored = ctx.read_env("NOO_BASE_REGISTRY").trim().trim_end_matches('/') == crate::registry::PUBLIC_BASE_REGISTRY
             || std::env::var("NOO_BASE_REGISTRY").map(|v| !v.trim().is_empty()).unwrap_or(false);
         if mirrored {
-            ctx.info("Docker Hub: not logged in — OPTIONAL (base images come from the ghcr mirrors;");
-            ctx.info("a free account only raises anonymous pull rate limits)");
+            ctx.info(DOCKER_HUB_OPTIONAL);
         } else {
             ctx.warn("Docker Hub: not logged in — needed for hardened base images (free account)");
         }
         // Interactive `docker login` needs the real terminal — skipped when a
         // full-screen frontend owns it (the TUI shows the manual hint above).
-        if !ctx.non_interactive && !ctx.dry_run && ctx.ui.inherit_stdio() && super::prompt::stdin_is_tty() {
+        // A standalone install runs released images only: nothing it pulls
+        // needs a Docker Hub account, so it is not asked.
+        let offer = offer_docker_hub_login(standalone_run(ctx));
+        if offer && !ctx.non_interactive && !ctx.dry_run && ctx.ui.inherit_stdio() && super::prompt::stdin_is_tty() {
             if ctx.asker.confirm("Log in to Docker Hub now?", !mirrored) {
                 let ok = Command::new("docker").arg("login").status().map(|s| s.success()).unwrap_or(false);
                 if ok {
@@ -414,7 +531,7 @@ pub fn prerequisites(ctx: &mut Ctx) -> bool {
             } else {
                 ctx.info("Skipped — run 'docker login' any time if pulls get rate-limited");
             }
-        } else {
+        } else if offer {
             ctx.info("Run: docker login");
         }
     }
@@ -524,10 +641,8 @@ systemctl restart docker"#;
         _ => ctx.info("  Ollama — CPU inference, GGUF quantized (recommended)"),
     }
 
-    // NOTE: Python's Step 1 also runs `pip install -e .` to sync the host
-    // package. That is only for the Python CLI/venv — the cluster runs from
-    // Docker images — so the zero-Python bootstrap deliberately skips it.
-    ctx.info("Python dep sync skipped (not needed — cluster runs from Docker images)");
+    // No Python dependency sync: the cluster runs from Docker images, and
+    // saying it skipped one told a stranger about a step that never applied.
 
     if all_ok {
         ensure_shell_completion(ctx);
@@ -1148,8 +1263,9 @@ fn ensure_controller_tag(ctx: &mut Ctx) {
     // with no tailnet at all, then offered five 15-second re-checks that
     // could not succeed (tag:controller is declared only in the multinode
     // branch). Say what is true and move on.
+    // The Tailscale step already said how to add a tailnet later
+    // (`noo onboard --reconfigure`): no second recipe here.
     if ctx.state.ts_ip.is_empty() {
-        ctx.info("No tailnet on this box — the controller tag applies once you add nodes: tailscale up, then noo onboard --only enrollment");
         return;
     }
     if ctx.state.multinode == Some(false) {
@@ -1557,6 +1673,7 @@ pub fn tailscale(ctx: &mut Ctx) -> bool {
         Ok(pair) => pair,
         Err(_) if chose_lan_only => {
             // The answer was n: a decision, not a failure.
+            ctx.state.tailscale_declined = true;
             ctx.info(LAN_ONLY_CHOSEN);
             return true;
         }
@@ -3259,11 +3376,10 @@ fn ensure_pki(ctx: &mut Ctx) {
         match ca.issue_gateway_cert(&hostname, &node_ip, DEFAULT_DAYS, &extra_sans, &extra_ips) {
             Ok(_) => {
                 if extra_sans.is_empty() {
-                    ctx.warn(
-                        "Gateway TLS certificate generated WITHOUT tailnet SANs — \
-                         tailnet HTTPS (tailscale serve) will fail against this cert. \
-                         Join the tailnet and re-run 'noo onboard --reconfigure' to fix.",
-                    );
+                    match gateway_cert_without_tailnet_line(ctx.state.tailscale_declined) {
+                        (true, line) => ctx.warn(line),
+                        (false, line) => ctx.info(line),
+                    }
                 } else {
                     ctx.success(&format!(
                         "Gateway TLS certificate generated (SANs include {} + {})",
@@ -3690,29 +3806,33 @@ pub fn storage(ctx: &mut Ctx) {
             };
             ctx.info(&format!("Auto-selected storage: {chosen_root}"));
         } else {
-            ctx.info("Detected storage locations:");
-            for (i, m) in mounts.iter().enumerate() {
+            let describe = |m: &Mount| {
                 let sys = if m.is_system { " (system)" } else { "" };
-                let rec = if Some(i) == rec_idx { "  <-- recommended" } else { "" };
-                ctx.info(&format!(
-                    "  {}. {}{}  [{}]  {}  {:.0} GB free / {:.0} GB total{}",
-                    i + 1,
-                    m.path,
-                    sys,
-                    m.label,
-                    m.fstype,
-                    m.free_gb,
-                    m.total_gb,
-                    rec
-                ));
-            }
-            let default_idx = rec_idx.map(|i| i + 1).unwrap_or(1);
-            let choice = ctx.asker.ask_choice(
-                &format!("  0. Custom path\nSelect a drive (1-{})", mounts.len()),
-                default_idx,
-                mounts.len(),
-                true,
-            );
+                format!("{}{}  [{}]  {}  {:.0} GB free / {:.0} GB total", m.path, sys, m.label, m.fstype, m.free_gb, m.total_gb)
+            };
+            // One drive: it is the pick, said in one line, and the "Storage
+            // root" question right after still takes any path (what
+            // "0. Custom path" was for).
+            let choice = match only_choice(mounts.len()) {
+                Some(only) => {
+                    ctx.info(&format!("Storage: {} — the one drive found; another path can be typed next", describe(&mounts[only - 1])));
+                    only
+                }
+                None => {
+                    ctx.info("Detected storage locations:");
+                    for (i, m) in mounts.iter().enumerate() {
+                        let rec = if Some(i) == rec_idx { "  <-- recommended" } else { "" };
+                        ctx.info(&format!("  {}. {}{}", i + 1, describe(m), rec));
+                    }
+                    let default_idx = rec_idx.map(|i| i + 1).unwrap_or(1);
+                    ctx.asker.ask_choice(
+                        &format!("  0. Custom path\nSelect a drive (1-{})", mounts.len()),
+                        default_idx,
+                        mounts.len(),
+                        true,
+                    )
+                }
+            };
             if choice == 0 {
                 let d = if existing_root.is_empty() { crate::commands::data_root::DEFAULT_DATA_ROOT.to_string() } else { existing_root.clone() };
                 chosen_root = ctx.asker.ask(&Prompt::new("Enter custom storage path").default(d));
@@ -5453,21 +5573,26 @@ pub fn services(ctx: &mut Ctx) {
     // handled just below, where the login is offered.
     let persisted_mode = ctx.read_env("NOO_INSTALL_MODE");
     let default_mode = if !persisted_mode.is_empty() { persisted_mode } else { "dist".to_string() };
-    let install_mode = loop {
-        let ans = ctx
-            .asker
-            .ask(
-                &Prompt::new("Run released images (dist, recommended) or build from source (dev)?")
-                    .default(default_mode.clone()),
-            )
-            .trim()
-            .to_ascii_lowercase();
-        if ans == "dist" || ans == "dev" {
-            break ans;
-        }
-        // Non-interactive takes the (always-valid) default above, so this
-        // loop can only be reached with a real answer to correct.
-        ctx.info("please answer 'dist' or 'dev'");
+    // A standalone install takes dist without the question (the summary
+    // says "Install mode dist"): it has no source to build.
+    let install_mode = match install_mode_without_asking(standalone_run(ctx)) {
+        Some(mode) => mode.to_string(),
+        None => loop {
+            let ans = ctx
+                .asker
+                .ask(
+                    &Prompt::new("Run released images (dist, recommended) or build from source (dev)?")
+                        .default(default_mode.clone()),
+                )
+                .trim()
+                .to_ascii_lowercase();
+            if ans == "dist" || ans == "dev" {
+                break ans;
+            }
+            // Non-interactive takes the (always-valid) default above, so this
+            // loop can only be reached with a real answer to correct.
+            ctx.info("please answer 'dist' or 'dev'");
+        },
     };
     ctx.update_env("NOO_INSTALL_MODE", &install_mode);
     // Third-party base images (loki/redis/prometheus/...) resolve through
@@ -5973,7 +6098,7 @@ fn ensure_self_agent(ctx: &mut Ctx) {
             ctx.info("This controller also needs its own node agent (a host process —");
             ctx.info("containers can't run it) to serve models and appear in the mesh.");
             let go = !interactive || ctx.asker.confirm(
-                &format!("Install the host agent and its node identity for '{node_id}' now? (uses sudo, once)"), true);
+                &format!("Install the host agent and its node identity for '{node_id}' now? (uses sudo)"), true);
             if go {
                 hydrate_process_env(ctx);
                 if !wait_for_api_read(ctx) {
@@ -6683,7 +6808,7 @@ fn ensure_hostd_worker(ctx: &mut Ctx) {
             return;
         }
     };
-    if !ctx.asker.confirm("Install noo-hostd in worker mode too? (system unit, uses sudo — lets this box run a harness)", true) {
+    if !ctx.asker.confirm("Install noo-hostd in worker mode too? (system unit, uses sudo — lets this box run coding agents such as Claude Code or Codex)", true) {
         ctx.info(&format!("Skipped — later: sudo {HOSTD_BIN} install --mode worker"));
         return;
     }
@@ -7107,26 +7232,40 @@ pub fn first_model(ctx: &mut Ctx) {
         ctx.info("Auto-selected backend: ollama");
         "ollama".to_string()
     } else {
-        ctx.info("1. Ollama — local inference, GGUF (recommended)");
-        if let VllmOffer::BelowFloor(why) | VllmOffer::OfferNotRecommended(why) = &offer {
-            say_vllm_floor_once(ctx, why);
-        }
+        // Ollama is always option 1; vLLM and a cloud API join it when they
+        // apply. With Ollama alone there is nothing to choose: one line, no
+        // question.
         let mut max = 1;
         let vllm_choice = if offer_vllm {
             max += 1;
-            ctx.info(&format!("{max}. vLLM — HuggingFace safetensors; for a controller that places it on tier-1 nodes"));
             Some(max)
         } else {
             None
         };
         let cloud_choice = if has_cloud {
             max += 1;
-            ctx.info(&format!("{max}. Cloud API — no download, uses your API key"));
             Some(max)
         } else {
             None
         };
-        let pick = ctx.asker.ask_choice("Select backend", 1, max, false);
+        if only_choice(max).is_some() {
+            ctx.info(ONLY_BACKEND_LINE);
+        } else {
+            ctx.info("1. Ollama — local inference, GGUF (recommended)");
+        }
+        if let VllmOffer::BelowFloor(why) | VllmOffer::OfferNotRecommended(why) = &offer {
+            say_vllm_floor_once(ctx, why);
+        }
+        if let Some(n) = vllm_choice {
+            ctx.info(&format!("{n}. vLLM — HuggingFace safetensors; for a controller that places it on tier-1 nodes"));
+        }
+        if let Some(n) = cloud_choice {
+            ctx.info(&format!("{n}. Cloud API — no download, uses your API key"));
+        }
+        let pick = match only_choice(max) {
+            Some(only) => only,
+            None => ctx.asker.ask_choice("Select backend", 1, max, false),
+        };
         if vllm_choice == Some(pick) {
             "vllm".to_string()
         } else if cloud_choice == Some(pick) {
@@ -7212,24 +7351,28 @@ pub fn first_model(ctx: &mut Ctx) {
         default_model.clone()
     } else {
         ctx.info(&format!("Recommended models for Tier {}:", ctx.state.tier));
-        for (i, (name, desc)) in starters.iter().enumerate() {
+        // The default the prompt offers is listed first, so the list never
+        // omits the model Enter pulls (a 0.6.28 stranger's list showed only
+        // llama3.2:3b over "[gemma4:e2b]").
+        let default_desc = if !declared.is_empty() { "the default — OLLAMA_MODEL in .env" } else { "the default" };
+        let listed = models_default_first(&starters, &default_model, default_desc);
+        for (i, (name, desc)) in listed.iter().enumerate() {
             ctx.info(&format!("  {}. {name}  ({desc})", i + 1));
         }
         ctx.info("Or type a model name/ID directly.");
         if backend == "ollama" {
             ctx.raw("    Ollama takes LIBRARY names (qwen3:8b) or hf.co/<user>/<GGUF-repo>;");
             ctx.raw("    plain HF ids are translated to hf.co/… and must be GGUF repos.");
-            ctx.raw("    Picks scoped by lab origin: NOO_MODEL_ORIGINS=us (default; widen: us,eu,cn — edit .env).");
-            if declared.is_empty() && default_note.is_none() {
-                ctx.raw(&format!("    Default {PRODUCT_DEFAULT_MODEL} = the product default."));
+            if ctx.g.verbose {
+                ctx.raw("    Picks scoped by lab origin: NOO_MODEL_ORIGINS=us (default; widen: us,eu,cn — edit .env).");
             }
         } else {
             ctx.raw("    vLLM takes HuggingFace repo ids (org/model), safetensors.");
         }
         let raw = ctx.asker.ask(&Prompt::new("Model (number or name)").default(default_model.clone()));
         if let Ok(idx) = raw.trim().parse::<usize>() {
-            if idx >= 1 && idx <= starters.len() {
-                starters[idx - 1].0.clone()
+            if idx >= 1 && idx <= listed.len() {
+                listed[idx - 1].0.clone()
             } else {
                 raw
             }
@@ -7258,6 +7401,19 @@ pub fn first_model(ctx: &mut Ctx) {
         // install (2026-10-17). The model still lands in the yaml as the
         // local backend's placement hint (`update_yaml_config`).
     }
+}
+
+/// The recommended list as the model step prints it: `default` first (its
+/// own row moved up when the list has it, else added with `default_desc`),
+/// the rest in their order. An empty default leaves the list as it is. Pure.
+pub(crate) fn models_default_first(starters: &[(String, String)], default: &str, default_desc: &str) -> Vec<(String, String)> {
+    if default.is_empty() {
+        return starters.to_vec();
+    }
+    let own = starters.iter().find(|(n, _)| n == default).cloned();
+    let mut out = vec![own.unwrap_or_else(|| (default.to_string(), default_desc.to_string()))];
+    out.extend(starters.iter().filter(|(n, _)| n != default).cloned());
+    out
 }
 
 /// What onboarding says of vLLM on this box.
@@ -8716,7 +8872,9 @@ pub fn security_posture(ctx: &mut Ctx) {
             if v["changed"].as_array().is_some_and(|a| a.is_empty()) {
                 ctx.info("No gate moved — this install was already at the hardened profile.");
             }
-            ctx.info("Exec approval is now `approval`: HIGH-risk tool calls wait for a human (dashboard Admin view, the chat card, or `noo approval approve <id>`). Active from the next gateway start; until then the gate is `strict` (deny).");
+            // No "active from the next gateway start": onboard restarts the
+            // gateway itself before it ends (print_final_summary).
+            ctx.info(EXEC_APPROVAL_NOTE);
             ctx.info("Review or change it: noo security posture list / noo security posture set NOO_EXEC_APPROVAL_MODE <mode>");
         }
         Err(e) => {
@@ -8728,6 +8886,9 @@ pub fn security_posture(ctx: &mut Ctx) {
         }
     }
 }
+
+/// What the hardened profile's exec gate means, said after it is applied.
+pub(crate) const EXEC_APPROVAL_NOTE: &str = "Exec approval is now `approval`: HIGH-risk tool calls wait for a human (dashboard Admin view, the chat card, or `noo approval approve <id>`).";
 
 /// The voice add-on's models (i105): when voice is on, the controller
 /// stages the configured whisper model and piper voice; the containers load
@@ -9185,6 +9346,7 @@ pub fn bind_mode(ctx: &mut Ctx) {
     let existing = ctx.read_env("NOO_BIND_MODE");
     if !existing.is_empty() {
         ctx.info(&format!("Cluster-plane bind: NOO_BIND_MODE={existing} (kept — change it in .env, confirm with: noo doctor exposure)"));
+        ctx.state.bind_mode = existing;
         return;
     }
     let has_tailnet = !ctx.state.ts_ip.is_empty();
@@ -9211,6 +9373,7 @@ pub fn bind_mode(ctx: &mut Ctx) {
         if tailnet_choice == Some(pick) { "tailnet" } else if pick == local_choice { "local" } else { "all" }
     };
     ctx.update_env("NOO_BIND_MODE", chosen);
+    ctx.state.bind_mode = chosen.to_string();
     ctx.success(&format!("Cluster-plane bind: NOO_BIND_MODE={chosen}"));
     if chosen == "tailnet" {
         make_tailnet_bind_survive_reboots(ctx);
@@ -10890,7 +11053,11 @@ mod required_tools_tests {
         let err = own.find("ctx.error(&format!(\"Tailscale unavailable: {why}\"));").expect("the failure arm");
         assert!(lan < err && ci < err, "both decided arms come before the failure arm");
         assert!(NON_INTERACTIVE_LAN_ONLY.contains("--skip-tailscale"));
-        assert!(TAILSCALE_NO.starts_with("LAN-only") && LAN_ONLY_CHOSEN.contains("noo onboard --reconfigure"));
+        // A typed n is THIS machine only (the bind default is loopback); the
+        // bind-mode question that follows is what opens it to the LAN.
+        assert!(TAILSCALE_NO.starts_with("this machine only") && !TAILSCALE_NO.contains("here and on your local network"));
+        assert!(TAILSCALE_NO.contains("the next question can open it to your local network"));
+        assert!(LAN_ONLY_CHOSEN.contains("noo onboard --reconfigure"));
     }
 
     #[test]
@@ -11271,5 +11438,112 @@ mod cpu_only_embed_parallel_tests {
         let guard = body.find("if yamlcfg::read_yaml_compose_env(ctx, k).is_none() {").expect("never over a value");
         let write = body.find("yamlcfg::update_yaml_compose_env(ctx, &[(k.to_string(), v.to_string())]);").expect("the write");
         assert!(seeded < guard && guard < write, "{body}");
+    }
+}
+
+/// A first-time user's onboard output (a stranger's literal 0.6.28 run:
+/// about 2,000 lines, 680 of them installer output; prompts with one
+/// option; lines that were not true on that box).
+#[cfg(test)]
+mod quiet_truthful_output_tests {
+    use super::*;
+
+    #[test]
+    fn a_question_with_one_option_is_not_asked() {
+        assert_eq!(only_choice(1), Some(1));
+        assert_eq!(only_choice(0), None);
+        assert_eq!(only_choice(2), None);
+        assert!(ONLY_BACKEND_LINE.starts_with("Backend: Ollama"));
+        let own = crate::test_src::own_code(include_str!("steps.rs"));
+        let drive = own.find("let choice = match only_choice(mounts.len()) {").expect("the drive pick");
+        assert!(own[drive..].find("Select a drive (1-{})").is_some());
+        let backend = own.find("let pick = match only_choice(max) {").expect("the backend pick");
+        assert!(own[backend..].find("Some(only) => only,").is_some_and(|at| at < 120), "one option is the pick, not a question");
+    }
+
+    #[test]
+    fn a_standalone_install_is_not_asked_dist_or_dev_nor_docker_hub() {
+        assert_eq!(install_mode_without_asking(true), Some("dist"));
+        assert_eq!(install_mode_without_asking(false), None);
+        assert!(!offer_docker_hub_login(true));
+        assert!(offer_docker_hub_login(false));
+        // nats and nginx come from Docker Hub itself, not the ghcr mirrors.
+        assert!(!DOCKER_HUB_OPTIONAL.contains("ghcr mirrors"));
+        assert!(DOCKER_HUB_OPTIONAL.contains("(nats, nginx) pull anonymously from Docker Hub"));
+        let compose = include_str!("../../../docker-compose.cluster.yml");
+        assert!(compose.contains("image: ${NATS_IMAGE:-nats:"), "nats is no longer a Docker Hub image: reword DOCKER_HUB_OPTIONAL");
+        assert!(compose.contains("image: nginx:"), "nginx is no longer a Docker Hub image: reword DOCKER_HUB_OPTIONAL");
+    }
+
+    #[test]
+    fn ffmpeg_is_an_optional_extra_never_auto_installed() {
+        assert!(!auto_installed("ffmpeg"), "nothing on the controller host runs ffmpeg");
+        assert!(auto_installed("curl"), "docker's installer needs curl");
+        assert!(!auto_installed("nvidia-smi"));
+    }
+
+    #[test]
+    fn installer_output_is_one_line_or_the_failed_tail() {
+        let ok = install_result_lines(true, "apt packages installed", "apt failed", "/x/onboard-apt.log", "lots\nof\nlines");
+        assert_eq!(ok, vec!["apt packages installed (log: /x/onboard-apt.log)".to_string()]);
+        let text: String = (1..=30).map(|n| format!("line {n}\n")).collect();
+        let bad = install_result_lines(false, "done", "apt failed", "/x/a.log", &text);
+        assert_eq!(bad[0], format!("apt failed — the last {INSTALL_LOG_TAIL} lines of /x/a.log:"));
+        assert_eq!(bad.len(), 1 + INSTALL_LOG_TAIL);
+        assert_eq!(bad[1], "    line 11");
+        assert_eq!(bad.last().map(String::as_str), Some("    line 30"));
+        let short = install_result_lines(false, "done", "failed", "/x/a.log", "only\n");
+        assert_eq!(short, vec!["failed — the last 1 lines of /x/a.log:".to_string(), "    only".to_string()]);
+        assert!(install_log_path("onboard-apt.log").ends_with("logs/onboard-apt.log"));
+    }
+
+    #[test]
+    fn the_default_model_is_listed_first() {
+        let starters = vec![("llama3.2:3b".to_string(), "2.0 GB".to_string()), ("qwen3:4b".to_string(), "2.5 GB".to_string())];
+        let listed = models_default_first(&starters, "gemma4:e2b", "the default");
+        assert_eq!(listed[0], ("gemma4:e2b".to_string(), "the default".to_string()));
+        assert_eq!(&listed[1..], &starters[..]);
+        let moved = models_default_first(&starters, "qwen3:4b", "the default");
+        assert_eq!(moved[0], starters[1], "a listed default keeps its own row, moved up");
+        assert_eq!(moved.len(), 2);
+        assert_eq!(models_default_first(&starters, "", "the default"), starters);
+    }
+
+    #[test]
+    fn a_declined_tailnet_makes_the_cert_line_information() {
+        let (warn, line) = gateway_cert_without_tailnet_line(true);
+        assert!(!warn);
+        assert!(line.contains("covers localhost and this machine's IP") && line.contains("noo onboard --reconfigure"));
+        let (warn, line) = gateway_cert_without_tailnet_line(false);
+        assert!(warn && line.contains("WITHOUT tailnet SANs"));
+    }
+
+    #[test]
+    fn lines_that_were_not_true_or_not_needed_are_gone() {
+        let own = crate::test_src::own_code(include_str!("steps.rs"));
+        assert!(!own.contains("Python dep sync skipped"), "contributor noise");
+        assert!(!own.contains("then noo onboard --only enrollment\");"), "the second add-Tailscale-later recipe");
+        assert!(!own.contains("(uses sudo, once)"), "it is not once");
+        assert!(own.contains("lets this box run coding agents such as Claude Code or Codex"));
+        assert!(!EXEC_APPROVAL_NOTE.contains("next gateway start"), "onboard restarts the gateway itself");
+        let origins = own.find("ctx.raw(\"    Picks scoped by lab origin").expect("the origins line");
+        let gate = own[..origins].rfind("if ").expect("its gate");
+        assert!(own[gate..origins].starts_with("if ctx.g.verbose {"), "the origins line is --verbose only");
+    }
+
+    #[test]
+    fn an_installer_writes_its_output_to_the_log_not_the_terminal() {
+        let dir = std::env::temp_dir().join(format!("noo-install-log-{}", std::process::id()));
+        let log = dir.join("logs").join("x.log");
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "echo out-line; echo err-line >&2"]);
+        assert!(run_logged(&mut cmd, &log));
+        let text = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(text.contains("out-line") && text.contains("err-line"), "{text:?}");
+        let mut bad = Command::new("sh");
+        bad.args(["-c", "echo why; exit 3"]);
+        assert!(!run_logged(&mut bad, &log));
+        assert_eq!(std::fs::read_to_string(&log).unwrap_or_default(), "why\n", "each run starts the log fresh");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

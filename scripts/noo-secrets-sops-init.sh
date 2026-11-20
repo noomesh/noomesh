@@ -165,6 +165,9 @@ else
     echo "== encrypted .env → $ENC_FILE"
 fi
 
+# Under `noo onboard` (NOO_ONBOARD=1) the switch-over below is what onboard
+# does next, and step 1 would print secrets into its transcript: not said.
+if [ "${NOO_ONBOARD:-}" != 1 ]; then
 cat <<DONE
 
 == Done. To switch the cluster onto encrypted secrets:
@@ -176,3 +179,4 @@ cat <<DONE
 
 Rotation + CA/JWT procedures: docs/security/secrets.md
 DONE
+fi
