@@ -188,7 +188,7 @@ logins are audited and lock the account after repeated failures.
 
 | Method | Path | Purpose |
 |---|---|---|
-| POST | `/api/identity/token` | RFC 8693 token exchange: a provisioning service key (the bearer, the *actor*) trades a `subject_token` naming a mesh account for a short-lived user JWT for that account, carrying an `act` claim that names the key. The result is an ordinary user token; it is refused `403` on anything an `act` credential may not do (for example starting `graph.entity_cleanup`) |
+| POST | `/api/identity/token` | RFC 8693 token exchange: a provisioning service key (the bearer, the *actor*) trades a `subject_token` naming a mesh account for a short-lived user JWT for that account, carrying an `act` claim that names the key. The result is an ordinary user token; it is refused `403` on anything an `act` credential may not do (for example starting `graph.entity_cleanup`). The minted tier is capped at operator, so a key bound to an admin account gets an operator token (and `scope` reports operator); admin actions need a person, see [who changes access](../security/who-changes-access.md) |
 | GET | `/.well-known/oauth-authorization-server`, `/.well-known/jwks.json` | exchange metadata and the signing keys (public) |
 | POST | `/api/security/operator-certs/register`, `/revoke`; `/api/security/operator-token` | operator client certificates: register a leaf's thumbprint, revoke it, and mint an Admin token bound to a registered leaf (5 min). Posture writes need such a bound token |
 

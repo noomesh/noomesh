@@ -39,7 +39,7 @@
 //!
 //! ## What holds it closed
 //!
-//! Five independent barriers, in the order they run:
+//! Six independent barriers, in the order they run:
 //!
 //! 1. the add-on gate — licensed feature, off by default ([`crate::addons`]);
 //! 2. the door — the middleware admits an `identity`-scoped key on this one
@@ -52,10 +52,17 @@
 //!    account may not mint for an account at or above its own tier;
 //! 5. the role clamp — the minted token carries the LOWER of the subject's
 //!    live tier and the issuer's, so a permitted pairing still cannot hand
-//!    out more than the issuer holds.
+//!    out more than the issuer holds;
+//! 6. the tier cap — the exchange never mints above Operator
+//!    ([`crate::auth::IDENTITY_EXCHANGE_MAX_ROLE`]), so a key bound to an
+//!    admin account, minting for itself or for another admin, gets an
+//!    Operator token. Admin actions need a person (`person_gate`); an
+//!    agent token has no use for the tier, only the exposure.
 //!
 //! Barriers 4 and 5 overlap deliberately. 4 decides whether the mint may
 //! happen; 5 decides what it is worth if the tier table changes under it.
+//! 6 does not decide whether: a key may still mint for any account below
+//! its own tier, and only the minted tier is capped.
 //!
 //! ## What it does not do
 //!
@@ -509,7 +516,7 @@ async fn token(
             .map_err(AppError::Forbidden)?;
     }
 
-    // Barrier 5.
+    // Barriers 5 and 6: the lower of the two tiers, capped at Operator.
     let minted_role = crate::auth::agent_token_role(subject_role, issuer_role);
     let ttl = crate::auth::clamp_agent_ttl(body.expires_in);
 
@@ -844,7 +851,27 @@ mod tests {
         // persona. `may_manage` refuses this pairing first; if the tier
         // table changes under a permitted one, the clamp still holds.
         assert_eq!(agent_token_role(Role::Admin, Role::Operator), Role::Operator);
-        assert_eq!(agent_token_role(Role::Admin, Role::Admin), Role::Admin);
+    }
+
+    /// Barrier 6 (i1096): the exchange never mints an Admin token. A key
+    /// bound to an admin account, minting for itself, gets Operator.
+    #[test]
+    fn an_admin_bound_key_minting_for_itself_gets_operator() {
+        use crate::auth::{agent_token_role, IDENTITY_EXCHANGE_MAX_ROLE};
+        assert_eq!(IDENTITY_EXCHANGE_MAX_ROLE, Role::Operator);
+        assert_eq!(agent_token_role(Role::Admin, Role::Admin), Role::Operator);
+    }
+
+    /// The cap changes only the minted tier: lower accounts keep theirs.
+    #[test]
+    fn the_tier_cap_leaves_lower_subjects_alone() {
+        use crate::auth::agent_token_role;
+        // Admin-bound key for an operator account.
+        assert_eq!(agent_token_role(Role::Operator, Role::Admin), Role::Operator);
+        // Admin-bound key for a user account.
+        assert_eq!(agent_token_role(Role::User, Role::Admin), Role::User);
+        // Operator-bound key for itself.
+        assert_eq!(agent_token_role(Role::Operator, Role::Operator), Role::Operator);
     }
 
     /// A token from the exchange must not be able to buy a standing one.

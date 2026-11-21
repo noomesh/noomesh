@@ -675,16 +675,24 @@ pub fn clamp_agent_ttl(requested: Option<u64>) -> u64 {
         .clamp(60, AGENT_TOKEN_MAX_TTL_SECS)
 }
 
+/// The highest tier the identity exchange ever mints. An exchanged token
+/// is an agent acting for an account, and admin actions need a person
+/// (`person_gate`), so an admin-tier agent token would only be a wider
+/// credential with nothing it may use the width for. A key bound to an
+/// admin account still mints, at Operator.
+pub const IDENTITY_EXCHANGE_MAX_ROLE: Role = Role::Operator;
+
 /// The role an exchanged token carries: the subject's own live tier, never
-/// above the issuer's.
+/// above the issuer's, and never above [`IDENTITY_EXCHANGE_MAX_ROLE`].
 ///
 /// The clamp is the part that matters. Without it a provisioning key bound
 /// to an operator could mint for an admin persona and hand itself a tier it
 /// does not hold — privilege escalation through a credential it is allowed
 /// to ask for. `may_manage` already refuses that pairing, so this is the
-/// second of two independent barriers, not the only one.
+/// second of two independent barriers, not the only one. The cap is a
+/// third: it holds even when both tiers are Admin.
 pub fn agent_token_role(subject_role: Role, issuer_role: Role) -> Role {
-    subject_role.min(issuer_role)
+    subject_role.min(issuer_role).min(IDENTITY_EXCHANGE_MAX_ROLE)
 }
 
 /// Mint the credential the identity exchange hands out.
