@@ -1027,8 +1027,10 @@ func (c *Client) StartBackendSDK(ctx context.Context, backend, model string, gpu
 		return err
 	}
 	// Enforcing nodes refuse to mount anything until their data root passes
-	// the policy (dataroots/policy.go); warn mode only reports.
-	if err := dataroots.Refusal(dataroots.Current()); err != nil {
+	// the policy (dataroots/policy.go); warn mode only reports, except a root
+	// not on its recorded filesystem or not answering, refused in both modes.
+	// Bounded: a hung mount answers "not answering" within the probe bound.
+	if err := dataroots.Gate(); err != nil {
 		return fmt.Errorf("backend %s: %w", backend, err)
 	}
 	if err := requireMountSources(backend, mounts); err != nil {

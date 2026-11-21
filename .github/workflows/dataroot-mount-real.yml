@@ -1,0 +1,79 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026 PersonifAI LLC
+
+# The node agent's data-root filesystem check against a REAL kernel mount
+# (i1160): a loop-mounted ext4 is the data root, the check records it, the
+# disk is unmounted (an empty mount point on the root filesystem), and the
+# agent's own policy code must refuse and create nothing under it; remounted,
+# the refusal must clear by itself. The unit tests fake the mount table; this
+# proves the mountinfo read and the comparison on a real one.
+#
+# What it cannot show: a mount that is late at a real boot (systemd
+# ordering), a hung mount (a hard NFS mount), the whole agent on the wire
+# (heartbeat, verify row), or the container-mode agent's view.
+# GitHub-hosted only (no secrets, read-only token).
+name: dataroot-mount-real
+
+on:
+  pull_request:
+    branches: [ main, staging, develop, dev ]
+    paths:
+      - 'node-agent-go/internal/dataroots/**'
+      - '.github/workflows/dataroot-mount-real.yml'
+  # A merge group has no path filter: the queue builds it, this lane reports.
+  merge_group:
+    types: [checks_requested]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dataroot-mount-real-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  dataroot-mount-real:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e   # v7.0.0
+        with:
+          go-version-file: node-agent-go/go.mod
+          cache-dependency-path: node-agent-go/go.sum
+
+      - name: Build the dataroots test binary (as the runner user)
+        working-directory: node-agent-go
+        run: go test -c -o "$RUNNER_TEMP/dataroots.test" ./internal/dataroots
+
+      - name: Loop-mount an ext4 data root
+        run: |
+          img="$RUNNER_TEMP/noo-data.img"
+          truncate -s 64M "$img"
+          mkfs.ext4 -q -F "$img"
+          # An explicit loop device (no autoclear): the test unmounts and
+          # remounts the SAME device, as a returning disk would be.
+          dev="$(sudo losetup -f --show "$img")"
+          sudo mkdir -p /srv/noo
+          sudo mount "$dev" /srv/noo
+          sudo udevadm settle || true
+          findmnt -T /srv/noo
+          ls -l /dev/disk/by-uuid/ || true
+          echo "NOO_REAL_MOUNT_DEV=$dev" >> "$GITHUB_ENV"
+
+      - name: Record, unmount (empty mount point), refuse, remount, clear
+        run: |
+          sudo env NOO_REAL_MOUNT_DEV="$NOO_REAL_MOUNT_DEV" NOO_REAL_MOUNT_AT=/srv/noo \
+            "$RUNNER_TEMP/dataroots.test" -test.run '^TestRealLoopMountEmptyMountPoint$' -test.v -test.count=1 | tee "$RUNNER_TEMP/out.txt"
+          # A skip is not a pass: the test must have RUN and passed.
+          grep -q -- '--- PASS: TestRealLoopMountEmptyMountPoint' "$RUNNER_TEMP/out.txt"
+
+      - name: Unmount
+        if: always()
+        run: |
+          sudo umount /srv/noo 2>/dev/null || true
+          [ -n "${NOO_REAL_MOUNT_DEV:-}" ] && sudo losetup -d "$NOO_REAL_MOUNT_DEV" || true

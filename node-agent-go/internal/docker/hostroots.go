@@ -139,7 +139,7 @@ func canonicalHostPathAllowMissing(p string) (string, error) {
 // never a "warn and continue": a mount the node would not have chosen is a
 // placement that must not start.
 func ValidateHostPathUnderRoots(p string) (string, error) {
-	if err := dataroots.Refusal(dataroots.Current()); err != nil {
+	if err := dataroots.Gate(); err != nil {
 		return "", fmt.Errorf("refusing host path %q: %w", p, err)
 	}
 	clean, err := canonicalHostPathAllowMissing(p)

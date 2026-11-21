@@ -1115,9 +1115,11 @@ func (r *Reporter) availableModels() []string {
 		}
 	}
 
-	// 2. GGUF files at the top level of MODELS_DIR.
+	// 2. GGUF files at the top level of MODELS_DIR. Bounded: a hung mount
+	// must not hold the beat (dataroots.ReadDirBounded); on timeout this
+	// beat lists none, and data_roots says the root is not answering.
 	if dir := os.Getenv("MODELS_DIR"); dir != "" {
-		if entries, err := os.ReadDir(dir); err == nil {
+		if entries, err := dataroots.ReadDirBounded(dir); err == nil {
 			for _, e := range entries {
 				if !e.IsDir() && strings.HasSuffix(strings.ToLower(e.Name()), ".gguf") {
 					add(strings.TrimSuffix(e.Name(), ".gguf"))

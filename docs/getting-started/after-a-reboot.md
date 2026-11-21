@@ -65,7 +65,10 @@ Each one has a followup that removes the need for the step.
   checked.)
 
 The data disk itself not mounting is a separate refusal with its own page:
-[data-root-recovery.md](../operating/runbooks/data-root-recovery.md).
+[data-root-recovery.md](../operating/runbooks/data-root-recovery.md). On a
+node (0.6.30), a data disk that mounts late is refused, not written to. The
+agent starts no backend and fetches nothing onto the empty mount point, and
+it carries on by itself once the mount appears.
 
 ## For agents
 

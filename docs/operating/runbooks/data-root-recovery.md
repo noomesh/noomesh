@@ -75,6 +75,33 @@ nothing breaks. If the disk is already missing on that first launch and the
 mountpoint is an empty directory on the root disk, that is indistinguishable
 from a fresh install: record it from a healthy boot, not a degraded one.
 
+### Nodes: the agent's own check (0.6.30)
+
+Each node agent checks its own data roots the same way, from the kernel's
+mount table, and keeps its record in its state directory
+(`/var/lib/noo-node-agent/data-root-fs.json`, one entry per root). It records
+a root the first time it sees it on its own disk. A root on the root disk is
+recorded only when the node declares it a plain directory
+(`NOO_DATA_ROOT_FS=directory` in `/etc/noo-node-agent.local.env`).
+
+When a mount is late at boot, or gone, the root is an empty directory on the
+root disk. The agent then **refuses, in warn mode too**: no backend start, no
+model fetch, no directory created under it. `noo cluster verify` shows `data
+root policy` as FAIL (`not_on_recorded_fs`). With nothing recorded yet, the
+agent also refuses when `/etc/fstab` mounts something above the root that is
+not mounted, or when the node declares `NOO_DATA_ROOT_FS=mount` and the root
+is on the root disk (`mount_missing`). Nothing waits: the agent checks again
+at every use, so once the mount is back the refusal clears by itself.
+
+A data root on a hung mount (a hard NFS mount, a dead USB disk) no longer
+silences the node. Each disk probe waits at most 5 s, the heartbeat still
+goes out, and verify shows `data root <path> not answering` as FAIL.
+
+The fix is to mount the disk (`findmnt <data root>`, your fstab), never to
+create the directory: a mount would hide it, along with anything the agent
+wrote there. After a deliberate disk change, remove the record file on the
+node; the agent records the new disk at its next check.
+
 ## For agents
 
 The refusal is the guard working: it stops postgres from starting an empty
@@ -97,3 +124,9 @@ database on the wrong disk. Never work around it.
   disk is mounted now as the right one.
 - **Once the disk is back** (the recorded UUID shows in `findmnt`),
   `noo stack start` is safe to run.
+- **On a node** (`data root policy` FAIL with `not_on_recorded_fs`,
+  `mount_missing` or `not answering`): the agent refuses on its own and
+  clears when the mount answers. Diagnose read-only (`findmnt <root>`, `cat
+  /var/lib/noo-node-agent/data-root-fs.json`, `dmesg`). Mounting the disk,
+  and removing the record after a deliberate disk change, are the person's.
+  Never `install -d` the root while its mount is missing.

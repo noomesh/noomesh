@@ -47,6 +47,7 @@ import (
 	"github.com/noomesh/noomesh/node-agent-go/internal/auth"
 	"github.com/noomesh/noomesh/node-agent-go/internal/config"
 	"github.com/noomesh/noomesh/node-agent-go/internal/ctrlenv"
+	"github.com/noomesh/noomesh/node-agent-go/internal/dataroots"
 	"github.com/noomesh/noomesh/node-agent-go/internal/nodewl"
 	"github.com/noomesh/noomesh/node-agent-go/internal/preseed"
 )
@@ -486,8 +487,8 @@ func (s *Store) fetch(ctx context.Context, ref Ref) error {
 		dests[i] = dest
 	}
 
-	// 4. Disk.
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	// 4. Disk. Gated: never created on an empty mount point (dataroots.MkdirAll).
+	if err := dataroots.MkdirAll(dir, 0o755); err != nil {
 		return fmt.Errorf("create %s: %w", dir, err)
 	}
 	if err := makeWritable(dir); err != nil {

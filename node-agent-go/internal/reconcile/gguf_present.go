@@ -6,10 +6,10 @@ package reconcile
 import (
 	"context"
 	"log/slog"
-	"os"
 	"path/filepath"
 	"strings"
 
+	"github.com/noomesh/noomesh/node-agent-go/internal/dataroots"
 	dockerpkg "github.com/noomesh/noomesh/node-agent-go/internal/docker"
 	"github.com/noomesh/noomesh/node-agent-go/internal/refusals"
 )
@@ -110,9 +110,10 @@ func (r *Reconciler) ggufFileOnNode(ctx context.Context, t *tick, p placement) b
 
 // newestQuarantined returns the path of the newest `<model>.quarantined-<UTC
 // stamp>` in dir (docker.ggufFetchOutcome's name; the stamp sorts by time),
-// or "" when there is none or dir cannot be read.
+// or "" when there is none or dir cannot be read. Bounded
+// (dataroots.ReadDirBounded): a hung mount must not stall the reconcile tick.
 func newestQuarantined(dir, model string) string {
-	entries, err := os.ReadDir(dir)
+	entries, err := dataroots.ReadDirBounded(dir)
 	if err != nil {
 		return ""
 	}
