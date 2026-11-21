@@ -529,6 +529,16 @@ file under its own `MODELS_DIR`/`HF_CACHE_DIR`. Success prints
 noo cluster place <node> llamacpp <file>
 ```
 
+When a placed `.gguf` is not on the node, the agent fetches it from the
+controller before the backend starts. While the controller is still hashing a
+large file the agent waits for it (up to 60 seconds per reconcile pass). If the file cannot be
+had (no manifest, still hashing after the wait, a failed copy), no container
+is created: `noo cluster status` shows a `gguf_unavailable` start refusal
+naming the file and the reason, and the agent retries on every reconcile pass.
+A file already on the node still starts. A running placement whose file has
+vanished is not treated as converged: the same refusal appears until the file
+is back.
+
 ## Pre-cache models on a schedule
 
 The heartbeat action `model_cache_warm` takes a list of `{model,

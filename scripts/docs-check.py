@@ -18,6 +18,9 @@ Checks:
       skills under prompts/skills/core/): every `noo …` they name resolves
       as in (f), and every `noo_*` tool they name is one the doors declare
       (gateway-rust/mcp-tools.json, mcp-tools-local.json, config/tools.json)
+  (i) every repo path an agent text names (a backticked span under one of the
+      repo's top-level directories) exists; and the `noo …` commands named in
+      the MCP tool descriptions and the doors' source strings resolve as (f)
   (h) every page outside cli/ and reference/ has `## For people` then
       `## For agents`, except those still in SHAPE_PENDING (shrinks only)
   (f) every `noo …` invocation in a docs code block or backtick span
@@ -319,6 +322,30 @@ def _declared_tools() -> set[str]:
     return names
 
 
+# A backticked span shaped like a path under one of the repo's own top-level
+# directories. Placeholders, globs and templates are skipped: they name no
+# one file.
+REPO_PATH = re.compile(r"^[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+/?$")
+BUILD_OUTPUT = {"node_modules", "target", "dist", "build", ".venv"}
+
+
+def check_agent_paths(errors: list[str]) -> None:
+    """(i) Every repo path an agent text names must exist (proposal 62, guard
+    item 4): a prompt that points at a moved or deleted file sends an agent
+    after nothing."""
+    tops = {p.name for p in REPO.iterdir() if p.is_dir() and not p.name.startswith(".")}
+    for path in agent_texts():
+        for i, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            for m in BACKTICK.finditer(line):
+                span = m.group(1).strip().split(":")[0].split("#")[0]
+                if not REPO_PATH.match(span) or span.split("/")[0] not in tops:
+                    continue
+                if BUILD_OUTPUT & set(span.split("/")):
+                    continue  # made by a build or an install, never committed
+                if not (REPO / span.rstrip("/")).exists():
+                    errors.append(f"{rel(path)}:{i}: `{span}` does not exist in this repo")
+
+
 def check_agent_tools(errors: list[str]) -> None:
     """(g) A tool an agent text names must be a tool the doors declare: a
     prompt that names a table, a retired tool or a guess sends an agent
@@ -334,10 +361,39 @@ def check_agent_tools(errors: list[str]) -> None:
                     errors.append(f"{rel(path)}:{i}: `{m.group(0)}` is not a tool the doors declare ({', '.join(TOOL_DECLARATIONS)})")
 
 
+# The texts an agent is handed that are not Markdown: the MCP tool
+# descriptions and the doors' instruction strings (proposal 62, guard item 2).
+DOOR_JSON = ("gateway-rust/mcp-tools.json", "gateway-rust/mcp-tools-local.json", "config/tools.json")
+DOOR_SOURCES = ("gateway-rust/src/mcp_external.rs", "gateway-rust/src/mcp_local.rs", "gateway-rust/src/agent_mailbox.rs")
+BACKTICK = re.compile(r"`([^`\n]+)`")
+
+
+def door_spans():
+    """(relpath, line, span) for every backticked span an agent can read in
+    the doors: each string in the tool JSON (line = the JSON line it is on),
+    and each backtick span in the door sources (their instruction strings and
+    the doc comments beside them)."""
+    for rel_path in DOOR_JSON:
+        f = REPO / rel_path
+        if not f.exists():
+            continue
+        for i, line in enumerate(f.read_text(encoding="utf-8").splitlines(), 1):
+            for m in BACKTICK.finditer(line):
+                yield rel_path, i, m.group(1)
+    for rel_path in DOOR_SOURCES:
+        f = REPO / rel_path
+        if not f.exists():
+            continue
+        for i, line in enumerate(f.read_text(encoding="utf-8").splitlines(), 1):
+            for m in BACKTICK.finditer(line):
+                yield rel_path, i, m.group(1)
+
+
 def check_commands(errors: list[str]) -> None:
     bare, groups, two = _registry()
-    for path in docs_md() + agent_texts():
-        for i, span in _code_spans(path.read_text(encoding="utf-8")):
+    spans = [(rel(path), i, span) for path in docs_md() + agent_texts() for i, span in _code_spans(path.read_text(encoding="utf-8"))]
+    spans += list(door_spans())
+    for where, i, span in spans:
             for m in CMD_IN_CODE.finditer(span):
                 words = m.group(1).split()
                 head = words[0]
@@ -352,7 +408,7 @@ def check_commands(errors: list[str]) -> None:
                 ):
                     continue  # provided by an add-on's cli-piece (ADDON_CLI)
                 errors.append(
-                    f"{rel(path)}:{i}: `noo {m.group(1)}` is not in the CLI registry "
+                    f"{where}:{i}: `noo {m.group(1)}` is not in the CLI registry "
                     f"(noo-cli/src/main.rs NATIVE)"
                 )
 
@@ -481,11 +537,9 @@ SHAPE_PENDING = frozenset({
     "docs/operating/runbooks/at-rest-migrate.md",
     "docs/operating/runbooks/at-rest-recovery.md",
     "docs/operating/runbooks/backup-restore-secrets.md",
-    "docs/operating/runbooks/data-root-recovery.md",
     "docs/operating/runbooks/host-updates.md",
     "docs/operating/runbooks/nats-isolation.md",
     "docs/operating/runbooks/security-release-upgrade.md",
-    "docs/operating/token-budgets.md",
     "docs/security/model-context.md",
     "docs/security/networks-and-containers.md",
     "docs/security/node-agent.md",
@@ -523,6 +577,7 @@ def main() -> int:
     check_forbidden(errors)
     check_commands(errors)
     check_agent_tools(errors)
+    check_agent_paths(errors)
     check_proposal_numbers(errors)
     check_agents_pages(errors)
     check_page_shape(errors)

@@ -66,6 +66,10 @@ const (
 	maxManifestRetryAfter       = 15 * time.Second
 )
 
+// manifestAwaitBudget is awaitManifestBudget as a variable, so a test waits
+// seconds, not ten minutes. Only tests assign it.
+var manifestAwaitBudget = awaitManifestBudget
+
 // probeManifestTimeout bounds one probe. The gateway hashes a file on
 // first request; a probe that times out reports "timed out", never absent.
 const probeManifestTimeout = 15 * time.Second
@@ -83,7 +87,13 @@ func lookupArtifactManifest(ctx context.Context, kind, name string) (*artifactMa
 // (a model_file job, an import): it follows the gateway's 202 "hashing"
 // answers until the manifest is ready or awaitManifestBudget runs out.
 func awaitArtifactManifest(ctx context.Context, kind, name string) (*artifactManifest, error) {
-	return awaitManifest(ctx, awaitManifestBudget, func(ctx context.Context) (*artifactManifest, error) {
+	return awaitArtifactManifestWithin(ctx, kind, name, manifestAwaitBudget)
+}
+
+// awaitArtifactManifestWithin is awaitArtifactManifest with the caller's own
+// budget, for a caller that must not wait the full ten minutes.
+func awaitArtifactManifestWithin(ctx context.Context, kind, name string, budget time.Duration) (*artifactManifest, error) {
+	return awaitManifest(ctx, budget, func(ctx context.Context) (*artifactManifest, error) {
 		return lookupArtifactManifestWithin(ctx, kind, name, awaitManifestRequestTimeout)
 	})
 }

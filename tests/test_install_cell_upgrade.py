@@ -561,3 +561,15 @@ def test_a_minimal_events_file_passes_the_upload_scan(tmp_path):
 def test_no_dockerhub_still_reads_the_old_full_shape(tmp_path):
     e = ev_full("image", "pull", name="noomesh/stunnel:latest") + ev_full("container", "create", image="alpine", name="chgrp")
     assert uj.judge_dockerhub(e.splitlines())[0] == "FAIL"
+
+
+def test_the_events_capture_keeps_only_pull_and_create_events():
+    """The judge reads only image `pull` and container `create`. Every other
+    event (exec_create/exec_start above all) carries the whole command line in
+    its Action, which can hold KEY=value text: the upload scan then refuses the
+    file and withholds logs/ and judge/ (rc.3 upgrade re-run, 44806360935).
+    Filtering at the capture keeps those out of the file entirely."""
+    src = (ROOT / "scripts" / "install-cell" / "upgrade.sh").read_text()
+    line = next(l for l in src.splitlines() if "events --format" in l)
+    assert "--filter event=pull" in line and "--filter event=create" in line, line
+    assert "exec" not in line, line

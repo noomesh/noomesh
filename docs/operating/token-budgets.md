@@ -11,7 +11,9 @@ prompt plus completion, whatever ran them.
   (`noo security user allowance <user> --tokens <n> --period month`; the
   period is `day`, `week` or `month`). No allowance means no standing cap.
 
-## The four rules
+## For people
+
+### The four rules
 
 1. **It is a switch that says no more turns.** When the task's budget or
    its owner's allowance is spent, no further loop starts.
@@ -40,7 +42,7 @@ prompt plus completion, whatever ran them.
    separately per harness kind. Your budget is one number; the accounting
    shows the columns side by side and never merges them.
 
-## Reading a task
+### Reading a task
 
 `noo tasks show <id>` shows `tokens` (spent, of the budget, and what is
 left) and the owner's `allowance`. A parked task shows why:
@@ -54,7 +56,7 @@ A parked task is `checkpointed`, never `failed`. It is not handed back to
 a harness when one restarts, and it is not reported stale: it waits for
 you.
 
-## Reading spend
+### Reading spend
 
 `noo usage me` shows your spend this period in three columns: node, cloud,
 and one row per harness kind, with your allowance and what is left.
@@ -66,7 +68,7 @@ model-name prefix to US dollars per million tokens, longest prefix wins,
 for example `{"claude-": 6.0, "gpt-4o": 5.0}`. It is reported only; budgets
 are counted in tokens.
 
-## Limits of this release
+### Limits of this release
 
 - The answer to a question is given with `noo tasks answer`, the
   `POST /api/tasks/{id}/answer` route or the `noo_task_answer` door tool.
@@ -76,3 +78,25 @@ are counted in tokens.
 
 API reference: [Tasks](../reference/api.md#tasks-routestasksrs) and the
 [harness rail](../reference/harness-protocol.md).
+
+## For agents
+
+- **A spent budget stops you between loops, never mid-turn.** The loop that
+  crosses it finishes and its tool results stand; the task then checkpoints
+  with `budget_state: exhausted` and the numbers in its last note. Wrap up
+  what the running loop can finish; do not start work that needs another
+  loop.
+- **More tokens are never yours to grant.** Raising a task's budget
+  (`noo tasks resubmit <id> --token-budget <n>`) is its owner's choice, and
+  a person's allowance (`noo security user allowance`) is an admin's.
+  Report the spend and stop.
+- **If you cannot go on without the person, ask once:** the `noo_task_ask`
+  tool (a CLI harness ends its answer with `NOO_QUESTION: <question>`). The
+  task then waits (`budget_state: awaiting_clarification`); the person's
+  answer starts a new loop that carries the question and the answer.
+- **Reading state:** `noo --json tasks show <id>` gives `.task.budget_state`
+  (always present: `null` unless parked, else `exhausted` or
+  `awaiting_clarification`), `.task.tokens_spent` / `.task.token_budget`, and
+  the owner's `.allowance` (`spent`, `limit`, `period`, `remaining`).
+  `noo --json usage me` gives node, cloud and per-harness rows, never
+  summed. A parked task is `checkpointed`, not `failed`.
