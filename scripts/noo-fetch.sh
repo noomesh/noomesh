@@ -132,8 +132,20 @@ birth_proof() {
 # find it unchanged. An older controller ignores the header and answers 200
 # with the full body: that is today's path. A missing or malformed $LAST sends
 # no header at all.
+#
+# Bounds (i1160): --connect-timeout alone let a transfer that stalled after
+# the headers (a controller that lost power mid-pull) hold this oneshot
+# `activating` forever, and its timer cannot fire while it is. A transfer
+# under 1 KiB/s for 120 s is a stall and gives up. --max-time 3600 still lets
+# the largest bundle seen (~400 MiB, vendor CLIs inside) arrive at 1 Mbit/s
+# (3355 s), and the gateway's 768 MiB staging ceiling at 2 Mbit/s (3221 s).
+# The unit's TimeoutStartSec (prep-host.sh) sits above this plus the apply.
+# curl failing after the headers still prints the 200 it saw, so its exit
+# status is read too: a cut-short body is never hashed, recorded or applied.
 fetch_bundle() {
     _inm=""
+    _lim="--max-time 3600 --speed-limit 1024 --speed-time 120"
+    _crc=0
     if [ -f "$LAST" ]; then
         _lv="$(head -c 64 "$LAST" 2>/dev/null || true)"
         case "$_lv" in
@@ -143,12 +155,17 @@ fetch_bundle() {
         esac
     fi
     if [ -n "$_inm" ]; then
-        CODE="$(curl -sS $TLS --connect-timeout 10 -o "$TMP/blob" -w '%{http_code}' \
+        CODE="$(curl -sS $TLS --connect-timeout 10 $_lim -o "$TMP/blob" -w '%{http_code}' \
             -H "If-None-Match: \"$_inm\"" \
-            "$URL/bootstrap/bundle/$NODE" 2>"$TMP/curlerr" || true)"
+            "$URL/bootstrap/bundle/$NODE" 2>"$TMP/curlerr")" || _crc=$?
     else
-        CODE="$(curl -sS $TLS --connect-timeout 10 -o "$TMP/blob" -w '%{http_code}' \
-            "$URL/bootstrap/bundle/$NODE" 2>"$TMP/curlerr" || true)"
+        CODE="$(curl -sS $TLS --connect-timeout 10 $_lim -o "$TMP/blob" -w '%{http_code}' \
+            "$URL/bootstrap/bundle/$NODE" 2>"$TMP/curlerr")" || _crc=$?
+    fi
+    if [ "$_crc" -ne 0 ]; then
+        echo "noo-fetch: bundle transfer gave up after HTTP ${CODE:-000} (curl exit $_crc) — partial body discarded; the next tick retries" >&2
+        rm -f "$TMP/blob"
+        CODE=""
     fi
 }
 fetch_bundle
