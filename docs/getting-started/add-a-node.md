@@ -43,7 +43,8 @@ The node is ready when `verify` shows no FAIL. Each row that fails names the com
     token is spent.
 - **Enroll** on the node: `noo enroll <noo1.blob>`, the exact line mint printed.
   There is no `noo enroll <controller-url>` form.
-  - Without Tailscale: `--skip-tailscale`.
+  - Without Tailscale: `--skip-tailscale` (the advanced path:
+    [without-a-tailnet.md](without-a-tailnet.md)).
   - Run it on the node AS ITS OWN USER, not under sudo. It calls `sudo` itself,
     several times (`tailscale up`, reading the root-owned PKI anchor, host prep),
     and a person types the password unless that machine has passwordless sudo.
