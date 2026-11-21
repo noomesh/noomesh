@@ -87,7 +87,13 @@ func lookupArtifactManifest(ctx context.Context, kind, name string) (*artifactMa
 // (a model_file job, an import): it follows the gateway's 202 "hashing"
 // answers until the manifest is ready or awaitManifestBudget runs out.
 func awaitArtifactManifest(ctx context.Context, kind, name string) (*artifactManifest, error) {
-	return awaitManifest(ctx, manifestAwaitBudget, func(ctx context.Context) (*artifactManifest, error) {
+	return awaitArtifactManifestWithin(ctx, kind, name, manifestAwaitBudget)
+}
+
+// awaitArtifactManifestWithin is awaitArtifactManifest with the caller's own
+// budget, for a caller that must not wait the full ten minutes.
+func awaitArtifactManifestWithin(ctx context.Context, kind, name string, budget time.Duration) (*artifactManifest, error) {
+	return awaitManifest(ctx, budget, func(ctx context.Context) (*artifactManifest, error) {
 		return lookupArtifactManifestWithin(ctx, kind, name, awaitManifestRequestTimeout)
 	})
 }

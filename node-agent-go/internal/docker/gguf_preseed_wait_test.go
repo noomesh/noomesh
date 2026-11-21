@@ -44,9 +44,9 @@ func ggufStore(t *testing.T, name string, body []byte, manifest http.HandlerFunc
 
 func shortBudget(t *testing.T, d time.Duration) {
 	t.Helper()
-	old := manifestAwaitBudget
-	manifestAwaitBudget = d
-	t.Cleanup(func() { manifestAwaitBudget = old })
+	old := ggufStartManifestBudget
+	ggufStartManifestBudget = d
+	t.Cleanup(func() { ggufStartManifestBudget = old })
 }
 
 func ggufManifestJSON(b []byte) string { return `{"sha256":"` + sha(b) + `","size_bytes":3}` }
@@ -90,7 +90,7 @@ func TestAPermanent202IsATypedErrorAndTheStartGateStopsBeforeAContainer(t *testi
 	if !errors.As(err, &un) {
 		t.Fatalf("err = %v, want *GGUFUnavailableError", err)
 	}
-	for _, want := range []string{"m.gguf", "still hashing", "retrying", "no container was started"} {
+	for _, want := range []string{"m.gguf", "still hashing", "retrying on the next reconcile pass", "no container was started"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error %q lacks %q", err, want)
 		}
@@ -117,7 +117,7 @@ func TestAnUnavailableManifestIsAnErrorNotARefusalThatReturnsNil(t *testing.T) {
 			case <-r.Context().Done():
 			case <-time.After(3 * time.Second):
 			}
-		}, 300 * time.Millisecond, "did not answer in time"},
+		}, 300 * time.Millisecond, "still hashing"},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -170,5 +170,45 @@ func TestTheGGUFGateRunsBeforeTheContainerIsCreated(t *testing.T) {
 	create := strings.Index(s, "c.docker.ContainerCreate(")
 	if gate < 0 || remove < 0 || create < 0 || gate > remove || gate > create {
 		t.Fatalf("ggufStartGate must precede the container remove/create (gate=%d remove=%d create=%d)", gate, remove, create)
+	}
+}
+
+// The start path holds the tick for its own short budget, not the long one the
+// other callers use: tick 1 returns within the cap; tick 2 (the controller has
+// finished hashing) gets the 200, writes the file and the start proceeds.
+func TestTheStartPathCapsItsWaitAndTheNextTickGetsTheFile(t *testing.T) {
+	w := ggufBytes()
+	var hashed atomic.Bool
+	dir := ggufStore(t, "m.gguf", w, func(rw http.ResponseWriter, r *http.Request) {
+		if !hashed.Load() {
+			rw.Header().Set("Retry-After", "1")
+			rw.WriteHeader(http.StatusAccepted)
+			return
+		}
+		_, _ = rw.Write([]byte(ggufManifestJSON(w)))
+	})
+	shortBudget(t, 1500*time.Millisecond)
+	// A long budget for every other caller must not leak into this one.
+	old := manifestAwaitBudget
+	manifestAwaitBudget = time.Minute
+	t.Cleanup(func() { manifestAwaitBudget = old })
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	began := time.Now()
+	err := (&Client{}).ggufStartGate(ctx, "llamacpp", "m.gguf", "")
+	if took := time.Since(began); took > 3*time.Second {
+		t.Fatalf("tick 1 held the start %s, want it back within the short cap", took)
+	}
+	var un *GGUFUnavailableError
+	if !errors.As(err, &un) {
+		t.Fatalf("tick 1: err = %v, want the typed refusal", err)
+	}
+	hashed.Store(true)
+	if err := (&Client{}).ggufStartGate(t.Context(), "llamacpp", "m.gguf", ""); err != nil {
+		t.Fatalf("tick 2: %v, want the start to proceed", err)
+	}
+	if got, rerr := os.ReadFile(filepath.Join(dir, "m.gguf")); rerr != nil || string(got) != string(w) {
+		t.Fatalf("tick 2 did not write the file: %v", rerr)
 	}
 }
