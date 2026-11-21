@@ -1985,6 +1985,6 @@ mod enroll_url_caution_tests {
         let warn = code.find("if let Some(line) = advertised_controller_caution() {").expect("said");
         let paste = code.find("say(&ui::emph(\"Run this on the new host:\"));").expect("the no-tailnet paste");
         assert!(warn < paste);
-        assert_eq!(code.matches("advertised_controller_caution()").count(), 1, "said once, on the no-tailnet paste");
+        assert_eq!(code.matches("= advertised_controller_caution() {").count(), 1, "said once, on the no-tailnet paste");
     }
 }
