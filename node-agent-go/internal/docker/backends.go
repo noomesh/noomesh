@@ -961,7 +961,9 @@ func (c *Client) StartBackendSDK(ctx context.Context, backend, model string, gpu
 	// An UNPLACED node (no NOO_MODEL_CACHE_URL: the controller's own agent, a
 	// dev box) has no store to preseed from; it runs online as before.
 	// GGUF weights (llama.cpp) are a flat file; copy from the store if present.
-	if _, err := c.preseedGGUF(ctx, backend, model); err != nil {
+	// A GGUF that cannot be fetched AND is not on the node stops the start
+	// here, before any container exists (ggufStartGate).
+	if err := c.ggufStartGate(ctx, backend, model, overrides.ModelsDir); err != nil {
 		return err
 	}
 
@@ -1267,8 +1269,11 @@ func (c *Client) StopBackendSDK(ctx context.Context, backend string) error {
 // starts, so an edge node that lacks the file pulls it over the LAN instead of
 // requiring manual placement. Unlike HF weights, a GGUF is one flat file and
 // llama.cpp loads it by path — no offline env flag needed, just presence.
-// Best-effort: on a miss, StartBackendSDK proceeds and llama.cpp fails exactly
-// as it would today if the file were absent. Requires NOO_MODEL_CACHE_URL.
+// A fetch that cannot be done (manifest absent, still hashing past the wait,
+// refused, a transport error) is a *GGUFUnavailableError, never (false, nil):
+// "unverifiable means refused" stays, but the caller can tell it from success
+// and ggufStartGate decides whether a local file lets the start go on.
+// Requires NOO_MODEL_CACHE_URL (unset = not a placed node = nothing to do).
 // In-process, against the host path: the agent is a host process (the
 // disposable helper container it once ran in is retired).
 func (c *Client) preseedGGUF(ctx context.Context, backend, model string) (bool, error) {
@@ -1305,17 +1310,28 @@ func (c *Client) preseedGGUF(ctx context.Context, backend, model string) (bool, 
 	// {name}) landed in gateway stack-v0.2.25. A node agent carrying this
 	// change against an OLDER gateway never preseeds GGUFs — ship the file
 	// with `noo cluster sync-model-files` instead, or roll the gateway first.
-	sha := fetchArtifactDigest(ctx, "gguf", model)
-	if sha == "" {
-		slog.Warn("gguf preseed refused: no artifact manifest for these bytes",
-			"model", model,
+	// A 202 (the controller is still hashing the file) is waited out within
+	// ggufStartManifestBudget, not read as "no manifest": that read left a first
+	// placement without its file and never retried it. The wait is short
+	// because it holds the reconcile tick; past it the start is refused and
+	// the next tick asks again. That converges: the gateway hashes in the
+	// BACKGROUND, single-flight, and caches the digest in memory and in
+	// /data/artifact-digests.json (gateway-rust/src/routes/artifacts.rs:31-49,
+	// HASH_WAIT_SECS :294, in_flight() :308, mem_cache() :301), so each tick
+	// re-joins the one running hash and the first tick after it ends gets 200.
+	man, merr := awaitArtifactManifestWithin(ctx, "gguf", model, ggufStartManifestBudget)
+	if merr != nil {
+		reason := ggufManifestReason(model, merr)
+		slog.Warn("gguf preseed refused: no verified artifact manifest for these bytes",
+			"model", model, "reason", reason,
 			"detail", "the controller could not state a sha256 for this file, so the "+
 				"copy would be unverified; refusing rather than loading bytes nothing vouched for",
 			"fix", "roll a gateway >= stack-v0.2.25 (which serves /api/artifacts/manifest), "+
 				"confirm the file is in the controller's model store, or place it on the node "+
 				"with `noo cluster sync-model-files`")
-		return false, nil
+		return false, &GGUFUnavailableError{Model: model, Reason: reason, Cause: merr}
 	}
+	sha := man.SHA256
 	slog.Info("gguf preseed will verify against controller manifest",
 		"model", model, "sha256", sha[:12]+"…")
 	fctx, cancel := context.WithTimeout(ctx, 15*time.Minute)
@@ -1325,15 +1341,17 @@ func (c *Client) preseedGGUF(ctx context.Context, backend, model string) (bool, 
 		return false, refusal
 	}
 	if err != nil {
+		reason := "the copy from the controller's store failed: " + err.Error()
 		if isPermissionErr(err) {
 			slog.Error("gguf preseed cannot write the node's models dir — expecting local file or manual placement",
 				"model", model, "dest", dest, "error", err,
 				"fix", "make "+modelsHost+" writable by the agent's user (it is a declared host root; prep-host owns it)")
+			reason = "this node cannot write " + modelsHost + " (" + err.Error() + ")"
 		} else {
 			slog.Info("gguf preseed miss; expecting local file or manual placement",
 				"model", model, "src", src, "err", err)
 		}
-		return false, nil
+		return false, &GGUFUnavailableError{Model: model, Reason: reason, Cause: err}
 	}
 	slog.Info("gguf preseeded from controller store", "model", model, "wrote", wrote, "dest", dest)
 	return true, nil
@@ -1382,6 +1400,70 @@ func (e *GGUFMismatchError) Error() string {
 	return fmt.Sprintf("gguf_mismatch: %s needs %s, but %s does not match the controller's record and could not be re-fetched (%s); "+
 		"%s. Once this node reaches the controller, re-fetch it with `noo cluster sync-model-files %s -m %s`; the next start loads the verified file",
 		e.Backend, e.Model, e.Path, e.Detail, where, nodeIDOrPlaceholder(), e.Model)
+}
+
+// GGUFUnavailableError: a placed GGUF could not be fetched from the
+// controller's store (no manifest, still hashing past the wait, refused, a
+// failed copy). The start path returns it only when the file is not already
+// on the node (ggufStartGate); the reconciler records it as a backend_start
+// refusal and tries again on the next tick.
+type GGUFUnavailableError struct {
+	Model, Reason string
+	Cause         error
+}
+
+func (e *GGUFUnavailableError) Error() string {
+	return fmt.Sprintf("gguf_unavailable: %s is not on this node and cannot be fetched from the controller yet: %s; "+
+		"no container was started, and the agent retries on the next reconcile tick (or ship it with `noo cluster sync-model-files %s -m %s`)",
+		e.Model, e.Reason, nodeIDOrPlaceholder(), e.Model)
+}
+
+func (e *GGUFUnavailableError) Unwrap() error { return e.Cause }
+
+// ggufStartManifestBudget caps how long the start path holds the reconcile
+// tick waiting for the controller's hash (the other callers keep the ten
+// minutes of manifestAwaitBudget). A variable so a test waits seconds.
+var ggufStartManifestBudget = 60 * time.Second
+
+// ggufManifestReason words why the manifest did not arrive, naming the model.
+func ggufManifestReason(model string, err error) string {
+	switch {
+	case errors.Is(err, ErrArtifactHashing) || errors.Is(err, ErrArtifactManifestTimeout):
+		return "the controller is still hashing " + model + "; retrying on the next reconcile pass"
+	case errors.Is(err, ErrArtifactRefused):
+		return "the controller refused to vouch for " + model + ": " + err.Error()
+	case errors.Is(err, ErrArtifactAbsent):
+		return "the controller has no artifact manifest for " + model + " (it is not in the controller's model store, or the gateway predates stack-v0.2.25)"
+	default:
+		return "the controller's manifest request for " + model + " failed: " + err.Error()
+	}
+}
+
+// ggufStartGate runs the preseed and decides whether the start may go on. A
+// GGUFUnavailableError with the file already in the effective models dir
+// (the controller-declared one, else the node's own) lets the start load the
+// local file as before; with no file there it is returned, so NO container is
+// created for a backend that would crash-loop without its weights. Any other
+// preseed error (a proven mismatch) is returned as it always was.
+func (c *Client) ggufStartGate(ctx context.Context, backend, model, modelsDir string) error {
+	_, err := c.preseedGGUF(ctx, backend, model)
+	if err == nil {
+		return nil
+	}
+	var un *GGUFUnavailableError
+	if !errors.As(err, &un) {
+		return err
+	}
+	dir := modelsDir
+	if dir == "" {
+		dir = resolveEnv(modelsSource)
+	}
+	if _, serr := os.Stat(filepath.Join(dir, model)); serr == nil {
+		slog.Warn("gguf preseed unavailable; the file is already on the node, starting with it",
+			"model", model, "dir", dir, "reason", un.Reason)
+		return nil
+	}
+	return err
 }
 
 // isPermissionErr tells "this process may not write here" from every other
