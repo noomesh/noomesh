@@ -386,6 +386,21 @@ func (r *Reconciler) nativeBackends(ctx context.Context) map[string]string {
 	return r.native.Running(ctx)
 }
 
+// nativeOnly reports whether backend runs on this node only through the
+// native lane (a Mac's Ollama): no container start, stop or image for it.
+func (r *Reconciler) nativeOnly(backend string) bool {
+	return r.native.NativeOnly(backend)
+}
+
+// nativeDownError is the refusal for a native-only backend this tick found
+// not serving (the caller has already checked it is not), nil for any other.
+func (r *Reconciler) nativeDownError(backend string) *backendrt.NativeDownError {
+	if !r.nativeOnly(backend) {
+		return nil
+	}
+	return r.native.DownError(backend)
+}
+
 // Run blocks until ctx cancels. First pass after a short delay (so
 // registration/heartbeat win the race), then every interval.
 func (r *Reconciler) Run(ctx context.Context) {
@@ -811,7 +826,7 @@ func (r *Reconciler) sizeGpuYield(ctx context.Context, t *tick) bool {
 func (r *Reconciler) prefetch(ctx context.Context, t *tick) bool {
 	// Fetch the images this tick will start, concurrently, before the
 	// ordered start loop (which then finds them local).
-	r.prefetchImages(ctx, t.effective, t.running, t.specLabels, t.floating, t.native)
+	r.prefetchImages(ctx, t.effective, t.running, t.specLabels, t.floating, t.native, r.nativeOnly)
 	return true
 }
 
@@ -838,6 +853,11 @@ func (r *Reconciler) convergeContainer(ctx context.Context, t *tick, p placement
 			slog.Warn("reconcile.native_backend_not_stopped",
 				"backend", p.Backend,
 				"detail", "the controller asked for it to stop, but this node did not start it and will not stop a process it does not own")
+			return
+		}
+		if r.nativeOnly(p.Backend) {
+			// The native lane is this node's only lane for it: there is
+			// no container to stop, and Docker is not asked.
 			return
 		}
 		if _, ok := t.running[p.Backend]; ok {
@@ -888,6 +908,22 @@ func (r *Reconciler) convergeContainer(ctx context.Context, t *tick, p placement
 				// `--env OLLAMA_FLASH_ATTENTION=1` reaches it.
 				backendrt.SetOllamaTuning(nativeOllamaTuning(t.ollamaRows, harnessprofile.Current()))
 			}
+			// Serving again: a native-down refusal from an earlier tick
+			// no longer holds.
+			if r.native.NativeOnly(p.Backend) {
+				r.clearBackendStart(p.Backend)
+			}
+			return
+		}
+		// A Mac (followup i1156): the native lane is the ONLY lane for a
+		// backend it can serve. Nothing answers on its port, so the
+		// backend is down; never fall through to a container start, which
+		// dials a Docker a Mac may not have and reports a docker.sock error
+		// instead of the cause. Refused every tick until it serves.
+		if derr := r.nativeDownError(p.Backend); derr != nil {
+			slog.Warn("reconcile.native_backend_down", "backend", p.Backend,
+				"binary_present", derr.BinaryPresent, "detail", derr.Error())
+			refusals.Record("backend_start", p.Backend, derr.Error())
 			return
 		}
 		// Paused for other work on the GPU (internal/gpuyield): the

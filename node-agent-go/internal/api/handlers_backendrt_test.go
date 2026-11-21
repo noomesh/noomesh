@@ -153,3 +153,42 @@ func TestTheProxyTransportPassesTheSelfNodeDoor(t *testing.T) {
 		t.Fatal("the door admitted a transport with no leaf — the test proves nothing")
 	}
 }
+
+// A Mac whose native Ollama is down (followup i1156): 503 native_backend_down
+// with the remedy, never `docker_unreachable` or "Docker not available" (this
+// Server has no Docker client at all: without the check the answer would be
+// that one).
+func TestStartOnAMacWithItsNativeOllamaDownNamesTheNativeLane(t *testing.T) {
+	prev := backendrt.OllamaBinaryPresent
+	backendrt.OllamaBinaryPresent = func() bool { return false }
+	t.Cleanup(func() { backendrt.OllamaBinaryPresent = prev })
+
+	s := &Server{cfg: &config.Config{}, mux: http.NewServeMux(), native: backendrt.NewNativeAt("http://127.0.0.1:1")}
+	w := httptest.NewRecorder()
+	s.handleStartBackend(w, httptest.NewRequest(
+		http.MethodPost, "/backends/start", strings.NewReader(`{"backend":"ollama","model":"qwen3:8b"}`)))
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", w.Code)
+	}
+	body := w.Body.String()
+	for _, want := range []string{`"error":"native_backend_down"`, "isn't installed on this Mac", "brew install ollama", "brew services start"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("response does not carry %q: %s", want, body)
+		}
+	}
+	if strings.Contains(strings.ToLower(body), "docker") {
+		t.Errorf("the answer must not name Docker: %s", body)
+	}
+}
+
+// Another backend on the same Mac is not the native lane's: unchanged path.
+func TestStartOfANonNativeBackendOnAMacIsUnchanged(t *testing.T) {
+	s := &Server{cfg: &config.Config{}, mux: http.NewServeMux(), native: backendrt.NewNativeAt("http://127.0.0.1:1")}
+	w := httptest.NewRecorder()
+	s.handleStartBackend(w, httptest.NewRequest(
+		http.MethodPost, "/backends/start", strings.NewReader(`{"backend":"llamacpp","model":"m.gguf"}`)))
+	if strings.Contains(w.Body.String(), "native_backend_down") {
+		t.Fatalf("llamacpp is not the native lane's: %s", w.Body.String())
+	}
+}

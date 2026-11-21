@@ -1732,65 +1732,184 @@ pub(crate) fn sh_quote(v: &str) -> String {
     format!("'{}'", v.replace('\'', "'\\''"))
 }
 
-/// The shell that puts noomesh's environment into the brew ollama plist and
-/// restarts the job. `OLLAMA_NO_CLOUD=1` is always set (docs/security/
-/// telemetry.md: it stops cloud models and web search handing prompts to
-/// ollama.com); `OLLAMA_MODELS` too when a data root was chosen — unless that
-/// would hide models: it is set only when the new store already holds models
-/// or ~/.ollama/models holds none (otherwise the script says where to move
-/// them, and the node agent switches once they are there).
-///
-/// What Homebrew does (Library/Homebrew/services/cli.rb, read 2026-10-03):
-/// `brew services start` on a service that is not already running or loaded
-/// ALWAYS calls `install_service_file`, which `remove_service_files`s the
-/// plist in ~/Library/LaunchAgents and re-copies one generated from the
-/// formula's `service` block. `brew services stop` removes that plist too
-/// (unless `--keep`), and `restart` is stop+start. So the edit must come
-/// AFTER the plist is generated, and the job must be restarted with launchctl
-/// (`bootout` + `bootstrap`: launchd caches the definition at bootstrap),
-/// never with `brew services`. A later `brew services restart|start` or a
-/// formula upgrade can still regenerate the plist; the node agent notices
-/// (node-agent-go backendrt OllamaGuard.Converge) and re-applies.
-///
-/// The domain is ASKED, not assumed: a Mac at its screen runs LaunchAgents in
-/// gui/<uid>, a headless Mac reached over SSH in user/<uid> (gui/<uid>
-/// answers "125: Domain does not support specified action" there). Values go
-/// through plutil, which takes each as its own argument — PlistBuddy parses
-/// its command text, and "Application Support" has a space.
-///
-/// Exit codes: 0 applied; 3 no brew ollama plist (Ollama.app or something
-/// else runs it — nothing touched); 4 a key could not be written; 5 the job
-/// could not be restarted. Every non-zero exit says why on stderr.
-pub(crate) fn ollama_env_script(home: &str, models: Option<&str>, uid: &str) -> String {
-    let agents = format!("{}/Library/LaunchAgents", home.trim_end_matches('/'));
+/// Where a Mac's boot-time (system) LaunchDaemons live.
+const LAUNCH_DAEMONS: &str = "/Library/LaunchDaemons";
+
+/// The model store the boot service must keep: the store Ollama uses TODAY.
+/// `current` is the `OLLAMA_MODELS` an existing plist carries (the boot
+/// service's on a re-run, else the user LaunchAgent's), else `~/.ollama/models`.
+/// A data root's store (`wanted`) replaces it only when that cannot hide
+/// models: it already holds them, or the current store holds none. A root
+/// LaunchDaemon without `OLLAMA_MODELS` and HOME would read root's home and
+/// find an empty store.
+pub(crate) fn ollama_boot_store(home: &str, current: Option<&str>, wanted: Option<&str>, has_models: &dyn Fn(&str) -> bool) -> String {
+    let current = current
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+        .map(String::from)
+        .unwrap_or_else(|| format!("{}/.ollama/models", home.trim_end_matches('/')));
+    match wanted.map(str::trim).filter(|w| !w.is_empty()) {
+        Some(w) if w != current && (has_models(w) || !has_models(&current)) => w.to_string(),
+        _ => current,
+    }
+}
+
+/// The shell prefix that finds the boot-service plist Homebrew wrote, as `$P`
+/// and its label as `$L` (current Homebrew names it `sh.brew.ollama`, older
+/// releases `homebrew.mxcl.ollama`). Exits 3 when there is none.
+fn system_ollama_plist_sh() -> String {
     let mut s = String::from("P=; L=; ");
     for l in OLLAMA_PLIST_LABELS {
         s.push_str(&format!(
             "[ -z \"$P\" ] && [ -f {f} ] && P={f} && L={l}; ",
-            f = sh_quote(&format!("{agents}/{l}.plist"))
-        ));
-    }
-    s.push_str(
-        "[ -n \"$P\" ] || { echo \"no Homebrew ollama service under ~/Library/LaunchAgents (looked for sh.brew.ollama and homebrew.mxcl.ollama) — nothing changed\" >&2; exit 3; }; \
-         plutil -insert EnvironmentVariables -dictionary \"$P\" >/dev/null 2>&1; \
-         plutil -replace EnvironmentVariables.OLLAMA_NO_CLOUD -string 1 \"$P\" || { echo \"could not set OLLAMA_NO_CLOUD in $P\" >&2; exit 4; }; ",
-    );
-    if let Some(m) = models {
-        let old = sh_quote(&format!("{}/.ollama/models/manifests", home.trim_end_matches('/')));
-        s.push_str(&format!(
-            "M={m}; if [ -n \"$(ls -A \"$M/manifests\" 2>/dev/null)\" ] || [ -z \"$(ls -A {old} 2>/dev/null)\" ]; then \
-             plutil -replace EnvironmentVariables.OLLAMA_MODELS -string \"$M\" \"$P\" || {{ echo \"could not set OLLAMA_MODELS in $P\" >&2; exit 4; }}; \
-             else echo \"kept OLLAMA_MODELS: models are in ~/.ollama/models — move them to $M and the node agent switches to it\" >&2; fi; ",
-            m = sh_quote(m)
+            f = sh_quote(&format!("{LAUNCH_DAEMONS}/{l}.plist"))
         ));
     }
     s.push_str(&format!(
-        "D=; for d in gui/{uid} user/{uid}; do launchctl print \"$d/$L\" >/dev/null 2>&1 && D=$d && break; done; \
-         [ -n \"$D\" ] || {{ launchctl print gui/{uid} >/dev/null 2>&1 && D=gui/{uid} || D=user/{uid}; }}; \
-         launchctl bootout \"$D\" \"$P\" >/dev/null 2>&1; \
-         launchctl bootstrap \"$D\" \"$P\" || {{ echo \"launchctl bootstrap $D $P failed\" >&2; exit 5; }}"
+        "[ -n \"$P\" ] || {{ echo \"no Homebrew ollama boot service under {LAUNCH_DAEMONS} (looked for sh.brew.ollama and homebrew.mxcl.ollama)\" >&2; exit 3; }}; "
     ));
     s
+}
+
+/// One step of a Mac's Ollama boot-service plan: what the step says, and the
+/// shell it runs (`sh -c`).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct OllamaBootStep {
+    pub what: &'static str,
+    pub sh: String,
+}
+
+/// The plan that makes a Mac's native Ollama a SYSTEM boot service run as the
+/// node's user, in order. Pure: it builds the commands, it runs nothing.
+///
+/// Why a system LaunchDaemon (operator, 2026-11-21, followup i1156): the node
+/// agent is one and comes back after a power cut; a per-user LaunchAgent
+/// (`brew services start` without sudo) starts only at that user's login, so
+/// a rebooted headless Mac had an agent and no Ollama.
+///
+/// Why Homebrew's own plist, edited (Library/Homebrew/services/cli.rb and
+/// service.rb, read 2026-11-21): `sudo brew services start` writes
+/// /Library/LaunchDaemons/<label>.plist from the formula's `service` block
+/// (`run [opt_bin/"ollama", "serve"]`, `keep_alive true`, `working_dir var`,
+/// its log paths and environment); `--sudo-service-user <user>` makes
+/// `install_service_file` add `UserName`, so Ollama runs unprivileged at
+/// boot. Homebrew writes no HOME and skips its per-user env-override file for
+/// root services, so `HOME`, `OLLAMA_MODELS` and `OLLAMA_NO_CLOUD` are set
+/// with plutil afterwards (plutil takes each value as its own argument;
+/// "Application Support" has a space), and the job is restarted with
+/// launchctl bootout/bootstrap: launchd caches a job's definition at
+/// bootstrap. Never `brew services restart`: every `start` re-copies the plist
+/// from the formula and drops the edits (`brew services start` of a loaded
+/// service is a no-op, so a re-run of this plan is safe). `UserName` is set
+/// with plutil too, for a boot service an older run registered without it.
+///
+/// A per-user LaunchAgent of the same service is unloaded and removed FIRST:
+/// two jobs would fight over 127.0.0.1:11434, and the agent's OllamaGuard
+/// would read the wrong plist. Both domains are tried (gui/<uid> at the
+/// screen, user/<uid> over SSH); a job that is not loaded is not an error.
+pub(crate) fn darwin_ollama_boot_plan(home: &str, user: &str, uid: &str, store: &str) -> Vec<OllamaBootStep> {
+    let b = crate::vendor::BREW_ENV;
+    let agents = format!("{}/Library/LaunchAgents", home.trim_end_matches('/'));
+    let mut unload = String::new();
+    for l in OLLAMA_PLIST_LABELS {
+        unload.push_str(&format!(
+            "launchctl bootout gui/{uid}/{l} >/dev/null 2>&1; launchctl bootout user/{uid}/{l} >/dev/null 2>&1; rm -f {f}; ",
+            f = sh_quote(&format!("{agents}/{l}.plist"))
+        ));
+    }
+    unload.push_str("true");
+    let find = system_ollama_plist_sh();
+    let set = |key: &str, val: &str| {
+        format!(
+            "sudo /usr/bin/plutil -replace {key} -string {v} \"$P\" || {{ echo \"could not set {key} in $P\" >&2; exit 4; }}; ",
+            v = sh_quote(val)
+        )
+    };
+    let mut env = find.clone();
+    env.push_str(&set("UserName", user));
+    env.push_str("sudo /usr/bin/plutil -insert EnvironmentVariables -dictionary \"$P\" >/dev/null 2>&1; ");
+    env.push_str(&set("EnvironmentVariables.HOME", home.trim_end_matches('/')));
+    env.push_str(&set("EnvironmentVariables.OLLAMA_MODELS", store));
+    env.push_str(&set("EnvironmentVariables.OLLAMA_NO_CLOUD", "1"));
+    env.push_str("true");
+    let restart = format!(
+        "{find}sudo launchctl bootout \"system/$L\" >/dev/null 2>&1; \
+         sudo launchctl bootstrap system \"$P\" || {{ sleep 2; sudo launchctl bootstrap system \"$P\"; }} || \
+         {{ echo \"launchctl bootstrap system $P failed\" >&2; exit 5; }}"
+    );
+    vec![
+        OllamaBootStep { what: "Homebrew analytics off", sh: crate::vendor::brew_analytics_off_cmd() },
+        OllamaBootStep { what: "install ollama if absent", sh: format!("{b} brew list ollama >/dev/null 2>&1 || {b} brew install ollama") },
+        OllamaBootStep { what: "unload the per-user ollama LaunchAgent", sh: unload },
+        OllamaBootStep {
+            what: "register ollama as a boot service",
+            sh: format!("sudo {b} brew services start --sudo-service-user {u} ollama", u = sh_quote(user)),
+        },
+        OllamaBootStep { what: "run it as the node user, with its model store and OLLAMA_NO_CLOUD=1", sh: env },
+        OllamaBootStep { what: "restart it with that environment", sh: restart },
+    ]
+}
+
+/// `OLLAMA_MODELS` in a plist, if it exists and carries one.
+fn plist_ollama_models(path: &str) -> Option<String> {
+    if !Path::new(path).exists() {
+        return None;
+    }
+    let (c, out) = run(Command::new("/usr/bin/plutil").args(["-extract", "EnvironmentVariables.OLLAMA_MODELS", "raw", "-o", "-", path]));
+    (c == 0).then(|| out.trim().to_string()).filter(|v| !v.is_empty())
+}
+
+/// The store Ollama uses today, read from the boot service's plist (a re-run)
+/// or the user LaunchAgent's, before the plan removes the latter.
+fn ollama_current_store(home: &str) -> Option<String> {
+    let agents = format!("{}/Library/LaunchAgents", home.trim_end_matches('/'));
+    OLLAMA_PLIST_LABELS
+        .iter()
+        .find_map(|l| plist_ollama_models(&format!("{LAUNCH_DAEMONS}/{l}.plist")))
+        .or_else(|| OLLAMA_PLIST_LABELS.iter().find_map(|l| plist_ollama_models(&format!("{agents}/{l}.plist"))))
+}
+
+/// Runs the boot-service plan. Install and the sudo step inherit the terminal
+/// (brew's and sudo's output are the operator's to watch). A failed step
+/// stops the plan with a warning; enrollment goes on (the agent's `native
+/// ollama` verify row and its start refusal say what is left).
+fn darwin_ollama_boot_service(home: &str, user: &str, data_root: Option<&str>) {
+    let wanted = data_root.filter(|r| !r.is_empty()).map(|root| format!("{root}/ollama"));
+    if let Some(m) = &wanted {
+        let _ = std::fs::create_dir_all(m);
+    }
+    let has_models = |d: &str| std::fs::read_dir(Path::new(d).join("manifests")).is_ok_and(|mut e| e.next().is_some());
+    let current = ollama_current_store(home);
+    let store = ollama_boot_store(home, current.as_deref(), wanted.as_deref(), &has_models);
+    if wanted.as_deref().is_some_and(|w| w != store) {
+        say(&ui::note(&format!(
+            "kept the ollama model store at {store}: it holds models and {} does not — move them there and the node agent switches",
+            wanted.as_deref().unwrap_or_default()
+        )));
+    }
+    let uid = run(Command::new("id").arg("-u")).1;
+    for step in darwin_ollama_boot_plan(home, user, uid.trim(), &store) {
+        ui::step(step.what);
+        let (code, why) = if step.what == "install ollama if absent" || step.what == "register ollama as a boot service" {
+            (run_visible(Command::new("sh").args(["-c", &step.sh])), String::new())
+        } else {
+            match Command::new("sh").args(["-c", &step.sh]).output() {
+                Ok(o) => (o.status.code().unwrap_or(1), String::from_utf8_lossy(&o.stderr).trim().to_string()),
+                Err(e) => (1, format!("could not run sh: {e}")),
+            }
+        };
+        if code != 0 {
+            ui::warned(&format!(
+                "ollama boot service NOT set up ({}{}): run `{}` on this Mac, or re-run `noo enroll`; `noo cluster verify` on the controller shows the native ollama row",
+                step.what,
+                if why.is_empty() { String::new() } else { format!(": {why}") },
+                crate::commands::cluster_verify::MAC_OLLAMA_START
+            ));
+            return;
+        }
+    }
+    say(&ui::note(&format!("ollama runs at boot as {user} (a system LaunchDaemon); model store: {store}")));
+    say(&ui::note("ollama cloud features off (OLLAMA_NO_CLOUD=1): prompts never go to ollama.com"));
 }
 
 /// The sudo half of the Mac lane: Ollama, the root-owned CLI, the fetch
@@ -1800,42 +1919,9 @@ fn darwin_arm_daemon(home: &str, noo_url: &str, node: &str, data_root: Option<&s
     let user = run(Command::new("id").arg("-un")).1;
     let _ = noo_url;
     phase("Service");
-    // Metal-native backend — the whole reason a Mac joins. Quiet brew.
-    ui::step("ensuring ollama (brew, Metal-native)");
-    let _ = run_visible(Command::new("sh").args([
-        "-c",
-        &format!(
-            "{off}; {b} brew list ollama >/dev/null 2>&1 || {b} brew install ollama; {b} brew services start ollama >/dev/null 2>&1 || true",
-            off = crate::vendor::brew_analytics_off_cmd(),
-            b = crate::vendor::BREW_ENV
-        ),
-    ]));
-    // `brew services start` has run once above, so the plist exists. Now set
-    // the environment the launchd job needs and restart it (see
-    // `ollama_env_script` for why this is NOT stop/edit/start).
-    let models = data_root.filter(|r| !r.is_empty()).map(|root| format!("{root}/ollama"));
-    if let Some(m) = &models {
-        let _ = std::fs::create_dir_all(m);
-    }
-    let uid = run(Command::new("id").arg("-u")).1;
-    // Say what happened, never what was meant to: until 2026-10-05 this line
-    // claimed "cloud features off" while the script had found no plist.
-    match Command::new("sh").args(["-c", &ollama_env_script(home, models.as_deref(), uid.trim())]).output() {
-        Ok(o) if o.status.success() => {
-            let note = String::from_utf8_lossy(&o.stderr).trim().to_string();
-            if !note.is_empty() {
-                say(&ui::note(&note));
-            } else if let Some(m) = &models {
-                say(&ui::note(&format!("ollama model store: {m}")));
-            }
-            say(&ui::note("ollama cloud features off (OLLAMA_NO_CLOUD=1): prompts never go to ollama.com"));
-        }
-        Ok(o) => {
-            let why = String::from_utf8_lossy(&o.stderr).trim().to_string();
-            ui::warned(&format!("ollama environment NOT applied: {why} — OLLAMA_NO_CLOUD is not proven; `noo cluster verify` on the controller shows it, and the node agent retries"));
-        }
-        Err(e) => ui::warned(&format!("ollama environment NOT applied: could not run sh: {e}")),
-    }
+    // Metal-native backend — the whole reason a Mac joins: installed, and
+    // registered to start at boot as this user (darwin_ollama_boot_plan).
+    darwin_ollama_boot_service(home, user.trim(), data_root);
 
     // The daemon runs as root: give it a root-owned copy of the CLI rather
     // than executing a user-writable file.
@@ -2024,81 +2110,72 @@ mod tests {
         assert!(msg.contains("teardown-node alpha-1"), "{msg}");
     }
 
-    fn tmp_home(tag: &str) -> std::path::PathBuf {
-        let d = std::env::temp_dir().join(format!("noo-ollama-script-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
-        d
-    }
-
-    /// Runs the script for real against stub `plutil` / `launchctl` that log
-    /// their argv, so the test checks behaviour, not spelling.
-    fn run_script(home: &std::path::Path, labels: &[&str], loaded: &str, models: Option<&str>) -> (i32, String, String) {
-        let agents = home.join("Library/LaunchAgents");
-        std::fs::create_dir_all(&agents).unwrap();
-        for l in labels {
-            std::fs::write(agents.join(format!("{l}.plist")), "<plist/>").unwrap();
+    // Followup i1156: a Mac's Ollama becomes a SYSTEM boot service run as the
+    // node user. The plan is pure: the commands, in order.
+    #[test]
+    fn the_mac_ollama_plan_installs_unloads_registers_and_pins_the_store() {
+        let plan = super::darwin_ollama_boot_plan("/Users/nodeuser", "nodeuser", "501", "/Users/nodeuser/.ollama/models");
+        let whats: Vec<&str> = plan.iter().map(|s| s.what).collect();
+        assert_eq!(
+            whats,
+            [
+                "Homebrew analytics off",
+                "install ollama if absent",
+                "unload the per-user ollama LaunchAgent",
+                "register ollama as a boot service",
+                "run it as the node user, with its model store and OLLAMA_NO_CLOUD=1",
+                "restart it with that environment",
+            ]
+        );
+        let sh = |i: usize| plan[i].sh.as_str();
+        assert!(sh(0).contains("brew analytics off"), "{}", sh(0));
+        assert!(sh(1).contains("brew list ollama >/dev/null 2>&1 || ") && sh(1).contains(" brew install ollama"), "{}", sh(1));
+        assert!(sh(1).contains("HOMEBREW_NO_ANALYTICS=1") && !sh(1).starts_with("sudo"), "brew never runs as root: {}", sh(1));
+        // The user agent, both labels, both domains, then its file.
+        for l in super::OLLAMA_PLIST_LABELS {
+            assert!(sh(2).contains(&format!("launchctl bootout gui/501/{l} ")), "{}", sh(2));
+            assert!(sh(2).contains(&format!("launchctl bootout user/501/{l} ")), "{}", sh(2));
+            assert!(sh(2).contains(&format!("rm -f '/Users/nodeuser/Library/LaunchAgents/{l}.plist'")), "{}", sh(2));
         }
-        let bin = home.join("bin");
-        std::fs::create_dir_all(&bin).unwrap();
-        let log = home.join("log");
-        let stub = |name: &str, body: &str| {
-            let p = bin.join(name);
-            crate::test_exec::write_exec(&p, format!("#!/bin/sh\necho \"{name} $*\" >> '{}'\n{body}\n", log.display()), 0o755);
-        };
-        stub("plutil", "exit 0");
-        // launchctl print succeeds only for the loaded domain's job.
-        stub("launchctl", &format!("[ \"$1\" = print ] && {{ case \"$2\" in {loaded}/*) exit 0;; *) exit 113;; esac; }}; exit 0"));
-        let out = std::process::Command::new("sh")
-            .args(["-c", &super::ollama_env_script(home.to_str().unwrap(), models, "501")])
-            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
-            .output()
-            .unwrap();
-        (out.status.code().unwrap_or(-1), std::fs::read_to_string(&log).unwrap_or_default(),
-         String::from_utf8_lossy(&out.stderr).to_string())
+        assert!(!sh(2).contains("sudo"), "the user agent is the user's: {}", sh(2));
+        assert_eq!(
+            sh(3),
+            format!("sudo {} brew services start --sudo-service-user 'nodeuser' ollama", crate::vendor::BREW_ENV)
+        );
+        // The system plist: UserName, HOME, the store that stays, the switch.
+        for want in [
+            "/Library/LaunchDaemons/sh.brew.ollama.plist",
+            "/Library/LaunchDaemons/homebrew.mxcl.ollama.plist",
+            "sudo /usr/bin/plutil -replace UserName -string 'nodeuser' \"$P\"",
+            "sudo /usr/bin/plutil -replace EnvironmentVariables.HOME -string '/Users/nodeuser' \"$P\"",
+            "sudo /usr/bin/plutil -replace EnvironmentVariables.OLLAMA_MODELS -string '/Users/nodeuser/.ollama/models' \"$P\"",
+            "sudo /usr/bin/plutil -replace EnvironmentVariables.OLLAMA_NO_CLOUD -string '1' \"$P\"",
+        ] {
+            assert!(sh(4).contains(want), "missing {want}: {}", sh(4));
+        }
+        assert!(!sh(4).contains("LaunchAgents"), "{}", sh(4));
+        assert!(sh(5).contains("sudo launchctl bootout \"system/$L\"") && sh(5).contains("sudo launchctl bootstrap system \"$P\""), "{}", sh(5));
+        // Never `brew services restart`: it regenerates the plist and drops the edits.
+        assert!(plan.iter().all(|s| !s.sh.contains("brew services restart")), "{plan:?}");
     }
 
+    // The store stays where Ollama keeps it today; a data root's store takes
+    // over only when that cannot hide models.
     #[test]
-    fn ollama_script_finds_current_brew_label_and_the_user_domain_over_ssh() {
-        let home = tmp_home("ssh");
-        let (rc, log, _) = run_script(&home, &["sh.brew.ollama"], "user/501", None);
-        assert_eq!(rc, 0, "{log}");
-        let plist = format!("{}/Library/LaunchAgents/sh.brew.ollama.plist", &home.display());
-        assert!(log.contains(&format!("plutil -replace EnvironmentVariables.OLLAMA_NO_CLOUD -string 1 {plist}")), "{log}");
-        assert!(log.contains(&format!("launchctl bootstrap user/501 {plist}")), "{log}");
-        assert!(!log.contains("bootstrap gui/") && !log.contains("OLLAMA_MODELS") && !log.contains("brew services"), "{log}");
-    }
-
-    #[test]
-    fn ollama_script_keeps_the_old_label_working() {
-        let home = tmp_home("old");
-        let (rc, log, _) = run_script(&home, &["homebrew.mxcl.ollama"], "gui/501", None);
-        assert_eq!(rc, 0, "{log}");
-        assert!(log.contains("launchctl bootstrap gui/501 ") && log.contains("homebrew.mxcl.ollama.plist"), "{log}");
-    }
-
-    #[test]
-    fn ollama_script_fails_loudly_without_a_brew_plist() {
-        let home = tmp_home("none");
-        let (rc, log, err) = run_script(&home, &[], "gui/501", None);
-        assert_eq!(rc, 3, "{err}");
-        assert!(err.contains("no Homebrew ollama service") && log.is_empty(), "{err} / {log}");
-    }
-
-    #[test]
-    fn ollama_script_sets_a_models_dir_with_a_space_but_never_hides_models() {
-        let home = tmp_home("space");
-        let m = format!("{}/Library/Application Support/noo/ollama", &home.display());
-        // ~/.ollama/models holds models and the new store does not: kept.
-        std::fs::create_dir_all(home.join(".ollama/models/manifests/registry")).unwrap();
-        let (rc, log, err) = run_script(&home, &["sh.brew.ollama"], "user/501", Some(&m));
-        assert_eq!(rc, 0, "{err}");
-        assert!(!log.contains("OLLAMA_MODELS") && err.contains("move them to"), "{log} / {err}");
-        // Once the models are moved, the space-carrying path is set whole.
-        std::fs::create_dir_all(format!("{m}/manifests/registry")).unwrap();
-        let (rc, log, _) = run_script(&home, &["sh.brew.ollama"], "user/501", Some(&m));
-        assert_eq!(rc, 0);
-        assert!(log.contains(&format!("plutil -replace EnvironmentVariables.OLLAMA_MODELS -string {m} ")), "{log}");
+    fn the_mac_ollama_store_never_hides_models() {
+        let home = "/Users/nodeuser";
+        let default = "/Users/nodeuser/.ollama/models";
+        let root = "/Users/nodeuser/Library/Application Support/noo/ollama";
+        let none = |_: &str| false;
+        assert_eq!(super::ollama_boot_store(home, None, None, &none), default);
+        assert_eq!(super::ollama_boot_store(home, Some("/data/ollama"), None, &none), "/data/ollama");
+        // default holds models, the root does not: kept.
+        let only_default = |d: &str| d == default;
+        assert_eq!(super::ollama_boot_store(home, None, Some(root), &only_default), default);
+        // the root holds them (moved), or nothing does: the root.
+        let only_root = |d: &str| d == root;
+        assert_eq!(super::ollama_boot_store(home, None, Some(root), &only_root), root);
+        assert_eq!(super::ollama_boot_store(home, None, Some(root), &none), root);
     }
 
     #[test]

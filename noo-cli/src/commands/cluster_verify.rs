@@ -549,6 +549,10 @@ pub(crate) fn node_checks(n: &Value, controller_tag: &str, cli_version: &str, no
     //       backend container lacks the switches that keep its vendor from
     //       phoning home (vLLM's stats.vllm.ai report above all).
     out.push(vendor_telemetry_check(n));
+    // 6c-mac. A Mac's native Ollama is its only Ollama lane (i1156): the
+    //         agent never starts an ollama container there, so a stopped
+    //         native Ollama is the whole reason nothing serves.
+    out.extend(native_ollama_check(id, n));
 
     // 6c-images. Backend images: no running backend container was created
     //            from a floating ref (`:latest` or untagged, no digest) — the
@@ -668,6 +672,11 @@ pub(crate) fn backend_starts_check(id: &str, n: &Value) -> Option<Check> {
         let target = r["target"].as_str().unwrap_or("?");
         let remedy = match reason.find(SYNC) {
             Some(i) => reason[i..].split(['`', ';']).next().unwrap_or(SYNC).trim_end().to_string(),
+            // A Mac's native Ollama is down (agent NativeDownError): its own
+            // remedy, the text after the first ": ".
+            None if reason.starts_with("the native Ollama isn't") => {
+                format!("on {id}: {}", reason.split_once(": ").map_or(reason, |(_, r)| r))
+            }
             None if is_no_space_refusal(reason) => no_space_remedy(id, target),
             None => format!("noo cluster show {id}   # the node's refusal says why"),
         };
@@ -2059,6 +2068,9 @@ pub(crate) fn vendor_telemetry_check(n: &Value) -> Check {
     let mut unmanaged_set: Vec<String> = Vec::new();
     let mut unmanaged_missing: Vec<(String, &'static str)> = Vec::new();
     let mut mac_ollama = false;
+    // The native ollama's plist is a boot service (root's, enroll since
+    // i1156): the agent cannot edit it, so the remedy is sudo.
+    let mut mac_system = false;
     for (b, entry) in bc {
         // A Mac's native ollama (node-agent-go backendrt/ollama_telemetry.go):
         // `managed: false` = no brew plist, so nothing here may touch or judge it.
@@ -2096,11 +2108,19 @@ pub(crate) fn vendor_telemetry_check(n: &Value) -> Check {
                 } else {
                     problems.push(format!("{b} lacks {}", names.join(", ")));
                     mac_ollama |= entry["runtime"].as_str() == Some("native");
+                    mac_system |= entry["plist_domain"].as_str() == Some("system");
                 }
             }
         }
     }
-    let remedy = if mac_ollama {
+    let remedy = if mac_ollama && mac_system {
+        "on the Mac: L=sh.brew.ollama; [ -f /Library/LaunchDaemons/$L.plist ] || L=homebrew.mxcl.ollama; \
+         P=/Library/LaunchDaemons/$L.plist; \
+         sudo plutil -insert EnvironmentVariables -dictionary $P 2>/dev/null; \
+         sudo plutil -replace EnvironmentVariables.OLLAMA_NO_CLOUD -string 1 $P; \
+         sudo launchctl bootout system/$L; sudo launchctl bootstrap system $P   \
+         # or re-run `noo enroll`; the agent cannot edit a boot service's plist".to_string()
+    } else if mac_ollama {
         // Either brew label (sh.brew.ollama is current Homebrew), and the
         // domain launchd actually holds the job in (user/<uid> on a headless
         // Mac over SSH, where gui/<uid> answers 125).
@@ -2151,6 +2171,51 @@ pub(crate) fn vendor_telemetry_check(n: &Value) -> Check {
         return ok(NAME, parts.join("; "));
     }
     ok(NAME, format!("{}: every vendor telemetry switch set", proven.join(", ")))
+}
+
+/// The boot-service command that starts a Mac's native Ollama as the node's
+/// user (node-agent-go backendrt `OllamaBootServiceCmd`, keep in lockstep).
+/// `--sudo-service-user` makes Homebrew write `UserName` into the system
+/// plist; without it a root `brew services start` runs Ollama as root, with
+/// root's home and an empty model store.
+pub(crate) const MAC_OLLAMA_START: &str = "sudo HOMEBREW_NO_ANALYTICS=1 brew services start --sudo-service-user \"$USER\" ollama";
+
+/// A heartbeat's `backend_containers.ollama` entry that is a Mac's native
+/// Ollama: runtime `native` (the agent's OllamaGuard report, darwin only) on
+/// a node whose `os` is darwin (an agent that does not report `os` is judged
+/// by the runtime alone).
+fn is_darwin_native_ollama(n: &Value, entry: &Value) -> bool {
+    entry["runtime"].as_str() == Some("native") && n["os"].as_str().is_none_or(|os| os == "darwin")
+}
+
+/// The `native ollama` row (followup i1156). On a Mac the native Ollama is
+/// the only Ollama lane: the agent refuses an ollama container there. The
+/// heartbeat's `backend_containers.ollama.running` says whether it answers on
+/// 127.0.0.1:11434; `binary_present` (newer agents, sent only while it is not
+/// running) picks the remedy: start the boot service, or install Ollama
+/// first. FAIL when it is not running; OK when it is; no row off a Mac.
+pub(crate) fn native_ollama_check(id: &str, n: &Value) -> Option<Check> {
+    const NAME: &str = "native ollama";
+    let entry = &n["backend_containers"]["ollama"];
+    if !is_darwin_native_ollama(n, entry) {
+        return None;
+    }
+    if entry["running"].as_bool() != Some(false) {
+        return Some(ok(NAME, "serving on 127.0.0.1:11434"));
+    }
+    let launcher = entry["launcher"].as_str().unwrap_or("none");
+    if entry["binary_present"].as_bool() == Some(false) {
+        return Some(fail(
+            NAME,
+            format!("{id}: the native Ollama isn't installed on this Mac, so nothing serves Ollama there (the agent never runs it in a container on a Mac)"),
+            format!("on {id}: install it: `HOMEBREW_NO_ANALYTICS=1 brew install ollama`, then start it with `{MAC_OLLAMA_START}` (a boot service), or re-run `noo enroll`"),
+        ));
+    }
+    Some(fail(
+        NAME,
+        format!("{id}: the native Ollama isn't running on this Mac (nothing answers on 127.0.0.1:11434; launcher: {launcher}), so nothing serves Ollama there"),
+        format!("on {id}: start it with `{MAC_OLLAMA_START}` (a boot service), or re-run `noo enroll`"),
+    ))
 }
 
 /// A leaf inside this window fails the row: the next backend recreate
@@ -14134,6 +14199,75 @@ mod tests {
         assert_eq!(vendor_telemetry_check(&older).verdict, Verdict::Warn);
         let none = serde_json::json!({"id": "host3", "backend_containers": {}});
         assert_eq!(vendor_telemetry_check(&none).verdict, Verdict::Ok);
+    }
+
+    // Followup i1156: a Mac's native Ollama is its only Ollama lane; a stopped
+    // one FAILs with the remedy that fits (start vs install first); a Linux
+    // node gets no row.
+    #[test]
+    fn native_ollama_row_fails_on_a_mac_whose_ollama_is_down() {
+        let down = serde_json::json!({"id": "node_a", "os": "darwin", "backend_containers": {
+            "ollama": {"running": false, "runtime": "native", "launcher": "brew-service", "managed": true, "binary_present": true}}});
+        let c = native_ollama_check("node_a", &down).expect("a row on a Mac");
+        assert_eq!(c.verdict, Verdict::Fail, "{c:?}");
+        assert!(c.detail.contains("the native Ollama isn't running on this Mac"), "{}", c.detail);
+        let r = c.remedy.as_deref().unwrap();
+        assert!(r.contains("sudo HOMEBREW_NO_ANALYTICS=1 brew services start --sudo-service-user \"$USER\" ollama"), "{r}");
+        assert!(r.contains("re-run `noo enroll`") && !r.contains("brew install"), "{r}");
+
+        let absent = serde_json::json!({"id": "node_a", "os": "darwin", "backend_containers": {
+            "ollama": {"running": false, "runtime": "native", "launcher": "none", "managed": false, "binary_present": false}}});
+        let c = native_ollama_check("node_a", &absent).expect("a row on a Mac");
+        assert_eq!(c.verdict, Verdict::Fail, "{c:?}");
+        assert!(c.detail.contains("isn't installed"), "{}", c.detail);
+        assert!(c.remedy.as_deref().unwrap().contains("`HOMEBREW_NO_ANALYTICS=1 brew install ollama`, then start it"), "{c:?}");
+
+        // An older agent (no `os`, no `binary_present`): judged by the
+        // runtime, the start remedy.
+        let older = serde_json::json!({"id": "node_a", "backend_containers": {
+            "ollama": {"running": false, "runtime": "native"}}});
+        assert_eq!(native_ollama_check("node_a", &older).map(|c| c.verdict), Some(Verdict::Fail));
+
+        let up = serde_json::json!({"id": "node_a", "os": "darwin", "backend_containers": {
+            "ollama": {"running": true, "runtime": "native", "managed": true}}});
+        assert_eq!(native_ollama_check("node_a", &up).map(|c| c.verdict), Some(Verdict::Ok));
+
+        // Linux: a stopped container ollama, or a native-looking entry on a
+        // node that says it is not a Mac: no row.
+        let linux = serde_json::json!({"id": "node_b", "os": "linux", "backend_containers": {
+            "ollama": {"running": false, "started_at": 1, "telemetry_missing": []}}});
+        assert!(native_ollama_check("node_b", &linux).is_none());
+        let not_mac = serde_json::json!({"id": "node_b", "os": "linux", "backend_containers": {
+            "ollama": {"running": false, "runtime": "native"}}});
+        assert!(native_ollama_check("node_b", &not_mac).is_none());
+        // The self-node's adopted stack ollama is not a Mac's.
+        let stack = serde_json::json!({"id": "ctrl", "backend_containers": {
+            "ollama": {"running": false, "runtime": "stack"}}});
+        assert!(native_ollama_check("ctrl", &stack).is_none());
+    }
+
+    // The agent's native-down refusal surfaces its own remedy in `backend
+    // starts`, not `noo cluster show`.
+    #[test]
+    fn backend_starts_row_surfaces_the_native_ollama_remedy() {
+        let n = serde_json::json!({"id": "node_a", "reconcile_refusals": [{"scope": "backend_start", "target": "ollama",
+            "reason": "the native Ollama isn't running on this Mac: start it with `sudo HOMEBREW_NO_ANALYTICS=1 brew services start --sudo-service-user nodeuser ollama` (a boot service), or re-run `noo enroll`"}]});
+        let c = backend_starts_check("node_a", &n).unwrap();
+        let r = c.remedy.as_deref().unwrap();
+        assert!(r.starts_with("on node_a: start it with `sudo HOMEBREW_NO_ANALYTICS=1 brew services start"), "{r}");
+        assert!(!r.contains("noo cluster show"), "{r}");
+    }
+
+    // A boot-service plist (root's) gets the sudo remedy in `vendor telemetry`.
+    #[test]
+    fn vendor_telemetry_row_gives_sudo_for_a_boot_service_plist() {
+        let n = serde_json::json!({"id": "node_a", "backend_containers": {
+            "ollama": {"running": true, "runtime": "native", "managed": true, "plist_label": "sh.brew.ollama",
+                       "plist_domain": "system", "telemetry_missing": ["OLLAMA_NO_CLOUD"]}}});
+        let c = vendor_telemetry_check(&n);
+        assert_eq!(c.verdict, Verdict::Fail, "{c:?}");
+        let r = c.remedy.as_deref().unwrap();
+        assert!(r.contains("sudo launchctl bootstrap system $P") && !r.contains("LaunchAgents"), "{r}");
     }
 
     // host8 2026-10-03: an old agent-created noo-ollama beside the stack's

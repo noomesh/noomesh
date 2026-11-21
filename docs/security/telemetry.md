@@ -348,35 +348,46 @@ tailnet.
 
 ## Checking a Mac
 
-A Mac node runs ollama natively (brew + launchd), not in a container. Check
-the switch in its plist — `sh.brew.ollama` under current Homebrew,
-`homebrew.mxcl.ollama` under older releases — and in the job launchd runs
-(`gui/<uid>` at the Mac's screen, `user/<uid>` on a headless Mac over SSH):
+A Mac node runs ollama natively (brew + launchd), never in a container.
+`noo enroll` registers it as a boot service: a system LaunchDaemon at
+`/Library/LaunchDaemons/sh.brew.ollama.plist` (`homebrew.mxcl.ollama` under
+older Homebrew) that runs as the node's user, so it starts at boot, not at a
+login. Check the switch in that plist and in the job launchd runs:
 
 ```sh
-L=sh.brew.ollama; [ -f ~/Library/LaunchAgents/$L.plist ] || L=homebrew.mxcl.ollama
-plutil -p ~/Library/LaunchAgents/$L.plist | grep -A6 EnvironmentVariables
-launchctl print gui/$(id -u)/$L 2>/dev/null || launchctl print user/$(id -u)/$L
+L=sh.brew.ollama; [ -f /Library/LaunchDaemons/$L.plist ] || L=homebrew.mxcl.ollama
+plutil -p /Library/LaunchDaemons/$L.plist | grep -A8 EnvironmentVariables
+sudo launchctl print system/$L
 ```
 
-`OLLAMA_NO_CLOUD = 1` must be listed. `noo cluster verify <node>` reports the
-same in its `vendor telemetry` row, judged from the plist and the running
-`ollama serve` process's environment.
+`OLLAMA_NO_CLOUD = 1` must be listed, beside `HOME` and `OLLAMA_MODELS` (the
+node user's store, `~/.ollama/models` unless a data root moved it).
+`noo cluster verify <node>` reports the switch in its `vendor telemetry` row,
+judged from the plist and the running `ollama serve` process's environment,
+and whether ollama answers at all in its `native ollama` row.
 
-noomesh manages the native ollama only when it runs as the Homebrew launchd
-service (that plist, loaded at login). If you run Ollama.app, or an
-`ollama serve` you started by hand, noomesh does not touch it, but the node
-agent still reads the running process's environment, so the switch is proven
-rather than guessed: the row passes when the process has `OLLAMA_NO_CLOUD=1`,
-fails when it does not, and names the launcher (`brew-service`, `ollama-app`,
-`manual`) so the remedy fits. Only when the process cannot be read does the row
-say "not managed by noomesh" and stay unproven. The fix for a failing
-Ollama.app or hand-run ollama is to quit it and run `HOMEBREW_NO_ANALYTICS=1 brew services start
-ollama`; the agent then sets the switch within a minute. Turn off Ollama.app's
-own login item as well, or it and the brew service will both try to serve on
-port 11434. Note that `brew services restart ollama` regenerates the plist
-without the key; the node agent puts it back and restarts ollama once, within
-a minute.
+The plist is root's, so the node agent (running as the node user) reads it but
+never writes it. If it lacks a key the agent would set (the switch, a
+placement's tuning, a moved store), the agent records a refusal that names the
+`sudo plutil … ; sudo launchctl bootout system/<label>; sudo launchctl
+bootstrap system <plist>` commands, and re-running `noo enroll` applies them
+too. Never `brew services restart ollama`: every `brew services start` re-copies
+the plist from the formula and drops these keys.
+
+A Mac enrolled before 0.6.30 runs ollama as a per-user LaunchAgent
+(`~/Library/LaunchAgents/<label>.plist`, started at login). The agent still
+manages that one as before; re-running `noo enroll` replaces it with the boot
+service (it unloads and removes the user agent first, so two jobs never fight
+over port 11434).
+
+If you run Ollama.app, or an `ollama serve` you started by hand, noomesh does
+not touch it, but the node agent still reads the running process's
+environment, so the switch is proven rather than guessed: the row passes when
+the process has `OLLAMA_NO_CLOUD=1`, fails when it does not, and names the
+launcher (`brew-service`, `ollama-app`, `manual`) so the remedy fits. Only when
+the process cannot be read does the row say "not managed by noomesh" and stay
+unproven. Turn off Ollama.app's own login item, or it and the brew service
+will both try to serve on port 11434.
 
 ## How the switches stay on
 
@@ -388,10 +399,13 @@ a minute.
   placement and node-local overrides are applied, the agent sets the
   switches again, so a placement's `env` cannot turn them back on.
 - **Mac node.** The native brew ollama is not a container. `noo enroll` writes
-  the switch into its launchd plist and restarts the job with `launchctl`
-  (never `brew services`, which regenerates the plist from the formula). The
-  agent re-checks every minute, restarts ollama once if it had to add the
-  key, and reports it as `backend_containers.ollama.telemetry_missing`.
+  the switch into its boot-service plist
+  (`/Library/LaunchDaemons/<label>.plist`) and restarts the job with
+  `launchctl` (never `brew services`, which regenerates the plist from the
+  formula). The agent re-checks every minute and reports it as
+  `backend_containers.ollama.telemetry_missing`; it cannot write root's plist,
+  so a missing key becomes a refusal naming the `sudo` commands (an older
+  per-user LaunchAgent it still fixes and restarts itself).
 - **Recreate on upgrade.** The agent's env generation is part of each
   placement's spec hash. The first reconcile after an agent upgrade
   therefore recreates each backend once, and an existing container without
