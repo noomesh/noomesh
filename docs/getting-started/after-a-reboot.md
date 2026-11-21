@@ -13,7 +13,7 @@ does not come back on its own yet. Done when `noo cluster verify` exits 0.
 | **The controller** | Docker restarts the stack's containers. Then `noo-hostd` runs a boot restore once: it rewrites the secret files (they live in memory and a reboot empties them), starts the containers that need them and any stopped core service, and retries for about two minutes while Docker is still starting. |
 | **A Linux node** | Its node agent starts at boot, reconnects to the controller and starts the backends placed on it. |
 | **A Mac node** | Its node agent starts at boot. Its Ollama does not, yet: see below. |
-| **A kiosk seat** | Its display starts at boot, except on some dedicated seats: see below. |
+| **A kiosk seat** | Its display starts at boot, except a dedicated seat on a machine with a desktop installed: see below. |
 
 Give it a few minutes, then:
 
@@ -38,13 +38,16 @@ Each one has a followup that removes the need for the step.
   force-unmount it to get past the wait: processes are blocked on it.
   Check with `timeout 5 stat <mount>` before you upgrade (a bare `stat`
   can hang too). (i1149: bounded calls and a verify row for hung mounts.)
-- **A dedicated kiosk seat stays black.** Its display waits behind the boot
-  splash, which on some seats is never told to quit. At the seat:
-  `sudo plymouth quit`. The display comes up at once. (i1153.)
-- **A Mac node's Ollama is not running.** It is registered to start when
-  the node's user logs in, not at boot. Log in on the Mac, or as the node's
-  user run `HOMEBREW_NO_ANALYTICS=1 brew services start ollama`. (i1156:
-  `noo enroll` will register it as a boot service.)
+- **A dedicated kiosk seat on a machine that also has a desktop installed
+  stays black.** Its display waits behind the boot splash, which nothing
+  tells to quit. At the seat: `sudo plymouth quit`. The display comes up at
+  once. (i1153: fixed in 0.6.30.)
+- **A Mac node's Ollama is not running.** Nothing registers it to start at
+  boot: it starts only if it was set up to start at the node user's login,
+  and that user has logged in. As the node's user, run
+  `HOMEBREW_NO_ANALYTICS=1 brew services start ollama` (it starts now and
+  at each login of that user). (i1156: `noo enroll` will register it as a
+  boot service.)
 - **A model file was never shipped to a node** (0.6.28 and earlier): the
   backend shows as running but crash-loops without its file. From the
   controller: `noo cluster sync-model-files <node> -m <file.gguf>`. The node
