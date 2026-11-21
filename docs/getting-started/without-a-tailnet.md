@@ -50,9 +50,11 @@ On the **controller**:
 1. Onboard without Tailscale. Answer the question that follows with your local
    network, so other machines can reach the gateway. `noo doctor exposure`
    shows what that opens.
-2. Set `services.gateway_url` in `noomesh.yaml` to the address nodes will use,
-   for example `https://192.0.2.10:8080` (your controller's reserved address,
-   or its name), then restart the gateway:
+2. Set `services.gateway_url` in `noomesh.yaml` to the address nodes will use.
+   Without a tailnet that is the controller's local network or cable address
+   (or a name for it): `https://<that address>:8080`, for example
+   `https://192.0.2.10:8080`. The gateway's refusal message says "its tailnet
+   address"; on this path it is this address instead. Then restart the gateway:
 
    ```sh
    noo stack restart gateway
@@ -86,15 +88,23 @@ noo cluster verify <node>
   verify's `agent certificate` row FAILs, and the agent's log shows
   `tls: bad certificate`. This happens behind a proxy or Docker Desktop, after
   a worker's address changed, and on 0.6.29 after a roll (`noo upgrade`) on a
-  node whose enrollment address is not the one the controller dials.
-  Fix it with:
+  node whose enrollment address is not the one the controller dials. The fix
+  issues a certificate for the address the row names, so check it first:
 
-  ```sh
-  noo security pki push-nodes <node>
-  ```
+  1. On the node itself, `ip -brief addr` shows the address the row names
+     (or it is the cable address you gave it).
+  2. Only then, on the controller:
 
-  If the row gives no command, the address belongs to another node: stop and
-  find out why before issuing anything.
+     ```sh
+     noo security pki push-nodes <node>
+     ```
+
+  3. If the row names an address you do not recognise, or one another machine
+     uses, stop and do not run it. If the row gives no command, the address
+     belongs to another node: stop.
+
+  Planned for 0.6.30: a changed address is proved with
+  `noo security pki push-nodes <node> --prove`.
 - **The controller's address changed.** Every node lost the controller, and
   nothing sent from the controller reaches them. Give the controller its old
   address back (reserve it in your router, then restart the machine).
