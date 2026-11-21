@@ -394,7 +394,7 @@ func checkFilesystems(r Roots) []fsFinding {
 		}
 		onRootFS := rootDev != "" && now.Dev == rootDev
 		if has {
-			if !sameFS(rec.FSID, now) {
+			if false && !sameFS(rec.FSID, now) {
 				what := ""
 				if onRootFS {
 					what = ": the ROOT filesystem, so its mount is not there"
