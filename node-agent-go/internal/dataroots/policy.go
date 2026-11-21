@@ -284,12 +284,19 @@ func checkContainment(r Roots) []Problem {
 func Check(r Roots, goos, home string, euid int) []Problem {
 	var probs []Problem
 	if r.NooDataRootSource == "legacy_default" {
-		probs = append(probs, Problem{Code: "undeclared_root", Detail: fmt.Sprintf(
-			"NOO_DATA_ROOT is unset; the agent kept the earlier default %s, which holds this node's data — declare it", r.NooDataRoot)})
+		d := fmt.Sprintf("NOO_DATA_ROOT is unset; the agent kept the earlier default %s, which holds this node's data — declare it", r.NooDataRoot)
+		if adoptedLate {
+			d += fmt.Sprintf(" (it was not there at start, its mount was late; it was kept because %s records it, and the agent refuses to use it until it is back)", RecordFileName)
+		}
+		probs = append(probs, Problem{Code: "undeclared_root", Detail: d})
 	}
 	probs = append(probs, CheckShape(r.NooDataRoot, goos, home)...)
 	probs = append(probs, checkContainment(r)...)
-	return append(probs, CheckOwnership(r.NooDataRoot, euid)...)
+	probs = append(probs, CheckOwnership(r.NooDataRoot, euid)...)
+	for _, f := range checkFilesystems(r) {
+		probs = append(probs, f.Problem)
+	}
+	return probs
 }
 
 // PolicyReport is the heartbeat's data_roots.policy object.
@@ -304,16 +311,38 @@ func PolicyReport(probs []Problem) map[string]any {
 	return map[string]any{"mode": mode, "ok": len(probs) == 0, "problems": probs}
 }
 
+// policyReport is PolicyReport plus what the root is meant to be.
+func policyReport(r Roots, probs []Problem) map[string]any {
+	out := PolicyReport(probs)
+	out["filesystem"] = FilesystemReport(r)
+	return out
+}
+
 // Current checks this process's own root, as the gates see it.
 func Current() []Problem {
 	return Check(Resolve(os.Getenv), runtime.GOOS, os.Getenv("HOME"), os.Geteuid())
 }
 
-// Refusal is the error an enforcing node returns for anything that would
-// mount under a root that fails the policy; nil when allowed.
+// Refusal is the error a node returns for anything that would mount under a
+// root that fails the policy; nil when allowed. An enforcing node refuses on
+// any problem. A SAFETY problem (IsSafety: the root is not on its recorded
+// filesystem, its declared mount is not there, or it does not answer) is
+// refused in warn mode too: using it would write to, or mount, the wrong disk.
 func Refusal(probs []Problem) error {
-	if !Enforcing() || len(probs) == 0 {
+	if len(probs) == 0 {
 		return nil
+	}
+	if !Enforcing() {
+		var safety []string
+		for _, p := range probs {
+			if IsSafety(p.Code) {
+				safety = append(safety, p.Code+": "+p.Detail)
+			}
+		}
+		if len(safety) == 0 {
+			return nil
+		}
+		return fmt.Errorf("data root refused (in %s=warn mode too): %s", PolicyEnv, strings.Join(safety, "; "))
 	}
 	parts := make([]string, 0, len(probs))
 	for _, p := range probs {

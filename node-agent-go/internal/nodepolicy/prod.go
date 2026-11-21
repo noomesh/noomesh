@@ -25,7 +25,18 @@ func FreeGB(root string, usages func([]string) []hardware.DiskUsage) (float64, e
 	return us[0].AvailGB, nil
 }
 
-// DataRootFreeGB is FreeGB for this process's resolved data root.
+// DataRootFreeGB is FreeGB for this process's resolved data root, bounded
+// (dataroots.Bounded): a statfs on a hung mount blocks in the kernel, and the
+// heartbeat that waits on it goes silent. On timeout the figure is omitted.
 func DataRootFreeGB() (float64, error) {
-	return FreeGB(dataroots.Resolve(os.Getenv).NooDataRoot, hardware.DiskUsages)
+	root := dataroots.Resolve(os.Getenv).NooDataRoot
+	type res struct {
+		gb  float64
+		err error
+	}
+	got, err := dataroots.Bounded(root, func() res { gb, err := FreeGB(root, hardware.DiskUsages); return res{gb, err} })
+	if err != nil {
+		return 0, err
+	}
+	return got.gb, got.err
 }
