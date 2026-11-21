@@ -437,6 +437,16 @@ pub(crate) fn carry_target_node(data: &mut Value, body: &Value) {
     for key in [crate::node_pin::CHECKS_TARGET_FIELD, crate::node_pin::REQUIRES_TARGET_FIELD] {
         data[key] = json!(body.get(key).and_then(Value::as_bool) == Some(true));
     }
+    // The agent's latest `wrong_node` refusal, while it reports one: gone
+    // from the record the beat it stops.
+    match body.get(crate::node_pin::WRONG_NODE_FIELD).filter(|v| v.is_object()) {
+        Some(w) => data[crate::node_pin::WRONG_NODE_FIELD] = w.clone(),
+        None => {
+            if let Some(m) = data.as_object_mut() {
+                m.remove(crate::node_pin::WRONG_NODE_FIELD);
+            }
+        }
+    }
 }
 
 /// Carry a heartbeat field onto the node record when the agent reported it;
@@ -2204,6 +2214,11 @@ pub(crate) async fn cluster_nodes(State(state): State<Arc<AppState>>) -> AppJson
     for n in nodes.iter_mut() {
         if let Some(id) = n.get("id").and_then(Value::as_str).map(str::to_string) {
             n["control_calls"] = crate::node_rpc::counts_json(&id);
+            // The latest call for this node the pin refused (i1174), for
+            // verify's `node identity` row; absent when none in ten minutes.
+            if let Some(m) = crate::node_pin::last_mismatch(&id) {
+                n[crate::node_pin::MISMATCH_FIELD] = m;
+            }
         }
     }
 
@@ -11386,5 +11401,29 @@ mod address_claim_tests {
         assert_eq!(data["requires_target_node"], false);
         carry_target_node(&mut data, &json!({"checks_target_node": true, "requires_target_node": false}));
         assert_eq!(data["checks_target_node"], true);
+    }
+
+    /// i1174: an agent's latest `wrong_node` refusal reaches the node record
+    /// (verify's `target-node check` row reads it), and leaves it the beat
+    /// the agent stops reporting one.
+    #[test]
+    fn a_wrong_node_refusal_rides_the_record_while_reported() {
+        let mut data = json!({});
+        let w = json!({"target": "node_b", "path": "/start", "at": 1});
+        carry_target_node(&mut data, &json!({"checks_target_node": true, "wrong_node_refused": w}));
+        assert_eq!(data["wrong_node_refused"], w);
+        carry_target_node(&mut data, &json!({"checks_target_node": true}));
+        assert!(data.get("wrong_node_refused").is_none(), "{data}");
+    }
+
+    /// i1174: the node list carries the pin's latest refusal per node, the
+    /// field verify's `node identity` row reads.
+    #[test]
+    fn the_node_list_carries_the_latest_identity_refusal() {
+        let code = crate::test_src::own_code(include_str!("cluster.rs"));
+        let list = crate::test_src::fn_body(&code, "pub(crate) async fn cluster_nodes(");
+        assert!(list.contains("if let Some(m) = crate::node_pin::last_mismatch(&id) {"), "{list}");
+        assert!(list.contains("n[crate::node_pin::MISMATCH_FIELD] = m;"), "{list}");
+        assert_eq!(crate::node_pin::MISMATCH_FIELD, "node_identity_mismatch");
     }
 }

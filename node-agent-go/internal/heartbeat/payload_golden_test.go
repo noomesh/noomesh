@@ -126,3 +126,23 @@ func TestPayloadReportsTheTargetNodeCheck(t *testing.T) {
 		}
 	}
 }
+
+// i1174: the agent's latest wrong_node refusal rides the beat while it is
+// reported (verify's `target-node check` row reads it), and is absent
+// otherwise.
+func TestPayloadCarriesTheLatestWrongNodeRefusal(t *testing.T) {
+	prev := wrongNodeReport
+	t.Cleanup(func() { wrongNodeReport = prev })
+	w := map[string]any{"target": "node_b", "path": "/start", "detail": "addressed to node_b", "at": int64(1)}
+	wrongNodeReport = func() map[string]any { return w }
+	beat, _ := capturePayloads(t)
+	got, ok := beat[auth.WrongNodeRefusedField].(map[string]any)
+	if !ok || got["target"] != "node_b" || got["path"] != "/start" {
+		t.Fatalf("wrong_node_refused = %#v, want the refusal", beat[auth.WrongNodeRefusedField])
+	}
+	wrongNodeReport = func() map[string]any { return nil }
+	beat, _ = capturePayloads(t)
+	if _, present := beat[auth.WrongNodeRefusedField]; present {
+		t.Fatalf("no refusal: the field must be absent, got %#v", beat[auth.WrongNodeRefusedField])
+	}
+}

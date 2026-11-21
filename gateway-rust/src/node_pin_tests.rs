@@ -194,3 +194,115 @@ fn every_cluster_client_carries_the_node_pin() {
     assert!(f.contains(".with_custom_certificate_verifier("), "{f}");
     assert!(!f.contains(".with_root_certificates("), "a stock verifier would skip the pin: {f}");
 }
+
+/// A client built from the real `cluster_rustls_config` over `ca`.
+fn pin_client(ca: &Ca, tag: &str) -> reqwest::ClientBuilder {
+    let dir = std::env::temp_dir().join(format!("noo-pin-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let ca_pem = dir.join("ca.crt");
+    std::fs::write(&ca_pem, ca.cert.pem()).unwrap();
+    let cfg = {
+        let _g = crate::tls::loopback_verification_tests::ENV.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("NOO_TLS_CA", &ca_pem);
+        let cfg = crate::tls::cluster_rustls_config().unwrap().expect("the cluster config");
+        std::env::remove_var("NOO_TLS_CA");
+        cfg
+    };
+    let _ = std::fs::remove_dir_all(&dir);
+    reqwest::Client::builder().tls_backend_preconfigured((*cfg).clone())
+}
+
+/// Every kind of peer the cluster clients reach, each serving a real leaf of
+/// its kind, dialled through the real `cluster_rustls_config`:
+///
+/// - a node agent with its own leaf: passes;
+/// - a node agent with another node's leaf: refused, typed, and kept for
+///   `noo cluster verify` ([`last_mismatch`]);
+/// - a SERVICE leaf (a backend door, loki, an add-on) at a node's address:
+///   passes, the pin judges node leaves only;
+/// - the self node's agent and the gateway's own leaf on the controller's
+///   address: pass;
+/// - a host not in the book: webpki alone (a node leaf naming any node
+///   passes; a leaf from another CA is still refused);
+/// - a docker service name (`noo-*`, `gateway`): never in the book, passes.
+#[tokio::test(flavor = "multi_thread")]
+async fn every_peer_kind_the_cluster_clients_reach() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let ca = ca();
+    let (ip_node, ip_ctrl, ip_free, ip_docker) = ("127.0.0.41", "127.0.0.42", "127.0.0.43", "127.0.0.44");
+
+    // A node agent, right and wrong, at its booked address.
+    let right = node_leaf(&ca, "pin-kind-a", NODE_ORG, &[ip_node]);
+    let wrong = node_leaf(&ca, "pin-kind-b", NODE_ORG, &[ip_node]);
+    // A backend door / service leaf on the same node's address.
+    let door = node_leaf(&ca, "ollama", crate::node_identity::SERVICE_ORG, &[ip_node]);
+    // The controller's machine: the self node's agent and the gateway.
+    let self_agent = node_leaf(&ca, "pin-kind-self", NODE_ORG, &[ip_ctrl]);
+    let gateway = node_leaf(&ca, "pin-kind-ctrl", "Mesh Cluster Gateway", &[ip_ctrl]);
+    // An address no node owns.
+    let stray = node_leaf(&ca, "pin-kind-z", NODE_ORG, &[ip_free]);
+    let other_ca = ca();
+    let foreign = node_leaf(&other_ca, "pin-kind-a", NODE_ORG, &[ip_free]);
+    // A docker service name.
+    let svc = node_leaf(&ca, "noo-trellion", crate::node_identity::SERVICE_ORG, &[]);
+
+    let p_right = serve_at(ip_node, &right).await;
+    let p_wrong = serve_at(ip_node, &wrong).await;
+    let p_door = serve_at(ip_node, &door).await;
+    let p_self = serve_at(ip_ctrl, &self_agent).await;
+    let p_gw = serve_at(ip_ctrl, &gateway).await;
+    let p_stray = serve_at(ip_free, &stray).await;
+    let p_foreign = serve_at(ip_free, &foreign).await;
+    let p_svc = serve_at(ip_docker, &svc).await;
+
+    note("pin-kind-a", &json!({"ip_address": ip_node}));
+    note("pin-kind-self", &json!({"ip_address": ip_ctrl, "self_node": true}));
+    let client = pin_client(&ca, "kinds")
+        .resolve("noo-trellion", format!("{ip_docker}:{p_svc}").parse().unwrap())
+        .build()
+        .unwrap();
+    let get = |host: &str, port: u16| client.get(format!("https://{host}:{port}/health")).send();
+
+    // A node agent with its own leaf.
+    assert!(get(ip_node, p_right).await.is_ok(), "node_a's own leaf at node_a's address");
+    // A node agent with another node's leaf: refused, typed, kept for verify.
+    let err = get(ip_node, p_wrong).await.expect_err("node_b's leaf at node_a's address");
+    let m = identity_mismatch(&err).expect("a typed node_identity_mismatch");
+    assert_eq!(m.presented, vec!["pin-kind-b".to_string()]);
+    let kept = last_mismatch("pin-kind-a").expect("verify reads the refusal");
+    assert_eq!(kept["host"], json!(ip_node));
+    assert_eq!(kept["presented"], json!(["pin-kind-b"]));
+    assert!(last_mismatch("pin-kind-b").is_none(), "kept for the node the call was meant for");
+    // A service leaf at a node's address.
+    let r = get(ip_node, p_door).await;
+    assert!(r.is_ok(), "a service leaf on a node's address is not a node's: {:?}", r.err());
+    // The self node's agent, and the gateway's own leaf, on the controller's address.
+    let r = get(ip_ctrl, p_self).await;
+    assert!(r.is_ok(), "the self node's own leaf: {:?}", r.err());
+    let r = get(ip_ctrl, p_gw).await;
+    assert!(r.is_ok(), "the gateway's leaf is not a node leaf: {:?}", r.err());
+    // A host not in the book: webpki only.
+    let r = get(ip_free, p_stray).await;
+    assert!(r.is_ok(), "no owner, nothing to pin: {:?}", r.err());
+    let err = get(ip_free, p_foreign).await.expect_err("webpki still refuses another CA's leaf");
+    assert!(identity_mismatch(&err).is_none(), "that refusal is webpki's, not the pin's");
+    // A docker service name.
+    let r = get("noo-trellion", p_svc).await;
+    assert!(r.is_ok(), "a docker service name is never in the book: {:?}", r.err());
+
+    for n in ["pin-kind-a", "pin-kind-self"] {
+        forget(n);
+    }
+}
+
+#[test]
+fn a_link_refused_before_the_dial_is_kept_for_verify() {
+    note("pin-keep-b", &json!({"ip_address": "10.231.5.2"}));
+    assert!(may_dial("pin-keep-a", &format!("https://{}", at("10.231.5.2"))).is_err());
+    let kept = last_mismatch("PIN-KEEP-A").expect("kept, read case-blind");
+    assert_eq!(kept["expected"], json!(["pin-keep-a"]));
+    assert_eq!(kept["presented"], json!(["address owned by pin-keep-b"]));
+    assert!(kept["at"].as_i64().unwrap_or(0) > 0);
+    forget("pin-keep-b");
+}

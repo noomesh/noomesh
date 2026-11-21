@@ -482,6 +482,10 @@ cluster-CA chain and the dialled address (i1174):
   before. A mismatch fails the handshake: the call is refused, the error
   carries `node_identity_mismatch` (the dialled host, the expected node, the
   names the leaf presented), and the gateway logs `node_identity_mismatch`.
+  The gateway keeps the latest refusal per node for ten minutes;
+  `/api/cluster/nodes` carries it as `node_identity_mismatch`, and `noo
+  cluster verify <node>`'s `node identity` row FAILs with the address, the
+  name it answered with and the next command.
 - **Before the dial.** A link resolved for a node (`noo` verbs, inference,
   the class table, the per-node container and log lists) is not built towards
   an address the book gives to another node; the refusal is a `502` naming
@@ -522,6 +526,12 @@ normal roll, controller first and then nodes, never strands a node: an older
 agent ignores the header and is never made strict. `noo cluster verify
 <node>`'s `target-node check` row reads `strict`, or WARN `tolerant` with the
 reason: the agent is older than the controller, or it has not been told yet.
+The agent starts tolerant: its listener is up before its first desired-config
+read, and a header-less call in that window is what an older controller
+sends anyway; a call naming another node is refused from the first second.
+The agent reports its latest refusal for ten minutes as `wrong_node_refused`
+(`target`, `path`, `at`); the same row then FAILs naming the call and the
+node it was meant for.
 
 ## A heartbeat cannot claim another node's address
 
@@ -545,7 +555,8 @@ A refused address is never stored. The record keeps its last good address
 (dropped instead when that one, too, is another node's) and carries
 `ip_address_refused` with the reason; the gateway logs `ip_address_refused`
 and raises the `node.ip_address_refused` operator alert, which points at
-`noo cluster verify <node>`.
+`noo cluster verify <node>`. Its `agent address` row FAILs with the reason
+and the next command for it.
 
 ---
 

@@ -496,7 +496,10 @@ pub(crate) fn node_checks(n: &Value, controller_tag: &str, cli_version: &str, no
 
     // 4c. The agent refuses calls addressed to another node (i1174), and
     //     whether the controller has made it strict yet.
-    out.push(target_node_check(id, n));
+    out.push(target_node_check(id, n, now_unix));
+    //     And the controller's own pin: the latest call for this node it
+    //     refused because the address answered as another node.
+    out.extend(node_identity_check(id, n, now_unix));
 
     // 5. The fleet signing key adopted. The CA-signed bundle lane is retired
     //    So a node that has not adopted takes nothing but a
@@ -705,6 +708,9 @@ fn no_space_remedy(id: &str, target: &str) -> String {
 /// instead: a FAIL naming the node and the reason. No row when nothing was
 /// refused.
 pub(crate) fn agent_address_check(id: &str, n: &Value) -> Option<Check> {
+    if let Some(why) = n["ip_address_refused"].as_str().filter(|s| !s.is_empty()) {
+        return Some(ip_address_refused_check(id, n, why));
+    }
     let why = n["agent_url_refused"].as_str().filter(|s| !s.is_empty())?;
     let ip = n["ip_address"].as_str().unwrap_or("its registered address");
     Some(fail(
@@ -712,6 +718,29 @@ pub(crate) fn agent_address_check(id: &str, n: &Value) -> Option<Check> {
         format!("{id}: the gateway refused the agent_url this node reported ({why}); it dials https://{ip}:8081 instead"),
         format!("on {id}, set the agent's address (NODE_IP in /etc/noo-node-agent.env) to the address it is registered at, so it reports https://<that address>:<its port>"),
     ))
+}
+
+/// The `agent address` row for an address the gateway did not store
+/// (`ip_address_refused`, i1174): another node holds it, it is the
+/// controller's own, or the heartbeat came from a different tailnet
+/// address. The record keeps its last accepted address (or none). The next
+/// command follows the reason.
+fn ip_address_refused_check(id: &str, n: &Value, why: &str) -> Check {
+    let dials = match n["ip_address"].as_str().filter(|s| !s.is_empty()) {
+        Some(ip) => format!("the controller keeps dialling it at {ip}"),
+        None => "the controller reaches it over its bus or tunnel only".to_string(),
+    };
+    let next = if let Some((_, other)) = why.split_once(" is claimed by ") {
+        let other = other.trim();
+        format!("noo cluster verify {other}   # {other} holds that address; if {id} really moved there, its certificate must carry it: noo security pki push-nodes {id} --prove")
+    } else if why.ends_with("is the controller's own address") {
+        format!("on {id}, set NODE_IP in /etc/noo-node-agent.env to {id}'s own address")
+    } else if let Some((peer, _)) = why.strip_prefix("the heartbeat came from tailnet address ").and_then(|r| r.split_once(", not ")) {
+        format!("on {id}, set NODE_IP in /etc/noo-node-agent.env to {peer}, the tailnet address it calls from")
+    } else {
+        format!("noo cluster logs {id}")
+    };
+    fail("agent address", format!("{id}: the controller did not store the address it reported ({why}); {dials}"), next)
 }
 
 /// The `backend caps` row (#1283): the capability set a node's backend
@@ -3417,8 +3446,27 @@ pub(crate) fn agent_metrics_check(nodes: &[(String, String)], up: Option<&Value>
 /// of the two reasons holds. Read from the node record (the heartbeat's
 /// `checks_target_node` and `requires_target_node`, false when the agent
 /// does not say).
-pub(crate) fn target_node_check(id: &str, n: &Value) -> Check {
+pub(crate) fn target_node_check(id: &str, n: &Value, now_unix: i64) -> Check {
     const NAME: &str = "target-node check";
+    // The agent refused a call addressed elsewhere in the last ten minutes
+    // (`wrong_node_refused`, 421 wrong_node): a FAIL naming the call.
+    if let Some(w) = n.get("wrong_node_refused").filter(|v| v.is_object()) {
+        let target = w["target"].as_str().map(str::trim).unwrap_or("");
+        let path = w["path"].as_str().unwrap_or("?");
+        let age = w["at"].as_i64().map(|t| format!(", {}s ago", (now_unix - t).max(0))).unwrap_or_default();
+        if target.is_empty() {
+            return fail(
+                NAME,
+                format!("{id}'s agent refused a controller call that named no node ({path}, 421 wrong_node{age}): it is strict and the call did not carry X-Noo-Node"),
+                format!("noo cluster logs {id}   # the agent's wrong_node line names the call"),
+            );
+        }
+        return fail(
+            NAME,
+            format!("{id}'s agent refused a call addressed to {target} ({path}, 421 wrong_node{age}): the controller dialled {id}'s address for {target}"),
+            format!("noo cluster verify {target}   # its node identity and agent address rows say where the controller dials {target}"),
+        );
+    }
     let checks = n["checks_target_node"].as_bool() == Some(true);
     let requires = n["requires_target_node"].as_bool() == Some(true);
     if checks && requires {
@@ -3436,6 +3484,36 @@ pub(crate) fn target_node_check(id: &str, n: &Value) -> Check {
         format!("tolerant: the agent is older than the controller (upgrade it: `noo cluster provision {id}`)"),
         Some(format!("noo cluster provision {id}")),
     )
+}
+
+/// The `node identity` row (i1174): the controller refused a call meant for
+/// this node in the last ten minutes because the address answered as
+/// another node (`node_identity_mismatch` on `/api/cluster/nodes`, the
+/// gateway's 502), or because its address book gives the dialled address to
+/// another node. FAIL with the fact and the next command; no row otherwise.
+pub(crate) fn node_identity_check(id: &str, n: &Value, now_unix: i64) -> Option<Check> {
+    const NAME: &str = "node identity";
+    let m = n.get("node_identity_mismatch").filter(|v| v.is_object())?;
+    let host = m["host"].as_str().unwrap_or("?");
+    let presented: Vec<&str> = m["presented"].as_array().map(|a| a.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
+    let age = m["at"].as_i64().map(|t| format!(", {}s ago", (now_unix - t).max(0))).unwrap_or_default();
+    let owner = presented.iter().find_map(|p| p.strip_prefix("address owned by "));
+    let detail = match owner {
+        Some(other) => format!(
+            "{host} was not dialled for {id} (502 node_identity_mismatch{age}): the controller's address book gives {host} to {other}, and {id}'s record still names it"
+        ),
+        None => format!(
+            "{host} answered with {}'s certificate when dialled for {id} (502 node_identity_mismatch{age}): the controller's address book gives {host} to {id}",
+            if presented.is_empty() { "another".to_string() } else { presented.join(", ") }
+        ),
+    };
+    // `--prove` is the proof form of push-nodes (#1457): it mints an address
+    // only once the node there shows it holds the node's current key.
+    Some(fail(
+        NAME,
+        detail,
+        format!("noo cluster verify {id} --json   # the agent address and agent certificate rows show the address {id} reports; if {id} really moved to {host}: noo security pki push-nodes {id} --prove"),
+    ))
 }
 
 /// The `agent certificate` row: the node's leaf (the controller's copy under
@@ -18281,14 +18359,14 @@ mod target_node_row_tests {
 
     #[test]
     fn the_target_node_row_tells_strict_from_the_two_tolerant_states() {
-        let strict = target_node_check("node-b", &serde_json::json!({"checks_target_node": true, "requires_target_node": true}));
+        let strict = target_node_check("node-b", &serde_json::json!({"checks_target_node": true, "requires_target_node": true}), 0);
         assert_eq!((strict.name, strict.verdict), ("target-node check", Verdict::Ok));
         assert!(strict.detail.starts_with("strict"), "{}", strict.detail);
-        let untold = target_node_check("node-b", &serde_json::json!({"checks_target_node": true, "requires_target_node": false}));
+        let untold = target_node_check("node-b", &serde_json::json!({"checks_target_node": true, "requires_target_node": false}), 0);
         assert_eq!(untold.verdict, Verdict::Warn);
         assert!(untold.detail.starts_with("tolerant: not yet told"), "{}", untold.detail);
         for old in [serde_json::json!({"checks_target_node": false, "requires_target_node": false}), serde_json::json!({})] {
-            let row = target_node_check("node-b", &old);
+            let row = target_node_check("node-b", &old, 0);
             assert_eq!(row.verdict, Verdict::Warn);
             assert!(row.detail.starts_with("tolerant: the agent is older than the controller"), "{}", row.detail);
             assert_eq!(row.remedy.as_deref(), Some("noo cluster provision node-b"));
@@ -18300,7 +18378,75 @@ mod target_node_row_tests {
         let src = include_str!("cluster_verify.rs");
         let f = &src[src.find("pub(crate) fn node_checks(").expect("fn")..];
         let f = &f[..f.find("\n}\n").expect("end")];
-        assert!(f.contains("out.push(target_node_check(id, n));"));
+        assert!(f.contains("out.push(target_node_check(id, n, now_unix));"));
+        assert!(f.contains("out.extend(node_identity_check(id, n, now_unix));"));
+    }
+
+    /// An agent's 421 wrong_node (the heartbeat's `wrong_node_refused`) is
+    /// one FAIL naming the call and the next command.
+    #[test]
+    fn a_wrong_node_refusal_fails_the_target_node_row() {
+        let n = serde_json::json!({"checks_target_node": true, "requires_target_node": true,
+            "wrong_node_refused": {"target": "node-c", "path": "/start", "at": 940}});
+        let row = target_node_check("node-b", &n, 1000);
+        assert_eq!(row.verdict, Verdict::Fail);
+        assert_eq!(
+            row.detail,
+            "node-b's agent refused a call addressed to node-c (/start, 421 wrong_node, 60s ago): the controller dialled node-b's address for node-c"
+        );
+        assert!(row.remedy.as_deref().unwrap().starts_with("noo cluster verify node-c"), "{:?}", row.remedy);
+        let headerless = serde_json::json!({"checks_target_node": true, "requires_target_node": true,
+            "wrong_node_refused": {"target": "", "path": "/start", "at": 940}});
+        let row = target_node_check("node-b", &headerless, 1000);
+        assert_eq!(row.verdict, Verdict::Fail);
+        assert!(row.detail.contains("a controller call that named no node"), "{}", row.detail);
+        assert!(row.remedy.as_deref().unwrap().starts_with("noo cluster logs node-b"), "{:?}", row.remedy);
+    }
+
+    /// The gateway's 502 node_identity_mismatch (`/api/cluster/nodes`'
+    /// `node_identity_mismatch`) is one FAIL with the fact and the next
+    /// command; no row without it.
+    #[test]
+    fn an_identity_refusal_fails_the_node_identity_row() {
+        assert!(node_identity_check("node-b", &serde_json::json!({}), 1000).is_none());
+        let n = serde_json::json!({"node_identity_mismatch": {"host": "192.0.2.41", "expected": ["node-b"], "presented": ["node-c"], "at": 990}});
+        let row = node_identity_check("node-b", &n, 1000).expect("a row");
+        assert_eq!((row.name, row.verdict), ("node identity", Verdict::Fail));
+        assert_eq!(
+            row.detail,
+            "192.0.2.41 answered with node-c's certificate when dialled for node-b (502 node_identity_mismatch, 10s ago): the controller's address book gives 192.0.2.41 to node-b"
+        );
+        let remedy = row.remedy.as_deref().unwrap();
+        assert!(remedy.starts_with("noo cluster verify node-b --json"), "{remedy}");
+        assert!(remedy.contains("noo security pki push-nodes node-b --prove"), "{remedy}");
+        assert!(!remedy.contains("provision"), "{remedy}");
+        let held = serde_json::json!({"node_identity_mismatch": {"host": "192.0.2.41:8081", "expected": ["node-b"], "presented": ["address owned by node-c"], "at": 990}});
+        let row = node_identity_check("node-b", &held, 1000).expect("a row");
+        assert!(row.detail.contains("gives 192.0.2.41:8081 to node-c, and node-b's record still names it"), "{}", row.detail);
+    }
+
+    /// `ip_address_refused` is one FAIL on the `agent address` row, with
+    /// the next command for its reason.
+    #[test]
+    fn a_refused_address_fails_the_agent_address_row() {
+        let row = |why: &str| {
+            agent_address_check("node-b", &serde_json::json!({"ip_address": "192.0.2.41", "ip_address_refused": why})).expect("a row")
+        };
+        let claimed = row("192.0.2.42 is claimed by node-c");
+        assert_eq!((claimed.name, claimed.verdict), ("agent address", Verdict::Fail));
+        assert_eq!(
+            claimed.detail,
+            "node-b: the controller did not store the address it reported (192.0.2.42 is claimed by node-c); the controller keeps dialling it at 192.0.2.41"
+        );
+        assert!(claimed.remedy.as_deref().unwrap().starts_with("noo cluster verify node-c"), "{:?}", claimed.remedy);
+        let own = row("192.0.2.1 is the controller's own address");
+        assert!(own.remedy.as_deref().unwrap().starts_with("on node-b, set NODE_IP"), "{:?}", own.remedy);
+        let peer = row("the heartbeat came from tailnet address 100.64.0.9, not 100.64.0.8");
+        assert!(peer.remedy.as_deref().unwrap().contains("to 100.64.0.9, the tailnet address it calls from"), "{:?}", peer.remedy);
+        for r in [&claimed, &own, &peer] {
+            assert!(!r.remedy.as_deref().unwrap().contains("provision"), "{:?}", r.remedy);
+        }
+        assert!(agent_address_check("node-b", &serde_json::json!({"ip_address": "192.0.2.41"})).is_none());
     }
 }
 
