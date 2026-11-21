@@ -23,6 +23,8 @@ noo cluster verify <node>
 
 The node is ready when `verify` shows no FAIL. Each row that fails names the command that fixes it.
 
+The tailnet is the default path: every machine keeps a name that does not change. Without a tailnet (the advanced path), nodes reach the controller by its local network address and keep it. If your router later gives the controller a new address, after a power cut say, every node loses it and must be enrolled again. Reserve the controller's address in your router (a DHCP reservation) first. `noo cluster verify` shows this as the `controller address` row, and the join command warns when it applies.
+
 ## For agents
 
 - **Mint** on the controller: `noo cluster bootstrap-token create --node <node>`.
@@ -58,6 +60,12 @@ The node is ready when `verify` shows no FAIL. Each row that fails names the com
   - Any `"verdict": "fail"` row is a blocker; its `remedy` is the command to run.
   - For a new node, the rows that matter first are `agent address`,
     `agent certificate` and `harness egress`.
+- **Without a tailnet** (the advanced path; the tailnet is the default), nodes
+  keep the controller URL they enrolled with and are never told a new one.
+  The `controller address` row WARNs on a local IP and FAILs once this machine
+  no longer holds it: every node enrolled with it is stranded, and nothing
+  from the controller reaches them. Report it with the row's remedy; never
+  edit a node's `/etc/noo/controller-url` yourself.
 - **Without a tailnet,** behind a proxy or Docker Desktop, the node's
   certificate can miss the address the controller dials (`agent certificate`
   FAIL). Fix it with `noo security pki push-nodes <node>` when the row offers
