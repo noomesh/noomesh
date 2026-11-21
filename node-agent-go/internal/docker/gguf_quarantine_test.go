@@ -87,11 +87,11 @@ func TestTheStartPathReturnsTheGGUFRefusal(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := "if _, err := c.preseedGGUF(ctx, backend, model); err != nil {\n\t\treturn err\n\t}"
+	want := "if err := c.ggufStartGate(ctx, backend, model, overrides.ModelsDir); err != nil {\n\t\treturn err\n\t}"
 	if !strings.Contains(string(raw), want) {
 		t.Fatalf("backends.go must return preseedGGUF's refusal from the start path:\n%s", want)
 	}
-	if strings.Count(string(raw), "c.preseedGGUF(") != 1 {
+	if strings.Count(string(raw), "c.preseedGGUF(") != 1 /* ggufStartGate */ {
 		t.Fatalf("preseedGGUF must have exactly one caller, the start path")
 	}
 }

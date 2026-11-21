@@ -78,6 +78,36 @@ func (r *Reconciler) ggufPresent(ctx context.Context, t *tick, p placement) bool
 	return false
 }
 
+// ggufFileOnNode is the converged-path check for a placed .gguf: true when the
+// file is in the effective models dir (the standing refusal for it is dropped)
+// or the check cannot run; false when it is gone. Unlike ggufPresent it does
+// not forgive a first placement: a RUNNING backend with no file is crash-looping
+// under its restart policy, whatever the start would fetch. It records nothing
+// and stops nothing; the start path the caller falls into does the refusing.
+func (r *Reconciler) ggufFileOnNode(ctx context.Context, t *tick, p placement) bool {
+	if !strings.HasSuffix(p.Model, ".gguf") {
+		return true
+	}
+	exists := r.ggufExists
+	if exists == nil {
+		if r.docker == nil {
+			return true
+		}
+		exists = r.docker.HostFileExists
+	}
+	ok, err := exists(ctx, effectiveModelsDir(t), p.Model)
+	if err != nil {
+		slog.Warn("reconcile.model_check_failed", "error", err)
+		return true
+	}
+	if !ok {
+		slog.Warn("reconcile.running_gguf_file_missing",
+			"backend", p.Backend, "model", p.Model, "models_dir", effectiveModelsDir(t),
+			"detail", "the backend is running but its model file is gone; not converged, re-fetching or refusing")
+	}
+	return ok
+}
+
 // newestQuarantined returns the path of the newest `<model>.quarantined-<UTC
 // stamp>` in dir (docker.ggufFetchOutcome's name; the stamp sorts by time),
 // or "" when there is none or dir cannot be read.
