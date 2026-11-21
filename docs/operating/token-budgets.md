@@ -88,12 +88,15 @@ API reference: [Tasks](../reference/api.md#tasks-routestasksrs) and the
   loop.
 - **More tokens are never yours to grant.** Raising a task's budget
   (`noo tasks resubmit <id> --token-budget <n>`) is its owner's choice, and
-  a person's allowance (`noo security user allowance`) is an operator's.
+  a person's allowance (`noo security user allowance`) is an admin's.
   Report the spend and stop.
 - **If you cannot go on without the person, ask once:** the `noo_task_ask`
   tool (a CLI harness ends its answer with `NOO_QUESTION: <question>`). The
   task then waits (`budget_state: awaiting_clarification`); the person's
   answer starts a new loop that carries the question and the answer.
-- **Reading state:** `noo --json tasks show <id>` (`tokens`, `allowance`,
-  `budget_state`) and `noo --json usage me` (node, cloud and per-harness
-  columns, never merged). A parked task is `checkpointed`, not `failed`.
+- **Reading state:** `noo --json tasks show <id>` gives `.task.budget_state`
+  (always present: `null` unless parked, else `exhausted` or
+  `awaiting_clarification`), `.task.tokens_spent` / `.task.token_budget`, and
+  the owner's `.allowance` (`spent`, `limit`, `period`, `remaining`).
+  `noo --json usage me` gives node, cloud and per-harness rows, never
+  summed. A parked task is `checkpointed`, not `failed`.
