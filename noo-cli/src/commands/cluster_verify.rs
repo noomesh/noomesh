@@ -4186,6 +4186,115 @@ pub(crate) fn externally_reachable_leaf_names(
     out
 }
 
+/// The "controller address" row (i1173): whether the address remote nodes
+/// were handed for this controller survives its LAN address changing.
+/// Nodes keep that URL (`/etc/noo/controller-url`, the agent env) and are
+/// never told a new one, so a controller that moves strands them, and the
+/// fix cannot reach them from here.
+///
+/// `advertised` is the URL enrollment hands out (`NOO_GATEWAY_URL`, else
+/// `services.gateway_url`); `dns` is `NOO_CONTROLLER_DNS`; `local` is this
+/// machine's addresses (`None`: unknown). `None` when nothing remote can
+/// enroll (no URL, or a loopback one the mint refuses). Pure.
+pub(crate) fn controller_address_check(advertised: Option<&str>, dns: Option<&str>, local: Option<&[String]>) -> Option<Check> {
+    const NAME: &str = "controller address";
+    if let Some(n) = dns.map(str::trim).filter(|n| !n.is_empty()) {
+        return Some(ok(NAME, format!("nodes reach this controller by the name {n}, which does not change with its address")));
+    }
+    let url = advertised.map(str::trim).filter(|u| !u.is_empty())?;
+    let host = url_host(url);
+    if host.is_empty() || host.eq_ignore_ascii_case("localhost") || host.eq_ignore_ascii_case("gateway") {
+        return None;
+    }
+    let Ok(ip) = host.parse::<std::net::IpAddr>() else {
+        return Some(ok(NAME, format!("nodes reach this controller by the name {host}, which does not change with its address")));
+    };
+    if ip.is_loopback() || ip.is_unspecified() {
+        return None;
+    }
+    if let std::net::IpAddr::V4(v4) = ip {
+        let o = v4.octets();
+        if o[0] == 100 && (64..128).contains(&o[1]) {
+            return Some(ok(NAME, format!("nodes reach this controller at its tailnet address {ip}, which a local network change does not move")));
+        }
+    }
+    const KEEP: &str = "put the controller on a tailnet, the default path (`noo onboard --reconfigure`), which gives it \
+        a name that does not move; or reserve this address for it in your router (often called a DHCP reservation)";
+    let holds = local.map(|l| l.iter().any(|a| a.trim().parse::<std::net::IpAddr>().is_ok_and(|x| x == ip)));
+    match holds {
+        Some(false) => Some(fail(
+            NAME,
+            format!(
+                "nodes were told to reach this controller at {ip}, which is no longer this machine's address (it now has {}): \
+                 every node set up with it has lost the controller, and nothing sent from here can reach them",
+                local.unwrap_or(&[]).join(", ")
+            ),
+            format!(
+                "give this machine {ip} back (reserve it in your router, then restart the machine), or set \
+                 services.gateway_url to its new address and enroll each node again (docs/getting-started/add-a-node.md)"
+            ),
+        )),
+        _ => Some(warn(
+            NAME,
+            format!(
+                "nodes reach this controller at {ip}, a local network address: if the router hands this machine a new one \
+                 (after a power cut, say), every node loses the controller and cannot be fixed from here"
+            ),
+            Some(KEEP.to_string()),
+        )),
+    }
+}
+
+/// The host of a URL or a bare `host[:port]`, brackets off an IPv6 literal.
+fn url_host(url: &str) -> String {
+    let rest = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
+    let hp = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    let hp = hp.rsplit_once('@').map(|(_, h)| h).unwrap_or(hp);
+    if let Some(v6) = hp.strip_prefix('[') {
+        return v6.split(']').next().unwrap_or("").to_string();
+    }
+    match hp.matches(':').count() {
+        1 => hp.split(':').next().unwrap_or("").to_string(),
+        _ => hp.to_string(),
+    }
+}
+
+/// This machine's addresses (`hostname -I`), or `None` when they cannot be
+/// read (macOS, a container without the tool).
+pub(crate) fn local_addresses() -> Option<Vec<String>> {
+    let out = std::process::Command::new("hostname").arg("-I").output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let v: Vec<String> = String::from_utf8_lossy(&out.stdout).split_whitespace().map(str::to_string).collect();
+    (!v.is_empty()).then_some(v)
+}
+
+/// The URL enrollment hands remote nodes, and `NOO_CONTROLLER_DNS`, as this
+/// controller declares them (process env, the repo `.env`, noomesh.yaml).
+pub(crate) fn advertised_controller() -> (Option<String>, Option<String>) {
+    crate::envfile::ensure_repo_env();
+    let root = crate::envfile::repo_root();
+    let read = |k: &str| {
+        std::env::var(k).ok().filter(|v| !v.trim().is_empty())
+            .or_else(|| Some(crate::onboard::env::read_env_key(&root.join(".env"), k)).filter(|v| !v.trim().is_empty()))
+    };
+    let url = read("NOO_GATEWAY_URL").or_else(|| {
+        std::fs::read_to_string(root.join("noomesh.yaml"))
+            .ok()
+            .and_then(|t| serde_yaml::from_str::<serde_yaml::Value>(&t).ok())
+            .and_then(|d| d.get("services")?.get("gateway_url")?.as_str().map(str::to_string))
+    });
+    (url, read("NOO_CONTROLLER_DNS"))
+}
+
+/// The row as judged on this machine.
+pub(crate) fn controller_address_row_here() -> Option<Check> {
+    let (url, dns) = advertised_controller();
+    let local = local_addresses();
+    controller_address_check(url.as_deref(), dns.as_deref(), local.as_deref())
+}
+
 /// The "service cert names" row. A leaf that serves remote
 /// nodes (`nats`, `redis`, `postgres`, `model-cache`) must carry the names
 /// they dial: the tailnet name when the box has one, `noo-controller`, the
@@ -9067,6 +9176,9 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                 &crate::commands::provision::cli_asset_cache_dir(&root), &fleet, &toks) {
                 checks.push(c);
             }
+        }
+        if let Some(c) = controller_address_row_here() {
+            checks.push(c);
         }
         let (id_host, id_ip, id_ts) = crate::onboard::steps::local_cert_identity();
         checks.push(service_cert_names_check(&externally_reachable_leaf_names(
@@ -18401,5 +18513,71 @@ mod default_chat_fleet_shape_tests {
         assert_eq!(brief_split(std::slice::from_ref(&c)).passed, 1);
         assert_eq!(fleet_node_count(&[]), None);
         assert_eq!(fleet_node_count(&[json!({"id": "ctrl"})]), Some(1));
+    }
+}
+
+#[cfg(test)]
+mod controller_address_tests {
+    use super::*;
+
+    fn s(v: &[&str]) -> Vec<String> {
+        v.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn a_name_or_a_tailnet_address_survives_a_move() {
+        let c = controller_address_check(Some("https://ctrl.example.ts.net:8080"), None, None).unwrap();
+        assert_eq!(c.verdict, Verdict::Ok, "{}", c.detail);
+        let c = controller_address_check(Some("https://100.64.0.1:8080"), None, Some(&s(&["192.0.2.5"]))).unwrap();
+        assert_eq!(c.verdict, Verdict::Ok, "{}", c.detail);
+        assert!(c.detail.contains("tailnet address"), "{}", c.detail);
+        let c = controller_address_check(Some("https://192.0.2.5:8080"), Some("noo.example.lan"), Some(&s(&["192.0.2.9"]))).unwrap();
+        assert_eq!(c.verdict, Verdict::Ok, "NOO_CONTROLLER_DNS wins: {}", c.detail);
+    }
+
+    /// i1173: a LAN IP this machine holds works today and strands every
+    /// node the day the router hands out another one: said, with the fix.
+    #[test]
+    fn a_local_ip_it_holds_warns_with_the_tailnet_first() {
+        let c = controller_address_check(Some("https://192.0.2.5:8080"), None, Some(&s(&["192.0.2.5", "100.64.0.3"]))).unwrap();
+        assert_eq!(c.verdict, Verdict::Warn, "{}", c.detail);
+        assert!(c.detail.contains("cannot be fixed from here"), "{}", c.detail);
+        let r = c.remedy.unwrap();
+        assert!(r.starts_with("put the controller on a tailnet, the default path"), "{r}");
+        assert!(r.contains("DHCP reservation"), "{r}");
+        let unknown = controller_address_check(Some("https://192.0.2.5:8080"), None, None).unwrap();
+        assert_eq!(unknown.verdict, Verdict::Warn, "unknown local addresses never FAIL");
+    }
+
+    /// The controller moved: the address nodes hold is no longer its own.
+    #[test]
+    fn a_local_ip_it_no_longer_holds_fails_naming_both() {
+        let c = controller_address_check(Some("https://192.0.2.5:8080/"), None, Some(&s(&["192.0.2.77"]))).unwrap();
+        assert_eq!(c.verdict, Verdict::Fail, "{}", c.detail);
+        assert!(c.detail.contains("192.0.2.5") && c.detail.contains("192.0.2.77"), "{}", c.detail);
+        assert!(c.remedy.unwrap().contains("enroll each node again"));
+    }
+
+    #[test]
+    fn nothing_to_judge_without_a_remote_url() {
+        for u in [None, Some(""), Some("https://localhost:8080"), Some("https://127.0.0.1:8080"), Some("https://gateway:8080")] {
+            assert!(controller_address_check(u, None, Some(&s(&["192.0.2.5"]))).is_none(), "{u:?}");
+        }
+    }
+
+    #[test]
+    fn hosts_parse_from_urls_and_bare_forms() {
+        assert_eq!(url_host("https://192.0.2.5:8080/x"), "192.0.2.5");
+        assert_eq!(url_host("192.0.2.5"), "192.0.2.5");
+        assert_eq!(url_host("https://[fd00::5]:8080"), "fd00::5");
+        assert_eq!(url_host("https://u@ctrl.lan:8080"), "ctrl.lan");
+    }
+
+    #[test]
+    fn verify_runs_the_row_beside_the_service_cert_names() {
+        let src = include_str!("cluster_verify.rs");
+        let row = src.find("if let Some(c) = controller_address_row_here() {").expect("called");
+        let svc = src.find("checks.push(service_cert_names_check(").expect("anchor");
+        assert!(row < svc);
     }
 }

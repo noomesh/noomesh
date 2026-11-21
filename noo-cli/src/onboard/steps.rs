@@ -148,6 +148,14 @@ pub(crate) const TAILSCALE_NO: &str =
 pub(crate) const LAN_ONLY_CHOSEN: &str =
     "LAN-only install, as chosen. To add Tailscale later: install it, run `tailscale up`, then `noo onboard --reconfigure`.";
 
+/// i1173 (operator 2026-11-21: the tailnet is the default, LAN-only the
+/// advanced path): said with every LAN-only outcome, because nodes keep
+/// this machine's address and are never told a new one.
+pub(crate) const LAN_ONLY_STABLE_ADDRESS: &str =
+    "Without a tailnet, other machines reach this one by its local address and keep it. If your router gives \
+     this machine a new address (after a power cut, say), they lose it and each must be enrolled again. \
+     Reserve its address in your router (a DHCP reservation), or use the tailnet, the default path.";
+
 pub(crate) const NON_INTERACTIVE_LAN_ONLY: &str =
     "No Tailscale here: continuing as a LAN-only install. --skip-tailscale says so explicitly; \
      to join a tailnet instead, install Tailscale and run `tailscale up` before onboarding.";
@@ -1697,6 +1705,7 @@ pub fn tailscale(ctx: &mut Ctx) -> bool {
             // The answer was n: a decision, not a failure.
             ctx.state.tailscale_declined = true;
             ctx.info(LAN_ONLY_CHOSEN);
+            ctx.info(LAN_ONLY_STABLE_ADDRESS);
             return true;
         }
         Err(_) if ctx.non_interactive => {
@@ -1704,6 +1713,7 @@ pub fn tailscale(ctx: &mut Ctx) -> bool {
             // expected case, said once as what happens and which flag says it
             // (general 11-14: nothing that runs --ci today breaks).
             ctx.info(NON_INTERACTIVE_LAN_ONLY);
+            ctx.info(LAN_ONLY_STABLE_ADDRESS);
             return true;
         }
         Err(why) => {
@@ -1722,6 +1732,7 @@ pub fn tailscale(ctx: &mut Ctx) -> bool {
                 ctx.info("Setup aborted — join the tailnet and re-run 'noo onboard'.");
                 return false;
             }
+            ctx.info(LAN_ONLY_STABLE_ADDRESS);
             return true;
         }
     };
@@ -11333,6 +11344,9 @@ mod required_tools_tests {
         assert!(TAILSCALE_NO.starts_with("this machine only") && !TAILSCALE_NO.contains("here and on your local network"));
         assert!(TAILSCALE_NO.contains("the next question can open it to your local network"));
         assert!(LAN_ONLY_CHOSEN.contains("noo onboard --reconfigure"));
+        // i1173: every LAN-only outcome says the address must not move.
+        assert_eq!(own.matches("ctx.info(LAN_ONLY_STABLE_ADDRESS);").count(), 3, "the chosen, --ci and continued (either way) arms");
+        assert!(LAN_ONLY_STABLE_ADDRESS.contains("DHCP reservation") && LAN_ONLY_STABLE_ADDRESS.contains("the default path"));
     }
 
     #[test]

@@ -1541,6 +1541,17 @@ pub(crate) const ROWS: &[Row] = &[
         doc: None,
     },
     Row {
+        id: "controller_address",
+        name: "controller address",
+        scope: Scope::Controller,
+        verdicts: &[Verdict::Ok, Verdict::Warn, Verdict::Fail],
+        meaning: "Whether the address remote nodes were given for this controller survives its local network address changing. Nodes keep that address and are never told a new one: a name or a tailnet address is OK; a local IP this machine holds warns; a local IP it no longer holds fails, because every node set up with it has lost the controller.",
+        clears: "Reserve the address for the controller in your router, or put the controller on a tailnet (`noo onboard --reconfigure`). After it has moved: give it the old address back, or set `services.gateway_url` to the new one and enroll each node again.",
+        findings: &[],
+        shown_as: None,
+        doc: None,
+    },
+    Row {
         id: "service_cert_names",
         name: "service cert names",
         scope: Scope::Controller,
