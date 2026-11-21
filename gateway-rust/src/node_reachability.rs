@@ -131,14 +131,17 @@ fn reason(e: &reqwest::Error) -> String {
 const NAME_MISMATCH: &str = "TLS: its certificate does not name the address the gateway dials";
 
 /// What the operator alert says and what it tells them to run, by the probe
-/// reason. Never `noo cluster provision`: provision re-issues for the
-/// ENROLLMENT address, which a node that moved no longer has (i1173).
+/// reason. The class keeps the observed fact; the next step is always
+/// `noo cluster verify <node>`, whose `agent certificate` row owns the
+/// remedy (one place, so i1174's change to what push-nodes mints touches
+/// only that row). Never `noo cluster provision`: provision re-issues for
+/// the ENROLLMENT address, which a node that moved no longer has (i1173).
 fn alert_advice(node: &str, why: &str) -> (&'static str, String) {
     if why == NAME_MISMATCH {
         (
-            "its certificate does not name the address the gateway dials it at, so its address \
+            "its certificate does not cover the address it now reports: its address \
              has likely changed (DHCP after a restart, a new network)",
-            format!("noo security pki push-nodes {node}"),
+            format!("noo cluster verify {node}"),
         )
     } else if why.to_ascii_lowercase().contains("cert") {
         (
@@ -340,14 +343,14 @@ pub fn spawn(state: Arc<AppState>) {
 mod tests {
     use super::*;
 
-    /// i1173: a moved node (its leaf names another address) is told to
-    /// push-nodes; any other certificate failure to verify first; and no
-    /// advice is ever provision, which re-issues for the old address.
+    /// i1173: a moved node (its leaf names another address) is SAID to have
+    /// moved; every case's next step is verify, whose `agent certificate`
+    /// row owns the remedy; no advice is provision (the old address).
     #[test]
-    fn the_alert_tells_a_moved_node_to_push_nodes_and_never_to_provision() {
+    fn the_alert_names_a_move_points_at_verify_and_never_at_provision() {
         let (class, next) = alert_advice("node-b", NAME_MISMATCH);
-        assert_eq!(next, "noo security pki push-nodes node-b");
-        assert!(class.contains("address has likely changed"), "{class}");
+        assert_eq!(next, "noo cluster verify node-b");
+        assert!(class.contains("does not cover the address it now reports: its address has likely changed"), "{class}");
         let (class, next) = alert_advice("node-b", "TLS handshake rejected (certificate may not name this address)");
         assert_eq!(next, "noo cluster verify node-b");
         assert!(class.contains("check before issuing anything"), "{class}");
@@ -356,6 +359,7 @@ mod tests {
         let src = include_str!("node_reachability.rs");
         let code = &src[..src.find("#[cfg(test)]").expect("tests")];
         assert!(!code.contains("noo cluster provision"), "no advice here is provision");
+        assert!(!code.contains("push-nodes {node}"), "the remedy is verify's row, not this alert's");
         assert!(code.contains("let (class, next) = alert_advice(&node, why);"), "the alert takes its advice from alert_advice");
     }
 
