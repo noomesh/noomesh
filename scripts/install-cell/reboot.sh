@@ -203,6 +203,10 @@ gs declare-tiny-model 60 "envf=\"\$(find \"\$HOME\" -maxdepth 4 -name .noo-stand
 gs onboard-model 1800 'noo onboard --ci --only model' || finish
 gs health 600 'for i in $(seq 1 40); do noo health >/dev/null 2>&1 && break; sleep 15; done; noo health' || finish
 gs switch-to-tiny-model 300 "noo models switch '$TINY_MODEL' --backend ollama --yes" || finish
+# The switch restarts the gateway and returns before it answers again (the
+# shake-out's chat 0.3 s later read "not reachable"); run.sh has other probes
+# in between. Wait for health as run.sh's health step does.
+gs health-after-switch 600 'for i in $(seq 1 40); do noo health >/dev/null 2>&1 && break; sleep 15; done; noo health' || finish
 CHAT_MSG="Reply with the single word ok."
 export CHAT_MSG
 gs chat-before 900 "noo chat --message '$CHAT_MSG'" || finish
