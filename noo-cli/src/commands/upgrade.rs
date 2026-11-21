@@ -905,6 +905,14 @@ fn version_less_than(a: &str, b: &str) -> bool {
     }
 }
 
+/// The stack is up and healthy: have the gateway that is serving now hash
+/// every tar this roll staged, waiting for it (a 20 minute budget; never
+/// fails the roll). The in-process hash of the gateway the roll replaced is
+/// gone, and a node's pinned start refuses on "still hashing" (i1167a).
+fn warm_release_digests(g: &Globals) {
+    crate::commands::image_stage::warm_release_tars(g, &crate::commands::provision::release_var("NOO_IMAGE_TAG"));
+}
+
 /// Run the requested fleet stages from a binary whose paired tag/assets are
 /// current (either freshly re-exec'd, or already-current with no swap).
 fn run_fleet_stages(g: &Globals, stack: bool, nodes: bool, seats: bool, tag_override: Option<&str>, force: bool, skip_gw_key_check: bool, allow_downgrade: bool)
@@ -975,6 +983,9 @@ fn run_fleet_stages(g: &Globals, stack: bool, nodes: bool, seats: bool, tag_over
             } else if !post_roll_restart_loops_clear(g, roll_started, &roll_baseline) {
                 rc = 1;
                 failed_stage = "stack";
+            } else {
+                // Nodes pick up the new pins on their own from here.
+                warm_release_digests(g);
             }
         }
     }
@@ -1019,6 +1030,10 @@ fn run_fleet_stages(g: &Globals, stack: bool, nodes: bool, seats: bool, tag_over
             rc = 1;
             failed_stage = "nodes";
         } else {
+            // The new gateway has hashed nothing: the pre-launch pre-warm hit
+            // the gateway this roll replaced. Wait for the digests BEFORE the
+            // node phase, so a node's first pinned start gets a 200 (i1167a).
+            warm_release_digests(g);
             if nodes {
                 rc = upgrade_nodes(g)?;
                 if rc != 0 { failed_stage = "nodes"; }
@@ -8266,6 +8281,31 @@ mod stage_before_launch_tests {
         let join = up.find(".finish_before_launch(g);").expect("and joins them");
         let launch = up.find("launch_stack(g, &roll, staging, stops)").expect("then launches");
         assert!(start < join && join < launch, "staging is finished before launch_stack");
+    }
+}
+
+/// i1167a: the gateway the roll starts has hashed nothing (the pre-launch
+/// pre-warm hit the one it replaced), so the digests are waited for AFTER the
+/// stack is up and BEFORE any node is rolled.
+#[cfg(test)]
+mod warm_digests_tests {
+    #[test]
+    fn the_digests_are_warmed_after_the_gateway_is_up_and_before_the_node_phase() {
+        let src = crate::test_src::own_code(include_str!("upgrade.rs"));
+        let f = crate::test_src::fn_body(&src, "fn run_fleet_stages(");
+        let wait = f.find("let budget = if stack { 180 } else { 60 };").expect("the gateway wait");
+        let warm = wait + f[wait..].find("warm_release_digests(g);").expect("the nodes path warms");
+        let nodes = f.find("rc = upgrade_nodes(g)?;").expect("the node phase");
+        assert!(wait < warm && warm < nodes, "warm after the gateway wait, before upgrade_nodes");
+        // The stack-only path warms too: nodes reconcile on their own.
+        assert_eq!(f.matches("warm_release_digests(g);").count(), 2, "stack-only and nodes paths");
+        let helper = crate::test_src::fn_body(&src, "fn warm_release_digests(");
+        assert!(helper.contains("warm_release_tars("), "it waits for the 200");
+        // It never runs inside the launcher phase (the old gateway is still up there).
+        let launch = crate::test_src::fn_body(&src, "fn launch_stack(");
+        assert!(!launch.contains("warm_release"), "not before the new gateway is up");
+        let up = crate::test_src::fn_body(&src, "fn upgrade_stack(");
+        assert!(!up.contains("warm_release"), "not before the new gateway is up");
     }
 }
 
