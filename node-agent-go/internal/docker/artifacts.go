@@ -163,6 +163,9 @@ func (c *Client) PullImageArtifact(ctx context.Context, ref, controllerImageID, 
 		if errors.Is(merr, ErrArtifactAbsent) {
 			return nil, &ImageNotStagedError{Ref: ref, Arch: arch, Tar: ImageTarGzName(ref, arch), AltTar: ImageTarName(ref, arch)}
 		}
+		if manifestStillHashing(merr) {
+			return nil, fmt.Errorf("%s: %w", stillHashingMessage(tarName), merr)
+		}
 		return nil, fmt.Errorf(
 			"no artifact manifest for %s (the manifest route or its auth failed: %v) — an image is executable code, so nothing is pulled unverified",
 			tarName, merr)

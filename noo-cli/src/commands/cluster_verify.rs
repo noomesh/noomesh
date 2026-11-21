@@ -4999,14 +4999,28 @@ const UNPROBED_GUESSES: [&str; 2] = [
     "(postgres container not running, or no routable address)",
 ];
 
-/// A live-probe row that could not probe, when docker refused this account:
-/// its guessed cause becomes docker's own words and the remedy the docker
-/// one. Any other row, or no refusal, is returned unchanged.
-pub(crate) fn docker_refused(mut c: Check, refusal: Option<&str>) -> Check {
-    let Some(e) = refusal else { return c };
-    if let Some(g) = UNPROBED_GUESSES.iter().find(|g| c.detail.contains(*g)) {
-        c.detail = c.detail.replace(g, &format!("— {e}"));
-        c.remedy = Some(crate::commands::secrets_delivery::DOCKER_REFUSED_REMEDY.into());
+/// A live-probe row that could not probe, when docker did not answer this
+/// account: its guessed cause becomes what was observed and the remedy the
+/// one for that cause. Any other row, or nothing observed, is unchanged.
+pub(crate) fn docker_refused(c: Check, refusal: Option<&crate::commands::secrets_delivery::DockerRefusal>) -> Check {
+    docker_unprobed(c, refusal, crate::commands::secrets::unknown_note().as_deref())
+}
+
+/// [`docker_refused`], pure over what was observed.
+pub(crate) fn docker_unprobed(
+    mut c: Check,
+    refusal: Option<&crate::commands::secrets_delivery::DockerRefusal>,
+    unknown: Option<&str>,
+) -> Check {
+    let Some(g) = UNPROBED_GUESSES.iter().find(|g| c.detail.contains(*g)) else { return c };
+    if let Some(e) = refusal {
+        c.detail = c.detail.replace(g, &format!("— {}", e.detail()));
+        c.remedy = Some(e.remedy());
+    } else if let Some(note) = unknown {
+        // docker answers `version`, yet an inspect did not: "not running" is
+        // not what was seen.
+        c.detail = c.detail.replace(g, &format!("— {note}"));
+        c.remedy = Some("docker info".into());
     }
     c
 }
@@ -9169,13 +9183,13 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         // said as that, not as "container not running" (failed lookup is not
         // absence; rc.3 stranger cell, docker group not active).
         let refused = crate::commands::secrets_delivery::docker_refusal();
-        checks.push(docker_refused(sandbox_listener_check(compose.as_deref(), sandbox_probe.as_ref()), refused.as_deref()));
+        checks.push(docker_refused(sandbox_listener_check(compose.as_deref(), sandbox_probe.as_ref()), refused.as_ref()));
         // The sandbox executor (i161): the health body that probe read over
         // the gateway's leaf says which uid model-written code runs as.
         // Which form of the AppArmor profile is installed (bundled, or the
         // AppArmor 3.x form without its `userns,` rule): stated, not silent.
         checks.push(with_profile_form(
-            docker_refused(sandbox_executor_check(sandbox_probe.as_ref()), refused.as_deref()),
+            docker_refused(sandbox_executor_check(sandbox_probe.as_ref()), refused.as_ref()),
             crate::onboard::sandbox_apparmor::installed_form(
                 std::fs::read_to_string(crate::onboard::sandbox_apparmor::INSTALLED).ok().as_deref()),
         ));
@@ -9230,7 +9244,7 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         checks.push(docker_refused(postgres_client_cert_check(
             no_cert.as_ref().map(|(ok, e)| (*ok, e.as_str())),
             plaintext.as_ref().map(|(ok, e)| (*ok, e.as_str())),
-        ), refused.as_deref()));
+        ), refused.as_ref()));
         // `cluster.postgres_memory` (unset = standard): the sizes asked for,
         // and "recreate needed" while the running postgres has others.
         checks.push(pg_memory::live(&root));
@@ -16924,7 +16938,7 @@ mod docker_refused_row_tests {
         for r in rows {
             let name = r.name;
             let before = r.detail.clone();
-            let c = docker_refused(r, Some(DENIED));
+            let c = docker_unprobed(r, Some(&crate::commands::secrets_delivery::DockerRefusal::Denied(DENIED.to_string())), None);
             assert!(c.detail.contains(DENIED), "{name}: {}", c.detail);
             assert!(!c.detail.contains("not running"), "{name}: failed lookup is not absence: {}", c.detail);
             assert_eq!(c.remedy.as_deref(), Some(crate::commands::secrets_delivery::DOCKER_REFUSED_REMEDY), "{name}");
@@ -16935,14 +16949,30 @@ mod docker_refused_row_tests {
                 "sandbox executor" => sandbox_executor_check(None),
                 _ => postgres_client_cert_check(None, None),
             };
-            assert_eq!(docker_refused(again, None).detail, before, "{name}");
+            assert_eq!(docker_unprobed(again, None, None).detail, before, "{name}");
         }
     }
 
     #[test]
     fn a_row_that_did_probe_is_never_rewritten() {
         let c = ok("sandbox executor", "code runs as sandbox-exec (uids 65600-65663)");
-        assert_eq!(docker_refused(c.clone(), Some(DENIED)).detail, c.detail);
+        let denied = crate::commands::secrets_delivery::DockerRefusal::Denied(DENIED.to_string());
+        assert_eq!(docker_unprobed(c.clone(), Some(&denied), None).detail, c.detail);
+        assert_eq!(docker_unprobed(c.clone(), None, Some("could not inspect x (y)")).detail, c.detail);
+    }
+
+    /// docker answered `version` but an inspect did not (a hung bind mount):
+    /// the row says that, not "container not running", with `docker info`.
+    #[test]
+    fn an_unknown_inspect_is_not_said_as_a_stopped_container() {
+        let note = crate::commands::secrets::container_unknown_message("noo-gateway", "`docker inspect` did not answer in 10 s");
+        for r in [sandbox_executor_check(None), postgres_client_cert_check(None, None)] {
+            let name = r.name;
+            let c = docker_unprobed(r, None, Some(&note));
+            assert!(c.detail.contains("could not inspect noo-gateway"), "{name}: {}", c.detail);
+            assert!(!c.detail.contains("not running"), "{name}: {}", c.detail);
+            assert_eq!(c.remedy.as_deref(), Some("docker info"), "{name}");
+        }
     }
 
     #[test]
