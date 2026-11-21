@@ -5,6 +5,7 @@ package docker
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"regexp"
 	"sort"
@@ -12,6 +13,10 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/moby/moby/client"
+
+	"github.com/noomesh/noomesh/node-agent-go/internal/hardware"
 )
 
 // Did a GPU llamacpp start reach the GPU? A CUDA llama.cpp whose CUDA init
@@ -24,7 +29,16 @@ import (
 // slog.Warn naming the likely cause, and a WARN row in `noo cluster verify`
 // (noo-cli cluster_verify.rs llamacpp_offload_check).
 //
-// The lines, as llama.cpp prints them at the pinned ref (b9628):
+// What b9628 REALLY prints (testdata/llamacpp_b9628_live_gpu.txt, the shipped
+// 0.6.28 image on a GPU node): a device_info block ("- CUDA0 : <name> (N MiB,
+// M MiB free)", BEFORE the load), system_info, "fitting params to device
+// memory ...", a llama_context warning, warm-up, slots, "model loaded". No
+// "offloaded N/M layers", no "model buffer size" and no load_tensors line at
+// all, with log_info verbosity = 3, on a model that serves at GPU speed. The
+// older fixtures were written from upstream's format strings, never from a
+// captured log, so they described lines this build does not print.
+//
+// The lines, as upstream's source formats them (NOT all printed at b9628):
 //
 //	ggml/src/ggml-cuda/ggml-cuda.cu:209  "%s: failed to initialize CUDA: %s\n"            (ggml_cuda_init)
 //	ggml/src/ggml-cuda/ggml-cuda.cu:221  "%s: found %d CUDA devices (Total VRAM: %zu MiB):\n"
@@ -105,6 +119,8 @@ var (
 	reUsingDevice = regexp.MustCompile(`using device (\S+) \((.+?)\) \(`)
 	reCUDAError   = regexp.MustCompile(`\bCUDA error: (.*)$`)
 	reCUDABuffer  = regexp.MustCompile(`\b(CUDA\d+) model buffer size =\s*([0-9.]+) MiB`)
+	// llama.cpp b9628's device_info block: "  - CUDA0   : NVIDIA GeForce GTX 1070 (8101 MiB, 7287 MiB free)".
+	reDeviceInfo  = regexp.MustCompile(`- (CUDA\d+)\s*: (.+?) \(\d+ MiB, \d+ MiB free\)`)
 	reModelLoaded = regexp.MustCompile(`: model loaded\s*$`)
 )
 
@@ -119,6 +135,14 @@ func parseLlamacppStartLog(lines []string) offloadLog {
 			o.offloadSeen = true
 			o.offloaded, _ = strconv.Atoi(m[1])
 			o.total, _ = strconv.Atoi(m[2])
+			continue
+		}
+		if m := reDeviceInfo.FindStringSubmatch(l); m != nil {
+			o.initSeen = true
+			o.devices++
+			if o.device == "" {
+				o.device = strings.TrimSpace(m[2])
+			}
 			continue
 		}
 		if m := reCUDAFailed.FindStringSubmatch(l); m != nil {
@@ -283,7 +307,7 @@ var (
 // it is conclusive or the bound passes, storing each answer, and logs a WARN
 // when the GPU start runs on the CPU. Runs on its own goroutine: the reconcile
 // loop never waits on a model load.
-func watchLlamacppOffload(ctx context.Context, gen int, backend, model string, fetch func(context.Context) ([]string, error)) {
+func watchLlamacppOffload(ctx context.Context, gen int, backend, model string, fetch func(context.Context) ([]string, error), procGPU func(context.Context) (int, bool)) {
 	deadline := time.Now().Add(offloadWatchTimeout)
 	t := time.NewTicker(offloadWatchInterval)
 	defer t.Stop()
@@ -299,6 +323,10 @@ func watchLlamacppOffload(ctx context.Context, gen int, backend, model string, f
 		}
 		timedOut := !time.Now().Before(deadline)
 		r, done := llamacppOffloadVerdict(backend, model, parseLlamacppStartLog(lines), timedOut, time.Now())
+		if done && r.State == offloadUnknown && procGPU != nil {
+			mib, ok := procGPU(ctx)
+			r = applyProcessGPU(r, mib, ok)
+		}
 		if !storeLlamacppOffload(gen, r) {
 			return // a newer start or a stop owns the report
 		}
@@ -307,6 +335,46 @@ func watchLlamacppOffload(ctx context.Context, gen int, backend, model string, f
 			return
 		}
 	}
+}
+
+// applyProcessGPU turns an unknown into gpu when nvidia-smi says the
+// llama-server process holds GPU memory (ok = the process was found in the
+// compute-apps list with a numeric size). Anything else leaves it unknown: a
+// process nvidia-smi cannot attribute (a containerised agent, WSL2 "[N/A]")
+// is no evidence of the CPU.
+func applyProcessGPU(r LlamacppOffload, mib int, ok bool) LlamacppOffload {
+	if r.State != offloadUnknown || !ok || mib <= 0 {
+		return r
+	}
+	r.State, r.Cause = offloadGPU, ""
+	r.Evidence = fmt.Sprintf("nvidia-smi: the llama-server process holds %d MiB of GPU memory", mib)
+	return r
+}
+
+// matchComputeApp is the GPU memory (MiB) the compute app with this PID holds.
+func matchComputeApp(apps []hardware.GPUComputeApp, pid int) (int, bool) {
+	if pid <= 0 {
+		return 0, false
+	}
+	total, found := 0.0, false
+	for _, a := range apps {
+		if a.PID == pid {
+			total += a.UsedMemoryMB
+			found = true
+		}
+	}
+	return int(total), found
+}
+
+// llamacppProcessGPUMiB reads the container's init PID (the image's CMD
+// exec's llama-server, so it is the server) and looks it up in nvidia-smi's
+// compute-apps, through the probe the agent already has (no new privilege).
+func (c *Client) llamacppProcessGPUMiB(ctx context.Context, containerName string) (int, bool) {
+	ins, err := c.docker.ContainerInspect(ctx, containerName, client.ContainerInspectOptions{})
+	if err != nil || ins.Container.State == nil {
+		return 0, false
+	}
+	return matchComputeApp((&hardware.GPUDetector{}).ComputeApps(), ins.Container.State.Pid)
 }
 
 // logLlamacppOffload is the agent log line for a finished watch.
@@ -349,6 +417,8 @@ func (c *Client) startLlamacppOffloadWatch(ctx context.Context, backend, model, 
 	wctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), offloadWatchTimeout+time.Minute)
 	go func() {
 		defer cancel()
-		watchLlamacppOffload(wctx, gen, backend, model, fetch)
+		watchLlamacppOffload(wctx, gen, backend, model, fetch, func(ctx context.Context) (int, bool) {
+			return c.llamacppProcessGPUMiB(ctx, containerName)
+		})
 	}()
 }
