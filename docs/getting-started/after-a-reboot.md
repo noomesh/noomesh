@@ -39,13 +39,17 @@ Each one has a followup that removes the need for the step.
   Check with `timeout 5 stat <mount>` before you upgrade (a bare `stat`
   can hang too). (i1149: bounded calls and a verify row for hung mounts.)
 - **The controller's stack did not come back until someone logged in.**
-  Where `noo-hostd` (which restores the stack at boot) runs as a user
-  service (`systemctl --user status noo-hostd` shows it), it starts at boot
-  only if that user has linger on. Check:
-  `loginctl show-user $USER -p Linger` (`Linger=yes` is right). Turn it on
-  with `sudo loginctl enable-linger $USER`, then `noo stack start` for this
-  boot. (i1160: 0.6.30's onboard turns it on, and verify gets a
-  `hostd at boot` row.)
+  `noo-hostd` restores the stack at boot. Its unit file says how it starts
+  (`<user>` is the account that installed noomesh):
+  - `/etc/systemd/system/noo-hostd.service` exists: a system service; it
+    starts at boot, and this case does not apply;
+  - otherwise `~<user>/.config/systemd/user/noo-hostd.service`: a user
+    service, which starts at boot only if
+    `loginctl show-user <user> -p Linger` says `Linger=yes`.
+
+  Turn it on with `sudo loginctl enable-linger <user>`, then `noo stack start`
+  for this boot. (i1160, #1507: 0.6.30's onboard turns it on, and verify gets
+  a `hostd at boot` row.)
 - **A dedicated kiosk seat on a machine that also has a desktop installed
   stays black.** Its display waits behind the boot splash, which nothing
   tells to quit. At the seat: `sudo plymouth quit`. The display comes up at
