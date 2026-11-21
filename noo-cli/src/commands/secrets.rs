@@ -4909,7 +4909,7 @@ pub(crate) fn container_state_of(probe: &crate::bounded::Bounded) -> ContainerSt
 
 /// The unknowns seen this process, for a row that could not probe and has
 /// to say why (the verify rows return `None` for "could not probe").
-static UNKNOWN_NOTES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+static UNKNOWN_NOTES: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new());
 
 /// "could not inspect <c> (<why>): ..." for [`ContainerState::Unknown`]: the
 /// observed fact, then the next command. Never "down" or "not running".
@@ -4927,15 +4927,22 @@ pub(crate) fn container_state(name: &str) -> ContainerState {
     ));
     if let ContainerState::Unknown(why) = &state {
         if let Ok(mut notes) = UNKNOWN_NOTES.lock() {
-            notes.push(container_unknown_message(name, why));
+            notes.push((name.to_string(), container_unknown_message(name, why)));
         }
     }
     state
 }
 
-/// The first unknown [`container_state`] met this process, if any.
-pub(crate) fn unknown_note() -> Option<String> {
-    UNKNOWN_NOTES.lock().ok().and_then(|n| n.first().cloned())
+/// Every unknown [`container_state`] met this process, as `(container,
+/// message)`: a row looks up only its own container.
+pub(crate) fn unknown_notes() -> Vec<(String, String)> {
+    UNKNOWN_NOTES.lock().map(|n| n.clone()).unwrap_or_default()
+}
+
+/// The note for `container` alone, from `notes`; another container's
+/// unknown is no evidence about this one.
+pub(crate) fn note_for<'a>(notes: &'a [(String, String)], container: &str) -> Option<&'a str> {
+    notes.iter().find(|(c, _)| c == container).map(|(_, m)| m.as_str())
 }
 
 /// Running, or not: for a caller whose message makes no claim about WHY it
