@@ -47,8 +47,8 @@ Each one has a followup that removes the need for the step.
     service, which starts at boot only if
     `loginctl show-user <user> -p Linger` says `Linger=yes`.
 
-  Turn it on with `sudo loginctl enable-linger <user>`, then `noo stack start`
-  for this boot. (i1160, #1507: 0.6.30's onboard turns it on, and verify gets
+  Turn it on with `sudo loginctl enable-linger <user>`, then `noo stack restart`
+  for this boot (`noo stack start` if that does not bring it back). (i1160, #1507: 0.6.30's onboard turns it on, and verify gets
   a `hostd at boot` row.)
 - **A dedicated kiosk seat on a machine that also has a desktop installed
   stays black.** Its display waits behind the boot splash, which nothing
@@ -85,7 +85,8 @@ The data disk itself not mounting is a separate refusal with its own page:
   row names the observed fact and its remedy. `noo cluster status` shows
   which nodes reported in. On the controller, hostd logs
   `BOOT-RESTORE WARN … still down: <services>` when a core service did not
-  come back; `noo stack start` is then the documented next step.
+  come back; `noo stack restart` is then the documented next step (it never
+  contacts the image registry), and `noo stack start` the one after it.
 - **Never** unmount (least of all force-unmount) or remount a filesystem, restart a host service
   (`systemctl`, `launchctl`, `brew services`), run `plymouth`, or reboot a
   machine. Each case above is the person's, at that machine.
