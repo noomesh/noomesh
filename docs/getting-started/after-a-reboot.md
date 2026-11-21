@@ -52,13 +52,17 @@ Each one has a followup that removes the need for the step.
   backend shows as running but crash-loops without its file. From the
   controller: `noo cluster sync-model-files <node> -m <file.gguf>`. The node
   pulls and verifies the file, and the backend finds it on its next restart
-  (observed: serving about a minute later, no re-place). (Fixed in 0.6.29:
-  i1154a.)
+  (observed: serving about a minute later, no re-place). (Fixed in 0.6.29,
+  i1154a: the node waits for the file and never starts the backend without
+  it; `noo cluster show <node>` shows a `gguf_unavailable` start refusal
+  instead, retried on every pass.)
 - **`llamacpp offload` says a GPU model runs on the CPU** (0.6.28): that
   row can read "placed on gpu runs on the CPU … update the NVIDIA driver"
   while the model is on the GPU, because that llama.cpp build prints no
   offload line. Nothing needs fixing; a request pinned to the node shows
-  the real speed. (Fixed in 0.6.29.)
+  the real speed: `noo inference run 'hi' -m <model> -n <node> --strict-node`.
+  (Fixed in 0.6.29: the row reads OK with nvidia-smi's evidence, or not
+  checked.)
 
 The data disk itself not mounting is a separate refusal with its own page:
 [data-root-recovery.md](../operating/runbooks/data-root-recovery.md).
