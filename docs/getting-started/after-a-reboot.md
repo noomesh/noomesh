@@ -32,9 +32,12 @@ Each one has a followup that removes the need for the step.
 - **A network storage mount the controller uses did not come back.** A hung
   network mount (an NFS share whose server lost power) makes `noo upgrade`
   and any `docker` call that touches it wait without saying why. Bring the
-  storage server back first; a hard mount resumes by itself once it
-  answers. Check with `timeout 5 stat <mount>` before you upgrade.
-  (i1149: bounded calls and a verify row for hung mounts.)
+  storage server back first: a `hard` mount resumes by itself once it
+  answers (observed: a waiting `noo upgrade` moved on within seconds of the
+  server returning, with nothing done on the controller). Do not
+  force-unmount it to get past the wait: processes are blocked on it.
+  Check with `timeout 5 stat <mount>` before you upgrade (a bare `stat`
+  can hang too). (i1149: bounded calls and a verify row for hung mounts.)
 - **A dedicated kiosk seat stays black.** Its display waits behind the boot
   splash, which on some seats is never told to quit. At the seat:
   `sudo plymouth quit`. The display comes up at once. (i1153.)
@@ -44,7 +47,15 @@ Each one has a followup that removes the need for the step.
   `noo enroll` will register it as a boot service.)
 - **A model file was never shipped to a node** (0.6.28 and earlier): the
   backend shows as running but crash-loops without its file. From the
-  controller: `noo cluster sync-model-files <node>`. (i1154a.)
+  controller: `noo cluster sync-model-files <node> -m <file.gguf>`. The node
+  pulls and verifies the file, and the backend finds it on its next restart
+  (observed: serving about a minute later, no re-place). (Fixed in 0.6.29:
+  i1154a.)
+- **`llamacpp offload` says a GPU model runs on the CPU** (0.6.28): that
+  row can read "placed on gpu runs on the CPU … update the NVIDIA driver"
+  while the model is on the GPU, because that llama.cpp build prints no
+  offload line. Nothing needs fixing; a request pinned to the node shows
+  the real speed. (Fixed in 0.6.29.)
 
 The data disk itself not mounting is a separate refusal with its own page:
 [data-root-recovery.md](../operating/runbooks/data-root-recovery.md).
@@ -56,7 +67,7 @@ The data disk itself not mounting is a separate refusal with its own page:
   which nodes reported in. On the controller, hostd logs
   `BOOT-RESTORE WARN … still down: <services>` when a core service did not
   come back; `noo stack start` is then the documented next step.
-- **Never** unmount or remount a filesystem, restart a host service
+- **Never** unmount (least of all force-unmount) or remount a filesystem, restart a host service
   (`systemctl`, `launchctl`, `brew services`), run `plymouth`, or reboot a
   machine. Each case above is the person's, at that machine.
 - **Never run `noo upgrade` while a mount may be hung:** it waits without
