@@ -879,6 +879,39 @@ dist_assert_third_party_ref() {
 # there is a stack image, so a ref under `${NOO_BASE_REGISTRY}/` is not held
 # to the stack TAG; it is held to its signed DIGEST pin instead, like every
 # other third-party runtime image (dist_assert_third_party_ref).
+# i1184: the image refs compose would run that are NOT present locally, one
+# per line, in DIST_MISSING. A ref pinned by digest is present when its
+# name@digest is (the tag is ignored: a digest names the bytes exactly, and
+# that is what `up` asks docker for); a ref without a digest when its
+# name:tag is. Makes no registry connection. When compose cannot list the
+# images, the answer is unknown and DIST_MISSING says so (the caller pulls,
+# as before).
+dist_missing_images() {
+    local _rc=0 _ref _name _last _probe
+    DIST_MISSING=""
+    compose_capture "$@" config --images || _rc=$?
+    if [ "$_rc" -ne 0 ]; then
+        DIST_MISSING="(compose could not list the images this start runs)"
+        return 0
+    fi
+    while IFS= read -r _ref; do
+        [ -n "$_ref" ] || continue
+        _probe="$_ref"
+        case "$_ref" in
+            *@sha256:*)
+                _name="${_ref%%@*}"
+                _last="${_name##*/}"
+                case "$_last" in *:*) _name="${_name%:*}" ;; esac
+                _probe="${_name}@${_ref#*@}" ;;
+        esac
+        docker image inspect "$_probe" >/dev/null 2>&1 || DIST_MISSING="${DIST_MISSING}${_ref}
+"
+    done <<REFS
+$COMPOSE_OUT
+REFS
+    return 0
+}
+
 dist_assert_pull_refs() {
     local _imgs _ref _rest _name _tag _dig _ok _p
     local _rc=0
