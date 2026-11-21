@@ -10,7 +10,7 @@ does not come back on its own yet. Done when `noo cluster verify` exits 0.
 
 | Machine | What restarts on its own |
 |---|---|
-| **The controller** | Docker restarts the stack's containers. Then `noo-hostd` runs a boot restore once: it rewrites the secret files (they live in memory and a reboot empties them), starts the containers that need them and any stopped core service, and retries for about two minutes while Docker is still starting. |
+| **The controller** | Docker restarts the stack's containers. Then `noo-hostd` runs a boot restore once: it rewrites the secret files (they live in memory and a reboot empties them), starts the containers that need them and any stopped core service, and retries for about two minutes while Docker is still starting. Where `noo-hostd` is a user service, it runs at boot only if that user has linger on (see below). |
 | **A Linux node** | Its node agent starts at boot, reconnects to the controller and starts the backends placed on it. |
 | **A Mac node** | Its node agent starts at boot. Its Ollama does not, yet: see below. |
 | **A kiosk seat** | Its display starts at boot, except a dedicated seat on a machine with a desktop installed: see below. |
@@ -38,6 +38,14 @@ Each one has a followup that removes the need for the step.
   force-unmount it to get past the wait: processes are blocked on it.
   Check with `timeout 5 stat <mount>` before you upgrade (a bare `stat`
   can hang too). (i1149: bounded calls and a verify row for hung mounts.)
+- **The controller's stack did not come back until someone logged in.**
+  Where `noo-hostd` (which restores the stack at boot) runs as a user
+  service (`systemctl --user status noo-hostd` shows it), it starts at boot
+  only if that user has linger on. Check:
+  `loginctl show-user $USER -p Linger` (`Linger=yes` is right). Turn it on
+  with `sudo loginctl enable-linger $USER`, then `noo stack start` for this
+  boot. (i1160: 0.6.30's onboard turns it on, and verify gets a
+  `hostd at boot` row.)
 - **A dedicated kiosk seat on a machine that also has a desktop installed
   stays black.** Its display waits behind the boot splash, which nothing
   tells to quit. At the seat: `sudo plymouth quit`. The display comes up at
