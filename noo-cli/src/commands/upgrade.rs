@@ -910,7 +910,7 @@ fn version_less_than(a: &str, b: &str) -> bool {
 /// fails the roll). The in-process hash of the gateway the roll replaced is
 /// gone, and a node's pinned start refuses on "still hashing" (i1167a).
 fn warm_release_digests(g: &Globals) {
-    crate::commands::image_stage::warm_release_tars(g, &crate::commands::provision::release_var("NOO_IMAGE_TAG"));
+    crate::commands::image_stage::warm_release_tars(g, &crate::commands::image_stage::staged_release_tag());
 }
 
 /// Run the requested fleet stages from a binary whose paired tag/assets are
