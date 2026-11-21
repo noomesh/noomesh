@@ -52,6 +52,11 @@ if [ -t 2 ]; then fd2=tty; else fd2=pipe; fi
 echo "DOCKER $args | TAG=${NOO_IMAGE_TAG:-} GW=${NOO_IMAGE_DIGEST_GATEWAY:-} FD2=$fd2" >> "$LOGF"
 case "$args" in
   "compose version") echo "Docker Compose version v2.30.0" ;;
+  # i1184: an image is present when INSPECT_RC=0 (default: missing, so the
+  # pull tests below still see their pull); a pull fails with PULL_RC.
+  "image inspect "*nginx*) exit 0 ;;  # the helper image: present
+  "image inspect "*) exit "${INSPECT_RC:-1}" ;;
+  *" pull "*) exit "${PULL_RC:-0}" ;;
   *"config --services"*) echo gateway; echo worker ;;
   *"config --images"*)
      echo "${NOO_IMAGE_PREFIX}/gateway:${NOO_IMAGE_TAG}${NOO_IMAGE_DIGEST_GATEWAY:-}"
@@ -305,3 +310,44 @@ def test_runtime_images_under_the_base_registry_path_are_pulled_as_declared(tmp_
         DHI_UNDER_PREFIX + f'     echo "${{NOO_IMAGE_PREFIX}}/worker:{OLD}"'))
     r = _run(tmp2, env, work)
     assert r.returncode == 1 and "refusing to pull the wrong images" in r.stderr, r.stderr
+
+
+# ── i1184: a dist start pulls only what is missing ──────────────────────
+
+def _start_missing(tmp: Path, extra_env: dict, args: tuple = ()) -> tuple[int, str, list[str]]:
+    work, env = _tree(tmp, False)
+    env.update(extra_env)
+    env.pop("NO_COLOR", None)
+    r = subprocess.run(["bash", "scripts/noomesh-start.sh", "--dist", *args], cwd=work, env=env,
+                       timeout=600, stdin=subprocess.DEVNULL, capture_output=True, text=True)
+    log = tmp / "log"
+    return r.returncode, r.stdout + r.stderr, (log.read_text().splitlines() if log.exists() else [])
+
+
+def _compose_pulls(log: list[str]) -> list[str]:
+    return [l for l in log if l.startswith("DOCKER compose") and " pull " in l]
+
+
+def test_a_start_with_every_image_present_makes_no_registry_connection(tmp_path):
+    rc, out, log = _start_missing(tmp_path, {"INSPECT_RC": "0"})
+    assert _compose_pulls(log) == [], "a start with every image present pulled:\n" + "\n".join(_compose_pulls(log))
+    assert "nothing to pull" in out, out[-2000:]
+    assert any(l.startswith("DOCKER image inspect ") and f"@{D_NEW}" in l for l in log), \
+        "the presence check asks for the locked digest:\n" + "\n".join(log)
+
+
+def test_a_failed_pull_of_present_images_never_fails_the_start(tmp_path):
+    # --pull forces the pull; the registry is down (every pull fails), yet
+    # every image is present: one attempt, then the start goes on.
+    rc, out, log = _start_missing(tmp_path, {"INSPECT_RC": "0", "PULL_RC": "1"}, ("--pull",))
+    assert len(_compose_pulls(log)) == 1, "retried a pull whose images are all present:\n" + "\n".join(_compose_pulls(log))
+    assert "starting with them" in out, out[-2000:]
+    assert "image pull failed" not in out, out[-2000:]
+
+
+def test_a_missing_image_still_fails_the_start_naming_it(tmp_path):
+    rc, out, log = _start_missing(tmp_path, {"INSPECT_RC": "1", "PULL_RC": "1"})
+    assert len(_compose_pulls(log)) == 3, "\n".join(_compose_pulls(log))
+    assert rc == 1
+    assert "image pull failed 3 times" in out and "still missing:" in out, out[-2000:]
+    assert f"gateway:{NEW}@{D_NEW}" in out.split("still missing:")[1], out[-2000:]
