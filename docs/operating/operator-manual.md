@@ -191,6 +191,14 @@ noo upgrade --nodes                 # re-provision every pull-capable node with 
 noo upgrade --all                   # both
 ```
 
+The node phase restarts nodes that share a model class or embedding space
+one at a time, and stages the next only once the previous one serves again
+(placed, healthy, lane serving, as `noo cluster class list` shows it). If it
+does not within 10 min to apply plus 15 min to serve, the phase stops rather
+than leave a class with nothing serving, names the node, and
+`noo upgrade --nodes` resumes; `--allow-unserved` rolls on without waiting
+([details](../cli/setup-and-host.md)).
+
 After any of the above rolls a node or the stack, `noo cluster verify` is
 the post-upgrade health view: it checks every node and the controller
 against their invariants (version paired with the release, certificate
