@@ -5,6 +5,7 @@ package docker
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"regexp"
 	"sort"
@@ -12,6 +13,10 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/moby/moby/client"
+
+	"github.com/noomesh/noomesh/node-agent-go/internal/hardware"
 )
 
 // Did a GPU llamacpp start reach the GPU? A CUDA llama.cpp whose CUDA init
@@ -24,7 +29,16 @@ import (
 // slog.Warn naming the likely cause, and a WARN row in `noo cluster verify`
 // (noo-cli cluster_verify.rs llamacpp_offload_check).
 //
-// The lines, as llama.cpp prints them at the pinned ref (b9628):
+// What b9628 REALLY prints (testdata/llamacpp_b9628_live_gpu.txt, the shipped
+// 0.6.28 image on a GPU node): a device_info block ("- CUDA0 : <name> (N MiB,
+// M MiB free)", BEFORE the load), system_info, "fitting params to device
+// memory ...", a llama_context warning, warm-up, slots, "model loaded". No
+// "offloaded N/M layers", no "model buffer size" and no load_tensors line at
+// all, with log_info verbosity = 3, on a model that serves at GPU speed. The
+// older fixtures were written from upstream's format strings, never from a
+// captured log, so they described lines this build does not print.
+//
+// The lines, as upstream's source formats them (NOT all printed at b9628):
 //
 //	ggml/src/ggml-cuda/ggml-cuda.cu:209  "%s: failed to initialize CUDA: %s\n"            (ggml_cuda_init)
 //	ggml/src/ggml-cuda/ggml-cuda.cu:221  "%s: found %d CUDA devices (Total VRAM: %zu MiB):\n"
@@ -35,11 +49,16 @@ import (
 //	tools/server/server.cpp:317          "model loaded"                                    (SRV_INF, after the warmup)
 //
 // When CUDA init fails there is no CUDA device, llama_supports_gpu_offload()
-// is false and the offload line is NOT printed at all; when the CUDA backend
-// module does not load (the image's backends are GGML_BACKEND_DL modules and
-// a release build loads them silently) there is not even a ggml_cuda_init
-// line. So "model loaded" with no offload line is as much a CPU run as
-// "offloaded 0/N".
+// is false and the offload line is NOT printed at all. But the converse does
+// not hold: a build that prints no offload line (or a log read that missed
+// it) can still be running on the GPU (a GTX 1070 doing 63 tok/s was told it
+// ran on the CPU). So an absent offload line is UNKNOWN, never "cpu". The
+// positive signal that needs no offload line is load_tensors' own
+//
+//	src/llama-model.cpp                  "%s: %12s model buffer size = %8.2f MiB\n"   (CUDA0 model buffer size = ...)
+//
+// a model buffer on a CUDA device with a size above zero is weights on the
+// GPU. "cpu" stays for: a CUDA failure, or "offloaded 0/N".
 
 // The causes a WARN names.
 const (
@@ -47,6 +66,7 @@ const (
 	LlamacppCauseNoDevice = "no CUDA device was visible in the container"
 	LlamacppCauseNoLayers = "llama.cpp was started with no GPU layers (N_GPU_LAYERS resolved to 0)"
 	LlamacppCauseNoLine   = "llama-server printed no offload line before the check gave up (still loading, or it exited)"
+	LlamacppCauseNotSaid  = "llama.cpp did not report its GPU offload (this build prints no offload line)"
 )
 
 // Offload states.
@@ -69,8 +89,11 @@ type LlamacppOffload struct {
 	Device      string `json:"device,omitempty"`
 	ComputeCap  string `json:"compute_cap,omitempty"`
 	Failure     string `json:"failure,omitempty"`
-	Cause       string `json:"cause,omitempty"`
-	CheckedAt   string `json:"checked_at"`
+	// Evidence names the positive signal when there was no offload line: the
+	// CUDA model buffer llama.cpp allocated.
+	Evidence  string `json:"evidence,omitempty"`
+	Cause     string `json:"cause,omitempty"`
+	CheckedAt string `json:"checked_at"`
 }
 
 // offloadLog is what llama-server's startup lines said.
@@ -84,6 +107,8 @@ type offloadLog struct {
 	computeCap  string
 	failure     string
 	modelLoaded bool
+	cudaBuf     string  // the first CUDA<n> model buffer line, e.g. "CUDA0 model buffer 4403 MiB"
+	cudaBufMiB  float64 // its size
 }
 
 var (
@@ -93,6 +118,9 @@ var (
 	reCUDADevice  = regexp.MustCompile(`Device (\d+): (.+), compute capability (\d+\.\d+),`)
 	reUsingDevice = regexp.MustCompile(`using device (\S+) \((.+?)\) \(`)
 	reCUDAError   = regexp.MustCompile(`\bCUDA error: (.*)$`)
+	reCUDABuffer  = regexp.MustCompile(`\b(CUDA\d+) model buffer size =\s*([0-9.]+) MiB`)
+	// llama.cpp b9628's device_info block: "  - CUDA0   : NVIDIA GeForce GTX 1070 (8101 MiB, 7287 MiB free)".
+	reDeviceInfo  = regexp.MustCompile(`- (CUDA\d+)\s*: (.+?) \(\d+ MiB, \d+ MiB free\)`)
 	reModelLoaded = regexp.MustCompile(`: model loaded\s*$`)
 )
 
@@ -107,6 +135,14 @@ func parseLlamacppStartLog(lines []string) offloadLog {
 			o.offloadSeen = true
 			o.offloaded, _ = strconv.Atoi(m[1])
 			o.total, _ = strconv.Atoi(m[2])
+			continue
+		}
+		if m := reDeviceInfo.FindStringSubmatch(l); m != nil {
+			o.initSeen = true
+			o.devices++
+			if o.device == "" {
+				o.device = strings.TrimSpace(m[2])
+			}
 			continue
 		}
 		if m := reCUDAFailed.FindStringSubmatch(l); m != nil {
@@ -134,6 +170,13 @@ func parseLlamacppStartLog(lines []string) offloadLog {
 		if m := reCUDAError.FindStringSubmatch(l); m != nil {
 			if o.failure == "" {
 				o.failure = strings.TrimSpace(m[1])
+			}
+			continue
+		}
+		if m := reCUDABuffer.FindStringSubmatch(l); m != nil {
+			if mib, err := strconv.ParseFloat(m[2], 64); err == nil && mib > o.cudaBufMiB {
+				o.cudaBufMiB = mib
+				o.cudaBuf = m[1] + " model buffer " + strconv.Itoa(int(mib)) + " MiB"
 			}
 			continue
 		}
@@ -183,17 +226,24 @@ func llamacppOffloadVerdict(backend, model string, o offloadLog, timedOut bool, 
 		// Layers are on the GPU; the watch goes on to "model loaded" so a
 		// CUDA error in the warmup (a PTX the driver cannot JIT) is caught.
 		r.State = offloadGPU
-	case o.offloadSeen || o.modelLoaded:
+	case o.offloadSeen:
 		r.State, r.Cause = offloadCPU, offloadCause(o)
+	case o.cudaBufMiB > 0:
+		// No offload line, but the weights sit in a CUDA buffer: on the GPU.
+		r.State, r.Evidence = offloadGPU, o.cudaBuf
+	case o.modelLoaded:
+		// Loaded, and llama.cpp never said where: unknown, not "cpu".
+		r.State, r.Cause = offloadUnknown, LlamacppCauseNotSaid
 	case timedOut:
 		r.State, r.Cause = offloadUnknown, LlamacppCauseNoLine
 	}
 	return r, done
 }
 
-// LlamacppOffloadWarns: the report is a GPU start that is not on the GPU.
+// LlamacppOffloadWarns: the report is a GPU start known to run on the CPU.
+// Unknown is not a WARN (the verify row reads NOT CHECKED).
 func LlamacppOffloadWarns(r LlamacppOffload) bool {
-	return r.Target == "gpu" && (r.State == offloadCPU || r.State == offloadUnknown)
+	return r.Target == "gpu" && r.State == offloadCPU
 }
 
 // The reports, per backend, and a generation per backend so a newer start
@@ -257,7 +307,7 @@ var (
 // it is conclusive or the bound passes, storing each answer, and logs a WARN
 // when the GPU start runs on the CPU. Runs on its own goroutine: the reconcile
 // loop never waits on a model load.
-func watchLlamacppOffload(ctx context.Context, gen int, backend, model string, fetch func(context.Context) ([]string, error)) {
+func watchLlamacppOffload(ctx context.Context, gen int, backend, model string, fetch func(context.Context) ([]string, error), procGPU func(context.Context) (int, bool)) {
 	deadline := time.Now().Add(offloadWatchTimeout)
 	t := time.NewTicker(offloadWatchInterval)
 	defer t.Stop()
@@ -273,6 +323,10 @@ func watchLlamacppOffload(ctx context.Context, gen int, backend, model string, f
 		}
 		timedOut := !time.Now().Before(deadline)
 		r, done := llamacppOffloadVerdict(backend, model, parseLlamacppStartLog(lines), timedOut, time.Now())
+		if done && r.State == offloadUnknown && procGPU != nil {
+			mib, ok := procGPU(ctx)
+			r = applyProcessGPU(r, mib, ok)
+		}
 		if !storeLlamacppOffload(gen, r) {
 			return // a newer start or a stop owns the report
 		}
@@ -283,12 +337,60 @@ func watchLlamacppOffload(ctx context.Context, gen int, backend, model string, f
 	}
 }
 
+// applyProcessGPU turns an unknown into gpu when nvidia-smi says the
+// llama-server process holds GPU memory (ok = the process was found in the
+// compute-apps list with a numeric size). Anything else leaves it unknown: a
+// process nvidia-smi cannot attribute (a containerised agent, WSL2 "[N/A]")
+// is no evidence of the CPU.
+func applyProcessGPU(r LlamacppOffload, mib int, ok bool) LlamacppOffload {
+	if r.State != offloadUnknown || !ok || mib <= 0 {
+		return r
+	}
+	r.State, r.Cause = offloadGPU, ""
+	r.Evidence = fmt.Sprintf("nvidia-smi: the llama-server process holds %d MiB of GPU memory", mib)
+	return r
+}
+
+// matchComputeApp is the GPU memory (MiB) the compute app with this PID holds.
+func matchComputeApp(apps []hardware.GPUComputeApp, pid int) (int, bool) {
+	if pid <= 0 {
+		return 0, false
+	}
+	total, found := 0.0, false
+	for _, a := range apps {
+		if a.PID == pid {
+			total += a.UsedMemoryMB
+			found = true
+		}
+	}
+	return int(total), found
+}
+
+// llamacppProcessGPUMiB reads the container's init PID (the image's CMD
+// exec's llama-server, so it is the server) and looks it up in nvidia-smi's
+// compute-apps, through the probe the agent already has (no new privilege).
+func (c *Client) llamacppProcessGPUMiB(ctx context.Context, containerName string) (int, bool) {
+	ins, err := c.docker.ContainerInspect(ctx, containerName, client.ContainerInspectOptions{})
+	if err != nil || ins.Container.State == nil {
+		return 0, false
+	}
+	return matchComputeApp((&hardware.GPUDetector{}).ComputeApps(), ins.Container.State.Pid)
+}
+
 // logLlamacppOffload is the agent log line for a finished watch.
 func logLlamacppOffload(r LlamacppOffload) {
 	if LlamacppOffloadWarns(r) {
 		slog.Warn("llamacpp placed on the GPU is running on the CPU: no layer was offloaded",
 			"backend", r.Backend, "model", r.Model, "failure", r.Failure, "likely_cause", r.Cause,
 			"remedy", "update the NVIDIA driver, or place it on cpu (noo cluster place <node> llamacpp <model> --on cpu)")
+		return
+	}
+	if r.State == offloadUnknown {
+		slog.Info("llamacpp offload not reported", "backend", r.Backend, "model", r.Model, "cause", r.Cause)
+		return
+	}
+	if r.Evidence != "" {
+		slog.Info("llamacpp on the GPU (no offload line)", "backend", r.Backend, "model", r.Model, "evidence", r.Evidence)
 		return
 	}
 	if r.Offloaded != nil && r.Total != nil {
@@ -315,6 +417,8 @@ func (c *Client) startLlamacppOffloadWatch(ctx context.Context, backend, model, 
 	wctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), offloadWatchTimeout+time.Minute)
 	go func() {
 		defer cancel()
-		watchLlamacppOffload(wctx, gen, backend, model, fetch)
+		watchLlamacppOffload(wctx, gen, backend, model, fetch, func(ctx context.Context) (int, bool) {
+			return c.llamacppProcessGPUMiB(ctx, containerName)
+		})
 	}()
 }

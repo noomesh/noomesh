@@ -1505,8 +1505,12 @@ fn llamacpp_offload_cause(r: &Value) -> String {
 /// reads llama-server's own startup lines (`llamacpp_offload`: layers
 /// offloaded of the total, the CUDA device, any CUDA init failure). OK names
 /// the device and the layers; WARN when a GPU start offloaded none, CUDA
-/// failed, or no offload line came by the agent's bound: the model runs on
-/// the CPU while the GPU stays reserved. No row without a GPU llamacpp start,
+/// failed: the model runs on the CPU while the GPU stays reserved. A start
+/// that offloaded nothing KNOWN (no offload line, no CUDA model buffer, the
+/// bound passed; or an older agent's "cpu" with no layer count and no failure)
+/// is NOT CHECKED, never a WARN: a build that prints no offload line is not a
+/// CPU run. A CUDA model buffer with no offload line is OK, naming it as the
+/// evidence. No row without a GPU llamacpp start,
 /// while the model is still loading, or from an agent that does not report it.
 pub(crate) fn llamacpp_offload_check(n: &Value) -> Option<Check> {
     const NAME: &str = "llamacpp offload";
@@ -1515,13 +1519,24 @@ pub(crate) fn llamacpp_offload_check(n: &Value) -> Option<Check> {
     let mut good = Vec::new();
     let mut warns = Vec::new();
     let mut models = Vec::new();
+    let mut unknown: Vec<String> = Vec::new();
     for r in rows.iter().filter(|r| r["target"].as_str() == Some("gpu")) {
         let model = r["model"].as_str().filter(|m| !m.is_empty()).unwrap_or("<model>");
         let offloaded = r["offloaded"].as_u64();
         let total = r["total"].as_u64();
         let failure = r["failure"].as_str().unwrap_or("");
         let state = r["state"].as_str().unwrap_or("");
+        let evidence = r["evidence"].as_str().unwrap_or("");
         let on_gpu = failure.is_empty() && offloaded.is_some_and(|o| o > 0);
+        if failure.is_empty() && offloaded.is_none() && state == "gpu" && !evidence.is_empty() {
+            let device = r["device"].as_str().filter(|d| !d.is_empty()).unwrap_or("the GPU");
+            good.push(format!("llamacpp on {device}: {evidence}; no offload line printed ({model})"));
+            continue;
+        }
+        if failure.is_empty() && offloaded.is_none() && matches!(state, "unknown" | "cpu") {
+            unknown.push(model.to_string());
+            continue;
+        }
         if on_gpu {
             let device = r["device"].as_str().filter(|d| !d.is_empty()).unwrap_or("the GPU");
             good.push(format!("llamacpp on {device}: {}/{} layers offloaded ({model})", offloaded.unwrap_or(0), total.unwrap_or(0)));
@@ -1530,8 +1545,6 @@ pub(crate) fn llamacpp_offload_check(n: &Value) -> Option<Check> {
         let what = match (failure.is_empty(), offloaded, state) {
             (false, _, _) => format!("CUDA failed ({failure})"),
             (true, Some(0), _) => format!("0/{} layers offloaded", total.unwrap_or(0)),
-            (true, None, "cpu") => "no layer offloaded (llama-server loaded the model without the GPU)".to_string(),
-            (true, None, "unknown") => "no offload line from llama-server by the agent's bound".to_string(),
             _ => continue, // still loading
         };
         warns.push(format!("{model} placed on gpu runs on the CPU: {what}; likely cause: {}", llamacpp_offload_cause(r)));
@@ -1542,8 +1555,20 @@ pub(crate) fn llamacpp_offload_check(n: &Value) -> Option<Check> {
         if !good.is_empty() {
             d.push_str(&format!("; on the GPU: {}", good.join(", ")));
         }
+        if !unknown.is_empty() {
+            d.push_str(&format!("; not checked: {}", unknown.join(", ")));
+        }
         return Some(warn(NAME, d, Some(format!(
             "update the NVIDIA driver on {id} (the CUDA 12.9 build needs a 12.9-capable driver, 575 or newer for a GPU on the PTX fallback), or place it on cpu: noo cluster place {id} llamacpp {first} --on cpu"
+        ))));
+    }
+    if !unknown.is_empty() {
+        let mut d = format!("NOT CHECKED — llama.cpp did not report its GPU offload (this build prints no offload line): {}", unknown.join(", "));
+        if !good.is_empty() {
+            d.push_str(&format!("; on the GPU: {}", good.join(", ")));
+        }
+        return Some(warn(NAME, d, Some(format!(
+            "on {id}: check the card is in use (nvidia-smi shows the llama-server process holding VRAM); a model that serves at GPU speed is on the GPU"
         ))));
     }
     (!good.is_empty()).then(|| ok(NAME, good.join(", ")))
@@ -17823,6 +17848,39 @@ mod llamacpp_offload_tests {
         let n = node(json!([{"backend": "llamacpp", "model": "m.gguf", "target": "gpu", "state": "unknown", "checked_at": "t"}]));
         let c = node_checks(&n, "", "", 0, None);
         assert!(c.iter().any(|c| c.name == "llamacpp offload" && c.verdict == Verdict::Warn), "{:?}", c.iter().map(|c| c.name).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn llamacpp_offload_absent_line_is_not_checked_never_a_cpu_claim() {
+        // The agent's unknown, and an older agent's "cpu" with no layer count and no failure.
+        for state in ["unknown", "cpu"] {
+            let n = node(json!([{"backend": "llamacpp", "model": "m.gguf", "target": "gpu", "state": state, "cuda_devices": 1, "checked_at": "t"}]));
+            let c = llamacpp_offload_check(&n).expect("a GPU start is a row");
+            assert!(c.detail.starts_with("NOT CHECKED"), "{state}: {}", c.detail);
+            assert!(c.detail.contains("did not report its GPU offload"), "{}", c.detail);
+            assert!(!c.detail.contains("runs on the CPU"), "{}", c.detail);
+            let remedy = c.remedy.as_deref().unwrap_or("");
+            assert!(!remedy.contains("update the NVIDIA driver"), "{remedy}");
+        }
+    }
+
+    #[test]
+    fn llamacpp_offload_cuda_buffer_without_an_offload_line_is_ok_naming_the_evidence() {
+        let n = node(json!([{"backend": "llamacpp", "model": "m.gguf", "target": "gpu", "state": "gpu", "device": "NVIDIA GeForce GTX 1070",
+            "evidence": "CUDA0 model buffer 4403 MiB", "cuda_devices": 1, "checked_at": "t"}]));
+        let c = llamacpp_offload_check(&n).expect("a GPU start is a row");
+        assert_eq!(c.verdict, Verdict::Ok, "{c:?}");
+        assert!(c.detail.contains("CUDA0 model buffer 4403 MiB"), "{}", c.detail);
+    }
+
+    #[test]
+    fn llamacpp_offload_a_real_warn_outranks_not_checked() {
+        let n = node(json!([
+            {"backend": "llamacpp", "model": "a.gguf", "target": "gpu", "state": "cpu", "offloaded": 0, "total": 33, "checked_at": "t"},
+            {"backend": "llamacpp", "model": "b.gguf", "target": "gpu", "state": "unknown", "checked_at": "t"}]));
+        let c = llamacpp_offload_check(&n).unwrap();
+        assert!(c.detail.contains("a.gguf placed on gpu runs on the CPU"), "{}", c.detail);
+        assert!(c.detail.contains("not checked: b.gguf"), "{}", c.detail);
     }
 }
 

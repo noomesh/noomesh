@@ -171,7 +171,9 @@ never call a CPU-bound placement GPU. Only a node that runs llamacpp on its
 GPU downloads the CUDA image: about 3 GB the first time, then only the
 layers a release changed. `verify`'s `llamacpp offload` row shows how many
 layers llama-server put on the GPU; 0 offloaded or a CUDA failure is a WARN
-naming the NVIDIA driver (too old for CUDA 12.9) or a missing CUDA device.
+naming the NVIDIA driver (too old for CUDA 12.9) or a missing CUDA device. A llama.cpp build that prints no offload
+line is not a CPU run: the row says NOT CHECKED, or OK when the weights sit in a
+CUDA buffer.
 
 `noo cluster fit` budgets each placement against its own pool: a gpu
 placement against GPU memory (`vram`, or the `unified` GPU share on Apple
