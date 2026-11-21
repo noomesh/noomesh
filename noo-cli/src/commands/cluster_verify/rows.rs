@@ -1112,6 +1112,17 @@ pub(crate) const ROWS: &[Row] = &[
         doc: None,
     },
     Row {
+        id: "native_ollama",
+        name: "native ollama",
+        scope: Scope::Node,
+        verdicts: &[Verdict::Fail],
+        meaning: "On a Mac node, whether the native Ollama answers on 127.0.0.1:11434; a Mac never runs Ollama in a container, so when it is down nothing serves Ollama there.",
+        clears: "On the Mac: `sudo HOMEBREW_NO_ANALYTICS=1 brew services start --sudo-service-user \"$USER\" ollama` (after `HOMEBREW_NO_ANALYTICS=1 brew install ollama` if it is not installed), or re-run `noo enroll`.",
+        findings: &[],
+        shown_as: None,
+        doc: None,
+    },
+    Row {
         id: "nats_at_rest",
         name: "nats at rest",
         scope: Scope::Controller,
