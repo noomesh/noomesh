@@ -13,7 +13,9 @@ makes the missing path on the root disk and postgres initialises a brand-new
 EMPTY database there, and the gateway comes up on it (2026-10-24 near miss: the
 data NVMe dropped off the bus; ext4 went read-only; postgres crash-looped).
 
-## Symptoms
+## For people
+
+### Symptoms
 
 - `noo stack start|restart|rebuild` prints `REFUSED: not starting — the data
   root ... is not on its recorded filesystem` (or `does not exist`, `cannot be
@@ -26,7 +28,7 @@ data NVMe dropped off the bus; ext4 went read-only; postgres crash-looped).
 
 Nothing was created: the data root is never made by the check.
 
-## 1. Look
+### 1. Look
 
 ```bash
 findmnt -T <data root>            # what is mounted there now
@@ -35,14 +37,14 @@ cat .noo-data-root-id             # what was recorded (UUID, source, target)
 dmesg | grep -i -E 'nvme|ext4|I/O error'
 ```
 
-## 2. Bring the disk back
+### 2. Bring the disk back
 
 A disk that fell off the bus usually needs a cold power cycle (full power off,
 not a reboot). Check `lsblk -f` shows it, then `sudo mount <target>` (or let
 fstab do it) and `findmnt -T <data root>` shows the recorded UUID. Then
 `noo stack start`. Do not create the directory by hand to "make it pass".
 
-## No findmnt (Linux)
+### No findmnt (Linux)
 
 `REFUSED: not starting — findmnt is not installed` means the host has no
 util-linux, so the check cannot see which filesystem holds the data root, and
@@ -53,7 +55,7 @@ either. `noo cluster verify --controller` shows the row as FAIL with the same
 fix. macOS has no findmnt and is never a controller: there the check is
 skipped with a warning.
 
-## 3. The disk was replaced, or the root moved on purpose
+### 3. The disk was replaced, or the root moved on purpose
 
 Only then, once the data is where it should be and the root lists cleanly:
 
@@ -65,10 +67,30 @@ This re-records the identity once. It does not bypass the postgres check: an
 empty postgres data directory on an install that has run before is always
 refused.
 
-## Upgrades
+### Upgrades
 
 On the first launch of a version that has this check, an install with no
 record and a healthy data root (it exists and lists) is recorded with a notice;
 nothing breaks. If the disk is already missing on that first launch and the
 mountpoint is an empty directory on the root disk, that is indistinguishable
 from a fresh install: record it from a healthy boot, not a degraded one.
+
+## For agents
+
+The refusal is the guard working: it stops postgres from starting an empty
+database on the wrong disk. Never work around it.
+
+- **Diagnose, read-only:** `noo --json cluster verify --controller` (the
+  `data root filesystem` row), `findmnt -T <data root>`, `lsblk -f`, the
+  install root's `.noo-data-root-id` and, after a boot, its
+  `.noo-data-root-refused`. Report what each shows.
+- **The person's, never yours:** power-cycling the machine, mounting the
+  disk (`sudo mount`), installing util-linux, and re-recording the identity
+  with `NOO_DATA_ROOT_RERECORD=1 noo stack start` (only after a disk was
+  replaced or the root moved on purpose, and only once the data is where
+  it should be).
+- **Never** create the data root directory by hand, and never set
+  `NOO_DATA_ROOT_RERECORD=1` to get past a refusal: it records whatever
+  disk is mounted now as the right one.
+- **Once the disk is back** (the recorded UUID shows in `findmnt`),
+  `noo stack start` is safe to run.

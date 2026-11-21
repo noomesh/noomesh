@@ -537,7 +537,6 @@ SHAPE_PENDING = frozenset({
     "docs/operating/runbooks/at-rest-migrate.md",
     "docs/operating/runbooks/at-rest-recovery.md",
     "docs/operating/runbooks/backup-restore-secrets.md",
-    "docs/operating/runbooks/data-root-recovery.md",
     "docs/operating/runbooks/host-updates.md",
     "docs/operating/runbooks/nats-isolation.md",
     "docs/operating/runbooks/security-release-upgrade.md",
