@@ -3675,7 +3675,7 @@ pub(crate) fn vetted_push_address(
         return Ok(());
     }
     Err(format!(
-        "{host} is not {node}'s enrollment, tailnet or current-leaf address; if {node} moved there, prove it:          `noo security pki push-nodes {node} --prove`"
+        "{host} is not {node}'s enrollment, tailnet or current-leaf address; if {node} moved there, prove it: `noo security pki push-nodes {node} --prove`"
     ))
 }
 
@@ -3793,8 +3793,9 @@ pub fn pki_push_nodes(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                 continue;
             }
         }
-        // i1174: mint only a vetted address. `--allow-shared-address` does
-        // not reach this: it answers a claim, not an unvetted address.
+        // i1174: mint only a vetted address. `--allow-shared-address`
+        // answers a claim only; it never waives the vetted-address rule.
+        // `--prove` (#1457) is the only exemption, by not entering this loop.
         let ts_ip: Vec<String> = ClusterCa::tailscale_ip4(name).into_iter().collect();
         let enrolled = super::provision::latest_redemption(&tokens, name)
             .and_then(|t| t.get("used_by_ip").and_then(|v| v.as_str()))
@@ -6918,8 +6919,24 @@ mod push_vetting_tests {
         assert!(vetted_push_address("node-b", "192.0.2.21", None, &ts, &leaf).is_ok(), "an address the current leaf carries");
         assert!(vetted_push_address("node-b", "node-b", None, &[], &[]).is_ok(), "its own name");
         let why = vetted_push_address("node-b", "192.0.2.99", Some("192.0.2.50"), &ts, &leaf).unwrap_err();
-        assert!(why.contains("192.0.2.99 is not node-b's enrollment, tailnet or current-leaf address"), "{why}");
-        assert!(why.contains("noo security pki push-nodes node-b --prove"), "the remedy is the proof form: {why}");
+        assert_eq!(
+            why,
+            "192.0.2.99 is not node-b's enrollment, tailnet or current-leaf address; if node-b moved there, prove it: `noo security pki push-nodes node-b --prove`"
+        );
+    }
+
+    /// `--prove` (#1457) is a separate path: it never enters push-nodes'
+    /// plain loop and never consults the vetted-address rule, which the
+    /// proof replaces. Skips cleanly while that function is not in the tree.
+    #[test]
+    fn the_proof_path_never_consults_the_vetted_address_rule() {
+        let own = include_str!("security_local.rs");
+        let own = &own[..own.find("mod push_vetting_tests").expect("tests")];
+        let Some(at) = own.find("fn pki_push_node_prove(") else { return };
+        let body = &own[at..];
+        let body = &body[..body.find("\n}\n").expect("end")];
+        assert!(!body.contains("vetted_push_address("), "{body}");
+        assert!(!body.contains("pki_push_nodes("), "the proof path does not enter the plain loop: {body}");
     }
 
     #[test]
