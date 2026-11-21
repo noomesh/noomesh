@@ -356,8 +356,7 @@ mod tests {
         assert!(class.contains("check before issuing anything"), "{class}");
         assert_eq!(alert_advice("node-b", "connection refused").1, "noo cluster verify node-b");
         assert_eq!(alert_advice("node-b", "timed out").1, "noo cluster verify node-b");
-        let src = include_str!("node_reachability.rs");
-        let code = &src[..src.find("#[cfg(test)]").expect("tests")];
+        let code = crate::test_src::own_code(include_str!("node_reachability.rs"));
         assert!(!code.contains("noo cluster provision"), "no advice here is provision");
         assert!(!code.contains("push-nodes {node}"), "the remedy is verify's row, not this alert's");
         assert!(code.contains("let (class, next) = alert_advice(&node, why);"), "the alert takes its advice from alert_advice");
