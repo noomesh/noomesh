@@ -459,7 +459,7 @@ decrypt_bundle() {  # sets NOO_REFUSAL and DECRYPT_RECORD; 0 or the report's rc
         NOO_REFUSAL=bundle_decrypt_io; return 73
     fi
     rm -f "$TMP/bundle.check"
-    NOO_REFUSAL=bundle_decrypt_failed; DECRYPT_RECORD=1; return 65
+    NOO_REFUSAL=bundle_decrypt_failed; return 65
 }
 # decrypt_refused RC — say it, record $LAST only for a mismatch, report RC.
 decrypt_refused() {
