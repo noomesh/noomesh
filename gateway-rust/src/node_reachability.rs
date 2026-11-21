@@ -108,6 +108,9 @@ fn own_agent_link(
 /// buries the useful part; the distinctions that matter here are refused
 /// vs. timed out vs. rejected at the handshake.
 fn reason(e: &reqwest::Error) -> String {
+    if crate::node_agent_auth::tls_name_mismatch(e) {
+        return NAME_MISMATCH.into();
+    }
     if e.is_timeout() {
         return "timed out".into();
     }
@@ -121,6 +124,31 @@ fn reason(e: &reqwest::Error) -> String {
         return "connection refused".into();
     }
     e.to_string().chars().take(120).collect()
+}
+
+/// The probe reason for a valid cluster leaf that does not name the dialed
+/// address (i1173: the node's address moved, or a roll narrowed its leaf).
+const NAME_MISMATCH: &str = "TLS: its certificate does not name the address the gateway dials";
+
+/// What the operator alert says and what it tells them to run, by the probe
+/// reason. Never `noo cluster provision`: provision re-issues for the
+/// ENROLLMENT address, which a node that moved no longer has (i1173).
+fn alert_advice(node: &str, why: &str) -> (&'static str, String) {
+    if why == NAME_MISMATCH {
+        (
+            "its certificate does not name the address the gateway dials it at, so its address \
+             has likely changed (DHCP after a restart, a new network)",
+            format!("noo security pki push-nodes {node}"),
+        )
+    } else if why.to_ascii_lowercase().contains("cert") {
+        (
+            "the agent at that address did not complete a handshake with a certificate of this \
+             node's; it may be another machine, so check before issuing anything",
+            format!("noo cluster verify {node}"),
+        )
+    } else {
+        ("the dial failed", format!("noo cluster verify {node}"))
+    }
 }
 
 /// How long a recorded result is believed. The prober runs every
@@ -233,16 +261,7 @@ pub async fn tick(state: &Arc<AppState>) {
             tracing::warn!(node = %node, status = %claimed, reason = %why, "node_unreachable_while_reporting_up");
             // The dial error (addresses, TLS internals) is the logged
             // detail; the channel gets the class and the next step.
-            let cert = why.to_ascii_lowercase().contains("cert");
-            let (class, next) = if cert {
-                (
-                    "its certificate was not accepted — re-issue it; provisioning re-issues \
-                     when the cert no longer names the node's address",
-                    format!("noo cluster provision {node}"),
-                )
-            } else {
-                ("the dial failed", format!("noo cluster verify {node}"))
-            };
+            let (class, next) = alert_advice(&node, why);
             crate::operator_alert::send_operator_alert_with(
                 state,
                 crate::operator_alert::OperatorAlert::new(
@@ -320,6 +339,25 @@ pub fn spawn(state: Arc<AppState>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// i1173: a moved node (its leaf names another address) is told to
+    /// push-nodes; any other certificate failure to verify first; and no
+    /// advice is ever provision, which re-issues for the old address.
+    #[test]
+    fn the_alert_tells_a_moved_node_to_push_nodes_and_never_to_provision() {
+        let (class, next) = alert_advice("node-b", NAME_MISMATCH);
+        assert_eq!(next, "noo security pki push-nodes node-b");
+        assert!(class.contains("address has likely changed"), "{class}");
+        let (class, next) = alert_advice("node-b", "TLS handshake rejected (certificate may not name this address)");
+        assert_eq!(next, "noo cluster verify node-b");
+        assert!(class.contains("check before issuing anything"), "{class}");
+        assert_eq!(alert_advice("node-b", "connection refused").1, "noo cluster verify node-b");
+        assert_eq!(alert_advice("node-b", "timed out").1, "noo cluster verify node-b");
+        let src = include_str!("node_reachability.rs");
+        let code = &src[..src.find("#[cfg(test)]").expect("tests")];
+        assert!(!code.contains("noo cluster provision"), "no advice here is provision");
+        assert!(code.contains("let (class, next) = alert_advice(&node, why);"), "the alert takes its advice from alert_advice");
+    }
 
     #[test]
     fn an_authenticated_refusal_still_proves_reachability() {

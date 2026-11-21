@@ -315,6 +315,32 @@ pub(crate) fn foreign_tls(err: &(dyn std::error::Error + 'static)) -> Option<Str
     None
 }
 
+/// i1173: the agent's certificate verified against this cluster's CA but
+/// does not name the address the gateway dialed. That is a node whose
+/// address moved (DHCP after a power cut, a new network) or whose leaf a
+/// roll narrowed: the fix is `noo security pki push-nodes <node>`, which
+/// issues for the address the node now reports. Every other certificate
+/// failure (another CA, the agent refusing our leaf) is NOT this.
+pub(crate) fn tls_name_mismatch(err: &(dyn std::error::Error + 'static)) -> bool {
+    let mut cur = Some(err);
+    while let Some(e) = cur {
+        if let Some(t) = e.downcast_ref::<rustls::Error>() {
+            return matches!(
+                t,
+                rustls::Error::InvalidCertificate(
+                    rustls::CertificateError::NotValidForName | rustls::CertificateError::NotValidForNameContext { .. }
+                )
+            );
+        }
+        // The same io::Error unwrapping as `foreign_tls`.
+        cur = match e.downcast_ref::<std::io::Error>() {
+            Some(io) => io.get_ref().map(|inner| inner as &(dyn std::error::Error + 'static)),
+            None => e.source(),
+        };
+    }
+    false
+}
+
 /// The self agent's address reached another cluster's agent: say so.
 fn warn_if_foreign(base: &str, err: &reqwest::Error) {
     let Some(why) = foreign_tls(err) else { return };
@@ -735,6 +761,23 @@ mod tests {
 
         let down = client.get("https://127.0.0.1:9/health").send().await.unwrap_err();
         assert_eq!(foreign_tls(&down), None, "an agent that is down is not foreign: {down:?}");
+    }
+
+    /// i1173: only a name mismatch (a valid leaf for another address) reads
+    /// as "moved"; another CA, our leaf refused, or a plain I/O error do not.
+    #[test]
+    fn a_name_mismatch_is_told_apart_from_every_other_failure() {
+        let nest = |t: rustls::Error| std::io::Error::other(std::io::Error::new(std::io::ErrorKind::InvalidData, t));
+        assert!(tls_name_mismatch(&nest(rustls::Error::InvalidCertificate(rustls::CertificateError::NotValidForName))));
+        for t in [
+            rustls::Error::InvalidCertificate(rustls::CertificateError::UnknownIssuer),
+            rustls::Error::InvalidCertificate(rustls::CertificateError::Expired),
+            rustls::Error::AlertReceived(rustls::AlertDescription::BadCertificate),
+        ] {
+            let e = nest(t);
+            assert!(!tls_name_mismatch(&e), "{e:?}");
+        }
+        assert!(!tls_name_mismatch(&std::io::Error::other("connection refused")));
     }
 
     #[test]
