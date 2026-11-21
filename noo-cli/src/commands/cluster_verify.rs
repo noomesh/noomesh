@@ -44,6 +44,7 @@ mod warmup;
 pub(crate) mod restart_loops;
 mod gpu_held;
 mod hf_hub;
+mod network_mount;
 mod key_bindings;
 pub(crate) mod rows;
 
@@ -9247,6 +9248,9 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         // cache judged is the self-node AGENT's (its heartbeat in `fleet`),
         // plus the compose cache's own row when that is another directory.
         checks.extend(hf_hub::live(Some(&Value::Array(fleet.clone()))));
+        // Every network mount under the data roots answers a bounded stat
+        // (i1149: a hung hard NFS mount made calls hang with no word why).
+        checks.push(network_mount::live());
         // One "<name> at rest" row per directory that holds state in the
         // clear (`at_rest_dirs`): the process env is what the launcher
         // resolved from `.env`, so the paths are the ones compose bound.

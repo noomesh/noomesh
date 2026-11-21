@@ -207,6 +207,13 @@ pub fn upgrade(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             Some(UPGRADE_USAGE));
     }
 
+    // i1149: before the CLI self-update, the channel step and the `# Stack`
+    // work: a hung data-root mount refuses here, in one line. `--check`
+    // only reads, so it is left alone.
+    if (stack || nodes) && !check_only {
+        refuse_when_storage_hangs(g);
+    }
+
     // Stage 2: we ARE the freshly-installed binary; run the stack/node
     // stages with THIS build's paired tag + embedded assets.
     if stage2 {
@@ -778,7 +785,19 @@ fn gateway_older_than_bundle(force: bool) -> Option<String> {
     if bundle.is_empty() {
         return None;
     }
-    let running = running_gateway_tag()?;
+    bundle_gate(bundle, running_gateway_tag(), force)
+}
+
+/// [`gateway_older_than_bundle`] over what docker said about the gateway.
+fn bundle_gate(bundle: &str, gateway: GatewayTag, force: bool) -> Option<String> {
+    let running = match gateway {
+        GatewayTag::Tag(t) => t,
+        GatewayTag::Unknown => return None,
+        // A hung mount under the gateway is not "unknown": nodes are not
+        // touched until the storage answers (i1149). --force overrides the
+        // version ordering, not a mount that does not answer.
+        GatewayTag::TimedOut { secs } => return Some(gateway_hung_message(secs)),
+    };
     if !version_less_than(&running, bundle) {
         return None;
     }
@@ -797,22 +816,80 @@ fn gateway_older_than_bundle(force: bool) -> Option<String> {
     ))
 }
 
-/// The tag of the image the running gateway container was created from.
-/// `None` when docker is unreachable, the container is absent, or the ref
-/// carries no recognisable tag.
-fn running_gateway_tag() -> Option<String> {
-    let out = std::process::Command::new("docker")
-        .args(["inspect", "noo-gateway", "--format", "{{.Config.Image}}"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
+/// What asking docker for the running gateway's image came to.
+#[derive(Debug, PartialEq, Eq)]
+enum GatewayTag {
+    /// The tag of the image the container was created from.
+    Tag(String),
+    /// Docker is unreachable, the container is absent, or the ref carries no
+    /// recognisable tag: nothing to judge.
+    Unknown,
+    /// `docker inspect` did not answer within the bound: a mount the
+    /// container binds may be hung (i1149). Never folded into `Unknown`.
+    TimedOut { secs: u64 },
+}
+
+/// The tag of the image the running gateway container was created from,
+/// asked with a bounded `docker inspect`.
+fn running_gateway_tag() -> GatewayTag {
+    let name = crate::envfile::container("gateway");
+    let limit = Duration::from_secs(crate::bounded::INSPECT_SECS);
+    gateway_tag_from(&crate::bounded::docker(&["inspect", &name, "--format", "{{.Config.Image}}"], limit))
+}
+
+/// What a bounded `docker inspect --format {{.Config.Image}}` of the gateway said.
+fn gateway_tag_from(b: &crate::bounded::Bounded) -> GatewayTag {
+    use crate::bounded::Bounded;
+    match b {
+        Bounded::TimedOut { secs } => GatewayTag::TimedOut { secs: *secs },
+        Bounded::SpawnFailed(_) => GatewayTag::Unknown,
+        Bounded::Answered(out) if !out.status.success() => GatewayTag::Unknown,
+        Bounded::Answered(out) => match image_tag(String::from_utf8_lossy(&out.stdout).trim()) {
+            Some(t) => GatewayTag::Tag(t),
+            None => GatewayTag::Unknown,
+        },
     }
-    let image = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    // `ghcr.io/…/gateway:v0.2.21@sha256:…` → `v0.2.21`
+}
+
+/// The one line when the gateway's `docker inspect` did not answer: the bind
+/// sources are the data roots from the environment (`NOO_DATA_ROOT`,
+/// `MODELS_DIR`, `HF_CACHE_DIR`), because inspect is the call that hung.
+fn gateway_hung_message(secs: u64) -> String {
+    crate::bounded::inspect_hung_message(&crate::envfile::container("gateway"), secs, &crate::bounded::env_roots())
+}
+
+/// `ghcr.io/…/gateway:v0.2.21@sha256:…` → `v0.2.21`; `None` for a ref with
+/// no version-shaped tag.
+fn image_tag(image: &str) -> Option<String> {
     let no_digest = image.split('@').next()?;
     let tag = no_digest.rsplit_once(':').map(|(_, t)| t.to_string())?;
     (tag.starts_with('v') && tag.chars().nth(1).is_some_and(|c| c.is_ascii_digit())).then_some(tag)
+}
+
+/// i1149: refuse BEFORE touching anything when the storage the stack binds
+/// does not answer. Two bounded asks, neither able to hang the upgrade: a
+/// child `stat` (5 s) of every network mount under the data roots
+/// (`NOO_DATA_ROOT`, `MODELS_DIR`, `HF_CACHE_DIR`), then `docker inspect` of
+/// the gateway (30 s), whose container binds those roots. A hard NFS mount
+/// that lost its server blocks both in D state; before this the upgrade
+/// printed `# Stack` and sat silent for hours.
+fn refuse_when_storage_hangs(g: &Globals) {
+    if let Some(msg) = storage_refusal(&crate::bounded::probe_data_roots(), running_gateway_tag) {
+        fail(g.json, ExitCode::Generic, "hung_mount", &msg, None);
+    }
+}
+
+/// The refusal, or `None`: a hung mount first (the gateway is not asked
+/// then, so a refusal never costs a second wait), else a gateway whose
+/// inspect did not answer.
+fn storage_refusal(mounts: &[(crate::bounded::Mount, bool)], gateway: impl FnOnce() -> GatewayTag) -> Option<String> {
+    if let Some(msg) = crate::bounded::hung_mount_refusal(mounts) {
+        return Some(msg);
+    }
+    match gateway() {
+        GatewayTag::TimedOut { secs } => Some(gateway_hung_message(secs)),
+        GatewayTag::Tag(_) | GatewayTag::Unknown => None,
+    }
 }
 
 /// `v0.2.19 < v0.2.21`. Compares numeric components; a component that does
@@ -1239,20 +1316,30 @@ fn upgrade_stack(g: &Globals, tag_override: Option<&str>, force: bool, skip_gw_k
 /// Never fails the roll.
 fn ensure_embedder_after_roll(g: &Globals) {
     let embed = crate::envfile::container("ollama-embed");
-    let running = std::process::Command::new("docker")
-        .args(["inspect", "-f", "{{.State.Running}}", &embed])
-        .output()
-        .map(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).trim() == "true")
-        .unwrap_or(false);
+    let state = embed_state(&crate::bounded::docker(
+        &["inspect", "-f", "{{.State.Running}}", &embed],
+        Duration::from_secs(crate::bounded::INSPECT_SECS),
+    ));
     let model = crate::commands::provision::release_var("PAGEINDEX_EMBEDDING_MODEL");
     let model = if model.is_empty() { "harrier".to_string() } else { model };
-    if !running {
-        if !g.json {
-            ui::warned(&format!(
-                "{embed} is not running, so the embedder ({model}) was not checked; \
-                 once it runs: noo models pull {model}"));
+    match state {
+        EmbedState::Running => {}
+        EmbedState::NotRunning => {
+            if !g.json {
+                ui::warned(&format!(
+                    "{embed} is not running, so the embedder ({model}) was not checked; \
+                     once it runs: noo models pull {model}"));
+            }
+            return;
         }
-        return;
+        EmbedState::Unknown(why) => {
+            if !g.json {
+                ui::warned(&format!(
+                    "could not inspect {embed} ({why}), so the embedder ({model}) was not checked; \
+                     once docker answers: noo models pull {model}"));
+            }
+            return;
+        }
     }
     for line in crate::onboard::steps::ensure_embed_model_core(&model) {
         if g.json {
@@ -1263,6 +1350,41 @@ fn ensure_embedder_after_roll(g: &Globals) {
             Some('!') => ui::warned(&line[1..]),
             Some('.') => ui::step(&line[1..]),
             _ => eprintln!("{line}"),
+        }
+    }
+}
+
+/// What a bounded `docker inspect -f {{.State.Running}}` said about the
+/// embed container.
+#[derive(Debug, PartialEq, Eq)]
+enum EmbedState {
+    Running,
+    /// A clean `false`, or no such container.
+    NotRunning,
+    /// No answer: the reason (timed out, could not be started, docker erred).
+    Unknown(String),
+}
+
+fn embed_state(b: &crate::bounded::Bounded) -> EmbedState {
+    use crate::bounded::Bounded;
+    match b {
+        Bounded::TimedOut { secs } => EmbedState::Unknown(format!("did not answer in {secs} s")),
+        Bounded::SpawnFailed(e) => EmbedState::Unknown(format!("docker could not be run: {e}")),
+        Bounded::Answered(o) => {
+            let out = String::from_utf8_lossy(&o.stdout);
+            let err = String::from_utf8_lossy(&o.stderr);
+            if o.status.success() {
+                match out.trim() {
+                    "true" => EmbedState::Running,
+                    "false" => EmbedState::NotRunning,
+                    other => EmbedState::Unknown(format!("docker said {other:?}")),
+                }
+            } else if err.contains("No such") {
+                EmbedState::NotRunning
+            } else {
+                let first = err.lines().next().unwrap_or("").trim();
+                EmbedState::Unknown(format!("docker inspect failed: {first}"))
+            }
         }
     }
 }
@@ -6374,7 +6496,7 @@ mod tests {
         assert_eq!(super::complete_stack_tags(|i| (i != "worker").then(|| vec!["v0.6.0".into()])), None);
     }
 
-    use super::{first_noo_on_path, local_agent_name, target_triple_for, version_less_than, running_gateway_tag};
+    use super::{first_noo_on_path, local_agent_name, target_triple_for, version_less_than, running_gateway_tag, GatewayTag};
 
     /// One deleter of superseded images: image retention. The roll's own
     /// pruner (finding #93) removed images on every roll, ignoring
@@ -6500,9 +6622,102 @@ mod tests {
     fn a_missing_gateway_container_is_unknown_not_unsafe() {
         // Whatever this box has, the call must not panic and must return an
         // Option — a tag only when it could actually read one.
-        if let Some(tag) = running_gateway_tag() {
+        if let GatewayTag::Tag(tag) = running_gateway_tag() {
             assert!(tag.starts_with('v'), "a returned tag is version-shaped: {tag}");
         }
+    }
+
+    fn answered(code: i32, so: &str) -> crate::bounded::Bounded {
+        use std::os::unix::process::ExitStatusExt;
+        crate::bounded::Bounded::Answered(std::process::Output {
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout: so.as_bytes().to_vec(),
+            stderr: Vec::new(),
+        })
+    }
+
+    /// i1149: the inspect that did not answer is its own state, and the
+    /// answers keep their meaning.
+    #[test]
+    fn a_gateway_inspect_that_timed_out_is_not_an_unknown_tag() {
+        use super::gateway_tag_from;
+        assert_eq!(gateway_tag_from(&crate::bounded::Bounded::TimedOut { secs: 30 }), GatewayTag::TimedOut { secs: 30 });
+        assert_eq!(gateway_tag_from(&answered(0, "ghcr.io/x/gateway:v0.6.29@sha256:ab\n")), GatewayTag::Tag("v0.6.29".into()));
+        assert_eq!(gateway_tag_from(&answered(1, "")), GatewayTag::Unknown);
+        assert_eq!(gateway_tag_from(&answered(0, "gateway:latest")), GatewayTag::Unknown);
+        assert_eq!(
+            gateway_tag_from(&crate::bounded::Bounded::SpawnFailed(std::io::Error::new(std::io::ErrorKind::NotFound, "x"))),
+            GatewayTag::Unknown
+        );
+    }
+
+    /// A gateway that does not answer holds the node phase even under
+    /// --force; an older gateway is refused unless forced.
+    #[test]
+    fn the_node_phase_waits_for_a_gateway_that_does_not_answer() {
+        use super::bundle_gate;
+        let hung = bundle_gate("v0.6.30", GatewayTag::TimedOut { secs: 30 }, true).expect("refused");
+        assert!(hung.contains("did not answer in 30 s") && hung.contains("Do not force-unmount"), "{hung}");
+        assert!(bundle_gate("v0.6.30", GatewayTag::Unknown, false).is_none());
+        assert!(bundle_gate("v0.6.30", GatewayTag::Tag("v0.6.30".into()), false).is_none());
+        assert!(bundle_gate("v0.6.30", GatewayTag::Tag("v0.6.29".into()), false).is_some());
+        assert!(bundle_gate("v0.6.30", GatewayTag::Tag("v0.6.29".into()), true).is_none());
+    }
+
+    #[test]
+    fn the_upgrade_refuses_a_hung_mount_or_a_silent_gateway_before_touching_anything() {
+        use super::storage_refusal;
+        use crate::bounded::Mount;
+        let nfs = Mount { point: "/srv/noo".into(), fstype: "nfs4".into(), source: "filer.example:/export/noo".into() };
+        let msg = storage_refusal(&[(nfs.clone(), false)], || panic!("the gateway is not asked after a hung mount")).expect("refused");
+        assert!(msg.starts_with("/srv/noo (nfs4 from filer.example:/export/noo) did not answer in 5 s"), "{msg}");
+        let msg = storage_refusal(&[(nfs.clone(), true)], || GatewayTag::TimedOut { secs: 30 }).expect("refused");
+        assert!(msg.contains("did not answer in 30 s: a mount the gateway uses may be hung"), "{msg}");
+        assert_eq!(storage_refusal(&[(nfs, true)], || GatewayTag::Tag("v0.6.29".into())), None);
+        assert_eq!(storage_refusal(&[], || GatewayTag::Unknown), None, "a fresh cell with no network mounts proceeds");
+        // Where it sits: the top of `upgrade`, before the self-update, the
+        // channel step and the stack work.
+        let src = crate::test_src::own_code(include_str!("upgrade.rs"));
+        let up = crate::test_src::fn_body(&src, "pub fn upgrade(");
+        let call = up.find("if (stack || nodes) && !check_only {\n        refuse_when_storage_hangs(g);").expect("the storage check");
+        for later in ["if stage2 {", "super::channel::request(&chan)", "resolve_latest(g)", "run_fleet_stages("] {
+            assert!(call < up.find(later).expect(later), "the storage check comes before {later}");
+        }
+    }
+
+    #[test]
+    fn an_image_ref_reads_as_its_version_tag_or_nothing() {
+        assert_eq!(super::image_tag("ghcr.io/x/gateway:v0.6.29@sha256:abc"), Some("v0.6.29".to_string()));
+        assert_eq!(super::image_tag("ghcr.io/x/gateway:v0.6.29"), Some("v0.6.29".to_string()));
+        assert_eq!(super::image_tag("ghcr.io/x/gateway:latest"), None);
+        assert_eq!(super::image_tag("gateway"), None);
+        assert_eq!(super::image_tag(""), None);
+    }
+
+    /// i1149: a docker that does not answer is its own state. It never
+    /// reads as "not running" (embedder) or as an unknown tag (gateway).
+    #[test]
+    fn a_docker_that_did_not_answer_is_not_a_clean_false() {
+        use super::{embed_state, EmbedState};
+        use crate::bounded::Bounded;
+        use std::os::unix::process::ExitStatusExt;
+        let out = |code: i32, so: &str, se: &str| Bounded::Answered(std::process::Output {
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout: so.as_bytes().to_vec(),
+            stderr: se.as_bytes().to_vec(),
+        });
+        assert_eq!(embed_state(&out(0, "true\n", "")), EmbedState::Running);
+        assert_eq!(embed_state(&out(0, "false\n", "")), EmbedState::NotRunning);
+        assert_eq!(embed_state(&out(1, "", "Error: No such object: noo-ollama-embed")), EmbedState::NotRunning);
+        assert_eq!(
+            embed_state(&Bounded::TimedOut { secs: 30 }),
+            EmbedState::Unknown("did not answer in 30 s".to_string())
+        );
+        assert!(matches!(embed_state(&out(1, "", "permission denied")), EmbedState::Unknown(_)));
+        assert!(matches!(
+            embed_state(&Bounded::SpawnFailed(std::io::Error::new(std::io::ErrorKind::NotFound, "no docker"))),
+            EmbedState::Unknown(_)
+        ));
     }
 
     use super::*;
@@ -8088,7 +8303,7 @@ mod embedder_after_roll_tests {
         let call = launch.find("ensure_embedder_after_roll(g)").expect("the roll ensures the embedder");
         assert!(success < done && done < call, "the embedder is ensured in the success arm, after the stack is up");
         let ensure = crate::test_src::fn_body(&src, "fn ensure_embedder_after_roll(");
-        let running = ensure.find("if !running").expect("a running check");
+        let running = ensure.find("EmbedState::NotRunning").expect("a running check");
         let create = ensure.find("ensure_embed_model_core(&model)").expect("the shared fetch-and-create");
         assert!(running < create, "nothing is created in a container that is down");
     }
