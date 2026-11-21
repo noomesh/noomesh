@@ -155,8 +155,9 @@ then `noo stack start` starts the held services.
 - **A GPU that did not answer at start** holds only the GPU services: the
   launcher exits 75, `noo upgrade --stack` reports "stack up except
   <service>", and verify's `GPU services` row stays FAIL. A host reboot
-  (the person's) clears a driver fault; after it, `noo stack start` starts
-  the held services.
+  (the person's) clears a driver fault. After it, run what the message
+  named: `noo upgrade --stack` when the hold came from an upgrade (its pin
+  has already moved), else `noo stack start`.
 - **The tailnet bind:** with `NOO_BIND_MODE=tailnet`, `noo doctor exposure`
-  must not report `boot_safe: false`; if it does, its one-line sysctl fix is
-  the person's to apply.
+  must not report `boot_safe: false` (`null` means the sysctl was not read);
+  on `false`, its one-line sysctl fix is the person's to apply.
