@@ -81,9 +81,12 @@ The refusal is the guard working: it stops postgres from starting an empty
 database on the wrong disk. Never work around it.
 
 - **Diagnose, read-only:** `noo --json cluster verify --controller` (the
-  `data root filesystem` row), `findmnt -T <data root>`, `lsblk -f`, the
-  install root's `.noo-data-root-id` and, after a boot, its
-  `.noo-data-root-refused`. Report what each shows.
+  `data root filesystem` row), `findmnt -T <data root>`, `lsblk -f`, and the
+  install root's `.noo-data-root-id`. Where the reason is depends on who
+  refused: a refused `noo stack start` prints it on stderr; only hostd's
+  boot restore writes it to `.noo-data-root-refused` in the install root
+  (or `NOO_DATA_ROOT_REFUSED_FILE`), with the containers it stopped.
+  Report what each shows.
 - **The person's, never yours:** power-cycling the machine, mounting the
   disk (`sudo mount`), installing util-linux, and re-recording the identity
   with `NOO_DATA_ROOT_RERECORD=1 noo stack start` (only after a disk was
