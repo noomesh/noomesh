@@ -492,7 +492,7 @@ def test_the_rag_probe_asks_the_pages_query_then_three_chat_paths_and_is_never_j
     wait = probe.index('if noo rag query "$RAG_QUERY_LINE" 2>&1 | grep -qiE "$fact"; then indexed=yes')
     ask = probe.index("for path in chat agent console; do")
     assert ingest < wait < ask
-    assert 'chat) out="$(noo chat --message "$RAG_CHAT_LINE" 2>&1)"' in probe
+    assert 'chat) c0="$(date +%s)"; out="$(noo chat --message "$RAG_CHAT_LINE" 2>&1)"' in probe
     assert 'agent) a0="$(date +%s)"; out="$(timeout 300 noo inference agent "$RAG_CHAT_LINE" 2>&1)"; arc=$?' in probe
     assert 'console) out="$(timeout 330 python3 -I "$RAG_WS_CHAT" "$RAG_CHAT_LINE" 2>&1)"' in probe
     assert 'fact="14(th)? (of )?march|ZIRCON-4471|kestrel"' in probe
@@ -1251,3 +1251,15 @@ def test_another_cell_never_rotates_and_says_where_it_runs(tmp_path):
     assert r.returncode == 0 and calls == "", calls
     assert v["START-AFTER-PROVISION"] == f"START-AFTER-PROVISION NOTE: runs in the {ROTATION_CELL} cell only (it rotates the worker NATS credential and recreates the stack)"
     assert v["START-AFTER-FORCED-RESTART"] == f"START-AFTER-FORCED-RESTART NOTE: runs in the {ROTATION_CELL} cell only"
+
+
+def test_the_rag_evidence_file_goes_through_the_redactor_and_the_upload_scan(tmp_path):
+    sse = f"data: {{\"type\":\"tool_result\",\"output\":\"Authorization: Bearer {JWT}\"}}"
+    red = _redact("RAG-CHAT EVIDENCE: x\n  sse: " + sse + "\n  gw: NOO_CLUSTER_TOKEN=s3cr3t-value-123\n")
+    assert JWT not in red and "s3cr3t-value-123" not in red
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    (logs / "rag-chat-evidence.log").write_text(red)
+    assert C.cmd_scan([str(tmp_path)]) == 0
+    (logs / "rag-chat-evidence.log").write_text("  sse: " + sse + "\n")
+    assert C.cmd_scan([str(tmp_path)]) == 3
