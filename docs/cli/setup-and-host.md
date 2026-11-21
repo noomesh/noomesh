@@ -173,10 +173,20 @@ standalone installs only; on a checkout use `noo stack start`/`rebuild`.
 fetch tick`. Nodes that callers fail over between (the candidates of one
 model class, the pool of one embedding space) are never all restarting at
 once: before staging a node, the roll checks that each of its groups keeps
-one other offered candidate (two for a group of four or more), and otherwise
-waits, at most 150 s once the restarting node has applied, saying what it
-waits for. A wait that runs out is said with the command to check
-(`noo cluster verify --wait`) and the roll goes on. Before it changes anything, `--stack`/`--nodes`/`--all` stat every network mount
+one other serving candidate (two for a group of four or more), and otherwise
+waits, saying what it waits for. Serving is what the router itself needs:
+the candidate is placed or available, healthy (a fresh heartbeat, the
+controller reaches its agent, the engine answers) and its lane serving or
+on demand, as `noo cluster class list` shows it; being listed in the class
+is not enough. A node staged earlier counts again once it has applied, serves
+in every class it served before, and the controller's reachability probe has
+reached it since it restarted. The wait is bounded: 10 min for that node to
+apply, then 15 min for it to serve. When a bound runs out the node phase
+stops instead of leaving a class with nothing serving: the node and every
+node after it are not staged (the nodes already staged are still waited for),
+and the roll names who is not serving what. Once it serves again,
+`noo upgrade --nodes` resumes. `noo upgrade --nodes --allow-unserved` (or
+`--all --allow-unserved`) stages the rest after the bound anyway, saying so. Before it changes anything, `--stack`/`--nodes`/`--all` stat every network mount
 (NFS, SMB, sshfs) under `NOO_DATA_ROOT`, `MODELS_DIR` and `HF_CACHE_DIR`, and ask
 docker about the gateway, each with a deadline (5 s, 30 s); a hung mount stops the
 upgrade with one line naming it (the `network mount` row of `noo cluster verify`
@@ -324,7 +334,7 @@ the other nodes first: [Start over](../getting-started/start-over.md).
 ### `noo upgrade` — Self-update the CLI; --stack/--nodes/--controller roll the rest
 | Command | Arguments | What it does |
 |---|---|---|
-| `noo upgrade` | `[--check] [--version <X.Y.Z>] [--stack] [--nodes] [--seats\|--no-seats] [--all] [--tag <vX.Y.Z>] [--controller] [--allow-unsigned] [--force] [--skip-gateway-key-check] [--allow-downgrade] [--stage2] [--channel <public\|rollback\|custom>] [--release-repo <owner/repo>] [--image-prefix <registry/path>] [--base-registry <registry/path>] [--yes]` | Self-update noo, optionally stack, nodes and kiosk seats; --channel moves release channel |
+| `noo upgrade` | `[--check] [--version <X.Y.Z>] [--stack] [--nodes] [--seats\|--no-seats] [--all] [--tag <vX.Y.Z>] [--controller] [--allow-unsigned] [--force] [--skip-gateway-key-check] [--allow-downgrade] [--allow-unserved] [--stage2] [--channel <public\|rollback\|custom>] [--release-repo <owner/repo>] [--image-prefix <registry/path>] [--base-registry <registry/path>] [--yes]` | Self-update noo, optionally stack, nodes and kiosk seats; --channel moves release channel |
 
 ### `noo doctor` — Host-plane health checks with guided recovery
 | Command | Arguments | What it does |

@@ -62,7 +62,7 @@ const TAG_PREFIX: &str = "noo-cli-v";
 /// The release installer, served by the controller mirror as `install.sh`.
 const INSTALLER: &str = include_str!("../../install.sh");
 const UPGRADE_USAGE: &str =
-    "usage: noo upgrade [--check] [--version X.Y.Z] [--stack] [--nodes] [--seats|--no-seats] [--all] [--tag vX.Y.Z] [--controller] [--allow-unsigned] [--skip-gateway-key-check] [--allow-downgrade] [--channel public|rollback|custom [--release-repo <owner/repo> --image-prefix <registry/path> [--base-registry <registry/path>]]] [--yes]";
+    "usage: noo upgrade [--check] [--version X.Y.Z] [--stack] [--nodes] [--seats|--no-seats] [--all] [--tag vX.Y.Z] [--controller] [--allow-unsigned] [--skip-gateway-key-check] [--allow-downgrade] [--allow-unserved] [--channel public|rollback|custom [--release-repo <owner/repo> --image-prefix <registry/path> [--base-registry <registry/path>]]] [--yes]";
 
 /// THE release repo, for every caller. `NOO_CLI_REPO` overrides the default.
 ///
@@ -134,6 +134,10 @@ pub fn upgrade(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     // an older signed version with it. Refused by default (add-ons may carry
     // database migrations).
     let mut allow_downgrade = false;
+    // The node phase: a node whose group would be left with nothing serving
+    // is staged anyway after the stagger's bound, instead of stopping the
+    // phase (roll_stagger::Release).
+    let mut allow_unserved = false;
     // Move this install between release channels.
     let mut chan = super::channel::Flags::default();
     let mut yes = false;
@@ -152,6 +156,7 @@ pub fn upgrade(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             "--force" => force = true,
             "--skip-gateway-key-check" => skip_gw_key_check = true,
             "--allow-downgrade" => allow_downgrade = true,
+            "--allow-unserved" => allow_unserved = true,
             "--yes" | "-y" => yes = true,
             "--channel" | "--release-repo" | "--image-prefix" | "--base-registry" => match it.next() {
                 Some(v) => {
@@ -220,7 +225,7 @@ pub fn upgrade(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         // The fresh binary corrects what an older one could not know about
         // (the parent of a self-update is the previous release).
         super::channel::migrate_legacy_base_registry(g, false);
-        return run_fleet_stages(g, stack, nodes, seats, tag_override.as_deref(), force, skip_gw_key_check, allow_downgrade);
+        return run_fleet_stages(g, stack, nodes, seats, tag_override.as_deref(), force, skip_gw_key_check, allow_downgrade, allow_unserved);
     }
 
     let current = env!("CARGO_PKG_VERSION").to_string();
@@ -414,7 +419,7 @@ pub fn upgrade(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         if stack || nodes || seats {
             // No swap happened — this process IS the current build, so its
             // paired tag and assets are already the right ones.
-            return run_fleet_stages(g, stack, nodes, seats, tag_override.as_deref(), force, skip_gw_key_check, allow_downgrade);
+            return run_fleet_stages(g, stack, nodes, seats, tag_override.as_deref(), force, skip_gw_key_check, allow_downgrade, allow_unserved);
         }
         return Ok(0);
     }
@@ -580,7 +585,7 @@ pub fn upgrade(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             if let Some(t) = &g.token { cmd.env("NOO_TOKEN", t); }
             cmd.args(stage2_args(g, &Stage2 {
                 stack, nodes, seats_only, no_seats, tag: tag_override.as_deref(),
-                force, skip_gw_key_check, allow_downgrade,
+                force, skip_gw_key_check, allow_downgrade, allow_unserved,
             }));
             let err = cmd.exec(); // only returns on failure
             fail(g.json, ExitCode::Generic, "reexec_failed",
@@ -915,7 +920,7 @@ fn warm_release_digests(g: &Globals) {
 
 /// Run the requested fleet stages from a binary whose paired tag/assets are
 /// current (either freshly re-exec'd, or already-current with no swap).
-fn run_fleet_stages(g: &Globals, stack: bool, nodes: bool, seats: bool, tag_override: Option<&str>, force: bool, skip_gw_key_check: bool, allow_downgrade: bool)
+fn run_fleet_stages(g: &Globals, stack: bool, nodes: bool, seats: bool, tag_override: Option<&str>, force: bool, skip_gw_key_check: bool, allow_downgrade: bool, allow_unserved: bool)
     -> Result<i32, Unhandled>
 {
     let mut rc = 0;
@@ -1035,7 +1040,7 @@ fn run_fleet_stages(g: &Globals, stack: bool, nodes: bool, seats: bool, tag_over
             // node phase, so a node's first pinned start gets a 200 (i1167a).
             warm_release_digests(g);
             if nodes {
-                rc = upgrade_nodes(g)?;
+                rc = upgrade_nodes(g, allow_unserved)?;
                 if rc != 0 { failed_stage = "nodes"; }
             }
             // Kiosk seats AFTER the nodes (i77), whatever the nodes did: a
@@ -3103,7 +3108,7 @@ fn rail_names(mut names: Vec<String>, is_self: impl Fn(&str) -> bool, on_control
 /// own noo-fetch timer — no SSH, no waiting here. The controller's own node
 /// rides the same rail, last (i67): no sudo, and a refusal with the remedy
 /// when its pull units are missing.
-fn upgrade_nodes(g: &Globals) -> Result<i32, Unhandled> {
+fn upgrade_nodes(g: &Globals, allow_unserved: bool) -> Result<i32, Unhandled> {
     // A node agent's stop during THIS roll is reported (drain_bound_hits).
     let roll_started = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     // The gateway wait is the caller's Gateway phase (run_fleet_stages).
@@ -3218,16 +3223,24 @@ fn upgrade_nodes(g: &Globals) -> Result<i32, Unhandled> {
     // space) are never restarting together. The groups are read once, before
     // anything is staged; the rail is staged in an order that keeps a pair
     // apart, and each staging first waits (bounded) for every earlier-staged
-    // node sharing a group with it to apply and be offered again.
+    // node sharing a group with it to apply and SERVE again. A bound that is
+    // hit stops the phase here (unless --allow-unserved): this node and every
+    // later one are held, the staged ones are waited for as usual.
     let me = local_agent_node(&names);
-    let mut stagger = super::roll_stagger::Stagger::start(g, &names, me.as_deref());
+    let mut stagger = super::roll_stagger::Stagger::start(g, &names, me.as_deref(), allow_unserved);
     let rail_order: Vec<String> = stagger.order.iter().filter(|n| Some(n.as_str()) != me.as_deref()).cloned().collect();
+    let mut stopped: Option<String> = None;
+    let mut held: Vec<String> = Vec::new();
     for n in &rail_order {
         if let Some((_, why)) = skipped.iter().find(|(s, _)| s == n) {
             ui::blank();
             ui::say(&ui::item(n));
             ui::say(&ui::sub(&ui::status_line(Glyph::Warn,
                 &format!("{n}: skipped — offline before the roll ({why}); nothing to wait for"))));
+            continue;
+        }
+        if stopped.is_some() {
+            held.push(n.clone());
             continue;
         }
         // Each node is an item; cluster provision prints the `ui::item`
@@ -3240,7 +3253,11 @@ fn upgrade_nodes(g: &Globals) -> Result<i32, Unhandled> {
         // A node that needs the applier first gets ONLY that bundle now;
         // the combined wait restages the full one when it is in.
         let applier_first = super::provision::applier_first_for(g, n);
-        stagger.before(g, n);
+        if let super::roll_stagger::Release::Stop(line) = stagger.before(g, n) {
+            held.push(n.clone());
+            stopped = Some(line);
+            continue;
+        }
         // `--stage-only`: stage and poke, return at once. The apply is
         // waited for below, for every node together, so one slow node no
         // longer holds up staging the rest.
@@ -3275,14 +3292,21 @@ fn upgrade_nodes(g: &Globals) -> Result<i32, Unhandled> {
     if let Some(me) = &me {
         // The child prints its own `ui::item` label, as the rail nodes do.
         ui::blank();
-        stagger.before(g, me);
-        upgrade_self_node(g, me, &mut failed, &mut pending);
+        if stopped.is_some() {
+            held.push(me.clone());
+        } else if let super::roll_stagger::Release::Stop(line) = stagger.before(g, me) {
+            held.push(me.clone());
+            stopped = Some(line);
+        } else {
+            upgrade_self_node(g, me, &mut failed, &mut pending);
+        }
     }
     let waited = if pending.is_empty() { Vec::new() } else { wait_and_settle_nodes(g, &pending, me.as_deref(), &mut failed) };
     // One line per node, whatever the others did (0.6.21: "stopped at the
     // nodes stage" hid that ctrl upgraded fine beside a failed node).
     let order: Vec<String> = rail_order.iter().cloned().chain(me.clone()).collect();
     print_node_outcomes(g, &node_outcome_rows(&order, &skipped, &waited, &failed));
+    print_held_nodes(g, &held);
     if g.json && !stagger.json.is_empty() {
         println!("{}", serde_json::json!({"stagger": stagger.json}));
     }
@@ -3293,7 +3317,7 @@ fn upgrade_nodes(g: &Globals) -> Result<i32, Unhandled> {
     // A node whose first staging failed is already in `failed`; waiting
     // for it to apply a bundle it never got would only burn the budget.
     let waiting: Vec<String> = leafless.into_iter()
-        .filter(|n| !failed.contains(n) && !skipped.iter().any(|(s, _)| s == n)).collect();
+        .filter(|n| !failed.contains(n) && !held.contains(n) && !skipped.iter().any(|(s, _)| s == n)).collect();
     let mut remaining: Vec<String> = Vec::new();
     if !waiting.is_empty() {
         let outcomes = mac_leaves_pass(g, &waiting, leaf_budget);
@@ -3316,7 +3340,11 @@ fn upgrade_nodes(g: &Globals) -> Result<i32, Unhandled> {
         }));
     }
     let staged_failed: Vec<String> = failed.iter().filter(|n| !remaining.contains(n)).cloned().collect();
-    let (rc, msg) = nodes_outcome(names.len(), &skipped_names, &staged_failed, &remaining);
+    let (rc, msg) = match &stopped {
+        // The stagger's own line: who does not serve what, and how to resume.
+        Some(line) => (1, line.clone()),
+        None => nodes_outcome(names.len(), &skipped_names, &staged_failed, &remaining),
+    };
     if !waited.is_empty() || !pending.is_empty() {
         record_roll();
     }
@@ -3344,7 +3372,29 @@ fn upgrade_nodes(g: &Globals) -> Result<i32, Unhandled> {
         let why = "stages the backend door leaves once the Mac reports the new CLI";
         ui::guide(&cmds.iter().map(|c| (c.as_str(), why)).collect::<Vec<_>>());
     }
+    if stopped.is_some() && !g.json {
+        ui::guide(&[
+            ("noo cluster class list", "shows which candidates serve now (placed and healthy)"),
+            ("noo upgrade --nodes", "resumes once they serve: restages every node, the rolled ones at the release they already run"),
+            ("noo upgrade --nodes --allow-unserved", "rolls the held nodes without waiting for a serving candidate"),
+        ]);
+    }
     Ok(rc)
+}
+
+/// The nodes the stagger held (the node phase stopped before them): one
+/// line each after the table, or one `held` row with --json.
+fn print_held_nodes(g: &Globals, held: &[String]) {
+    if held.is_empty() {
+        return;
+    }
+    if g.json {
+        println!("{}", serde_json::json!({"held": held}));
+        return;
+    }
+    for n in held {
+        ui::say(&ui::status_line(Glyph::Warn, &format!("{n}: not rolled — the node phase stopped before it (see above)")));
+    }
 }
 
 /// The closing line of a clean nodes stage: restarted agents read as
@@ -5935,6 +5985,7 @@ struct Stage2<'a> {
     force: bool,
     skip_gw_key_check: bool,
     allow_downgrade: bool,
+    allow_unserved: bool,
 }
 
 /// The re-exec's argv after the binary: the globals first (the stage-2 run is
@@ -5952,7 +6003,7 @@ fn stage2_args(g: &Globals, s: &Stage2) -> Vec<String> {
     for (on, flag) in [
         (s.stack, "--stack"), (s.nodes, "--nodes"), (s.seats_only, "--seats"), (s.no_seats, "--no-seats"),
         (s.force, "--force"), (s.skip_gw_key_check, "--skip-gateway-key-check"),
-        (s.allow_downgrade, "--allow-downgrade"),
+        (s.allow_downgrade, "--allow-downgrade"), (s.allow_unserved, "--allow-unserved"),
     ] {
         if on { a.push(flag.into()); }
     }
@@ -5972,6 +6023,7 @@ mod reexec_tests {
         ("--stack", "stack"), ("--nodes", "nodes"), ("--seats", "seats_only"), ("--no-seats", "no_seats"),
         ("--tag", "tag_override"), ("--force", "force"),
         ("--skip-gateway-key-check", "skip_gw_key_check"), ("--allow-downgrade", "allow_downgrade"),
+        ("--allow-unserved", "allow_unserved"),
     ];
 
     fn all_set() -> Vec<String> {
@@ -5981,7 +6033,7 @@ mod reexec_tests {
         };
         stage2_args(&g, &Stage2 {
             stack: true, nodes: true, seats_only: true, no_seats: true, tag: Some("v0.6.16"),
-            force: true, skip_gw_key_check: true, allow_downgrade: true,
+            force: true, skip_gw_key_check: true, allow_downgrade: true, allow_unserved: true,
         })
     }
 
