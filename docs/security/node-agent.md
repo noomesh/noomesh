@@ -476,10 +476,15 @@ cluster-CA chain and the dialled address (i1174):
   heard from for ten minutes owns none.
 - **At the handshake.** Every client built from the cluster TLS config (the
   unary, streaming and failover clients and the WebSocket relay) runs webpki's
-  verification, then requires a NODE leaf presented at an address in the book
-  to name a node that owns an agent address on that host. Any other leaf (a
-  service door, the gateway's own listener, an add-on) is verified exactly as
-  before. A mismatch fails the handshake: the call is refused, the error
+  verification, then requires the leaf presented at an address in the book
+  to be a NODE leaf naming a node that owns an agent address on that host.
+  A leaf of another kind at such an address is refused too, except on the
+  controller's own machine (an address of the self node), where the
+  gateway's and the stack services' leaves answer on the same address. No
+  other leaf carries a node's address: node backend doors name only
+  `127.0.0.1`, add-on and role leaves carry no IP. Addresses not in the book
+  and docker service names are verified exactly as before. A mismatch fails
+  the handshake: the call is refused, the error
   carries `node_identity_mismatch` (the dialled host, the expected node, the
   names the leaf presented), and the gateway logs `node_identity_mismatch`.
   The gateway keeps the latest refusal per node for ten minutes;

@@ -270,9 +270,15 @@ pub(crate) fn leaf_names(der: &[u8]) -> Option<LeafNames> {
 
 /// The pin itself, pure: `owners` are the nodes the book places on the
 /// dialed `host`. No owner: nothing to pin (the address is not a node
-/// agent's the gateway knows). A leaf that is not a node leaf is not
-/// judged here. A node leaf must name one of the owners.
-pub(crate) fn check_leaf(host: &str, owners: &[String], der: &[u8]) -> Result<(), NodeIdentityMismatch> {
+/// agent's the gateway knows). At an address the book gives to a node,
+/// only a node leaf naming one of the owners passes (i1174). The one
+/// exception is the controller's own machine (`self_owned`: an owner is
+/// the self node), where the gateway's and the stack services' leaves
+/// legitimately answer on the same address. Elsewhere no other leaf
+/// carries a node's address (node backend doors name only 127.0.0.1;
+/// add-on and role leaves carry no IP), so refusing one costs nothing
+/// and keeps the pin from resting on how other leaves are issued.
+pub(crate) fn check_leaf(host: &str, owners: &[String], self_owned: bool, der: &[u8]) -> Result<(), NodeIdentityMismatch> {
     if owners.is_empty() {
         return Ok(());
     }
@@ -285,7 +291,14 @@ pub(crate) fn check_leaf(host: &str, owners: &[String], der: &[u8]) -> Result<()
         });
     };
     if !leaf.node_leaf {
-        return Ok(());
+        if self_owned {
+            return Ok(());
+        }
+        return Err(NodeIdentityMismatch {
+            host: host.to_string(),
+            expected,
+            presented: vec![format!("a certificate that is not a node's ({})", leaf.names.join(", "))],
+        });
     }
     if leaf.names.iter().any(|n| expected.contains(n)) {
         return Ok(());
@@ -408,7 +421,8 @@ impl rustls::client::danger::ServerCertVerifier for NodePinVerifier {
         let verified = self.inner.verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)?;
         let host = server_host(server_name);
         let owners = owners_at_host(&host);
-        match check_leaf(&host, &owners, end_entity.as_ref()) {
+        let self_owned = self_node().is_some_and(|s| owners.contains(&s));
+        match check_leaf(&host, &owners, self_owned, end_entity.as_ref()) {
             Ok(()) => Ok(verified),
             Err(m) => {
                 m.record_for(&owners);
