@@ -1,0 +1,43 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026 PersonifAI LLC
+
+# i1160 risk 5 against a REAL systemd + logind: a user unit
+# WantedBy=default.target (the controller's noo-hostd) runs with no login once
+# its user lingers, and not without (tests/ci/hostd-linger-systemd.sh). A
+# runner cannot reboot; a lingering user's manager starting with no session is
+# what a boot gives it. Its own workflow so its path filter does not start the
+# egress lanes. GitHub-hosted only (no secrets, read-only token).
+name: hostd-linger-systemd
+
+on:
+  pull_request:
+    branches: [ main, staging, develop, dev ]
+    paths:
+      - 'tests/ci/hostd-linger-systemd.sh'
+      - '.github/workflows/hostd-linger-systemd.yml'
+      - 'noo-cli/src/hostd_boot.rs'
+      - 'node-agent-go/internal/hostd/install.go'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hostd-linger-systemd-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  hostd-linger-systemd:
+    runs-on: ${{ matrix.ubuntu == 22 && 'ubuntu-22.04' || 'ubuntu-24.04' }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        ubuntu: [ 22, 24 ]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Linger starts a user unit with no login
+        run: sudo bash tests/ci/hostd-linger-systemd.sh

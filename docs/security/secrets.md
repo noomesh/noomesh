@@ -284,10 +284,17 @@ restores that. When it starts and finds the secret directory missing or empty
 
 What this relies on: noo-hostd must be running at boot, as the user who owns
 the age key. A controller installs it as a systemd **user** unit
-(`WantedBy=default.target`), which starts at boot only with linger on:
-`sudo loginctl enable-linger <user>` (`noo-hostd install` prints this line).
-Without linger the user manager, and so hostd, starts at first login, and the
-stack stays down until then or until `noo stack start`. A boot that cannot
+(`WantedBy=default.target`), which starts at boot only with linger on.
+`noo onboard` turns linger on for the user it runs as (it reads `loginctl
+show-user <user> -p Linger` first, and runs `loginctl enable-linger <user>`
+through its sudo only when it is off); a by-hand `noo-hostd install` prints
+`sudo loginctl enable-linger <user>` when linger is off. Without linger the
+user manager, and so hostd, starts at first login, and the stack stays down
+until then or until `noo stack start`. `noo cluster verify` says so in its
+`hostd at boot` row: WARN with that command when linger is off, OK when it is
+on. On a Mac a by-hand `noo-hostd install --mode controller` writes a
+LaunchAgent, which also waits for a login: the row says so, and there is no
+noomesh remedy for it today (a Mac is not a controller; onboard refuses it). A boot that cannot
 decrypt the store (age key missing) writes nothing and starts nothing, loudly,
 rather than starting services with empty credentials.
 

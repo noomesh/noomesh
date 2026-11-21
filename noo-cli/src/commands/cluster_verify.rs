@@ -3996,6 +3996,57 @@ fn netns_restore_row_here(root: &std::path::Path) -> Check {
     netns_restore_row(systemd, state, remedy)
 }
 
+/// The `hostd at boot` row (i1160 risk 5): does the controller's noo-hostd,
+/// whose BootRestore brings the stack back after a reboot, start at boot
+/// with no one logged in? Pure over the facts. `linger` is read only for a
+/// user unit. No row when no hostd unit or agent is installed here.
+///
+/// - systemd user unit, linger on: OK; off: WARN with the exact enable
+///   command; unreadable: WARN, cannot be checked;
+/// - systemd system unit: OK;
+/// - macOS LaunchAgent: WARN, said plainly (there is no noomesh remedy).
+pub(crate) fn hostd_at_boot_row(
+    kind: crate::hostd_boot::HostdKind,
+    user: &str,
+    linger: Option<crate::hostd_boot::Linger>,
+) -> Option<Check> {
+    use crate::hostd_boot::{remedy, HostdKind, Linger};
+    const NAME: &str = "hostd at boot";
+    let lose = format!("after a reboot nothing restores the stack until {user} logs in");
+    match kind {
+        HostdKind::Absent => None,
+        HostdKind::SystemUnit => Some(ok(NAME, "noo-hostd is a system unit: it starts at boot")),
+        HostdKind::LaunchAgent => Some(warn(
+            NAME,
+            format!("noo-hostd is {user}'s LaunchAgent, which runs only in a login session: {lose}. \
+                     noomesh has no setting for this today; macOS automatic login for {user} is the only way, and FileVault turns it off"),
+            None,
+        )),
+        HostdKind::UserUnit => {
+            let linger = linger.unwrap_or_else(|| Linger::Unreadable("not read".into()));
+            if let Linger::Unreadable(why) = &linger {
+                return Some(warn(
+                    NAME,
+                    format!("cannot be checked: linger for {user} could not be read ({why}); without it, {lose}"),
+                    Some(remedy(user)),
+                ));
+            }
+            if linger == Linger::Off {
+                return Some(warn(NAME, format!("noo-hostd is {user}'s user unit and linger is off: {lose}"), Some(remedy(user))));
+            }
+            Some(ok(NAME, format!("noo-hostd is {user}'s user unit and linger is on: it starts at boot, with no login")))
+        }
+    }
+}
+
+fn hostd_at_boot_row_here() -> Option<Check> {
+    use crate::hostd_boot as hb;
+    let kind = hb::kind_here();
+    let user = crate::netns_unit::owner();
+    let linger = (kind == hb::HostdKind::UserUnit).then(|| hb::read_linger(&user));
+    hostd_at_boot_row(kind, &user, linger)
+}
+
 /// The `ollama slots` row's advice (i802), and the command that applies it.
 pub(crate) const CPU_ONLY_SLOTS_ADVICE: &str = "CPU-only: one Ollama slot prefills about 3x faster on a 4-core CPU (~370 against ~125 tok/s) and saves cache, with no embedding loss (measured, i802)";
 pub(crate) const CPU_ONLY_SLOTS_REMEDY: &str = "noo config set compose_env '{\"OLLAMA_EMBED_NUM_PARALLEL\":\"1\"}' && noo stack restart --force ollama-embed";
@@ -9228,6 +9279,9 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         }
         checks.push(noo_data_bound_row(&crate::envfile::repo_root()));
         checks.push(netns_restore_row_here(&crate::envfile::repo_root()));
+        if let Some(row) = hostd_at_boot_row_here() {
+            checks.push(row);
+        }
         // i802: advisory only, on a CPU-only controller.
         if let Some(row) = cpu_only_ollama_slots_row_here(&crate::envfile::repo_root()) {
             checks.push(row);
@@ -17215,6 +17269,58 @@ mod netns_restore_row_tests {
         let own = crate::test_src::own_code(include_str!("cluster_verify.rs"));
         let run = crate::test_src::fn_body(&own, "pub fn cluster_verify(");
         assert!(run.contains("checks.push(netns_restore_row_here(&crate::envfile::repo_root()));"), "{run}");
+    }
+}
+
+#[cfg(test)]
+mod hostd_at_boot_row_tests {
+    use super::*;
+    use crate::hostd_boot::{HostdKind, Linger};
+
+    /// i1160 risk 5: a user unit with linger off is the controller that
+    /// stays down after a power cut until someone logs in.
+    #[test]
+    fn hostd_at_boot_warns_when_linger_is_off() {
+        let c = hostd_at_boot_row(HostdKind::UserUnit, "alex", Some(Linger::Off)).expect("a row");
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert_eq!(c.detail, "noo-hostd is alex's user unit and linger is off: after a reboot nothing restores the stack until alex logs in");
+        assert_eq!(c.remedy.as_deref(), Some("sudo loginctl enable-linger alex"));
+    }
+
+    #[test]
+    fn hostd_at_boot_is_ok_with_linger_on_or_a_system_unit() {
+        let c = hostd_at_boot_row(HostdKind::UserUnit, "alex", Some(Linger::On)).expect("a row");
+        assert_eq!(c.verdict, Verdict::Ok);
+        assert!(c.detail.contains("linger is on") && c.detail.contains("starts at boot"), "{}", c.detail);
+        assert_eq!(hostd_at_boot_row(HostdKind::SystemUnit, "alex", None).expect("a row").verdict, Verdict::Ok);
+        assert!(hostd_at_boot_row(HostdKind::Absent, "alex", None).is_none());
+    }
+
+    #[test]
+    fn hostd_at_boot_unreadable_linger_cannot_be_checked() {
+        for linger in [Some(Linger::Unreadable("Failed to connect to bus".into())), None] {
+            let c = hostd_at_boot_row(HostdKind::UserUnit, "alex", linger.clone()).expect("a row");
+            assert_eq!(c.verdict, Verdict::Warn, "{linger:?}");
+            assert!(c.detail.starts_with("cannot be checked: linger for alex could not be read"), "{}", c.detail);
+            assert!(c.detail.contains("until alex logs in"), "{}", c.detail);
+            assert_eq!(c.remedy.as_deref(), Some("sudo loginctl enable-linger alex"));
+        }
+    }
+
+    #[test]
+    fn hostd_at_boot_says_a_mac_launch_agent_waits_for_login() {
+        let c = hostd_at_boot_row(HostdKind::LaunchAgent, "alex", None).expect("a row");
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.starts_with("noo-hostd is alex's LaunchAgent") && c.detail.contains("until alex logs in"), "{}", c.detail);
+        assert!(c.detail.contains("automatic login") && c.detail.contains("FileVault"), "{}", c.detail);
+        assert_eq!(c.remedy, None);
+    }
+
+    #[test]
+    fn the_controller_run_has_the_hostd_at_boot_row() {
+        let own = crate::test_src::own_code(include_str!("cluster_verify.rs"));
+        let run = crate::test_src::fn_body(&own, "pub fn cluster_verify(");
+        assert!(run.contains("hostd_at_boot_row_here()"), "{run}");
     }
 }
 

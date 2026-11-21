@@ -6841,7 +6841,7 @@ fn hostd_can_run_here(ctx: &mut Ctx) -> bool {
 /// Controller mode: a user unit on this install's spool.
 fn ensure_hostd_controller(ctx: &mut Ctx) {
     if ctx.dry_run {
-        ctx.dry("install noo-hostd (controller mode: a user unit on this install's spool; the watcher stops first)");
+        ctx.dry("turn on linger for this user (sudo loginctl enable-linger, unless on), then install noo-hostd (controller mode: a user unit on this install's spool; the watcher stops first)");
         return;
     }
     if !hostd_can_run_here(ctx) {
@@ -6857,6 +6857,9 @@ fn ensure_hostd_controller(ctx: &mut Ctx) {
     if watcher_running() {
         stop_watcher(ctx);
     }
+    // Before the install, so `noo-hostd install` finds linger on and does
+    // not print its by-hand line.
+    ensure_hostd_linger(ctx);
     ctx.progress("Installing noo-hostd, controller mode (compose, backup, rotate — a user unit)...");
     let root = ctx.repo_root.to_string_lossy().into_owned();
     let ok = Command::new(&bin).args(hostd_install_args("controller", &root)).status().map(|s| s.success()).unwrap_or(false);
@@ -6864,6 +6867,38 @@ fn ensure_hostd_controller(ctx: &mut Ctx) {
         ctx.success("noo-hostd (controller mode) installed and running");
     } else {
         ctx.warn(&format!("noo-hostd install (controller mode) failed — run: {HOSTD_BIN} install --root {root} --mode controller"));
+    }
+}
+
+/// i1160 risk 5: the controller's hostd is a systemd user unit, which starts
+/// at boot only when its user lingers; without it, after a power cut nothing
+/// restores the stack (hostd's BootRestore) until that user logs in. Turn
+/// linger on for the user running onboard (who the unit runs as), through
+/// the same sudo as every root step here; [`hostd_can_run_here`] has already
+/// decided root steps may run. Reads `loginctl show-user` first: nothing is
+/// run when linger is already on.
+fn ensure_hostd_linger(ctx: &mut Ctx) {
+    use crate::hostd_boot as hb;
+    if !crate::netns_unit::systemd_here() {
+        return;
+    }
+    let user = crate::netns_unit::owner();
+    if user.is_empty() {
+        ctx.warn("linger not checked: the user running onboard could not be read (id -un); after a reboot noo-hostd may not start until someone logs in");
+        return;
+    }
+    let Some(cmd) = hb::enable_plan(&user, &hb::read_linger(&user)) else {
+        return;
+    };
+    let ok = ctx_sudo(ctx).args(&cmd).status().map(|s| s.success()).unwrap_or(false);
+    if ok {
+        ctx.success(&format!("Linger on for {user}: noo-hostd starts at boot, with no login"));
+    } else {
+        ctx.warn(&format!(
+            "linger not enabled for {user}: after a reboot nothing restores the stack until {user} logs in — run: {}",
+            hb::remedy(&user)
+        ));
+        sudo_refused(ctx, "linger for noo-hostd", &hb::remedy(&user));
     }
 }
 
@@ -11858,5 +11893,26 @@ mod quiet_truthful_output_tests {
         assert!(!run_logged(&mut bad, &log));
         assert_eq!(std::fs::read_to_string(&log).unwrap_or_default(), "why\n", "each run starts the log fresh");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod hostd_linger_tests {
+    /// i1160 risk 5: onboard turns linger on for the controller's hostd user
+    /// before installing the user unit, through the run's sudo, and only
+    /// when `loginctl` says it is not on (the plan itself is pinned in
+    /// hostd_boot.rs).
+    #[test]
+    fn onboard_enables_linger_before_the_controller_hostd_install() {
+        let src = crate::test_src::own_code(include_str!("steps.rs"));
+        let ctl = crate::test_src::fn_body(&src, "fn ensure_hostd_controller(");
+        let linger = ctl.find("ensure_hostd_linger(ctx);").expect("the controller install enables linger");
+        let install = ctl.find("hostd_install_args(\"controller\"").expect("the install");
+        assert!(linger < install, "linger is enabled before the install, so install does not print the by-hand line");
+        let step = crate::test_src::fn_body(&src, "fn ensure_hostd_linger(");
+        let plan = step.find("hb::enable_plan(&user, &hb::read_linger(&user))").expect("the plan reads loginctl first");
+        let run = step.find("ctx_sudo(ctx).args(&cmd)").expect("the command runs through the run's sudo");
+        assert!(plan < run, "{step}");
+        assert!(step.contains("sudo_refused(ctx,"), "a refused sudo in a non-interactive run is a hard failure");
     }
 }

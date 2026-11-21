@@ -43,7 +43,7 @@ on Ubuntu/Debian the wizard offers to install it). The details of each step are 
 2. `noo onboard --ci --root-ok`: exit 0. `--root-ok` runs the root steps through `sudo -n`, so it needs passwordless sudo. The admin password is generated and never shown.
 3. `noo --json cluster verify --wait`: exit 0 means done; exit 1 means run each failing row's `remedy`.
 
-**Left for a person:** storing the two backup passphrases off this machine; learning the admin password (`noo security admin-password reset --stdout --yes`); joining a tailnet (a browser login); `sudo loginctl enable-linger <user>`.
+**Left for a person:** storing the two backup passphrases off this machine; learning the admin password (`noo security admin-password reset --stdout --yes`); joining a tailnet (a browser login). Onboard turns on linger for the user it runs as (`loginctl enable-linger`, through the same sudo), so noo-hostd starts at boot with no login; `noo cluster verify`'s `hostd at boot` row WARNs when it is off and prints the `sudo loginctl enable-linger <user>` line.
 
 ### Requirements and platform
 

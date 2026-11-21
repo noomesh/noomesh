@@ -169,7 +169,11 @@ noo stack rebuild-status --follow
 `--background` needs noo-hostd, the controller-mode user unit `noo
 onboard` installs at a terminal or with `--ci --root-ok` (plain `--ci` skips it) (`systemctl --user status noo-hostd`; reinstall with
 `noo onboard --only services`). The same executor runs scheduled
-backups, certificate rotation and disk reclaim from the spool. A
+backups, certificate rotation and disk reclaim from the spool, and
+restores the stack after a reboot. A user unit starts at boot only when
+its user lingers: onboard turns linger on (`loginctl enable-linger`, through
+its sudo), and `noo cluster verify`'s `hostd at boot` row WARNs with
+`sudo loginctl enable-linger <user>` when it is off. A
 background rebuild logs to `.noo-host-spool/<name>.rebuild.log` and refuses `--profile`
 and the engine flags. On a dist install `rebuild` builds but refuses to
 recreate — upgrade instead.
