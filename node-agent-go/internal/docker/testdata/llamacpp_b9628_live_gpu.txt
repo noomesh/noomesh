@@ -1,0 +1,44 @@
+2026-11-21T15:04:35.591235257Z warn: LLAMA_ARG_MODEL environment variable is set, but will be overwritten by command line argument --model
+2026-11-21T15:04:35.733470206Z warn: LLAMA_ARG_CTX_SIZE environment variable is set, but will be overwritten by command line argument --ctx-size
+2026-11-21T15:04:35.733491997Z warn: LLAMA_ARG_HOST environment variable is set, but will be overwritten by command line argument --host
+2026-11-21T15:04:35.733494994Z warn: LLAMA_ARG_PORT environment variable is set, but will be overwritten by command line argument --port
+2026-11-21T15:04:35.733497590Z warn: LLAMA_ARG_JINJA environment variable is set, but will be overwritten by command line argument --jinja
+2026-11-21T15:04:35.733499903Z 0.00.067.517 I log_info: verbosity = 3 (adjust with the `-lv N` CLI arg)
+2026-11-21T15:04:35.733502092Z 0.00.067.519 I device_info:
+2026-11-21T15:04:35.733504248Z 0.00.138.118 I   - CUDA0   : NVIDIA GeForce GTX 1070 (8101 MiB, 7287 MiB free)
+2026-11-21T15:04:35.733506563Z 0.00.138.127 I   - CPU     : CPU model (15326 MiB, 15326 MiB free)
+2026-11-21T15:04:35.733509742Z 0.00.138.199 I system_info: n_threads = 4 (n_threads_batch = 4) / 12 | CUDA : ARCHS = 610,750,860,890,1200 | USE_GRAPHS = 1 | PEER_MAX_BATCH_SIZE = 128 | CPU : SSE3 = 1 | SSSE3 = 1 | AVX = 1 | AVX2 = 1 | F16C = 1 | FMA = 1 | BMI2 = 1 | LLAMAFILE = 1 | OPENMP = 1 | REPACK = 1 | 
+2026-11-21T15:04:35.733512684Z 0.00.138.282 I srv          init: using 11 threads for HTTP server
+2026-11-21T15:04:35.733514866Z 0.00.138.491 I srv         start: binding port with default address family
+2026-11-21T15:04:35.733517064Z 0.00.139.660 I srv  llama_server: loading model
+2026-11-21T15:04:35.733519216Z 0.00.139.693 I srv    load_model: loading model '/models/Llama-3.2-3B-Instruct-Q4_K_M.gguf'
+2026-11-21T15:04:35.733521473Z 0.00.139.767 I common_init_result: fitting params to device memory ...
+2026-11-21T15:04:35.733530588Z 0.00.139.776 I common_init_result: (for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)
+2026-11-21T15:04:37.325820373Z 0.01.801.745 W llama_context: n_ctx_seq (4096) < n_ctx_train (131072) -- the full capacity of the model will not be utilized
+2026-11-21T15:04:37.339320821Z 0.01.815.253 I common_init_from_params: warming up the model with an empty run - please wait ... (--no-warmup to disable)
+2026-11-21T15:04:37.380270835Z 0.01.856.205 I srv    load_model: initializing slots, n_slots = 1
+2026-11-21T15:04:37.400899920Z 0.01.876.831 W common_speculative_init: no implementations specified for speculative decoding
+2026-11-21T15:04:37.400911522Z 0.01.876.836 I slot   load_model: id  0 | task -1 | new slot, n_ctx = 4096
+2026-11-21T15:04:37.400914038Z 0.01.876.867 I srv    load_model: prompt cache is enabled, size limit: 8192 MiB
+2026-11-21T15:04:37.400915891Z 0.01.876.867 I srv    load_model: use `--cache-ram 0` to disable the prompt cache
+2026-11-21T15:04:37.400917672Z 0.01.876.868 I srv    load_model: for more info see https://github.com/ggml-org/llama.cpp/pull/16391
+2026-11-21T15:04:37.400919423Z 0.01.876.868 I srv    load_model: context checkpoints enabled, max = 32, min spacing = 256
+2026-11-21T15:04:37.400921172Z 0.01.876.889 I srv          init: idle slots will be saved to prompt cache upon starting a new task
+2026-11-21T15:04:37.406946182Z 0.01.882.904 I init: chat template, example_format: '<|start_header_id|>system<|end_header_id|>
+2026-11-21T15:04:37.406974492Z 
+2026-11-21T15:04:37.406976786Z Cutting Knowledge Date: December 2023
+2026-11-21T15:04:37.406978631Z Today Date: 21 Nov 2026
+2026-11-21T15:04:37.406980307Z 
+2026-11-21T15:04:37.406981994Z You are a helpful assistant<|eot_id|><|start_header_id|>user<|end_header_id|>
+2026-11-21T15:04:37.406984027Z 
+2026-11-21T15:04:37.406985652Z Hello<|eot_id|><|start_header_id|>assistant<|end_header_id|>
+2026-11-21T15:04:37.406987556Z 
+2026-11-21T15:04:37.406989172Z Hi there<|eot_id|><|start_header_id|>user<|end_header_id|>
+2026-11-21T15:04:37.406991003Z 
+2026-11-21T15:04:37.406992641Z How are you?<|eot_id|><|start_header_id|>assistant<|end_header_id|>
+2026-11-21T15:04:37.406994452Z 
+2026-11-21T15:04:37.406996071Z '
+2026-11-21T15:04:37.411051656Z 0.01.887.019 I srv          init: init: chat template, thinking = 0
+2026-11-21T15:04:37.411062173Z 0.01.887.070 I srv  llama_server: model loaded
+2026-11-21T15:04:37.411064655Z 0.01.887.074 I srv  llama_server: server is listening on http://127.0.0.1:8085
+2026-11-21T15:04:37.411066539Z 0.01.887.083 I srv  update_slots: all slots are idle
