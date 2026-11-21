@@ -149,7 +149,8 @@ LaunchDaemon, which runs `noo node fetch` every minute; `noo enroll
 --resume` re-runs only that arming step. `noo node fetch` refuses to run on
 Linux (nodes there use the systemd `noo-fetch` timer: a bundle transfer gives
 up after 120 s below 1 KiB/s or 60 minutes in all, the unit after 2 hours, and
-the next tick tries again). The daemon's copy is
+the next tick tries again; a node enrolled before that bound gets it from its
+applier as `noo-fetch.service.d/10-timeout.conf`, with a reload and no restart). The daemon's copy is
 `/usr/local/bin/noo`, maintained by the rail: a bundle that carries a different
 CLI installs it (verified against the signed manifest, never an older applier
 generation) and re-runs the apply under it before judging any kind or env key,

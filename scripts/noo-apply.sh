@@ -2004,6 +2004,98 @@ netns_unit_remove() {
 }
 # END netns_unit
 
+# BEGIN fetch_unit_timeout
+# noo-fetch.service's start timeout (i1160 risk 4). The unit is a oneshot with
+# no start timeout by default, so a hung run stayed activating and its timer
+# never fired again. prep-host writes TimeoutStartSec into the unit on a fresh
+# install; a node enrolled before that gets it here, as a fixed drop-in this
+# applier renders itself (release-listed as `applier`, i908). No kind carries
+# it and nothing in a bundle changes a byte of it:
+#   /etc/systemd/system/noo-fetch.service.d/10-timeout.conf
+# Written when absent or different (bytes, 0644, root:root), then
+# daemon-reload. Never a start, stop or restart: noo-fetch.service is the unit
+# this apply runs in.
+# A daemon-reload re-reads the unit of the RUNNING fetch too, and systemd then
+# counts the new start timeout from when that run started. So the drop-in is
+# written only while this run is younger than FETCH_RELOAD_MAX_AGE_S (an hour
+# or more is left for the rest of this apply), or when noo-fetch.service is not
+# starting at all (an apply run by hand). An older run, or one whose age cannot
+# be read, writes nothing and says so; the next run writes it. Only where
+# systemd runs and noo-fetch.service is installed. FETCH_UNIT_DIR /
+# FT_OWNER_ARGS / FT_STAT_OWNER / FT_SYSTEMD_DIR are seams for the unprivileged
+# test (tests/test_apply_fetch_unit_timeout.py).
+FETCH_UNIT_NAME=noo-fetch.service
+FETCH_UNIT_DIR="${FETCH_UNIT_DIR:-/etc/systemd/system}"
+FETCH_DROPIN_DIR="$FETCH_UNIT_DIR/$FETCH_UNIT_NAME.d"
+FETCH_DROPIN="$FETCH_DROPIN_DIR/10-timeout.conf"
+FETCH_TIMEOUT_S=7200
+FETCH_RELOAD_MAX_AGE_S=3600
+FT_OWNER_ARGS="${FT_OWNER_ARGS--o root -g root}"   # empty in tests (not root)
+FT_STAT_OWNER="${FT_STAT_OWNER-root:root}"
+
+# ft_render — the drop-in, fixed.
+ft_render() {
+    printf '%s\n' "# Written by noo-apply: a stalled bundle pull ends, and the timer runs again." \
+        "[Service]" "TimeoutStartSec=$FETCH_TIMEOUT_S"
+}
+
+# ft_same INSTALLED CANDIDATE — bytes, mode 644 and owner (config_unchanged).
+ft_same() {
+    if [ -n "$FT_STAT_OWNER" ]; then
+        config_unchanged "$2" "$1" 644 "$FT_STAT_OWNER"
+    else
+        [ -f "$1" ] && cmp -s "$2" "$1"
+    fi
+}
+
+# ft_run_age — seconds the running start of noo-fetch.service has taken; 0
+# when it is not starting; nothing when that cannot be read.
+ft_run_age() {
+    _ft_state="$(systemctl show -p ActiveState --value "$FETCH_UNIT_NAME" 2>/dev/null)" || return 0
+    [ -n "$_ft_state" ] || return 0
+    [ "$_ft_state" = activating ] || { echo 0; return 0; }
+    _ft_pid="$(systemctl show -p MainPID --value "$FETCH_UNIT_NAME" 2>/dev/null)" || return 0
+    case "$_ft_pid" in ''|*[!0-9]*|0) return 0 ;; esac
+    ps -o etimes= -p "$_ft_pid" 2>/dev/null | tr -d ' ' || true
+}
+
+# fetch_unit_timeout_apply — write the drop-in when absent or different, then
+# daemon-reload. Never fails the apply.
+fetch_unit_timeout_apply() {
+    [ -d "${FT_SYSTEMD_DIR:-/run/systemd/system}" ] || return 0
+    [ -f "$FETCH_UNIT_DIR/$FETCH_UNIT_NAME" ] || return 0
+    _ft_tmp="$(mktemp)"
+    ft_render > "$_ft_tmp"
+    if ft_same "$FETCH_DROPIN" "$_ft_tmp"; then
+        rm -f -- "$_ft_tmp"
+        return 0
+    fi
+    _ft_age="$(ft_run_age)"
+    case "$_ft_age" in
+        ''|*[!0-9]*)
+            rm -f -- "$_ft_tmp"
+            echo "noo-apply: noo-fetch unit: start timeout not set yet (this run's age cannot be read, and a reload would time it); the next run sets it"
+            return 0 ;;
+    esac
+    if [ "$_ft_age" -ge "$FETCH_RELOAD_MAX_AGE_S" ]; then
+        rm -f -- "$_ft_tmp"
+        echo "noo-apply: noo-fetch unit: start timeout not set yet (this run started ${_ft_age} s ago, and a reload would time it); the next run sets it"
+        return 0
+    fi
+    # shellcheck disable=SC2086
+    if ! install -d -m 755 $FT_OWNER_ARGS "$FETCH_DROPIN_DIR" \
+        || ! install -m 644 $FT_OWNER_ARGS "$_ft_tmp" "$FETCH_DROPIN"; then
+        rm -f -- "$_ft_tmp"
+        echo "noo-apply: noo-fetch unit: could not write $FETCH_DROPIN; the start timeout is not set" >&2
+        return 0
+    fi
+    rm -f -- "$_ft_tmp"
+    systemctl daemon-reload 2>/dev/null || true
+    echo "noo-apply: noo-fetch unit: start timeout set ($FETCH_TIMEOUT_S s)"
+    logger -t noo-apply "noo-fetch unit: start timeout set ($FETCH_TIMEOUT_S s)" 2>/dev/null || true
+}
+# END fetch_unit_timeout
+
 # ── teardown — the graceful, controller-initiated node destroy ─────────────
 # A signed `teardown` kind means "return this node to never-met-the-fleet".
 # It runs the local de-enroll — but that script deletes noo-apply itself,
@@ -3267,6 +3359,10 @@ echo "verified-by: $SIG_VIA"
 # operator reading the controller's copy of this report (`noo cluster
 # provision <node> --wait`) sees the lane's state from the applier itself.
 echo "ca-lane: retired"
+# noo-fetch.service's start timeout, for nodes enrolled before prep-host wrote
+# it (see fetch_unit_timeout). After every install and the floor: it never
+# changes what this apply did.
+fetch_unit_timeout_apply
 
 
 # ── 4. Orchestrate — the agent must LOAD what changed ─────
