@@ -62,7 +62,8 @@ The node is ready when `verify` shows no FAIL. Each row that fails names the com
   FAIL). Fix it with `noo security pki push-nodes <node>` when the row offers
   it. When it gives no remedy, the address is another node's: stop and report.
   Up to 0.6.29, a roll (`noo upgrade --nodes` or `--all`) re-issues such a
-  node's certificate for its enrollment address alone and the row FAILs
-  again, with `tls: bad certificate` in the agent log: run
+  node's certificate for its enrollment address alone and the
+  `agent certificate` row FAILs again, with `tls: bad certificate` in the
+  agent log: run
   `noo security pki push-nodes <node>` after each roll. (i1074: from 0.6.30
   a roll keeps the address.)
