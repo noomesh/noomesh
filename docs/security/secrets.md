@@ -629,7 +629,9 @@ noo security secrets resync POSTGRES_PASSWORD NOO_APP_DB_PASSWORD
 Postgres roles are **cluster-global**, and a restored dump or a replayed
 migration chain can leave a role's password different from the store's.
 `resync` makes the role match the store — it never mints, never writes the
-store, never recreates a consumer. It refuses to act when Postgres is down
+store, never recreates a consumer. It refuses to act when Postgres is not
+running (a stopped or absent container; when docker does not answer inspecting
+it, the message says that instead and points at `docker info`)
 or when the result could not have failed (a `trust` rule on the path), and it
 re-probes after the `ALTER ROLE` rather than trusting the exit status.
 Anything that replays the migration chain into a throwaway database must
