@@ -540,7 +540,6 @@ SHAPE_PENDING = frozenset({
     "docs/operating/runbooks/host-updates.md",
     "docs/operating/runbooks/nats-isolation.md",
     "docs/operating/runbooks/security-release-upgrade.md",
-    "docs/security/model-context.md",
     "docs/security/networks-and-containers.md",
     "docs/security/node-agent.md",
     "docs/security/secrets.md",
