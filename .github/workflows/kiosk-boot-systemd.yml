@@ -1,0 +1,54 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026 PersonifAI LLC
+
+# A dedicated kiosk unit against a REAL systemd (i1153): the kiosk.service
+# `noo kiosk setup` renders, with a sleeping stub for the display, beside a
+# fake plymouth-quit-wait that never returns (tests/ci/kiosk-boot-systemd.sh).
+# Proves this release's unit starts with nobody quitting plymouth, the old
+# ordering stays queued, and `noo kiosk status` names the job it waits behind.
+# The unit-text tests cannot prove what systemd does with the ordering.
+# GitHub-hosted only (no secrets, read-only token).
+name: kiosk-boot-systemd
+
+on:
+  pull_request:
+    branches: [ main, staging, develop, dev ]
+    paths:
+      - 'noo-cli/src/commands/kiosk.rs'
+      - 'noo-cli/src/commands/kiosk_assets/**'
+      - 'tests/ci/kiosk-boot-systemd.sh'
+      - '.github/workflows/kiosk-boot-systemd.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: kiosk-boot-systemd-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  kiosk-boot-systemd:
+    # systemd 249 (22.04, the incident's) and 255 (24.04).
+    runs-on: ${{ matrix.ubuntu == 22 && 'ubuntu-22.04' || 'ubuntu-24.04' }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        ubuntu: [ 22, 24 ]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Host cargo: the binary runs on this runner's own glibc. rustup
+      # installs the toolchain noo-cli/rust-toolchain.toml pins.
+      - name: Build noo
+        working-directory: noo-cli
+        run: |
+          systemctl --version | head -1
+          test "$(ps -o comm= -p 1)" = systemd
+          cargo build --locked --bin noo
+
+      - name: Dedicated kiosk unit against the runner's real systemd
+        run: sudo -E env "PATH=$PATH" bash tests/ci/kiosk-boot-systemd.sh "$PWD/noo-cli/target/debug/noo"

@@ -56,6 +56,35 @@ fail() {
     as_kiosk bash -c 'umask 077; printf "%s %s\n" "$(date -Is)" "$1" > "$2"' _ "$1" "$ERR_FILE" 2>/dev/null || true
 }
 
+# The restart: --no-block plus a bounded wait for its job, never a blocking
+# `systemctl restart`. One queued behind a boot job that never finishes
+# (plymouth-quit-wait) hung this tick, and with it every later one (i1153).
+RESTART_BOUND=60
+kiosk_job() { systemctl show -p Job --value kiosk.service 2>/dev/null || true; }
+# What kiosk.service's job waits behind: a unit it is ordered After= with a
+# job of its own, a running one first. Empty when none is listed.
+kiosk_blocker() {
+    local after
+    after=" $(systemctl show -p After --value kiosk.service 2>/dev/null || true) "
+    systemctl list-jobs --no-legend --full --no-pager 2>/dev/null | while read -r _ u _ st _; do
+        case "$after" in *" $u "*) echo "$st $u" ;; esac
+    done | sort | sed -n '1s/^[a-z]* //p'
+}
+restart_kiosk_bounded() {
+    local i=0 behind
+    systemctl restart kiosk.service --no-block || { fail "systemctl restart kiosk.service failed"; return 1; }
+    while [ -n "$(kiosk_job)" ]; do
+        i=$((i + 1))
+        if [ "$i" -ge "$RESTART_BOUND" ]; then
+            behind=$(kiosk_blocker)
+            fail "kiosk.service did not start within $RESTART_BOUND s: a start job is queued behind ${behind:-a unit systemctl list-jobs names}"
+            return 1
+        fi
+        sleep 1
+    done
+    return 0
+}
+
 if ! as_kiosk noo-kiosk-cdp probe >/dev/null 2>&1; then
     n=$(( $(cat "$STRIKES" 2>/dev/null || echo 0) + 1 ))
     echo "$n" > "$STRIKES"
@@ -63,7 +92,7 @@ if ! as_kiosk noo-kiosk-cdp probe >/dev/null 2>&1; then
     if [ "$n" -ge 3 ]; then
         echo "noo-kiosk-watchdog: restarting kiosk.service" >&2
         rm -f "$STRIKES"
-        systemctl restart kiosk.service
+        restart_kiosk_bounded
     fi
     exit 0
 fi
