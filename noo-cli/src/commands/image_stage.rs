@@ -991,9 +991,24 @@ pub(crate) fn warm_release_tars(g: &Globals, tag: &str) {
     warm_release_tars_within(g, tag, WARM_BUDGET_SECS);
 }
 
+/// The release tag the lock's rows were staged under: the lock's own
+/// `# tag` line, as `stage_lock` records it (via `lock_release`), else
+/// NOO_IMAGE_TAG. Never fails: a missing lock falls back, so the roll goes on.
+pub(crate) fn staged_release_tag() -> String {
+    match std::fs::read_to_string(crate::envfile::repo_root().join("stack.lock")) {
+        Ok(l) => lock_release(l).2,
+        Err(_) => crate::commands::provision::release_var("NOO_IMAGE_TAG"),
+    }
+}
+
 pub(crate) fn warm_release_tars_within(g: &Globals, tag: &str, budget_secs: u64) {
     let tars = release_tars(&read_index(&images_store_dir()), tag);
     if tars.is_empty() {
+        // Said, not silent: a tag that matches no staged row would otherwise
+        // skip the wait without a word.
+        if !g.json {
+            crate::ui::step(&format!("no staged image tar is recorded under release {tag}; nothing to wait for"));
+        }
         return;
     }
     let started = std::time::Instant::now();
