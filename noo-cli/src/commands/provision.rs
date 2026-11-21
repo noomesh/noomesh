@@ -6183,14 +6183,17 @@ mod tests {
         // Only the real code: the literals in this test would otherwise
         // match themselves.
         let src = crate::test_src::own_code(whole);
+        // i1074 C: provision mints through `issue_node_with`, whose 5th
+        // argument is `mint_only`; it must be `true` at every call site.
+        assert!(!src.contains("pki_issue_node("), "provision calls issue_node_with, never the CLI verb");
         let calls: Vec<&str> = src
-            .match_indices("pki_issue_node(")
+            .match_indices("issue_node_with(")
             .map(|(i, _)| &src[i..(i + 200).min(src.len())])
             .collect();
-        assert!(!calls.is_empty(), "no pki_issue_node call sites found — did they move?");
+        assert!(!calls.is_empty(), "no issue_node_with call sites found — did they move?");
         for c in &calls {
             assert!(
-                c.contains("--mint-only"),
+                c.contains("crate::pki::DEFAULT_DAYS, true, "),
                 "a provision call site issues certs WITHOUT --mint-only, so it \
                  would deliver and hard-stop on an unconfirmed node: {c}"
             );
