@@ -226,6 +226,7 @@ pub(crate) fn may_dial(node: &str, base: &str) -> Result<(), NodeIdentityMismatc
                 expected: vec![node.to_string()],
                 presented: vec![format!("address owned by {other}")],
             };
+            m.record_for(&[node.to_string()]);
             m.log();
             Err(m)
         }
@@ -306,6 +307,20 @@ pub struct NodeIdentityMismatch {
 }
 
 impl NodeIdentityMismatch {
+    /// Keep this refusal as the latest for each of `nodes` (the nodes the
+    /// call was meant for), for `noo cluster verify`'s `node identity` row.
+    pub(crate) fn record_for(&self, nodes: &[String]) {
+        let at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        if let Ok(mut last) = LAST_MISMATCH.write() {
+            for n in nodes {
+                last.insert(n.trim().to_ascii_lowercase(), (self.clone(), std::time::Instant::now(), at));
+            }
+        }
+    }
+
     pub(crate) fn log(&self) {
         // Once a minute per address and expectation: a held mismatch is
         // judged on every routing pass.
@@ -396,6 +411,7 @@ impl rustls::client::danger::ServerCertVerifier for NodePinVerifier {
         match check_leaf(&host, &owners, end_entity.as_ref()) {
             Ok(()) => Ok(verified),
             Err(m) => {
+                m.record_for(&owners);
                 m.log();
                 Err(rustls::Error::InvalidCertificate(rustls::CertificateError::Other(rustls::OtherError(Arc::new(m)))))
             }
@@ -423,6 +439,38 @@ impl rustls::client::danger::ServerCertVerifier for NodePinVerifier {
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
         self.inner.supported_verify_schemes()
     }
+}
+
+/// The node record field `/api/cluster/nodes` carries the latest refusal
+/// in ([`last_mismatch`]), read by `noo cluster verify`'s `node identity`
+/// row.
+pub(crate) const MISMATCH_FIELD: &str = "node_identity_mismatch";
+
+/// The heartbeat field an agent reports its latest `wrong_node` refusal in
+/// (for ten minutes), carried onto the node record for `noo cluster
+/// verify`'s `target-node check` row.
+pub(crate) const WRONG_NODE_FIELD: &str = "wrong_node_refused";
+
+/// The latest refusal per node the call was meant for (lower-cased): the
+/// refusal, when it was recorded, and its Unix time.
+type Recorded = (NodeIdentityMismatch, std::time::Instant, i64);
+static LAST_MISMATCH: LazyLock<RwLock<HashMap<String, Recorded>>> = LazyLock::new(Default::default);
+
+/// The latest refusal of a call meant for `node`, as the node record's
+/// [`MISMATCH_FIELD`]: `{host, expected, presented, at}`. `None` when there
+/// was none in the last [`BOOK_TTL`] (a fixed address stops refusing, and
+/// the row clears with it).
+pub(crate) fn last_mismatch(node: &str) -> Option<Value> {
+    let last = LAST_MISMATCH.read().ok()?;
+    let (m, seen, at) = last.get(&node.trim().to_ascii_lowercase())?;
+    (seen.elapsed() < BOOK_TTL).then(|| {
+        serde_json::json!({
+            "host": m.host,
+            "expected": m.expected,
+            "presented": m.presented,
+            "at": at,
+        })
+    })
 }
 
 #[cfg(test)]

@@ -30,6 +30,10 @@ type payloadSection struct {
 	add   func(r *Reporter, p map[string]any)
 }
 
+// wrongNodeReport reads the agent's latest wrong_node refusal (a seam for
+// the payload tests).
+var wrongNodeReport = auth.LastWrongNode
+
 // The sections both a registration and a heartbeat carry. Each field is
 // assembled here and nowhere else.
 var (
@@ -75,6 +79,12 @@ var (
 		// first field). i1174.
 		p[auth.ChecksTargetNodeField] = true
 		p[auth.RequiresTargetNodeField] = auth.RequiresTargetNode()
+		// The latest call this agent refused as addressed elsewhere, for ten
+		// minutes after it (verify's `target-node check` row). Absent when
+		// there was none.
+		if w := wrongNodeReport(); w != nil {
+			p[auth.WrongNodeRefusedField] = w
+		}
 	}}
 
 	secBackendLeaves = payloadSection{name: "backendLeaves", stage: "backend_leaves", add: func(r *Reporter, p map[string]any) {

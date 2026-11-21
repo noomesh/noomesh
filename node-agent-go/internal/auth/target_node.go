@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strings"
 	"sync/atomic"
+	"time"
 
 	"github.com/noomesh/noomesh/node-agent-go/internal/config"
 )
@@ -52,7 +53,60 @@ const RequiresTargetNodeField = "requires_target_node"
 // WrongNodeCode is the refusal's machine-readable code.
 const WrongNodeCode = "wrong_node"
 
+// startsStrict is the flag before the first desired-config read: tolerant
+// until told. The HTTPS listener comes up first in the agent's start
+// (agent.Run step 1), then registration (step 3), the tunnel and the
+// heartbeat (step 4), and only then the reconcile loop's first fetch (step
+// 4b), which applies `require_target_node`. In that window the controller
+// can already call this agent: after an agent restart its record (and the
+// address book entry) outlive the restart, so routed inference
+// (`/v1/chat/completions`) and the per-node polls (`GET /gpu`) arrive before
+// the first fetch. Tolerant is the safe direction for that window: a call
+// whose X-Noo-Node names ANOTHER node is refused from the first second
+// regardless of this flag; only a header-LESS controller call is accepted
+// until the first fetch, which is what an older controller sends anyway.
+// Starting strict instead would refuse an older controller's every call
+// until the fetch told the agent otherwise.
+const startsStrict = false
+
 var requireTargetNode atomic.Bool
+
+func init() { requireTargetNode.Store(startsStrict) }
+
+// WrongNodeRefusedField is the heartbeat field carrying the latest refusal
+// (LastWrongNode), for verify's `target-node check` row.
+const WrongNodeRefusedField = "wrong_node_refused"
+
+// wrongNodeReportFor is how long a refusal is reported after it happened.
+const wrongNodeReportFor = 10 * time.Minute
+
+type wrongNodeRefusal struct {
+	target, path, detail string
+	at                   time.Time
+}
+
+var lastWrongNode atomic.Pointer[wrongNodeRefusal]
+
+// noteWrongNode keeps the refusal for the heartbeat.
+func noteWrongNode(r *http.Request, why string) {
+	lastWrongNode.Store(&wrongNodeRefusal{
+		target: strings.TrimSpace(r.Header.Get(TargetNodeHeader)),
+		path:   r.URL.Path,
+		detail: why,
+		at:     time.Now(),
+	})
+}
+
+// LastWrongNode is the latest refusal within wrongNodeReportFor, as the
+// heartbeat's WrongNodeRefusedField ({target, path, detail, at}; target ""
+// for a header-less controller call), or nil when there was none.
+func LastWrongNode() map[string]any {
+	w := lastWrongNode.Load()
+	if w == nil || time.Since(w.at) > wrongNodeReportFor {
+		return nil
+	}
+	return map[string]any{"target": w.target, "path": w.path, "detail": w.detail, "at": w.at.Unix()}
+}
 
 // SetRequireTargetNode applies desired-config's `require_target_node`
 // (absent = false).
@@ -72,6 +126,7 @@ func TargetNode(cfg *config.Config) func(http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if why := TargetNodeRefusal(cfg, r); why != "" {
 				slog.Warn("wrong_node", "path", r.URL.Path, "target", r.Header.Get(TargetNodeHeader), "detail", why)
+				noteWrongNode(r, why)
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusMisdirectedRequest)
 				_ = json.NewEncoder(w).Encode(map[string]string{"code": WrongNodeCode, "detail": why})

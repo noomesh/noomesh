@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/noomesh/noomesh/node-agent-go/internal/config"
 )
@@ -93,5 +94,53 @@ func TestDesiredConfigFlagIsAppliedAsSent(t *testing.T) {
 	SetRequireTargetNode(false)
 	if RequiresTargetNode() {
 		t.Fatal("an absent flag (an older controller) must make the agent tolerant again")
+	}
+}
+
+// i1174 (the early window): before the first desired-config read the agent
+// is tolerant of a header-less controller call and still refuses a call
+// naming another node, from the first second.
+func TestTheInitialStateIsTolerantAndRefusesAMismatch(t *testing.T) {
+	if startsStrict {
+		t.Fatal("the agent must start tolerant: an older controller's calls arrive before the first desired-config read")
+	}
+	strictFor(t, startsStrict)
+	cfg := &config.Config{NodeID: "node_a"}
+	ctrl := leaf(t, "gateway", "Mesh Cluster Gateway")
+	if c := runTarget(t, cfg, "POST", "/start", "", ctrl).Code; c != http.StatusOK {
+		t.Fatalf("initial state: a header-less controller call got %d, want 200", c)
+	}
+	if c := runTarget(t, cfg, "POST", "/start", "node_b", ctrl).Code; c != http.StatusMisdirectedRequest {
+		t.Fatalf("initial state: a call for node_b got %d, want 421", c)
+	}
+}
+
+// i1174: a refusal is kept for the heartbeat (verify's `target-node check`
+// row), naming the node the call was for and the path.
+func TestARefusalIsKeptForTheHeartbeat(t *testing.T) {
+	strictFor(t, false)
+	prev := lastWrongNode.Load()
+	t.Cleanup(func() { lastWrongNode.Store(prev) })
+	lastWrongNode.Store(nil)
+	if LastWrongNode() != nil {
+		t.Fatal("nothing refused, nothing reported")
+	}
+	cfg := &config.Config{NodeID: "node_a"}
+	ctrl := leaf(t, "gateway", "Mesh Cluster Gateway")
+	if c := runTarget(t, cfg, "POST", "/start", "node_a", ctrl).Code; c != http.StatusOK || LastWrongNode() != nil {
+		t.Fatalf("a call for this node is no refusal: %d %v", c, LastWrongNode())
+	}
+	runTarget(t, cfg, "POST", "/start", "node_b", ctrl)
+	w := LastWrongNode()
+	if w == nil || w["target"] != "node_b" || w["path"] != "/start" {
+		t.Fatalf("the refusal was not kept: %#v", w)
+	}
+	if at, _ := w["at"].(int64); at <= 0 {
+		t.Fatalf("at: %#v", w["at"])
+	}
+	// An old refusal is not reported.
+	lastWrongNode.Store(&wrongNodeRefusal{target: "node_b", at: time.Now().Add(-wrongNodeReportFor - time.Minute)})
+	if LastWrongNode() != nil {
+		t.Fatal("a refusal older than the report window is still reported")
 	}
 }
