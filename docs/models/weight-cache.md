@@ -477,7 +477,16 @@ its image through one function (`EnsureImage`):
 4. **Controller still hashing** → the image is staged, so this is not a
    "not staged" refusal: `<image>: the controller is still hashing its image
    tar; the start is retried on the next reconcile pass`. No registry
-   fallback and no `sync-images` advice.
+   fallback and no `sync-images` advice. For a **pinned** start (a roll)
+   the start is a wait, not a refusal: `the controller is still hashing
+   <tar>; keeping the running image; retrying in <n>s`. The old container
+   keeps serving, the agent nudges itself after the gateway's Retry-After
+   (5 to 30 s) up to 12 times, and records no `backend_start` refusal (so
+   no operator alert) in that window. `noo upgrade` also waits, after the new
+   gateway is up and before the node phase, until the gateway has hashed every
+   tar the release staged (up to 20 minutes; it prints `hashing <tar> on the
+   controller (<size>)… <n>s`, and goes on with a warning if the budget runs
+   out).
 5. **Absent and not staged** → for our images (`$NOO_IMAGE_PREFIX/*`, the
    release namespaces, `noomesh/*`, `pai-assistant/*`, `noo-*`) a refusal:
    `image X not staged on the controller — run noo cluster sync-images

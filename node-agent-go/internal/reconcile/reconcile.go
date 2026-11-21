@@ -245,6 +245,11 @@ type Reconciler struct {
 	// desired hash to change. Single-goroutine (ticker) access; no lock.
 	driftRecreated map[string]string
 
+	// hashWaits counts, per backend, the quick retries spent on a start the
+	// controller could not vouch for yet because it was still hashing the
+	// image tar (docker.ImageHashingError). Tick goroutine only.
+	hashWaits map[string]int
+
 	// ggufMissing: backend -> the standing refusal for a placed .gguf that
 	// is missing from the effective models dir (ggufPresent). Kept until
 	// the file is back so nothing clears the refusal meanwhile. Tick
@@ -349,6 +354,7 @@ func New(cfg *config.Config, docker *dockerpkg.Client, client *http.Client, harn
 		cliInstalled:    cliOnPath,
 		harnessEgress:   egressReaderFor(harness),
 		driftRecreated:  map[string]string{},
+		hashWaits:       map[string]int{},
 		ggufMissing:     map[string]string{},
 		ggufExists:      docker.HostFileExists,
 	}
@@ -482,6 +488,7 @@ func (r *Reconciler) nudgeWhenReady(ctx context.Context, backend, model string, 
 // only backend whose next tick has work left: ensure, import, verify).
 func (r *Reconciler) backendStarted(ctx context.Context, backend, model string) {
 	r.clearBackendStart(backend)
+	delete(r.hashWaits, backend)
 	if backend == "ollama" {
 		go r.nudgeWhenReady(ctx, backend, model, startReadyWithin, startReadyEvery)
 	}
@@ -1071,7 +1078,7 @@ func (r *Reconciler) convergeContainer(ctx context.Context, t *tick, p placement
 			// Record it with the error verbatim so the
 			// heartbeat carries it; cleared when the backend is next
 			// seen running (above) or starts (below).
-			refusals.Record("backend_start", p.Backend, err.Error())
+			r.recordBackendStartFailure(p.Backend, err)
 			return
 		}
 		r.backendStarted(ctx, p.Backend, p.Model)
