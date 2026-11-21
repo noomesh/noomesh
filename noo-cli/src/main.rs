@@ -56,6 +56,7 @@ mod addon_lock;
 mod addons;
 mod args;
 mod auth;
+mod bounded;
 mod catalog;
 mod child_stdin;
 mod commands;

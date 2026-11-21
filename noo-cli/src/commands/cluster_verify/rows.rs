@@ -1145,6 +1145,17 @@ pub(crate) const ROWS: &[Row] = &[
         doc: None,
     },
     Row {
+        id: "network_mount",
+        name: "network mount",
+        scope: Scope::Controller,
+        verdicts: &[Verdict::Fail],
+        meaning: "Whether every network mount (NFS, SMB, sshfs) under the data roots (NOO_DATA_ROOT, MODELS_DIR, HF_CACHE_DIR) answers a stat within 5 seconds; a hung one blocks every call that touches it.",
+        clears: "Bring the storage back (a hard NFS mount resumes by itself once its server answers); do not force-unmount it. `timeout 5 stat <mount>` shows whether it answers.",
+        findings: &[],
+        shown_as: None,
+        doc: None,
+    },
+    Row {
         id: "next_boot",
         name: "next boot",
         scope: Scope::Node,

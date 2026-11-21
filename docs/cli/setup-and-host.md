@@ -176,7 +176,12 @@ once: before staging a node, the roll checks that each of its groups keeps
 one other offered candidate (two for a group of four or more), and otherwise
 waits, at most 150 s once the restarting node has applied, saying what it
 waits for. A wait that runs out is said with the command to check
-(`noo cluster verify --wait`) and the roll goes on. An enrolled node upgrades its own binary from the controller's
+(`noo cluster verify --wait`) and the roll goes on. Before it changes anything, `--stack`/`--nodes`/`--all` stat every network mount
+(NFS, SMB, sshfs) under `NOO_DATA_ROOT`, `MODELS_DIR` and `HF_CACHE_DIR`, and ask
+docker about the gateway, each with a deadline (5 s, 30 s); a hung mount stops the
+upgrade with one line naming it (the `network mount` row of `noo cluster verify`
+says the same), and the fix is to bring the storage back, never to force-unmount
+it: see [data root recovery](../operating/runbooks/data-root-recovery.md). An enrolled node upgrades its own binary from the controller's
 mirror (`/bootstrap/cli`), so nodes need no GitHub access. From the mirror it
 downloads only when the mirror's signed manifest names a different version or
 binary than the one running; an unverified manifest never counts as current. Private release
