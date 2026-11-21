@@ -56,7 +56,7 @@ pub(crate) fn reported(body: &Value) -> bool {
 }
 
 /// `host:port`, lower-cased, of a URL; `None` when it does not parse.
-fn authority(url: &str) -> Option<String> {
+pub(crate) fn authority(url: &str) -> Option<String> {
     let u = reqwest::Url::parse(url.trim()).ok()?;
     let host = u.host_str()?.trim_matches(|c| c == '[' || c == ']').to_ascii_lowercase();
     let port = u.port_or_known_default()?;
@@ -67,7 +67,7 @@ fn authority(url: &str) -> Option<String> {
 /// `agent_url` (`get_node_agent_url`), and `https://{ip}:8081` — which the
 /// inference and coordinator paths build directly — unless `agent_url`
 /// names another port (a second agent on the same host is a different node).
-fn record_authorities(record: &Value) -> Vec<String> {
+pub(crate) fn record_authorities(record: &Value) -> Vec<String> {
     let mut out = Vec::new();
     let agent_url = record.get("agent_url").and_then(Value::as_str).and_then(authority);
     let ip = record
@@ -131,6 +131,7 @@ pub(crate) async fn seed(state: &crate::state::AppState) {
                         n += 1;
                     }
                     note(&key, &record);
+                    crate::node_pin::note(&key, &record);
                 }
             }
         }
@@ -286,6 +287,11 @@ const FOREIGN_SELF_AGENT_LOG_EVERY: std::time::Duration = std::time::Duration::f
 /// reached something that is not this cluster's agent. `None` for every
 /// other failure (refused, timed out, reset): an agent that is merely down.
 pub(crate) fn foreign_tls(err: &(dyn std::error::Error + 'static)) -> Option<String> {
+    // The cluster's own agent, but not the node the address belongs to
+    // (i1174's pin): say that, not "another CA".
+    if let Some(m) = crate::node_pin::identity_mismatch(err) {
+        return Some(m.to_string());
+    }
     let mut cur = Some(err);
     while let Some(e) = cur {
         match e.downcast_ref::<rustls::Error>() {

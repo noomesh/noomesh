@@ -230,9 +230,9 @@ async fn call_model(
     }
 
     let url = format!("{}/v1/chat/completions", backend.url.trim_end_matches('/'));
-    let client = crate::tls::cluster_client();
-    let resp = match client
-        .post(&url)
+    // Through the one door for backend calls: a node agent gets its
+    // credential, the backend hint and the target node (i1174).
+    let resp = match crate::node_link::backend_request(reqwest::Method::POST, &url, &backend.backend_type)
         .json(&body)
         .timeout(std::time::Duration::from_secs(120))
         .send()

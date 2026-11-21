@@ -3651,6 +3651,34 @@ pub(crate) fn address_claimed_by_other(node: &str, addr: &str, claims: &[(String
         .map(|(id, _)| id.clone())
 }
 
+/// May push-nodes mint a leaf for `node` at `host` (i1174)? Only for a
+/// VETTED address: the node's enrollment address (`used_by_ip`, seen by the
+/// controller when the node redeemed its token), its tailnet address, an
+/// address its current CA-signed leaf already carries, or its own name. The
+/// dialed host is what the node's heartbeat reported; an address that is
+/// none of these is refused with the proof remedy (`--prove` mints it once
+/// the node at that address shows it holds the node's current key).
+pub(crate) fn vetted_push_address(
+    node: &str,
+    host: &str,
+    enrollment_ip: Option<&str>,
+    tailnet_ips: &[String],
+    leaf_ips: &[String],
+) -> Result<(), String> {
+    let norm = |s: &str| s.trim().trim_matches(|c| c == '[' || c == ']').to_ascii_lowercase();
+    let h = norm(host);
+    let vetted = h == norm(node)
+        || enrollment_ip.is_some_and(|e| norm(e) == h)
+        || tailnet_ips.iter().any(|t| norm(t) == h)
+        || leaf_ips.iter().any(|l| norm(l) == h);
+    if vetted {
+        return Ok(());
+    }
+    Err(format!(
+        "{host} is not {node}'s enrollment, tailnet or current-leaf address; if {node} moved there, prove it:          `noo security pki push-nodes {node} --prove`"
+    ))
+}
+
 /// The leaf IP SANs of `node` in this controller's PKI (empty when unreadable).
 pub(crate) fn local_leaf_ips(node: &str) -> Vec<String> {
     ClusterCa::cert_names(&pki_dir().join("nodes").join(node).join("node.crt")).map(|n| n.ips).unwrap_or_default()
@@ -3746,6 +3774,11 @@ pub fn pki_push_nodes(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         .and_then(|b| b["nodes"].as_array().cloned())
         .unwrap_or_default();
     let claims = node_address_claims(&registry, &local_leaf_ips);
+    // The enrollment records, read once: each node's enrollment address is
+    // one of the addresses push-nodes may mint (i1174).
+    let tokens: Vec<serde_json::Value> = crate::http::get_json_opt(g, "/api/security/bootstrap-tokens", true, 15)
+        .and_then(|b| b["tokens"].as_array().cloned())
+        .unwrap_or_default();
     let mut failed: Vec<String> = Vec::new();
     for (name, host, _user) in &nodes {
         if let Some(other) = address_claimed_by_other(name, host, &claims) {
@@ -3760,12 +3793,25 @@ pub fn pki_push_nodes(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                 continue;
             }
         }
+        // i1174: mint only a vetted address. `--allow-shared-address` does
+        // not reach this: it answers a claim, not an unvetted address.
+        let ts_ip: Vec<String> = ClusterCa::tailscale_ip4(name).into_iter().collect();
+        let enrolled = super::provision::latest_redemption(&tokens, name)
+            .and_then(|t| t.get("used_by_ip").and_then(|v| v.as_str()))
+            .map(str::to_string);
+        if let Err(why) = vetted_push_address(name, host, enrolled.as_deref(), &ts_ip, &local_leaf_ips(name)) {
+            if !g.json {
+                println!("{}", ui::item(name));
+                println!("{}", ui::sub(&ui::status_line(Glyph::Err, &format!("REFUSED: {why}"))));
+            }
+            failed.push(name.clone());
+            continue;
+        }
         if !g.json {
             println!("{}", ui::item(name));
             println!("{}", ui::sub(&ui::status_line(Glyph::Step, "issuing the node certificate")));
         }
         // The local controller node is filtered out above; this is a worker.
-        let ts_ip: Vec<String> = ClusterCa::tailscale_ip4(name).into_iter().collect();
         let role = crate::pki::NodeRole::Worker;
         if let Err(e) = ca.issue_node_cert(name, host, days, &["node-agent".to_string()], &ts_ip, &role) {
             if !g.json {
@@ -6851,5 +6897,38 @@ mod address_claim_tests {
         let issue = body.find("ca.issue_node_cert(name, host").expect("the issue");
         assert!(check < issue, "the check runs before the certificate is issued");
         assert!(body.contains("if !allow.iter().any(|a| a.trim() == host.trim()) {"), "only the named address is allowed");
+    }
+}
+
+#[cfg(test)]
+mod push_vetting_tests {
+    //! i1174: push-nodes mints only vetted addresses.
+    use super::*;
+
+    fn v(s: &[&str]) -> Vec<String> {
+        s.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn push_nodes_mints_only_vetted_addresses() {
+        let ts = v(&["100.64.0.21"]);
+        let leaf = v(&["192.0.2.21", "127.0.0.1"]);
+        assert!(vetted_push_address("node-b", "192.0.2.50", Some("192.0.2.50"), &ts, &leaf).is_ok(), "the enrollment address");
+        assert!(vetted_push_address("node-b", "100.64.0.21", None, &ts, &leaf).is_ok(), "the tailnet address");
+        assert!(vetted_push_address("node-b", "192.0.2.21", None, &ts, &leaf).is_ok(), "an address the current leaf carries");
+        assert!(vetted_push_address("node-b", "node-b", None, &[], &[]).is_ok(), "its own name");
+        let why = vetted_push_address("node-b", "192.0.2.99", Some("192.0.2.50"), &ts, &leaf).unwrap_err();
+        assert!(why.contains("192.0.2.99 is not node-b's enrollment, tailnet or current-leaf address"), "{why}");
+        assert!(why.contains("noo security pki push-nodes node-b --prove"), "the remedy is the proof form: {why}");
+    }
+
+    #[test]
+    fn the_vetting_runs_before_anything_is_minted() {
+        let own = include_str!("security_local.rs");
+        let body = &own[own.find("pub fn pki_push_nodes(").expect("fn")..];
+        let body = &body[..body.find("\n}\n").expect("end")];
+        let vet = body.find("vetted_push_address(name, host, enrolled.as_deref(), &ts_ip, &local_leaf_ips(name))").expect("the vetting");
+        let mint = body.find("ca.issue_node_cert(name, host,").expect("the mint");
+        assert!(vet < mint);
     }
 }

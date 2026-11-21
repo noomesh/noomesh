@@ -1698,6 +1698,17 @@ pub(crate) const ROWS: &[Row] = &[
         doc: None,
     },
     Row {
+        id: "target_node_check",
+        name: "target-node check",
+        scope: Scope::Node,
+        verdicts: &[Verdict::Warn],
+        meaning: "Whether the node agent refuses a call addressed to another node and, once the controller says so, a controller call that names none (strict); tolerant names why.",
+        clears: "An older agent: `noo cluster provision <node>`; not yet told: the node's next reconcile applies the controller's flag (re-run `noo cluster verify <node>`).",
+        findings: &[],
+        shown_as: None,
+        doc: None,
+    },
+    Row {
         id: "tempo",
         name: "tempo",
         scope: Scope::Controller,

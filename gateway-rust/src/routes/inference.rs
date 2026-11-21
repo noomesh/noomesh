@@ -911,7 +911,12 @@ pub(crate) async fn node_chat_backend(state: &AppState, node_id: &str) -> NodeCh
             }
         };
         match pick_chat_backend(id, rb, &non_chat) {
-            Ok((bt, m)) => return NodeChat::Serves(bt, m, crate::node_link::NodeLink::for_ip(ip).base().to_string()),
+            Ok((bt, m)) => match crate::node_link::NodeLink::for_node_ip(id, ip) {
+                Ok(link) => return NodeChat::Serves(bt, m, link.base().to_string()),
+                // The address is another node's in the gateway's book
+                // (i1174): this node is not served at it.
+                Err(_) => continue,
+            },
             Err(served) if !served.is_empty() => {
                 let roles = crate::repo::cluster::node_running_roles(&state.db, id).await.unwrap_or_default();
                 let msg = no_chat_refusal(id, &served, &roles);
@@ -971,10 +976,12 @@ async fn backend_node_agent_url(state: &AppState, backend_type: &str) -> Option<
             .map(|m| !m.is_empty()).unwrap_or(false);
         if !has { continue; }
 
-        let url = crate::node_link::NodeLink::for_ip(ip).base().to_string();
         // Prefer the gossip-chosen node when the KV confirms it exists and
         // actually runs this backend; otherwise take the first that does.
         let id = data.get("id").and_then(|v| v.as_str()).unwrap_or(key.as_str());
+        // By node (i1174): skipped when the address is another node's.
+        let Ok(link) = crate::node_link::NodeLink::for_node_ip(id, ip) else { continue };
+        let url = link.base().to_string();
         let host = data.get("hostname").and_then(|v| v.as_str()).unwrap_or(key.as_str());
         if preferred.as_deref() == Some(id) || preferred.as_deref() == Some(host) {
             return Some(url);

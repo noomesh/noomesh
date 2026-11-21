@@ -451,7 +451,7 @@ func (s *Server) ListenAndServe() error {
 			return err
 		}
 		server := &http.Server{
-			Handler:   s.mux,
+			Handler:   auth.TargetNode(s.cfg)(s.mux),
 			ErrorLog:  log.New(quietTLSLogger{}, "", 0),
 			TLSConfig: tlsCfg,
 		}
@@ -504,7 +504,7 @@ func (s *Server) ListenAndServeWithTLS(tlsCfg *tls.Config) error {
 	addr := fmt.Sprintf(":%d", port)
 	server := &http.Server{
 		Addr:      addr,
-		Handler:   s.mux,
+		Handler:   auth.TargetNode(s.cfg)(s.mux),
 		TLSConfig: tlsCfg,
 	}
 	slog.Info("control API starting with TLS", "addr", addr)

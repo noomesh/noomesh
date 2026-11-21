@@ -493,6 +493,10 @@ pub(crate) fn node_checks(n: &Value, controller_tag: &str, cli_version: &str, no
         None => out.push(warn("peer identity", "not reported (older agent)", Some(format!("noo cluster provision {id} --wait")))),
     }
 
+    // 4c. The agent refuses calls addressed to another node (i1174), and
+    //     whether the controller has made it strict yet.
+    out.push(target_node_check(id, n));
+
     // 5. The fleet signing key adopted. The CA-signed bundle lane is retired
     //    So a node that has not adopted takes nothing but a
     //    rollover — which every CA-signed bundle now is, so a provision
@@ -3404,6 +3408,35 @@ pub(crate) fn agent_metrics_check(nodes: &[(String, String)], up: Option<&Value>
     ok(NAME, format!("{total}/{total} node agents scraped"))
 }
 
+/// The `target-node check` row (i1174): every controller call names the node
+/// it is meant for (`X-Noo-Node`) and the agent refuses one that names
+/// another. STRICT once the agent also refuses a controller call that names
+/// none, which the controller turns on per node in desired-config as soon as
+/// the agent reports the check. Tolerant otherwise, and the row says which
+/// of the two reasons holds. Read from the node record (the heartbeat's
+/// `checks_target_node` and `requires_target_node`, false when the agent
+/// does not say).
+pub(crate) fn target_node_check(id: &str, n: &Value) -> Check {
+    const NAME: &str = "target-node check";
+    let checks = n["checks_target_node"].as_bool() == Some(true);
+    let requires = n["requires_target_node"].as_bool() == Some(true);
+    if checks && requires {
+        return ok(NAME, "strict: the agent refuses a call addressed to another node, and a controller call that names none");
+    }
+    if checks {
+        return warn(
+            NAME,
+            "tolerant: not yet told (the agent refuses a call addressed to another node; the controller's flag to refuse a call that names none applies at its next desired-config read)",
+            Some(format!("noo cluster verify {id}   # re-run after the node's next reconcile")),
+        );
+    }
+    warn(
+        NAME,
+        format!("tolerant: the agent is older than the controller (upgrade it: `noo cluster provision {id}`)"),
+        Some(format!("noo cluster provision {id}")),
+    )
+}
+
 /// The `agent certificate` row: the node's leaf (the controller's copy under
 /// `pki/nodes/<id>/node.crt`) must cover the host of the `agent_url` the
 /// gateway dials. When it does not, every gateway call to the node fails TLS
@@ -3417,6 +3450,10 @@ pub(crate) fn agent_metrics_check(nodes: &[(String, String)], up: Option<&Value>
 /// node claims that address (`other`: its registered or dialed address, or a
 /// SAN in its leaf). A leaf for another node's address would let this node
 /// answer as that one; then it is a finding to investigate, with no remedy.
+/// An address the leaf does not carry is not one push-nodes mints on its own
+/// (it mints only vetted addresses: the enrollment, tailnet and current-leaf
+/// ones, i1174), so the remedy is the proof form, `--prove`, which mints it
+/// once the node at that address shows it holds the node's current key.
 pub(crate) fn agent_cert_check(id: &str, host: &str, covers: Option<bool>, other: Option<&str>) -> Option<Check> {
     match covers {
         Some(true) => return None,
@@ -3449,8 +3486,8 @@ pub(crate) fn agent_cert_check(id: &str, host: &str, covers: Option<bool>, other
         ),
         None => fail(
             "agent certificate",
-            format!("{id}: its certificate does not cover the address the controller dials it at ({host}), so every call to it fails TLS (imports, logs, metrics); `noo security pki push-nodes {id}` will issue it a certificate for {host}"),
-            format!("noo security pki push-nodes {id}   # then: noo cluster verify"),
+            format!("{id}: its certificate does not cover the address the controller dials it at ({host}), so every call to it fails TLS (imports, logs, metrics); {host} is not {id}'s enrollment, tailnet or current-leaf address, so `noo security pki push-nodes {id} --prove` will issue it a certificate for {host} once the node there proves it holds {id}'s current key"),
+            format!("noo security pki push-nodes {id} --prove   # then: noo cluster verify {id}"),
         ),
     })
 }
@@ -18006,6 +18043,35 @@ mod docker_compose_tests {
 }
 
 #[cfg(test)]
+mod target_node_row_tests {
+    use super::*;
+
+    #[test]
+    fn the_target_node_row_tells_strict_from_the_two_tolerant_states() {
+        let strict = target_node_check("node-b", &serde_json::json!({"checks_target_node": true, "requires_target_node": true}));
+        assert_eq!((strict.name, strict.verdict), ("target-node check", Verdict::Ok));
+        assert!(strict.detail.starts_with("strict"), "{}", strict.detail);
+        let untold = target_node_check("node-b", &serde_json::json!({"checks_target_node": true, "requires_target_node": false}));
+        assert_eq!(untold.verdict, Verdict::Warn);
+        assert!(untold.detail.starts_with("tolerant: not yet told"), "{}", untold.detail);
+        for old in [serde_json::json!({"checks_target_node": false, "requires_target_node": false}), serde_json::json!({})] {
+            let row = target_node_check("node-b", &old);
+            assert_eq!(row.verdict, Verdict::Warn);
+            assert!(row.detail.starts_with("tolerant: the agent is older than the controller"), "{}", row.detail);
+            assert_eq!(row.remedy.as_deref(), Some("noo cluster provision node-b"));
+        }
+    }
+
+    #[test]
+    fn every_node_gets_the_target_node_row() {
+        let src = include_str!("cluster_verify.rs");
+        let f = &src[src.find("pub(crate) fn node_checks(").expect("fn")..];
+        let f = &f[..f.find("\n}\n").expect("end")];
+        assert!(f.contains("out.push(target_node_check(id, n));"));
+    }
+}
+
+#[cfg(test)]
 mod agent_cert_tests {
     use super::*;
 
@@ -18026,8 +18092,9 @@ mod agent_cert_tests {
         assert_eq!(row.name, "agent certificate");
         assert_eq!(row.verdict, Verdict::Fail);
         assert!(row.detail.contains("node-b") && row.detail.contains("192.0.2.41") && row.detail.contains("fails TLS"), "{}", row.detail);
-        assert!(row.remedy.as_deref().unwrap().contains("noo security pki push-nodes node-b"));
+        assert!(row.remedy.as_deref().unwrap().contains("noo security pki push-nodes node-b --prove"), "{:?}", row.remedy);
         assert!(row.detail.contains("will issue it a certificate for 192.0.2.41"), "the row says what it would certify: {}", row.detail);
+        assert!(row.detail.contains("not node-b's enrollment, tailnet or current-leaf address"), "{}", row.detail);
     }
 
     /// The address is another node's: a finding, never a remedy that would
