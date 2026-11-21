@@ -245,7 +245,7 @@ async fn every_peer_kind_the_cluster_clients_reach() {
     let gateway = node_leaf(&ca, "pin-kind-ctrl", "Mesh Cluster Gateway", &[ip_ctrl]);
     // An address no node owns.
     let stray = node_leaf(&ca, "pin-kind-z", NODE_ORG, &[ip_free]);
-    let other_ca = ca();
+    let other_ca = self::ca();
     let foreign = node_leaf(&other_ca, "pin-kind-a", NODE_ORG, &[ip_free]);
     // A docker service name.
     let svc = node_leaf(&ca, "noo-trellion", crate::node_identity::SERVICE_ORG, &[]);
