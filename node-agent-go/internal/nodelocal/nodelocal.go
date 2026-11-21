@@ -84,6 +84,10 @@ var Keys = map[string]rule{
 	"NOO_SKILL_BIND_ROOTS":           {kind: trust, check: checkBindRoots},
 	"NOO_MCP_SECRETS_FILE":           {kind: trust, check: checkFilePath},
 	"NOO_IMAGE_REGISTRY_FALLBACK":    {kind: trust, check: oneOf("public", "off"), onRefuse: "off"},
+	// What the data root is: "mount" (its own filesystem; refused while on
+	// the root disk) or "directory" (plain; recorded where it is).
+	// dataroots/fsid.go.
+	"NOO_DATA_ROOT_FS": {kind: trust, check: oneOf("mount", "directory")},
 	// Tuning.
 	"NOO_GPU_YIELD":            {kind: tuning, check: oneOf("on", "off")},
 	"NOO_GPU_YIELD_FOREIGN_MB": {kind: tuning, check: checkCount},

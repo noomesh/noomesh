@@ -25,6 +25,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"runtime"
 	"strconv"
 	"time"
 
@@ -160,9 +161,17 @@ func main() {
 	if root := dataroots.AdoptLegacyRoot(os.Getenv, os.Setenv, func(d string) bool {
 		fi, err := os.Stat(d)
 		return err == nil && fi.IsDir()
-	}); root != "" {
+	}); root != "" && dataroots.AdoptedLate() {
+		slog.Error("data_root.legacy_default_late", "root", root,
+			"detail", "the earlier default "+root+" holds this node's data (its filesystem is recorded) but is not there at start: its mount is late",
+			"effect", "kept, not swapped for "+dataroots.DefaultDataRoot+"; backend starts and fetches into it are refused until the mount appears, then clear by themselves",
+			"fix", "mount it (findmnt "+root+" / your fstab); then declare it: noo cluster set-config <node> --data-root "+root)
+	} else if root != "" {
 		slog.Warn("data_root.legacy_default_adopted", "root", root,
 			"fix", "declare it: noo cluster set-config <node> --data-root "+root+", then noo cluster provision <node> --wait")
+	} else if os.Getenv("NOO_DATA_ROOT") == "" {
+		slog.Info("data_root.default", "root", dataroots.DefaultFor(runtime.GOOS, os.Getenv("HOME")),
+			"detail", "NOO_DATA_ROOT is unset and no earlier default is present or recorded; a late legacy mount never seen by this check is not told apart from none")
 	}
 	cfg := config.Load()
 

@@ -86,6 +86,17 @@ var LegacyDefaults = []string{"/mnt/d/noo", "/data/noo"}
 // adoptedLegacy is the legacy root AdoptLegacyRoot pinned, for reporting.
 var adoptedLegacy string
 
+// adoptedLate: the legacy root was adopted while absent, because the
+// filesystem record names it (its mount was late at start).
+var adoptedLate bool
+
+// AdoptedLate reports whether AdoptLegacyRoot kept a legacy root that was not
+// there at start (its mount was late) because the filesystem record names it.
+func AdoptedLate() bool { return adoptedLate }
+
+// legacyRecorded is recorded(); a seam for tests.
+var legacyRecorded = recorded
+
 // AdoptLegacyRoot keeps an undeclared node on the root it already uses: with
 // NOO_DATA_ROOT unset and a legacy default directory present, it SETS
 // NOO_DATA_ROOT to that directory for this process, so every resolver (the
@@ -93,6 +104,16 @@ var adoptedLegacy string
 // heartbeat then reports source "legacy_default" and the policy asks for it
 // to be declared. Returns the adopted root, or "" when nothing was adopted.
 // Called once at startup, before anything resolves a path.
+//
+// A legacy root on a mount that is LATE at start is not a directory yet.
+// It used to fall through to today's default for the whole process: the
+// node ran on /var/lib/noo, an empty tree, until a restart. Now a legacy
+// root the filesystem record names (data-root-fs.json: it was seen on its
+// own disk at an earlier start) is kept even while absent; the policy then
+// refuses it (not_on_recorded_fs) until the mount appears, and clears by
+// itself when it does. A legacy root never recorded (its first start under
+// this check) cannot be told from one that is gone, and keeps the old
+// behaviour; main logs which case it was.
 func AdoptLegacyRoot(getenv func(string) string, setenv func(string, string) error, isDir func(string) bool) string {
 	return adoptLegacyRoot(runtime.GOOS, getenv, setenv, isDir)
 }
@@ -101,12 +122,25 @@ func adoptLegacyRoot(goos string, getenv func(string) string, setenv func(string
 	if strings.TrimSpace(getenv("NOO_DATA_ROOT")) != "" {
 		return ""
 	}
-	for _, d := range legacyDefaultsFor(goos, getenv("HOME")) {
+	legacy := legacyDefaultsFor(goos, getenv("HOME"))
+	for _, d := range legacy {
 		if isDir(d) {
 			if err := setenv("NOO_DATA_ROOT", d); err != nil {
 				return ""
 			}
-			adoptedLegacy = d
+			adoptedLegacy, adoptedLate = d, false
+			return d
+		}
+	}
+	if goos != "linux" {
+		return ""
+	}
+	for _, d := range legacy {
+		if legacyRecorded(d) {
+			if err := setenv("NOO_DATA_ROOT", d); err != nil {
+				return ""
+			}
+			adoptedLegacy, adoptedLate = d, true
 			return d
 		}
 	}
@@ -180,9 +214,52 @@ func ResolveMounts(m map[string][]string, eval ResolveFunc) map[string]string {
 // paths; an error omits running_mounts and is named in
 // running_mounts_error. A nil mounts func (agent without a docker client)
 // is the same as an error.
+//
+// The disk part is bounded (Bounded, ProbeTimeout): a root on a hung mount
+// (a hard NFS mount, a dead USB disk) blocks a stat in the kernel, and the
+// heartbeat that waited on it went silent. On timeout the beat still goes
+// out with the paths it resolves (no disk), the running mounts, and a
+// `not_answering` policy problem, which `noo cluster verify` shows as FAIL.
+// Docker is asked first, outside the bound: a slow docker is not a slow disk.
 func Report(r Roots, mounts func() (map[string][]string, error)) map[string]any {
+	if mounts != nil {
+		m, err := mounts()
+		mounts = func() (map[string][]string, error) { return m, err }
+	}
+	out, err := Bounded(r.NooDataRoot, func() map[string]any { return reportDisk(r, mounts) })
+	if err != nil {
+		return notAnsweringReport(r, mounts, err)
+	}
+	return out
+}
+
+// notAnsweringReport is the beat's data_roots when the disk did not answer.
+func notAnsweringReport(r Roots, mounts func() (map[string][]string, error), why error) map[string]any {
+	out := map[string]any{
+		"noo_data_root":        r.NooDataRoot,
+		"noo_data_root_source": r.NooDataRootSource,
+		"hf_cache_dir":         r.HFCacheDir,
+		"models_dir":           r.ModelsDir,
+		"ollama_data_dir":      r.OllamaDataDir,
+		"probe_error":          why.Error(),
+	}
+	if mounts == nil {
+		out["running_mounts_error"] = "no docker client"
+	} else if m, err := mounts(); err != nil {
+		out["running_mounts_error"] = err.Error()
+	} else {
+		if m == nil {
+			m = map[string][]string{}
+		}
+		out["running_mounts"] = m
+	}
+	out["policy"] = PolicyReport([]Problem{{Code: "not_answering", Detail: why.Error()}})
+	return out
+}
+
+func reportDisk(r Roots, mounts func() (map[string][]string, error)) map[string]any {
 	out := report(r, mounts, filepath.EvalSymlinks)
-	out["policy"] = PolicyReport(Check(r, runtime.GOOS, os.Getenv("HOME"), os.Geteuid()))
+	out["policy"] = policyReport(r, Check(r, runtime.GOOS, os.Getenv("HOME"), os.Geteuid()))
 	out["stores"] = StoresReport(r)
 	return out
 }

@@ -2543,6 +2543,8 @@ pub(crate) fn data_root_policy_row(n: &Value) -> Option<Check> {
     } else if self_owned_by_operator {
         "noo onboard --only services (declares your data root to the agent in /etc/noo/data-root-owner; asks for sudo once)"
             .to_string()
+    } else if only_ownership && codes.contains(&"missing") {
+        data_root_missing_remedy(id, root, pol["filesystem"]["meant"].as_str())
     } else if only_ownership {
         format!("on {id}: sudo install -d -o noo-agent -g noo-agent {root} && sudo chmod go-w {root}")
     } else {
@@ -2555,7 +2557,55 @@ pub(crate) fn data_root_policy_row(n: &Value) -> Option<Check> {
         format!("noo cluster set-config {id} --data-root {target} && noo cluster provision {id} --move-data --wait")
     };
     let msg = format!("{root}: {detail}");
+    // Refused in warn mode too (the agent's safety problems, i1160): a root
+    // that does not answer, or whose mount is not there.
+    if codes.contains(&"not_answering") {
+        // The agent's detail already leads with the phrase; say it once.
+        let lead = format!("data root {root} not answering: ");
+        let rest = detail.strip_prefix(lead.as_str()).unwrap_or(detail.as_str());
+        return Some(fail(NAME, format!("{lead}{rest}"), data_root_hung_remedy(id, root)));
+    }
+    if codes.iter().any(|c| matches!(*c, "not_on_recorded_fs" | "mount_missing")) {
+        let mut r = data_root_mount_remedy(id, root);
+        if codes.contains(&"not_on_recorded_fs") {
+            r.push_str(&format!("; only if the disk was replaced or the root moved ON PURPOSE: on {id}: sudo rm {DATA_ROOT_FS_RECORD} (the agent records the new filesystem at its next check)"));
+        }
+        return Some(fail(NAME, msg, r));
+    }
     Some(if pol["mode"] == "enforce" { fail(NAME, msg, remedy) } else { warn(NAME, msg, Some(remedy)) })
+}
+
+/// The agent's record of each data root's filesystem
+/// (node-agent-go/internal/dataroots/fsid.go RecordFileName, in its state dir).
+const DATA_ROOT_FS_RECORD: &str = "/var/lib/noo-node-agent/data-root-fs.json";
+
+/// The remedy for a root whose mount is not there. It never creates the
+/// directory: `install -d` on an unmounted root makes an agent-owned
+/// directory on the ROOT disk, which the agent then fills and the mount
+/// later hides (i1160).
+pub(crate) fn data_root_mount_remedy(id: &str, root: &str) -> String {
+    format!("on {id}: the mount for {root} is not there: mount it (check `findmnt {root}` / your fstab) — do NOT create the directory, a mount would hide it; \
+             the agent clears this by itself once the mount is back")
+}
+
+/// The remedy for a root that does not answer (a hung mount, a failing disk).
+fn data_root_hung_remedy(id: &str, root: &str) -> String {
+    format!("on {id}: the disk under {root} does not answer (a hung NFS mount or a failing disk): check `findmnt {root}` and \
+             `dmesg | grep -iE 'I/O error|nfs|usb|nvme'`; the agent keeps beating and refuses backend starts and fetches into it until it answers")
+}
+
+/// The remedy for a MISSING root: create it only when it is meant to be a
+/// plain directory (`data_roots.policy.filesystem.meant`, sent by agents
+/// since 0.6.30); a mount, or a root an older agent cannot say, gets the
+/// mount remedy first.
+pub(crate) fn data_root_missing_remedy(id: &str, root: &str, meant: Option<&str>) -> String {
+    let create = format!("sudo install -d -o noo-agent -g noo-agent {root} && sudo chmod go-w {root}");
+    match meant {
+        Some("directory") => format!("on {id}: {create}"),
+        Some("mount") => data_root_mount_remedy(id, root),
+        _ => format!("{}; only if {root} is meant to be a plain directory on this disk (no mount): on {id}: {create}",
+            data_root_mount_remedy(id, root)),
+    }
 }
 
 /// The node record plus the gateway's answer on the harness (and the
@@ -15956,6 +16006,53 @@ mod config_mount_tests {
         let both = json!({"id": "box", "self_node": true, "data_roots": {"noo_data_root": "/var/lib/noo",
             "policy": {"mode": "warn", "ok": false, "problems": [{"code": "wrong_owner", "detail": "x"}, {"code": "writable_by_others", "detail": "y"}]}}});
         assert!(!super::data_root_policy_row(&both).unwrap().remedy.unwrap().starts_with("noo onboard"));
+    }
+
+    /// i1160: a root that does not answer is a FAIL, in warn mode too,
+    /// named "data root <path> not answering".
+    #[test]
+    fn a_data_root_not_answering_fails() {
+        use serde_json::json;
+        let n = json!({"id": "node_a", "data_roots": {"noo_data_root": "/data/noo", "probe_error": "x",
+            "policy": {"mode": "warn", "ok": false, "problems": [{"code": "not_answering",
+                "detail": "data root /data/noo not answering: no reply within 5s"}]}}});
+        let c = super::data_root_policy_row(&n).unwrap();
+        assert_eq!(c.verdict, super::Verdict::Fail);
+        assert!(c.detail.starts_with("data root /data/noo not answering: no reply"), "{}", c.detail);
+        let r = c.remedy.unwrap();
+        assert!(r.contains("findmnt /data/noo") && !r.contains("install -d"), "{r}");
+    }
+
+    /// i1160: a missing root whose mount is not there is never fixed by
+    /// creating the directory: the remedy says to mount it, first.
+    #[test]
+    fn a_missing_mount_is_mounted_not_created() {
+        use serde_json::json;
+        let missing = |meant: Option<&str>| {
+            let mut pol = json!({"mode": "warn", "ok": false, "problems": [{"code": "missing", "detail": "/data/noo does not exist"}]});
+            if let Some(m) = meant {
+                pol["filesystem"] = json!({"meant": m});
+            }
+            json!({"id": "node_a", "data_roots": {"noo_data_root": "/data/noo", "policy": pol}})
+        };
+        let mount = super::data_root_policy_row(&missing(Some("mount"))).unwrap().remedy.unwrap();
+        assert!(mount.starts_with("on node_a: the mount for /data/noo is not there: mount it (check `findmnt /data/noo` / your fstab)"), "{mount}");
+        assert!(mount.contains("do NOT create the directory") && !mount.contains("install -d"), "{mount}");
+        // An agent that cannot say (older, or nothing recorded): the mount first.
+        let unknown = super::data_root_policy_row(&missing(None)).unwrap().remedy.unwrap();
+        assert!(unknown.starts_with("on node_a: the mount for /data/noo is not there"), "{unknown}");
+        assert!(unknown.find("findmnt").unwrap() < unknown.find("install -d").unwrap(), "{unknown}");
+        // A plain directory: creating it is the remedy.
+        let dir = super::data_root_policy_row(&missing(Some("directory"))).unwrap().remedy.unwrap();
+        assert_eq!(dir, "on node_a: sudo install -d -o noo-agent -g noo-agent /data/noo && sudo chmod go-w /data/noo");
+        // Not on its recorded filesystem: FAIL in warn mode, mount it, never create.
+        let moved = json!({"id": "node_a", "data_roots": {"noo_data_root": "/data/noo",
+            "policy": {"mode": "warn", "ok": false, "problems": [{"code": "not_on_recorded_fs", "detail": "on / (ext4)"}]}}});
+        let c = super::data_root_policy_row(&moved).unwrap();
+        assert_eq!(c.verdict, super::Verdict::Fail);
+        let r = c.remedy.unwrap();
+        assert!(r.starts_with("on node_a: the mount for /data/noo is not there") && !r.contains("install -d"), "{r}");
+        assert!(r.contains("data-root-fs.json"), "{r}");
     }
 
     #[test]
