@@ -131,6 +131,9 @@ TS_OURS_EARLY="$(grep -E '^INSTALLED_TAILSCALE=' /etc/noo/host-prepped 2>/dev/nu
 systemctl disable --now noo-fetch.timer 2>/dev/null || true
 systemctl stop noo-fetch.service 2>/dev/null || true
 rm -f /etc/systemd/system/noo-fetch.service /etc/systemd/system/noo-fetch.timer       /usr/local/bin/noo-fetch
+# The start-timeout drop-in noo-apply writes (its fetch_unit_timeout block).
+rm -f /etc/systemd/system/noo-fetch.service.d/10-timeout.conf
+rmdir /etc/systemd/system/noo-fetch.service.d 2>/dev/null || true
 systemctl daemon-reload
 say "noo-fetch loop disarmed + removed"
 rm -rf /etc/noo /var/lib/noo-node-agent
