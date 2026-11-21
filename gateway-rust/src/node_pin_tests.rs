@@ -81,17 +81,20 @@ fn a_leaf_for_another_node_is_refused_and_the_right_one_passes() {
     let a = node_leaf(&ca, "node_a", NODE_ORG, &["10.231.2.1"]);
     let b = node_leaf(&ca, "node_b", NODE_ORG, &["10.231.2.1"]);
     let owners = vec!["node_a".to_string()];
-    assert!(check_leaf("10.231.2.1", &owners, a.cert.der()).is_ok());
-    let m = check_leaf("10.231.2.1", &owners, b.cert.der()).unwrap_err();
+    assert!(check_leaf("10.231.2.1", &owners, false, a.cert.der()).is_ok());
+    let m = check_leaf("10.231.2.1", &owners, false, b.cert.der()).unwrap_err();
     assert_eq!(m.presented, vec!["node_b".to_string()]);
     assert_eq!(m.expected, vec!["node_a".to_string()]);
     // A host the book does not place a node on: nothing to pin.
-    assert!(check_leaf("10.231.2.1", &[], b.cert.der()).is_ok());
-    // A service leaf on a node's host (an add-on door) is not judged here.
+    assert!(check_leaf("10.231.2.1", &[], false, b.cert.der()).is_ok());
+    // At a node's address only that node's leaf passes: a service leaf
+    // covering the address is refused, except on the controller's machine.
     let door = node_leaf(&ca, "some-door", "Mesh Cluster Service", &["10.231.2.1"]);
-    assert!(check_leaf("10.231.2.1", &owners, door.cert.der()).is_ok());
+    let m = check_leaf("10.231.2.1", &owners, false, door.cert.der()).unwrap_err();
+    assert!(m.presented[0].starts_with("a certificate that is not a node's"), "{:?}", m.presented);
+    assert!(check_leaf("10.231.2.1", &owners, true, door.cert.der()).is_ok(), "the controller's own machine");
     // A sensor companion presents its machine's node leaf.
-    assert!(check_leaf("10.231.2.1", &["node_a-sensors".to_string()], a.cert.der()).is_ok());
+    assert!(check_leaf("10.231.2.1", &["node_a-sensors".to_string()], false, a.cert.der()).is_ok());
 }
 
 #[test]
@@ -274,9 +277,10 @@ async fn every_peer_kind_the_cluster_clients_reach() {
     assert_eq!(kept["host"], json!(ip_node));
     assert_eq!(kept["presented"], json!(["pin-kind-b"]));
     assert!(last_mismatch("pin-kind-b").is_none(), "kept for the node the call was meant for");
-    // A service leaf at a node's address.
-    let r = get(ip_node, p_door).await;
-    assert!(r.is_ok(), "a service leaf on a node's address is not a node's: {:?}", r.err());
+    // A service leaf at a node's address: refused (only the node's own leaf
+    // answers there; real door leaves never carry a node's address).
+    let err = get(ip_node, p_door).await.expect_err("a service leaf at node_a's address");
+    assert!(identity_mismatch(&err).is_some(), "refused by the pin, typed");
     // The self node's agent, and the gateway's own leaf, on the controller's address.
     let r = get(ip_ctrl, p_self).await;
     assert!(r.is_ok(), "the self node's own leaf: {:?}", r.err());
