@@ -876,52 +876,36 @@ fn ensure_node_certs(g: &Globals, a: &ProvisionArgs, site: &ProvSite, id: &ProvI
     } else {
         None
     };
-    // i1074 C: a re-issue here must never NARROW a worker's leaf. A roll
-    // reaches this with the ENROLLMENT address (the peer seen at redeem);
-    // behind a NAT, a Docker bridge or a hairpin that is not the address the
-    // gateway dials, which a person added with `push-nodes` (or `--prove`).
-    // Re-issuing for the enrollment address alone dropped it, and after the
-    // agent restarted the controller got `bad certificate` (rc.4 Part B).
-    // So the re-issue also keeps the IP SANs of the CURRENT, CA-signed leaf,
-    // minus loopback and minus any address another node claims now. Nothing
-    // the node reports enters this way. A stale address leaves with the
-    // explicit `push-nodes` / `--prove`, which mint the set fresh.
+    // i1074 C: a re-issue here must never drop the address the gateway
+    // DIALS this node at. A roll reaches this with the ENROLLMENT address
+    // (the peer seen at redeem); behind a NAT, a Docker bridge or a hairpin
+    // the dialed address differs, and a person added it with `push-nodes`
+    // (or `--prove`). Re-issuing for the enrollment address alone dropped
+    // it, and after the agent restarted the controller got `bad
+    // certificate` (rc.4 Part B). `carry_for` keeps exactly the CURRENT
+    // leaf's IPs that this node is still registered or dialed at in the
+    // registry (never its own report), minus any address another node
+    // claims; nothing when the registry cannot be read (fail closed).
     let carried: Vec<String> = if is_self || !node_crt.exists() {
         Vec::new()
     } else {
         let current = crate::pki::ClusterCa::cert_names(&node_crt).map(|n| n.ips).unwrap_or_default();
-        let registry: Vec<serde_json::Value> = crate::http::get_json_opt(g, "/api/cluster/nodes", true, 10)
-            .and_then(|b| b["nodes"].as_array().cloned())
-            .unwrap_or_default();
-        let claims = super::security_local::node_address_claims(&registry, &super::security_local::local_leaf_ips);
-        carried_leaf_ips(&node, &current, &want_ips, &claims)
+        let registry = crate::http::get_json_opt(g, "/api/cluster/nodes", true, 10).and_then(|b| b["nodes"].as_array().cloned());
+        if registry.is_none() && reason.is_some() {
+            nnote(&format!(
+                "the node registry could not be read, so the re-issue keeps only {node}'s enrollment address; \
+                 if the controller dials it elsewhere, run `noo security pki push-nodes {node}` after this"
+            ));
+        }
+        carry_for(&node, &current, &want_ips, registry.as_deref(), &super::security_local::local_leaf_ips)
     };
     if let Some(why) = reason {
         nstep(&format!("{why} — issuing into the local PKI"));
         if !carried.is_empty() {
-            nstep(&format!("keeping the leaf's other addresses ({}): a re-issue never narrows it", carried.join(", ")));
-            let extra: Vec<String> = want_ips.iter().filter(|a| **a != ip && *a != "127.0.0.1").cloned().chain(carried.iter().cloned()).collect();
-            let ca = crate::pki::ClusterCa::new(pki.clone());
-            if let Err(e) = ca.issue_node_cert(&node, &ip, crate::pki::DEFAULT_DAYS, &["node-agent".to_string()], &extra, &role) {
-                fail(g.json, ExitCode::Generic, "issue_failed", &format!("could not issue a cert for {node}: {e}"), None);
-            }
-            return pki;
+            nstep(&format!("keeping the leaf's other addresses ({}): a re-issue never drops the dialed address", carried.join(", ")));
         }
-        // --mint-only, deliberately: issue-node DELIVERS by default and exits
-        // non-zero when the node does not confirm, which is correct for an
-        // operator re-issuing a live node and wrong here. The node is mid-
-        // setup: no agent is running to present the cert or report an apply,
-        // so "staged but unconfirmed" is the EXPECTED state at this moment,
-        // and this call site treats anything but Ok(0) as fatal. Without the
-        // flag every fresh provision would hard-stop on its own cert step.
-        // The bundle we are about to build is what carries these certs over.
-        // Pass the ADDRESS we just resolved: without it the issuer looks the
-        // node NAME up in the tailnet, and a machine whose tailnet hostname
-        // differs from its node name (host1 enrolled as `host2`,
-        // 2026-09-09) failed with "cannot determine an address" although the
-        // enrollment record — and the line above — already had it.
-        match super::security_local::pki_issue_node(
-            g, &[node.clone(), ip.clone(), "--mint-only".to_string()]) {
+        match super::security_local::issue_node_with(
+            g, node.clone(), Some(ip.clone()), crate::pki::DEFAULT_DAYS, true, &carried) {
             Ok(0) => {}
             _ => fail(g.json, ExitCode::Generic, "issue_failed",
                 &format!("could not issue a cert for {node}"), None),
@@ -930,13 +914,35 @@ fn ensure_node_certs(g: &Globals, a: &ProvisionArgs, site: &ProvSite, id: &ProvI
     pki
 }
 
-/// The IP SANs a provision re-issue carries over from `node`'s CURRENT leaf
-/// (i1074 C): every IP it already names, except loopback, the addresses
-/// already wanted, and any address another node claims now (registered,
-/// dialed, or in its leaf). Each one was vetted when it was first issued
-/// (enrollment, `push-nodes`, `--prove`); none comes from the node's report.
-/// Pure.
-pub(crate) fn carried_leaf_ips(node: &str, current: &[String], want: &[String], claims: &[(String, Vec<String>)]) -> Vec<String> {
+/// The IP SANs a provision re-issue carries over from `node`'s CURRENT,
+/// CA-signed leaf (i1074 C). Kept: each IP the leaf names that this node is
+/// still registered or dialed at in the registry (`ip`, `ip_address`, the
+/// `agent_url` host: never its leaf, never its own report). Not kept:
+/// loopback, the addresses already wanted, any address another node claims
+/// (`address_claimed_by_other`). With no registry (`None`: the gateway was
+/// down, slow or refused) it keeps NOTHING: the claim check cannot run, so
+/// nothing is carried unchecked. Bounded by construction: a stale address
+/// the node is no longer dialed at drops on the next roll. Pure but for
+/// `leaf_ips` (the other nodes' leaves, read for the claims).
+pub(crate) fn carry_for(
+    node: &str,
+    current: &[String],
+    want: &[String],
+    registry: Option<&[serde_json::Value]>,
+    leaf_ips: &dyn Fn(&str) -> Vec<String>,
+) -> Vec<String> {
+    let Some(registry) = registry else { return Vec::new() };
+    let dialed: Vec<String> = registry
+        .iter()
+        .filter(|n| n["id"].as_str().is_some_and(|id| id.eq_ignore_ascii_case(node)))
+        .flat_map(|n| {
+            let mut a: Vec<String> = ["ip", "ip_address"].iter().filter_map(|k| n[*k].as_str().map(|v| v.trim().to_string())).collect();
+            a.extend(n["agent_url"].as_str().and_then(super::security_local::url_host_of));
+            a
+        })
+        .filter(|a| !a.is_empty())
+        .collect();
+    let claims = super::security_local::node_address_claims(registry, leaf_ips);
     let mut out: Vec<String> = Vec::new();
     for a in current {
         let a = a.trim();
@@ -946,7 +952,10 @@ pub(crate) fn carried_leaf_ips(node: &str, current: &[String], want: &[String], 
         if want.iter().any(|w| w.eq_ignore_ascii_case(a)) || out.iter().any(|o| o.eq_ignore_ascii_case(a)) {
             continue;
         }
-        if super::security_local::address_claimed_by_other(node, a, claims).is_some() {
+        if !dialed.iter().any(|d| d.eq_ignore_ascii_case(a)) {
+            continue; // no longer this node's registered or dialed address
+        }
+        if super::security_local::address_claimed_by_other(node, a, &claims).is_some() {
             continue;
         }
         out.push(a.to_string());
@@ -7919,64 +7928,102 @@ mod apply_refusal_tests {
 #[cfg(test)]
 mod leaf_carry_tests {
     use super::*;
+    use serde_json::json;
 
     fn s(v: &[&str]) -> Vec<String> {
         v.iter().map(|x| x.to_string()).collect()
     }
+    fn no_leaves(_: &str) -> Vec<String> {
+        Vec::new()
+    }
+    /// rc.4 Part B: enrolled from 172.18.0.1 (the bridge), dialed at
+    /// 172.31.250.42, which a `push-nodes` put in the leaf.
+    fn reg() -> Vec<serde_json::Value> {
+        vec![
+            json!({"id": "node-b", "ip": "172.31.250.42", "ip_address": "172.18.0.1", "agent_url": "https://172.31.250.42:8081"}),
+            json!({"id": "node-c", "ip": "172.31.250.43", "agent_url": "https://172.31.250.43:8081"}),
+        ]
+    }
 
-    /// i1074 C, rc.4 Part B: a `push-nodes` added the dialed address; the
-    /// roll re-issues for the enrollment peer. The pushed address is kept.
     #[test]
-    fn a_roll_keeps_the_address_a_person_pushed() {
+    fn a_roll_keeps_the_address_the_controller_dials() {
         let current = s(&["172.31.250.42", "127.0.0.1"]);
         let want = s(&["172.18.0.1", "127.0.0.1"]);
-        assert_eq!(carried_leaf_ips("node-b", &current, &want, &[]), s(&["172.31.250.42"]));
+        assert_eq!(carry_for("node-b", &current, &want, Some(&reg()), &no_leaves), s(&["172.31.250.42"]));
+    }
+
+    /// 97: carried addresses must not only grow. One the node is no longer
+    /// registered or dialed at drops on the next roll.
+    #[test]
+    fn a_carried_address_the_controller_no_longer_dials_is_dropped() {
+        let current = s(&["172.31.250.42", "10.9.9.9"]);
+        assert_eq!(carry_for("node-b", &current, &s(&["172.18.0.1"]), Some(&reg()), &no_leaves), s(&["172.31.250.42"]));
+    }
+
+    /// 97, the must: no registry means no claim check, so nothing is
+    /// carried (fail closed), never everything.
+    #[test]
+    fn no_registry_carries_nothing() {
+        let current = s(&["172.31.250.42", "10.9.9.9"]);
+        assert!(carry_for("node-b", &current, &s(&["172.18.0.1"]), None, &no_leaves).is_empty());
+    }
+
+    /// An address another node claims now is dropped, even if this node's
+    /// row also names it (another node's leaf holds it here).
+    #[test]
+    fn an_address_another_node_claims_now_is_dropped() {
+        let reg = vec![json!({"id": "node-b", "ip": "172.31.250.42", "agent_url": "https://172.31.250.42:8081"}), json!({"id": "node-c"})];
+        let leaves = |n: &str| if n == "node-c" { s(&["172.31.250.42"]) } else { Vec::new() };
+        assert!(carry_for("node-b", &s(&["172.31.250.42"]), &s(&["172.18.0.1"]), Some(&reg), &leaves).is_empty());
     }
 
     #[test]
     fn loopback_wanted_and_repeated_addresses_are_not_carried() {
         let current = s(&["127.0.0.1", "::1", "172.18.0.1", "172.31.250.42", "172.31.250.42", ""]);
         let want = s(&["172.18.0.1", "127.0.0.1"]);
-        assert_eq!(carried_leaf_ips("node-b", &current, &want, &[]), s(&["172.31.250.42"]));
+        assert_eq!(carry_for("node-b", &current, &want, Some(&reg()), &no_leaves), s(&["172.31.250.42"]));
     }
 
-    /// A carried address another node claims NOW is dropped: a leaf never
-    /// keeps an address that lets this node answer as another.
+    /// Loopback is never carried, even when a registry row names it.
     #[test]
-    fn an_address_another_node_claims_now_is_dropped() {
-        let current = s(&["172.31.250.42", "172.31.250.43"]);
-        let claims = vec![("node-c".to_string(), s(&["172.31.250.43"])), ("node-b".to_string(), s(&["172.31.250.42"]))];
-        assert_eq!(carried_leaf_ips("node-b", &current, &s(&["172.18.0.1"]), &claims), s(&["172.31.250.42"]),
-            "its own claim is fine; node-c's address goes");
+    fn loopback_is_never_carried_even_if_registered() {
+        let reg = vec![json!({"id": "node-b", "ip": "::1", "agent_url": "https://127.0.0.2:8081"})];
+        assert!(carry_for("node-b", &s(&["::1", "127.0.0.2"]), &s(&["172.18.0.1"]), Some(&reg), &no_leaves).is_empty());
     }
 
     #[test]
     fn a_first_provision_carries_nothing() {
-        assert!(carried_leaf_ips("node-b", &[], &s(&["172.18.0.1", "127.0.0.1"]), &[]).is_empty());
+        assert!(carry_for("node-b", &[], &s(&["172.18.0.1", "127.0.0.1"]), Some(&reg()), &no_leaves).is_empty());
     }
 
-    /// The re-issue passes the carried set into the mint, for workers only.
+    /// One mint path: the re-issue goes through `issue_node_with` with the
+    /// carried set (workers only), as `pki issue-node` does with none.
     #[test]
-    fn the_reissue_mints_with_the_carried_addresses() {
+    fn the_reissue_mints_through_the_one_path_with_the_carried_set() {
         let code = include_str!("provision.rs");
         let body = crate::test_src::fn_body(code, "fn ensure_node_certs(");
-        let carry = body.find("carried_leaf_ips(&node, &current, &want_ips, &claims)").expect("the carried set is computed");
-        let mint = body.find("ca.issue_node_cert(&node, &ip, crate::pki::DEFAULT_DAYS, &[\"node-agent\".to_string()], &extra, &role)").expect("the mint takes the carried set");
-        assert!(carry < mint, "computed before the mint");
-        assert!(body.contains(".chain(carried.iter().cloned())"), "the extra IPs include the carried set");
+        let carry = body.find("carry_for(&node, &current, &want_ips, registry.as_deref(), &super::security_local::local_leaf_ips)").expect("the carried set");
+        let mint = body.find("super::security_local::issue_node_with(\n            g, node.clone(), Some(ip.clone()), crate::pki::DEFAULT_DAYS, true, &carried)").expect("the one mint path");
+        assert!(carry < mint);
         assert!(body.contains("let carried: Vec<String> = if is_self || !node_crt.exists() {"), "the self node and a first issue carry nothing");
+        assert!(!body.contains("ca.issue_node_cert("), "no second mint path");
+        let sl = include_str!("security_local.rs");
+        let issue = crate::test_src::fn_body(sl, "pub fn pki_issue_node(");
+        assert!(issue.contains("issue_node_with(g, node, ip, days, mint_only, &[])"), "the CLI verb carries nothing");
+        let with = crate::test_src::fn_body(sl, "pub(crate) fn issue_node_with(");
+        let ext = with.find("ts_ip.extend(carried.iter().cloned());").expect("the carried set joins the extra IPs");
+        let cert = with.find("ca.issue_node_cert(&node, &ip, days, &[\"node-agent\".to_string()], &ts_ip, &role)").expect("the mint");
+        assert!(ext < cert, "before the mint");
     }
 
-    /// i1074 C, the other half: a stale carried address must not live
-    /// forever. The explicit `push-nodes` mints the set FRESH (the dialed
-    /// host plus the tailnet IP), carrying nothing, so it is what removes
-    /// an address the node no longer uses.
+    /// A stale address also leaves with a person's explicit push, which
+    /// mints the set FRESH (the dialed host plus the tailnet IP).
     #[test]
     fn the_explicit_push_replaces_the_set() {
         let code = include_str!("security_local.rs");
         let body = crate::test_src::fn_body(code, "pub fn pki_push_nodes(");
         assert!(body.contains("ca.issue_node_cert(name, host, days, &[\"node-agent\".to_string()], &ts_ip, &role)"),
             "push-nodes mints exactly the host and the tailnet IP");
-        assert!(!body.contains("carried_leaf_ips"), "push-nodes never carries the old set");
+        assert!(!body.contains("carry_for"), "push-nodes never carries the old set");
     }
 }
