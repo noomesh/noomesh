@@ -1311,9 +1311,15 @@ func (c *Client) preseedGGUF(ctx context.Context, backend, model string) (bool, 
 	// change against an OLDER gateway never preseeds GGUFs — ship the file
 	// with `noo cluster sync-model-files` instead, or roll the gateway first.
 	// A 202 (the controller is still hashing the file) is waited out within
-	// manifestAwaitBudget, not read as "no manifest": that read left a first
-	// placement without its file and never retried it.
-	man, merr := awaitArtifactManifest(ctx, "gguf", model)
+	// ggufStartManifestBudget, not read as "no manifest": that read left a first
+	// placement without its file and never retried it. The wait is short
+	// because it holds the reconcile tick; past it the start is refused and
+	// the next tick asks again. That converges: the gateway hashes in the
+	// BACKGROUND, single-flight, and caches the digest in memory and in
+	// /data/artifact-digests.json (gateway-rust/src/routes/artifacts.rs:31-49,
+	// HASH_WAIT_SECS :294, in_flight() :308, mem_cache() :301), so each tick
+	// re-joins the one running hash and the first tick after it ends gets 200.
+	man, merr := awaitArtifactManifestWithin(ctx, "gguf", model, ggufStartManifestBudget)
 	if merr != nil {
 		reason := ggufManifestReason(model, merr)
 		slog.Warn("gguf preseed refused: no verified artifact manifest for these bytes",
@@ -1414,11 +1420,16 @@ func (e *GGUFUnavailableError) Error() string {
 
 func (e *GGUFUnavailableError) Unwrap() error { return e.Cause }
 
+// ggufStartManifestBudget caps how long the start path holds the reconcile
+// tick waiting for the controller's hash (the other callers keep the ten
+// minutes of manifestAwaitBudget). A variable so a test waits seconds.
+var ggufStartManifestBudget = 60 * time.Second
+
 // ggufManifestReason words why the manifest did not arrive, naming the model.
 func ggufManifestReason(model string, err error) string {
 	switch {
 	case errors.Is(err, ErrArtifactHashing) || errors.Is(err, ErrArtifactManifestTimeout):
-		return "the controller is still hashing " + model + " (or did not answer in time); retrying"
+		return "the controller is still hashing " + model + "; retrying on the next reconcile pass"
 	case errors.Is(err, ErrArtifactRefused):
 		return "the controller refused to vouch for " + model + ": " + err.Error()
 	case errors.Is(err, ErrArtifactAbsent):

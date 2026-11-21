@@ -531,7 +531,7 @@ noo cluster place <node> llamacpp <file>
 
 When a placed `.gguf` is not on the node, the agent fetches it from the
 controller before the backend starts. While the controller is still hashing a
-large file the agent waits for it (up to ten minutes). If the file cannot be
+large file the agent waits for it (up to 60 seconds per reconcile pass). If the file cannot be
 had (no manifest, still hashing after the wait, a failed copy), no container
 is created: `noo cluster status` shows a `gguf_unavailable` start refusal
 naming the file and the reason, and the agent retries on every reconcile pass.

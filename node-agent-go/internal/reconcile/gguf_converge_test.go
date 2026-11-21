@@ -60,7 +60,7 @@ func ggufTick(running bool) *tick {
 	return tk
 }
 
-var unavailable = &dockerpkg.GGUFUnavailableError{Model: ggufModel, Reason: "the controller is still hashing m.gguf (or did not answer in time); retrying"}
+var unavailable = &dockerpkg.GGUFUnavailableError{Model: ggufModel, Reason: "the controller is still hashing m.gguf ; retrying on the next reconcile pass"}
 
 // A placed .gguf with no file whose preseed errors: the start's error is the
 // recorded backend_start refusal, naming the model and the reason; and when
