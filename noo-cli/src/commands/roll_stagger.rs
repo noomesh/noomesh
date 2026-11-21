@@ -360,7 +360,9 @@ impl Stagger {
                 return Release::Stage;
             }
             if !said {
-                ui::say(&ui::sub(&ui::status_line(Glyph::Step, &format!("{node}: waiting before staging: {}", describe(&b)))));
+                ui::say(&ui::sub(&ui::status_line(Glyph::Step, &format!(
+                    "{node}: waiting before staging: {} (up to {APPLY_BUDGET_SECS}s for it to apply, then {SERVING_BUDGET_SECS}s to serve)",
+                    describe(&b)))));
                 said = true;
                 last_line = secs;
             }
@@ -373,12 +375,16 @@ impl Stagger {
             let back = if back.is_empty() { "no restarting node".to_string() } else { back.join(", ") };
             if first_applied.is_some() && !said_serving {
                 ui::say(&ui::sub(&ui::status_line(Glyph::Step, &format!(
-                    "{node}: waiting for {groups} to be served again by {back} (applied; pulling its image or loading its model?) …"))));
+                    "{node}: waiting for {groups} to be served again by {back} (applied after {secs}s; up to {SERVING_BUDGET_SECS}s more to serve) …"))));
                 said_serving = true;
                 last_line = secs;
             } else if secs.saturating_sub(last_line) >= PROGRESS_SECS {
+                let (limit, phase) = match first_applied {
+                    Some(t) => (t + SERVING_BUDGET_SECS, "to serve"),
+                    None => (APPLY_BUDGET_SECS, "to apply"),
+                };
                 ui::say(&ui::sub(&ui::status_line(Glyph::Step, &format!(
-                    "{node}: still waiting after {}m: {}", secs / 60, describe(&b)))));
+                    "{node}: still waiting after {secs}s of {limit}s ({phase}): {}", describe(&b)))));
                 last_line = secs;
             }
             let over = match first_applied {
