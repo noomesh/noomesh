@@ -67,6 +67,26 @@ This re-records the identity once. It does not bypass the postgres check: an
 empty postgres data directory on an install that has run before is always
 refused.
 
+### A network mount that stopped answering
+
+A data root, model store or HF cache on NFS or SMB can stop answering when its
+server goes away (a power cut at the storage host). A hard NFS mount does not
+fail: every call that touches it waits, in D state, until the server is back.
+
+- `noo upgrade --stack`, `--nodes` and `--all` check this first. A network
+  mount under `NOO_DATA_ROOT`, `MODELS_DIR` or `HF_CACHE_DIR` that does not
+  answer a `stat` in 5 s stops the upgrade with one line naming the mount, before
+  anything is changed. If `docker inspect` of the gateway does not answer in
+  30 s the upgrade stops the same way.
+- `noo cluster verify --controller` shows the `network mount` row as FAIL
+  with the same words; it is OK when there are no network mounts.
+- **Bring the storage back** (power the storage host, restore its network). A
+  hard NFS mount resumes by itself once its server answers; then rerun
+  `noo upgrade`. **Do not force-unmount it** (`umount -f`, `umount -l`):
+  that drops writes the clients still hold.
+- To see whether a mount answers: `timeout 5 stat <mount>` (exit 124 means it
+  did not).
+
 ### Upgrades
 
 On the first launch of a version that has this check, an install with no
