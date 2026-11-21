@@ -859,6 +859,17 @@ pub(crate) const ROWS: &[Row] = &[
         doc: None,
     },
     Row {
+        id: "hostd_at_boot",
+        name: "hostd at boot",
+        scope: Scope::Controller,
+        verdicts: &[Verdict::Warn],
+        meaning: "Whether the controller's noo-hostd, whose boot restore brings the stack back after a reboot, starts at boot with no one logged in (a systemd user unit needs linger; a Mac LaunchAgent waits for a login).",
+        clears: "Run the row's `sudo loginctl enable-linger <user>` (`noo onboard` does this); a Mac LaunchAgent has no noomesh remedy today.",
+        findings: &[],
+        shown_as: None,
+        doc: None,
+    },
+    Row {
         id: "image_family",
         name: "image family",
         scope: Scope::Controller,

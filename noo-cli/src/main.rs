@@ -73,6 +73,7 @@ mod model_set;
 mod registry;
 mod release_fetch;
 mod netns_unit;
+mod hostd_boot;
 mod release_sig;
 mod release_gate;
 mod envfile;
