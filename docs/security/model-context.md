@@ -75,8 +75,10 @@ reversed the same way.
   files it as `evolved` with a pending proposal; it reaches the system
   message only after a person promotes it. Never ask to have your own skill
   promoted, and do not call the decision routes: they need an operator or
-  admin login and refuse a worker-delegated token, a harness token and an
-  MCP-door key.
+  admin login and refuse every agent credential (a worker-delegated or
+  harness token, an MCP-door key, a token exchanged from a service key). A
+  person decides with `noo prompt-skills decide <id> --promote` or
+  `--reject`.
 - **Reading the state:** `noo prompt-skills proposals` lists the pending
   ones. A write whose answer says `not_filed` filed no proposal yet; the
   gateway log line `prompt_skill_decisions_unavailable` means every runtime
