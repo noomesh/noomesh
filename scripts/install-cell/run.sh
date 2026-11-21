@@ -608,7 +608,11 @@ RAG_WS_CHAT="$HERE/ws_chat.py"
 # (0.6.25-rc.4 run 1, slots4: killed at 300 s with nothing kept).
 RAG_AGENT_EVIDENCE="$HERE/agent_evidence.py"
 RAG_VERDICT="$OUT/rag-chat.verdict"
-export RAG_QUERY_LINE RAG_CHAT_LINE RAG_WS_CHAT RAG_VERDICT RAG_AGENT_EVIDENCE
+# On a chat miss (and always on the default-model cell) the gateway's lines for
+# the turn, the chat_contexts and a replayed SSE: logs/rag-chat-evidence.log.
+RAG_CHAT_EVIDENCE="$HERE/rag_chat_evidence.py"
+RAG_EVIDENCE_LOG="$OUT/logs/rag-chat-evidence.log"
+export RAG_QUERY_LINE RAG_CHAT_LINE RAG_WS_CHAT RAG_VERDICT RAG_AGENT_EVIDENCE RAG_CHAT_EVIDENCE RAG_EVIDENCE_LOG CELL_PY
 step probe-rag-chat 1500 -- sh -c '
   [ -n "$RAG_QUERY_LINE" ] || { echo "RAG PROBE: first-chat.md has no noo rag query line about anything.md"; exit 0; }
   fact="14(th)? (of )?march|ZIRCON-4471|kestrel"
@@ -627,7 +631,7 @@ step probe-rag-chat 1500 -- sh -c '
   for path in chat agent console; do
     echo "== $path: \"$RAG_CHAT_LINE\""
     case "$path" in
-      chat) out="$(noo chat --message "$RAG_CHAT_LINE" 2>&1)" ;;
+      chat) c0="$(date +%s)"; out="$(noo chat --message "$RAG_CHAT_LINE" 2>&1)" ;;
       agent) a0="$(date +%s)"; out="$(timeout 300 noo inference agent "$RAG_CHAT_LINE" 2>&1)"; arc=$?
              if [ "$arc" = 124 ]; then
                out="$out
@@ -640,6 +644,14 @@ RAG PROBE: agent timed out after 300 s (killed)"
     if printf "%s" "$out" | grep -qiE "$fact"; then got=yes; else got=no; fi
     echo "RAG PROBE: $path returned the fact=$got (index ready=$indexed)"
     [ "$path" = chat ] && echo "got=$got indexed=$indexed" > "$RAG_VERDICT"
+    if [ "$path" = chat ] && { [ "$got" = no ] || [ "$MODEL" = default ]; }; then
+      rp=""; [ "$got" = no ] && rp="$RAG_CHAT_LINE"
+      { echo "RAG-CHAT EVIDENCE: noo chat returned the fact=$got; judged output (first 30 lines):"
+        printf "%s\n" "$out" | head -n 30
+        timeout 600 python3 -I "$RAG_CHAT_EVIDENCE" --since "$c0" --replay "$rp" 2>&1
+      } 2>&1 | python3 "$CELL_PY" redact > "$RAG_EVIDENCE_LOG"
+      echo "RAG PROBE: chat evidence kept in logs/rag-chat-evidence.log"
+    fi
   done
   true'
 
@@ -664,7 +676,7 @@ step rag-chat 60 -- sh -c '
   case "$v" in *"indexed=yes"*) ;; *) echo "RAG-CHAT: not judged: the index never returned the fact (${v:-no verdict})"; exit 0 ;; esac
   case "$v" in *"got=yes"*) echo "RAG-CHAT PASS: noo chat returned the ingested document'"'"'s fact"; exit 0 ;; esac
   if [ "$MODEL" = default ]; then
-    echo "RAG-CHAT FAIL: noo chat (the coordinator route) did not return the fact the index holds"; exit 1
+    echo "RAG-CHAT FAIL: noo chat (the coordinator route) did not return the fact the index holds (evidence: logs/rag-chat-evidence.log)"; exit 1
   fi
   echo "RAG-CHAT NOTE: the tiny test model ($TINY_MODEL) did not return the fact; this cell runs MODEL=$MODEL, not the product default, so this is not a product verdict"' || fail_onboarded
 
