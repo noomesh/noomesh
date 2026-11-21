@@ -3350,6 +3350,14 @@ pub(crate) fn parse_issue_node_with(a: &mut Args) -> Result<(String, Option<Stri
 /// for a node that is offline now and will collect later.
 pub fn pki_issue_node(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     let (node, ip, days, mint_only) = parse_issue_node_with(&mut Args::new(args))?;
+    issue_node_with(g, node, ip, days, mint_only, &[])
+}
+
+/// The one mint path for a node leaf: `pki issue-node`, and provision's
+/// re-issue (i1074 C), which passes the `carried` IPs (`provision::carry_for`:
+/// the current leaf's IPs this node is still registered or dialed at,
+/// never the node's own report). `carried` is empty for every other caller.
+pub(crate) fn issue_node_with(g: &Globals, node: String, ip: Option<String>, days: i64, mint_only: bool, carried: &[String]) -> Result<i32, Unhandled> {
     // The address goes into the cert's SANs, and the gateway rejects a
     // handshake to a name or address the cert does not carry — so getting
     // this wrong is not cosmetic.
@@ -3390,7 +3398,8 @@ pub fn pki_issue_node(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     }
     // #79: the tailnet IP is the address the agent registers — a node
     // cert without it fails every gpu_health/dispatch probe by name.
-    let ts_ip: Vec<String> = role.tailnet_ip4(&node).into_iter().collect();
+    let mut ts_ip: Vec<String> = role.tailnet_ip4(&node).into_iter().collect();
+    ts_ip.extend(carried.iter().cloned());
     match ca.issue_node_cert(&node, &ip, days, &["node-agent".to_string()], &ts_ip, &role) {
         Ok((crt, key)) => {
             if !mint_only {
@@ -3604,7 +3613,7 @@ fn pki_push_node_prove(g: &Globals, node: &str, days: i64, yes: bool) -> Result<
 }
 
 /// The host of an `agent_url` (`https://HOST:PORT`): brackets and port off.
-fn url_host_of(url: &str) -> Option<String> {
+pub(crate) fn url_host_of(url: &str) -> Option<String> {
     let authority = url.split("//").nth(1)?.split('/').next()?;
     let host = match authority.strip_prefix('[') {
         Some(v6) => v6.split(']').next()?,
