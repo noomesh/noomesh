@@ -178,6 +178,8 @@ The install matrix runs the release path above on fresh machines; this
 from-source path is **not** covered by it (nothing installs from a fresh
 clone in CI), so treat it as the developer's path.
 
+A separate **reboot cell** (dispatch only, `cells=reboot`) installs the release in a KVM guest, reboots it and judges that the stack comes back with no command (noo-hostd's boot restore); it reports `REBOOT <check> PASS|FAIL|SKIP` lines, and a skipped cell means the runner had no `/dev/kvm`.
+
 ```bash
 git clone https://github.com/noomesh/noomesh.git ~/noomesh
 cd ~/noomesh

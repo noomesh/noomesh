@@ -327,8 +327,8 @@ def test_the_size_job_waits_for_the_cells_and_reads_both_cells_memory():
     yaml = pytest.importorskip("yaml")
     doc = yaml.safe_load((ROOT / ".github/workflows/install-matrix.yml").read_text())
     size = doc["jobs"]["size"]
-    # runs when cells fail; skipped only on an upgrade-cell-only dispatch (no cell ran)
-    assert size["needs"] == "cell" and size["if"] == "always() && inputs.cells != 'upgrade'", size["if"]
+    # runs when cells fail; skipped only on an upgrade-cell-only or reboot-cell-only dispatch (no cell ran)
+    assert size["needs"] == "cell" and size["if"] == "always() && inputs.cells != 'upgrade' && inputs.cells != 'reboot'", size["if"]
     every = [s for s in size["steps"] if str(s.get("uses", "")).startswith("actions/download-artifact@")]
     # the memory cells by name; the verify ratchet's run summary takes every
     # cell's report by pattern (tests/test_install_cell_ratchet.py)
