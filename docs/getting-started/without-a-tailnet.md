@@ -4,7 +4,12 @@ The advanced path: a cluster whose machines reach each other by their local
 network addresses (or over a direct Ethernet or Thunderbolt cable) instead of
 a tailnet. The tailnet is the default and the easy path: every machine keeps a
 name that does not change, so nothing here applies to it. Choose this page only
-when a tailnet is not an option. Done when `noo cluster verify` exits 0 and you
+when a tailnet is not an option.
+
+On this path, a router that hands out a new address after a power cut breaks
+things: the nodes lose the controller, or the controller loses a node, until a
+command is run. The tailnet path does not have that problem. That is the
+reason to prefer the default. Done when `noo cluster verify` exits 0 and you
 have made the controller's address one that does not move.
 
 Covers: when to choose it, what it needs, the steps as they work on 0.6.29,
