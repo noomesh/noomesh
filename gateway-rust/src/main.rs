@@ -91,6 +91,7 @@ mod fd_watch;
 mod proc_self;
 mod node_agent_auth;
 mod node_link;
+mod node_pin;
 mod node_rpc;
 mod tunnel;
 mod tunnel_door;

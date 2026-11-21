@@ -116,6 +116,9 @@ type desiredConfig struct {
 	// What the controller understands from this agent (stopdrain): absent on
 	// an older gateway, which then never gets the node_restarting refusal.
 	GatewayFeatures []string `json:"gateway_features"`
+	// i1174: refuse a controller call that names no target node
+	// (auth.TargetNode). Absent (an older controller) is false: tolerant.
+	RequireTargetNode bool `json:"require_target_node"`
 	// The node's resolved harness profile (tier default, override,
 	// measured). A pre-profile gateway omits it; absent means "no
 	// profile", which is exactly the behaviour before profiles existed.
@@ -1717,6 +1720,8 @@ func (r *Reconciler) fetch(ctx context.Context) (*desiredConfig, error) {
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		return nil, err
 	}
+	// The controller decides strictness, per node, on every read.
+	auth.SetRequireTargetNode(out.RequireTargetNode)
 	return &out, nil
 }
 

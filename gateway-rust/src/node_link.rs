@@ -138,12 +138,15 @@ impl NodeLink {
                 // node's registered address (a record written before the
                 // heartbeat held it to that); otherwise the address below.
                 if !url.is_empty() && crate::routes::cluster::dialable_agent_url(url, ip) {
+                    pinned(node_id, url)?;
                     return Ok(Self::with_node(url.to_string(), node_id).advertising(data));
                 }
             }
             if let Some(ip) = data.get("ip_address").and_then(|v| v.as_str()) {
                 if !ip.is_empty() {
-                    return Ok(Self::with_node(format!("https://{ip}:{AGENT_PORT}"), node_id).advertising(data));
+                    let base = format!("https://{ip}:{AGENT_PORT}");
+                    pinned(node_id, &base)?;
+                    return Ok(Self::with_node(base, node_id).advertising(data));
                 }
             }
             // No address, but the node holds an outbound transport to this
@@ -200,8 +203,20 @@ impl NodeLink {
         self
     }
 
-    /// The agent on `ip` (`https://{ip}:AGENT_PORT`), for paths that already
-    /// hold the address (inference discovery, the coordinator).
+    /// The agent of `node_id` at its registered address `ip`
+    /// (`https://{ip}:AGENT_PORT`): the by-node form of [`NodeLink::for_ip`]
+    /// that inference resolution and the class table use, so the call knows
+    /// which node it is for. Refused when the gateway's address book gives
+    /// that address to another node (`node_pin::may_dial`, i1174).
+    pub fn for_node_ip(node_id: &str, ip: &str) -> Result<Self, crate::node_pin::NodeIdentityMismatch> {
+        let base = format!("https://{ip}:{AGENT_PORT}");
+        crate::node_pin::may_dial(node_id, &base)?;
+        Ok(Self::with_node(base, node_id))
+    }
+
+    /// The agent on `ip` (`https://{ip}:AGENT_PORT`) as an address only: for
+    /// comparing a backend URL with a node's address, never to dial a node
+    /// by (that is [`NodeLink::for_node_ip`] / [`NodeLink::for_node`]).
     pub fn for_ip(ip: &str) -> Self {
         Self { base: format!("https://{ip}:{AGENT_PORT}"), node_id: None, auth: Auth::Node, nats_rpc: false, bus: None, tunnel: false }
     }
@@ -309,10 +324,31 @@ impl NodeLink {
     }
 
     /// The credential headers for a call this link hands to another
-    /// consumer together with [`NodeLink::url`] (a `MeshTarget`): empty for
-    /// an agent that admits the controller's leaf alone.
+    /// consumer together with [`NodeLink::url`] (a `MeshTarget`): the bearer
+    /// (none for an agent that admits the controller's leaf alone), and the
+    /// node the call is meant for ([`crate::node_pin::TARGET_HEADER`]) when
+    /// the link knows it.
     pub fn auth_headers(&self) -> Vec<(String, String)> {
-        self.credential(&self.base).map(|kv| vec![kv]).unwrap_or_default()
+        let mut out: Vec<(String, String)> = self.credential(&self.base).into_iter().collect();
+        if let Some(node) = self.target_node() {
+            out.push((crate::node_pin::TARGET_HEADER.to_string(), node));
+        }
+        out
+    }
+
+    /// The node a call on this link is meant for, sent as
+    /// [`crate::node_pin::TARGET_HEADER`] so the agent refuses a call
+    /// addressed to another node: the node the link was resolved for; for
+    /// the controller's own agent, the self node; for a link that holds
+    /// only an address, the node the gateway's address book gives it to.
+    /// `None` for an address no node owns (nothing to name).
+    pub(crate) fn target_node(&self) -> Option<String> {
+        match (&self.node_id, self.auth) {
+            (Some(id), _) => Some(id.clone()),
+            (None, Auth::SelfAgent) => crate::node_pin::self_node(),
+            (None, Auth::Node) if self.has_address() => crate::node_pin::owner_of_url(&self.base),
+            _ => None,
+        }
     }
 
     /// A unary call. Over HTTPS: the shared cluster client plus exactly the
@@ -337,6 +373,10 @@ impl NodeLink {
         // The tunnel is chosen at send time (a tunnel can drop between here and
         // there); here we only record which node's tunnel to look for.
         let tunnel = self.tunnel_node();
+        // The target node rides every transport that carries headers (the
+        // tunnel replays them; the bus addresses the node by its subject).
+        let headers: Vec<(String, String)> =
+            self.target_node().map(|n| (crate::node_pin::TARGET_HEADER.to_string(), n)).into_iter().collect();
         NodeRequest {
             http: self.build(method.clone(), path),
             bus: target.zip(cop.clone()),
@@ -347,7 +387,7 @@ impl NodeLink {
             tunnel,
             method,
             path: path.to_string(),
-            headers: Vec::new(),
+            headers,
         }
     }
 
@@ -446,7 +486,9 @@ impl NodeLink {
     pub fn stream(&self, method: Method, path: &str) -> reqwest::RequestBuilder {
         if let Some(node) = self.tunnel_node() {
             if let Some(door) = crate::tunnel_door::door_url(&node, path) {
-                let req = crate::tls::cluster_stream_client().request(method, door.as_str());
+                let req = crate::tls::cluster_stream_client()
+                    .request(method, door.as_str())
+                    .header(crate::node_pin::TARGET_HEADER, node.as_str());
                 return crate::tunnel_door::mark(req, &door);
             }
         }
@@ -469,8 +511,17 @@ impl NodeLink {
         if let Some((k, v)) = self.credential(&url) {
             req = req.header(k, v);
         }
+        if let Some(node) = self.target_node() {
+            req = req.header(crate::node_pin::TARGET_HEADER, node);
+        }
         req
     }
+}
+
+/// A link for `node_id` at `base` only when the address book does not give
+/// `base` to another node; the refusal is a 502 naming the mismatch.
+fn pinned(node_id: &str, base: &str) -> Result<(), AppError> {
+    crate::node_pin::may_dial(node_id, base).map_err(|m| AppError::Upstream(m.to_string()))
 }
 
 /// A unary call to a node agent, not yet sent. It has the builder methods
@@ -747,6 +798,45 @@ mod tests {
     use super::*;
 
     use crate::node_agent_auth::TEST_SERIAL as SERIAL;
+
+    /// i1174: every call to an agent names the node it is meant for, on
+    /// HTTPS and in the headers the tunnel replays.
+    #[test]
+    fn every_agent_call_names_its_target_node() {
+        let l = NodeLink::from_record("pin-hdr-n", Some(&json!({"ip_address": "10.231.3.1"}))).unwrap();
+        let req = l.request(Method::GET, "/gpu");
+        assert_eq!(req.headers, vec![(crate::node_pin::TARGET_HEADER.to_string(), "pin-hdr-n".to_string())]);
+        let built = req.into_http().build().unwrap();
+        assert_eq!(built.headers().get(crate::node_pin::TARGET_HEADER).unwrap(), "pin-hdr-n");
+        assert!(l.auth_headers().iter().any(|(k, v)| k == crate::node_pin::TARGET_HEADER && v == "pin-hdr-n"));
+        // A link holding only an address names the node the book gives it to.
+        crate::node_pin::note("pin-hdr-m", &json!({"ip_address": "10.231.3.2"}));
+        let by_addr = NodeLink::for_base("https://10.231.3.2:8081").request(Method::GET, "/gpu").into_http().build().unwrap();
+        assert_eq!(by_addr.headers().get(crate::node_pin::TARGET_HEADER).unwrap(), "pin-hdr-m");
+        // An address no node owns: nothing to name.
+        let none = NodeLink::for_base("https://10.231.3.99:8081").request(Method::GET, "/gpu").into_http().build().unwrap();
+        assert!(none.headers().get(crate::node_pin::TARGET_HEADER).is_none());
+        crate::node_pin::forget("pin-hdr-m");
+    }
+
+    /// i1174: inference and every by-node link are resolved BY NODE, and a
+    /// link is not built towards an address another node owns.
+    #[test]
+    fn a_link_resolved_for_one_node_refuses_another_nodes_address() {
+        crate::node_pin::note("pin-res-b", &json!({"ip_address": "10.231.4.2"}));
+        assert!(NodeLink::for_node_ip("pin-res-a", "10.231.4.2").is_err());
+        match NodeLink::from_record("pin-res-a", Some(&json!({"ip_address": "10.231.4.2"}))) {
+            Err(AppError::Upstream(m)) => assert!(m.starts_with("node_identity_mismatch"), "{m}"),
+            other => panic!("expected the mismatch, got {other:?}"),
+        }
+        let own = NodeLink::for_node_ip("pin-res-b", "10.231.4.2").unwrap();
+        assert_eq!(own.node_id(), Some("pin-res-b"));
+        let src = crate::test_src::own_code(include_str!("coordinator/backend.rs"));
+        let resolve = crate::test_src::fn_body(&src, "async fn resolve_backend_url(");
+        assert!(resolve.contains("NodeLink::for_node_ip(node_id, ip)"), "{resolve}");
+        assert!(!resolve.contains("NodeLink::for_ip("), "{resolve}");
+        crate::node_pin::forget("pin-res-b");
+    }
 
     #[test]
     fn a_stored_agent_url_off_the_registered_address_is_not_dialled() {

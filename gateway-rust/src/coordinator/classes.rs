@@ -811,12 +811,19 @@ fn health_of(n: &NodeFacts) -> (bool, String) {
     if !n.inbound_ok {
         return (false, "agent not reachable from the controller".into());
     }
+    if !n.ip.is_empty() {
+        if let Err(m) = crate::node_link::NodeLink::for_node_ip(&n.node_id, &n.ip) {
+            return (false, m.to_string());
+        }
+    }
     (true, String::new())
 }
 
 fn url_for(n: &NodeFacts, backend: &str) -> String {
     if !n.ip.is_empty() {
-        crate::node_link::NodeLink::for_ip(&n.ip).base().to_string()
+        // By node (i1174): an address the gateway's book gives to another
+        // node yields no URL, and `health_of` keeps the node out of routing.
+        crate::node_link::NodeLink::for_node_ip(&n.node_id, &n.ip).map(|l| l.base().to_string()).unwrap_or_default()
     } else {
         // No address: the controller's own node (a standalone box). Its
         // ollama is the controller's own door, which on standalone is the

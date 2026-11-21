@@ -69,6 +69,12 @@ var (
 		// receiving the bearer — both roll orders stay safe.
 		p["controller_leaf_only"] = auth.ControllerLeafOnly(r.cfg)
 		p["control_transports"] = r.controlTransports()
+		// This agent refuses a call addressed to another node (X-Noo-Node),
+		// and whether it currently refuses a header-less controller call
+		// (the desired-config flag the controller sends once it read the
+		// first field). i1174.
+		p[auth.ChecksTargetNodeField] = true
+		p[auth.RequiresTargetNodeField] = auth.RequiresTargetNode()
 	}}
 
 	secBackendLeaves = payloadSection{name: "backendLeaves", stage: "backend_leaves", add: func(r *Reporter, p map[string]any) {

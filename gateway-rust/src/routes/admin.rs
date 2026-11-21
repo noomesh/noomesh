@@ -382,15 +382,12 @@ pub(crate) async fn all_node_agents(state: &AppState) -> Vec<(String, String, St
                         if data.get("tier").and_then(|t| t.as_u64()) == Some(0) { continue; }
                         let hostname = data.get("hostname").and_then(|h| h.as_str())
                             .unwrap_or(&key).to_string();
-                        // Resolve agent URL
-                        let agent_url = if let Some(url) = data.get("agent_url").and_then(|v| v.as_str()) {
-                            if !url.is_empty() { url.to_string() } else { continue; }
-                        } else if let Some(ip) = data.get("ip_address").and_then(|v| v.as_str()) {
-                            if !ip.is_empty() {
-                                crate::node_link::NodeLink::for_ip(ip).base().to_string()
-                            } else { continue; }
-                        } else {
-                            continue;
+                        // Resolve the agent URL BY NODE: the agent_url rule
+                        // and the address-book pin (i1174) apply, as for
+                        // every other link to a node.
+                        let agent_url = match crate::node_link::NodeLink::from_record(&key, Some(&data)) {
+                            Ok(link) if link.has_address() => link.base().to_string(),
+                            _ => continue,
                         };
                         nodes.push((key, agent_url, hostname));
                     }

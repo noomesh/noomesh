@@ -251,7 +251,10 @@ re-onboard, for instance) and remote agents are crash-looping on
 `certificate signed by unknown authority`, `noo security pki push-nodes`
 re-issues each node's cert and stages a bundle carrying it plus `ca.crt`
 on the pull rail for the node's own applier to collect and apply
-(exit 1 if any node fails). A **fresh** node never needs
+(exit 1 if any node fails). It mints only a vetted address for each node:
+its enrollment address, its tailnet address, or one its current leaf already
+carries; any other dialled address is refused with the proof remedy
+(`push-nodes <node> --prove`). A **fresh** node never needs
 `push-nodes` — `noo cluster provision` issues its cert.
 
 ### Trust the CA on this machine
