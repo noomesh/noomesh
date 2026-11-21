@@ -93,3 +93,102 @@ def test_the_storage_check_runs_before_anything_is_touched():
     check = rs.fn_body(code, "fn refuse_when_storage_hangs(")
     assert "probe_data_roots()" in check and "running_gateway_tag" in check, check
     assert "fail(" in check, "a hung mount stops the upgrade"
+
+
+# ── i1159b: the container-state batch ────────────────────────────────────
+#
+# In the files below the claims about a container ("not running", "Postgres
+# is DOWN") and about docker itself ("give this account the docker API") ride
+# on bounded probes: `container_state()`, `docker_refusal()`, the ghost-record
+# sample. Every other `Command::new("docker")` here is listed by function:
+# those calls run a command whose result is not read as a cause (an exec, a
+# listing, a digest), and are the later batch's to bound. A NEW site, or a
+# listed function that stops calling docker, fails this guard.
+
+FN = re.compile(r"\bfn\s+(\w+)")
+
+MIGRATED: dict[str, dict[str, str]] = {
+    "commands/secrets_delivery.rs": {
+        "env_entries": "reads a container's env for the digest rows; no cause claimed",
+        "stack_project": "compose project label lookup; an empty answer is 'no stack'",
+        "holders_in": "lists holders; docker_refusal() speaks for a refused listing",
+        "audience_of": "reads one container's env for an audience",
+        "digest_one": "exec of a digest; the row names the container",
+    },
+    "commands/secrets.rs": {
+        "psql_stdin": "pipes SQL into psql; its failure is its own error text",
+        "try_login": "a login probe whose failure is classified by its stderr",
+        "container_routable_host": "inspect for an address; None is 'no address'",
+        "container_created": "inspect for the created time (present())",
+        "depends_on": "inspect of compose labels; empty on failure",
+    },
+    "commands/cluster_push_secrets.rs": {
+        "gateway_env_digest": "exec of a digest in the gateway",
+    },
+    "commands/cluster_verify.rs": {
+        "vantage_here": "a version/vantage probe",
+        "noo_data_bound_row": "inspect of mounts for the row",
+        "sandbox_live_probe": "exec of the probe; the container gate is container_running",
+        "voice_live_probe": "exec of the probe; the container gate is container_running",
+        "postgres_probe": "exec of psql",
+        "docker_lines": "a listing",
+        "stack_rows_here": "a listing",
+        "config_mounters": "inspect of mounts",
+        "config_view": "exec of cat",
+    },
+    "commands/doctor.rs": {
+        "docker_lines": "`ps` listings in the doctor; the daemon gate and the ghost loop are bounded",
+        "container_env": "inspect of env",
+        "docker_daemon_up": "a yes/no for callers that make no claim",
+        "declared_services": "a listing",
+        "doctor_strangers": "a listing",
+    },
+}
+
+
+def docker_fns(code: str) -> dict[str, int]:
+    found: dict[str, int] = {}
+    for m in DOCKER_CMD.finditer(code):
+        fns = FN.findall(code[: m.start()])
+        name = fns[-1] if fns else "<top>"
+        found[name] = found.get(name, 0) + 1
+    return found
+
+
+def test_the_fn_detector_names_the_enclosing_function():
+    code = 'fn a() {}\nfn b() { Command::new("docker").output(); }\n'
+    assert docker_fns(code) == {"b": 1}
+
+
+def test_migrated_files_spawn_docker_only_from_the_listed_functions():
+    for rel, allowed in MIGRATED.items():
+        found = docker_fns(code_of(rel))
+        extra = sorted(set(found) - set(allowed))
+        stale = sorted(set(allowed) - set(found))
+        assert not extra, (
+            f"{rel}: an unbounded Command::new(\"docker\") in {extra}: use crate::bounded::docker "
+            "(container_state() for a container's state, docker_refusal() for the daemon), or list it "
+            "in MIGRATED with the reason its result claims no cause")
+        assert not stale, f"{rel}: {stale} no longer call docker directly; drop them from MIGRATED"
+
+
+def test_the_container_state_probe_and_the_daemon_probe_are_bounded():
+    sec = code_of("commands/secrets.rs")
+    state = rs.fn_body(sec, "pub(crate) fn container_state(")
+    assert "crate::bounded::docker(" in state and "CONTAINER_STATE_SECS" in state, state
+    delivery = code_of("commands/secrets_delivery.rs")
+    probe = rs.fn_body(delivery, "pub(crate) fn docker_version_probe(")
+    assert "crate::bounded::docker(" in probe and "DOCKER_VERSION_SECS" in probe, probe
+    assert not unbounded_sites(probe) and not unbounded_sites(state)
+
+
+def test_no_message_claims_a_cause_the_probe_did_not_see():
+    sec = code_of("commands/secrets.rs")
+    # The two "Postgres is not running" failures branch on the state.
+    assert sec.count("container_state(&pg_container)") == 2
+    assert "container_running(&pg_container)" not in sec
+    push = code_of("commands/cluster_push_secrets.rs")
+    assert "container_state(&gateway_container)" in push and "container_running(" not in push
+    doc = code_of("commands/doctor.rs")
+    for f in ("pub fn doctor_docker(", "pub fn doctor_exposure("):
+        assert "daemon_gate(" in rs.fn_body(doc, f), f

@@ -372,7 +372,13 @@ func (c *Client) resolveImage(ctx context.Context, ref string) (source, imageID 
 		}
 		return imagesource.Local, localID, nil
 	}
-	// 4. Absent and not staged.
+	// 4. Absent. A manifest that is still being hashed is a staged image, so
+	// neither "not staged" (sync-images) nor the registry fallback applies:
+	// the start is retried on the next reconcile pass.
+	if manifestStillHashing(merr) {
+		return "", "", fmt.Errorf("%s: the controller is still hashing its image tar; the start is retried on the next reconcile pass: %w", ref, merr)
+	}
+	// Absent and not staged.
 	notStaged := &ImageNotStagedError{Ref: ref, Arch: arch, Tar: ImageTarGzName(ref, arch), AltTar: ImageTarName(ref, arch)}
 	if isOwnImage(ref) || isRailOnly(ctx) || registryFallbackPolicy() != RegistryFallbackPublic {
 		if merr != nil && !errors.Is(merr, ErrArtifactAbsent) {

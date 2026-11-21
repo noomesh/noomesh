@@ -474,7 +474,11 @@ its image through one function (`EnsureImage`):
    manifest without `size_bytes` (an older gateway) skips the check.
 3. **Local, nothing to compare** (not staged, an older gateway, controller
    unreachable) → used, and reported as `local`.
-4. **Absent and not staged** → for our images (`$NOO_IMAGE_PREFIX/*`, the
+4. **Controller still hashing** → the image is staged, so this is not a
+   "not staged" refusal: `<image>: the controller is still hashing its image
+   tar; the start is retried on the next reconcile pass`. No registry
+   fallback and no `sync-images` advice.
+5. **Absent and not staged** → for our images (`$NOO_IMAGE_PREFIX/*`, the
    release namespaces, `noomesh/*`, `pai-assistant/*`, `noo-*`) a refusal:
    `image X not staged on the controller — run noo cluster sync-images
    <node> -i X or noo upgrade`. A **public third-party** image (upstream

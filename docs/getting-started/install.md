@@ -296,7 +296,13 @@ prints the gateway's raw body, which includes an `addons` object
 Docker. It never repairs by itself: a damaged host gets a four-step
 runbook (remove what Docker can remove, stop Docker and clear
 `/var/lib/docker/containers`, prune the builder, `noo stack start`). Exit
-code is 1 when damaged, 0 when clean.
+code is 1 when damaged, 0 when clean. An `inspect` that does not answer in
+10 s is counted on its own line (`inspect timed out`), never as a ghost:
+the daemon, or a container's bind mount, is hung. When docker itself does
+not answer, it says which of four things it saw: permission denied (join the
+docker group), not answering (`sudo systemctl start docker`), a timeout
+(`sudo systemctl status docker`), or docker missing; `noo doctor exposure`
+says the same.
 
 The exit-code contract every `noo` command follows is in the
 [CLI overview](../cli/README.md#contracts).
