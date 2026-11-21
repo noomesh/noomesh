@@ -35,11 +35,16 @@ import (
 //	tools/server/server.cpp:317          "model loaded"                                    (SRV_INF, after the warmup)
 //
 // When CUDA init fails there is no CUDA device, llama_supports_gpu_offload()
-// is false and the offload line is NOT printed at all; when the CUDA backend
-// module does not load (the image's backends are GGML_BACKEND_DL modules and
-// a release build loads them silently) there is not even a ggml_cuda_init
-// line. So "model loaded" with no offload line is as much a CPU run as
-// "offloaded 0/N".
+// is false and the offload line is NOT printed at all. But the converse does
+// not hold: a build that prints no offload line (or a log read that missed
+// it) can still be running on the GPU (a GTX 1070 doing 63 tok/s was told it
+// ran on the CPU). So an absent offload line is UNKNOWN, never "cpu". The
+// positive signal that needs no offload line is load_tensors' own
+//
+//	src/llama-model.cpp                  "%s: %12s model buffer size = %8.2f MiB\n"   (CUDA0 model buffer size = ...)
+//
+// a model buffer on a CUDA device with a size above zero is weights on the
+// GPU. "cpu" stays for: a CUDA failure, or "offloaded 0/N".
 
 // The causes a WARN names.
 const (
@@ -47,6 +52,7 @@ const (
 	LlamacppCauseNoDevice = "no CUDA device was visible in the container"
 	LlamacppCauseNoLayers = "llama.cpp was started with no GPU layers (N_GPU_LAYERS resolved to 0)"
 	LlamacppCauseNoLine   = "llama-server printed no offload line before the check gave up (still loading, or it exited)"
+	LlamacppCauseNotSaid  = "llama.cpp did not report its GPU offload (this build prints no offload line)"
 )
 
 // Offload states.
@@ -69,8 +75,11 @@ type LlamacppOffload struct {
 	Device      string `json:"device,omitempty"`
 	ComputeCap  string `json:"compute_cap,omitempty"`
 	Failure     string `json:"failure,omitempty"`
-	Cause       string `json:"cause,omitempty"`
-	CheckedAt   string `json:"checked_at"`
+	// Evidence names the positive signal when there was no offload line: the
+	// CUDA model buffer llama.cpp allocated.
+	Evidence  string `json:"evidence,omitempty"`
+	Cause     string `json:"cause,omitempty"`
+	CheckedAt string `json:"checked_at"`
 }
 
 // offloadLog is what llama-server's startup lines said.
@@ -84,6 +93,8 @@ type offloadLog struct {
 	computeCap  string
 	failure     string
 	modelLoaded bool
+	cudaBuf     string  // the first CUDA<n> model buffer line, e.g. "CUDA0 model buffer 4403 MiB"
+	cudaBufMiB  float64 // its size
 }
 
 var (
@@ -93,6 +104,7 @@ var (
 	reCUDADevice  = regexp.MustCompile(`Device (\d+): (.+), compute capability (\d+\.\d+),`)
 	reUsingDevice = regexp.MustCompile(`using device (\S+) \((.+?)\) \(`)
 	reCUDAError   = regexp.MustCompile(`\bCUDA error: (.*)$`)
+	reCUDABuffer  = regexp.MustCompile(`\b(CUDA\d+) model buffer size =\s*([0-9.]+) MiB`)
 	reModelLoaded = regexp.MustCompile(`: model loaded\s*$`)
 )
 
@@ -134,6 +146,13 @@ func parseLlamacppStartLog(lines []string) offloadLog {
 		if m := reCUDAError.FindStringSubmatch(l); m != nil {
 			if o.failure == "" {
 				o.failure = strings.TrimSpace(m[1])
+			}
+			continue
+		}
+		if m := reCUDABuffer.FindStringSubmatch(l); m != nil {
+			if mib, err := strconv.ParseFloat(m[2], 64); err == nil && mib > o.cudaBufMiB {
+				o.cudaBufMiB = mib
+				o.cudaBuf = m[1] + " model buffer " + strconv.Itoa(int(mib)) + " MiB"
 			}
 			continue
 		}
@@ -183,17 +202,24 @@ func llamacppOffloadVerdict(backend, model string, o offloadLog, timedOut bool, 
 		// Layers are on the GPU; the watch goes on to "model loaded" so a
 		// CUDA error in the warmup (a PTX the driver cannot JIT) is caught.
 		r.State = offloadGPU
-	case o.offloadSeen || o.modelLoaded:
+	case o.offloadSeen:
 		r.State, r.Cause = offloadCPU, offloadCause(o)
+	case o.cudaBufMiB > 0:
+		// No offload line, but the weights sit in a CUDA buffer: on the GPU.
+		r.State, r.Evidence = offloadGPU, o.cudaBuf
+	case o.modelLoaded:
+		// Loaded, and llama.cpp never said where: unknown, not "cpu".
+		r.State, r.Cause = offloadUnknown, LlamacppCauseNotSaid
 	case timedOut:
 		r.State, r.Cause = offloadUnknown, LlamacppCauseNoLine
 	}
 	return r, done
 }
 
-// LlamacppOffloadWarns: the report is a GPU start that is not on the GPU.
+// LlamacppOffloadWarns: the report is a GPU start known to run on the CPU.
+// Unknown is not a WARN (the verify row reads NOT CHECKED).
 func LlamacppOffloadWarns(r LlamacppOffload) bool {
-	return r.Target == "gpu" && (r.State == offloadCPU || r.State == offloadUnknown)
+	return r.Target == "gpu" && r.State == offloadCPU
 }
 
 // The reports, per backend, and a generation per backend so a newer start
@@ -289,6 +315,14 @@ func logLlamacppOffload(r LlamacppOffload) {
 		slog.Warn("llamacpp placed on the GPU is running on the CPU: no layer was offloaded",
 			"backend", r.Backend, "model", r.Model, "failure", r.Failure, "likely_cause", r.Cause,
 			"remedy", "update the NVIDIA driver, or place it on cpu (noo cluster place <node> llamacpp <model> --on cpu)")
+		return
+	}
+	if r.State == offloadUnknown {
+		slog.Info("llamacpp offload not reported", "backend", r.Backend, "model", r.Model, "cause", r.Cause)
+		return
+	}
+	if r.Evidence != "" {
+		slog.Info("llamacpp on the GPU (no offload line)", "backend", r.Backend, "model", r.Model, "evidence", r.Evidence)
 		return
 	}
 	if r.Offloaded != nil && r.Total != nil {

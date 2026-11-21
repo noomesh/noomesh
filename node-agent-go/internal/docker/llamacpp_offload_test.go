@@ -148,11 +148,42 @@ func TestLlamacppOffloadCUDAInitFailureNamesTheDriver(t *testing.T) {
 }
 
 func TestLlamacppOffloadNoCUDADeviceNamesNoDevice(t *testing.T) {
-	for name, log := range map[string]string{"init failed": noDeviceLog, "no cuda backend": noCUDABackendLog} {
-		r, done := verdict(t, log, false)
-		if !done || r.State != "cpu" || !LlamacppOffloadWarns(r) || r.Cause != LlamacppCauseNoDevice {
-			t.Fatalf("%s: done=%v %+v", name, done, r)
-		}
+	r, done := verdict(t, noDeviceLog, false)
+	if !done || r.State != "cpu" || !LlamacppOffloadWarns(r) || r.Cause != LlamacppCauseNoDevice {
+		t.Fatalf("init failed: done=%v %+v", done, r)
+	}
+}
+
+// A build that prints no offload line and no CUDA buffer: unknown, never cpu.
+func TestLlamacppOffloadNoLineAtAllIsUnknownNotCPU(t *testing.T) {
+	r, done := verdict(t, noCUDABackendLog, false)
+	if !done || r.State != "unknown" || LlamacppOffloadWarns(r) || r.Cause != LlamacppCauseNotSaid {
+		t.Fatalf("no offload line: done=%v %+v", done, r)
+	}
+}
+
+// The live case: this build prints no offload line, yet the weights are in a
+// CUDA buffer. Positive evidence, state gpu, no layer counts.
+func TestLlamacppOffloadNoLineButCUDABufferIsGPU(t *testing.T) {
+	log := `
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 8192 MiB):
+  Device 0: NVIDIA GeForce GTX 1070, compute capability 6.1, VMM: yes, VRAM: 8192 MiB
+load_tensors:        CUDA0 model buffer size =  4403.49 MiB
+load_tensors:   CPU_Mapped model buffer size =   281.81 MiB
+srv          main: model loaded
+`
+	r, done := verdict(t, log, false)
+	if !done || r.State != "gpu" || r.Offloaded != nil || r.Evidence != "CUDA0 model buffer 4403 MiB" || LlamacppOffloadWarns(r) {
+		t.Fatalf("cuda buffer without an offload line: done=%v %+v", done, r)
+	}
+}
+
+// A zero-layer offload line wins over any buffer line.
+func TestLlamacppOffloadZeroLayersBeatsBuffer(t *testing.T) {
+	log := zeroOffloadLog + "load_tensors:        CUDA0 model buffer size =     0.00 MiB\n"
+	r, _ := verdict(t, log, false)
+	if r.State != "cpu" || !LlamacppOffloadWarns(r) {
+		t.Fatalf("%+v", r)
 	}
 }
 
@@ -163,7 +194,7 @@ func TestLlamacppOffloadCUDAErrorAfterOffloadWarns(t *testing.T) {
 	}
 }
 
-func TestLlamacppOffloadNoLineByTheBoundWarns(t *testing.T) {
+func TestLlamacppOffloadNoLineByTheBoundIsUnknown(t *testing.T) {
 	loading := `
 ggml_cuda_init: found 1 CUDA devices (Total VRAM: 8192 MiB):
 load_tensors: loading model tensors, this can take a while... (mmap = true, direct_io = false)
@@ -173,7 +204,7 @@ load_tensors: loading model tensors, this can take a while... (mmap = true, dire
 		t.Fatalf("still loading is not an answer: done=%v %+v", done, r)
 	}
 	r, done = verdict(t, loading, true)
-	if !done || r.State != "unknown" || !LlamacppOffloadWarns(r) || r.Cause != LlamacppCauseNoLine {
+	if !done || r.State != "unknown" || LlamacppOffloadWarns(r) || r.Cause != LlamacppCauseNoLine {
 		t.Fatalf("timed out: done=%v %+v", done, r)
 	}
 }
