@@ -26,7 +26,9 @@
 # Every judged assert prints exactly one line, `UPGRADE <id> PASS|FAIL|NOT
 # REACHED: <why>`, quoting the product's own line on a FAIL. The asserts are
 # 97's spec (A1-A7 after `--all`, B1-B4 after the same-tag `--stack`) and
-# general's (G1-G5: the verify rows, the journal, a chat answer after).
+# general's (G1-G5: the verify rows, the journal, a chat answer after), and K1/K2:
+# the roll's own "N recreated (...), M kept (...)" line against the cell's
+# container-id snapshots (before/after --all, after the same-tag --stack).
 set -uo pipefail
 : "${OUT:?}" "${CELL:=upgrade-24.04}" "${RUNNER:=?}" "${CLI_TAG:=latest}" "${PREV_TAG:=}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -129,10 +131,15 @@ echo "$EVENTS_PID" > "$J/docker-events.pid"
 sleep 1
 
 # ── 3. the roll: --all to the release under test ────────────────────────────
+python3 "$HERE/recreated.py" snap "$J/roll.before" > /dev/null 2>&1 || true
 ROLL_T0="$(date +%s)"
 step upgrade-all 3600 -- noo upgrade --all --version "$TARGET" --yes
 ROLL_RC=$?
 echo "$ROLL_RC" > "$J/roll.rc"
+# The container ids after --all (K1's AFTER, and the same-tag --stack's BEFORE
+# for K2). roll.before is taken just above the roll; both carry a noo.inputs
+# column (recreated.py snap), which says labelled from unlabelled.
+python3 "$HERE/recreated.py" snap "$J/roll.after" > /dev/null 2>&1 || true
 noo --json cluster verify > "$J/verify-after.json" 2>/dev/null
 # The --all window ONLY, captured before the same-tag --stack can apply
 # anything: A2 judges whether --all installed the generation-2 applier, and a
@@ -175,6 +182,9 @@ STACK_T0="$(date +%s)"
 step upgrade-stack-same-tag 2400 -- noo upgrade --stack --version "$TARGET" --yes
 echo "$?" > "$J/stack.rc"
 STACK_T1="$(date +%s)"
+# The ids after the same-tag --stack (K2's AFTER). After STACK_T1, like B4's
+# snapshots, so a `sudo -n docker` fallback is outside B3's window.
+python3 "$HERE/recreated.py" snap "$J/stack.after" > /dev/null 2>&1 || true
 
 # ── 4b. a plain start after the upgrade recreates nothing (B4) ─────────────
 # Every container the upgrade made must carry the start-inputs labels, or the
