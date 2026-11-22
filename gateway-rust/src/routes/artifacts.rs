@@ -564,8 +564,8 @@ async fn modelset_manifest(name: &str) -> Result<Response, AppError> {
 // to it (preseed.MirrorHFRepo).
 //
 // The gateway does not take the controller's HF cache on faith either: it is
-// written by huggingface_hub (and by the controller's own vllm/TEI, which
-// mount it read-write), not by a verified fetch. In an HF cache every
+// written by huggingface_hub (and by the controller's own vllm, which
+// mounts it read-write), not by a verified fetch. In an HF cache every
 // snapshot file is a link to `blobs/<oid>`, where the oid IS a content
 // digest: an LFS blob is named by the sha256 of its bytes, a git blob by its
 // git object id (sha1 over `blob <len>\0` + the bytes). So each blob is

@@ -424,6 +424,7 @@ pub const SERVICE_KEY_READERS: &[(&str, KeyReader)] = &[
     ("ollama", KeyReader::ContainerUid(65532)),
     ("ollama-embed", KeyReader::ContainerUid(65532)),
     ("ollama-embed-cpu", KeyReader::ContainerUid(65532)),
+    // i1182a: accepted for one release after TEI's removal; drop in 0.6.31
     ("tei", KeyReader::ContainerUid(65532)),
     ("reranker", KeyReader::ContainerUid(65532)),
     // DHI runtime images: nonroot 65532.

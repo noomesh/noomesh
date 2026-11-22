@@ -35,7 +35,7 @@
 //! Seeded once, on the first boot that has the table empty: `knowledge` =
 //! the model the role=embed placements declare (most common), else the
 //! configured one (`PAGEINDEX_EMBEDDING_MODEL` → `EMBEDDING_MODEL` →
-//! `TEI_MODEL` → `harrier`). After that those env vars are not read for
+//! `harrier`). After that those env vars are not read for
 //! routing; a value that disagrees with the record is logged at boot.
 
 use std::sync::{OnceLock, RwLock};
@@ -638,7 +638,7 @@ pub fn spawn_refresh(state: std::sync::Arc<crate::state::AppState>) {
 /// ignored after the seed, and says so once when it disagrees.
 fn warn_env_disagrees(spaces: &[Space]) {
     let Ok(knowledge) = resolve(spaces, None) else { return };
-    for var in ["PAGEINDEX_EMBEDDING_MODEL", "EMBEDDING_MODEL", "TEI_MODEL"] {
+    for var in ["PAGEINDEX_EMBEDDING_MODEL", "EMBEDDING_MODEL"] {
         if let Ok(v) = std::env::var(var) {
             if !v.trim().is_empty() && !same_model(&v, &knowledge.model) {
                 tracing::warn!(

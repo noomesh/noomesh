@@ -65,8 +65,9 @@ def test_noo_apply_still_gates_on_the_string() -> None:
     assert 'case " $KNOWN_KINDS " in' in text
 
 
-# The backend door leaves (the design A): ten kinds, one pair per door
-# service. Pinned by name in all three lists for the same reason as
+# The backend door leaves (the design A): one pair per door service, plus
+# `tei` (i1182a: 0.6.30 no longer issues it, but every list still ACCEPTS it for
+# one release so a 0.6.29 controller's bundle never refuses; drop in 0.6.31). Pinned by name in all three lists for the same reason as
 # nats-creds above — a pair added to two lists out of three is a bundle the
 # third refuses whole.
 DOOR_LEAF_KINDS = [

@@ -49,7 +49,7 @@ def _rust_rows() -> list[dict]:
             assert m, f"row without {field}: {block}"
             row[field] = re.findall(r'"([^"]+)"', m.group(1))
         rows.append(row)
-    assert len(rows) >= 5, f"parsed {len(rows)} rows -- the parser, not the table, is broken"
+    assert len(rows) >= 4, f"parsed {len(rows)} rows -- the parser, not the table, is broken"
     return rows
 
 
@@ -59,8 +59,18 @@ def _apply_loop() -> list[str]:
     return m.group(1).split()
 
 
+# i1182a (expand then contract): 0.6.30's controller stops issuing the `tei` leaf,
+# but the applier still installs one a 0.6.29 controller's bundle carries, for
+# ONE release. Drop `tei` from this set (and from the applier loop) in 0.6.31.
+LEGACY_ACCEPTED = ("tei",)
+
+
 def test_the_applier_installs_every_service_the_controller_packs() -> None:
-    assert _apply_loop() == [r["service"] for r in _rust_rows()]
+    loop = _apply_loop()
+    assert [s for s in loop if s not in LEGACY_ACCEPTED] == [r["service"] for r in _rust_rows()]
+    for legacy in LEGACY_ACCEPTED:
+        assert legacy in loop, f"the applier loop dropped {legacy}: a 0.6.29 bundle's leaf would be accepted but never installed"
+        assert legacy not in [r["service"] for r in _rust_rows()], f"the controller issues {legacy} again"
 
 
 def test_the_applier_loop_reads_the_kinds_the_controller_writes() -> None:
@@ -94,10 +104,9 @@ def test_the_agent_door_table_agrees_when_it_is_present() -> None:
         go[backend] = m.group(1) if m else "vllm"
     assert go, "parsed no rows from backendDoors"
     rust = {b: r["service"] for r in _rust_rows() for b in r["backends"]}
-    # The controller still issues the `tei` leaf for one release (a 0.6.29 node
-    # verifying a 0.6.30 bundle must not fail: i1182a, expand then contract);
-    # the node agent has no `embedding` door any more.
-    rust.pop("embedding", None)
+    # The controller no longer issues a `tei` leaf and the agent has no
+    # `embedding` door (i1182a); both tables must agree with no exception.
+    assert "embedding" not in rust and "tei" not in rust.values(), rust
     assert go == rust, f"agent doors {go} vs controller leaves {rust}"
 
 

@@ -12,7 +12,7 @@ function c(name: string, node: string, status = 'running', cpu = 1, memUsed = 10
 describe('doorBackendName — the source naming rule', () => {
   it('maps <p>-stunnel-<x> to <p>-<x>', () => {
     expect(doorBackendName('noo-stunnel-ollama')).toBe('noo-ollama');
-    expect(doorBackendName('noo-stunnel-tei-gpu')).toBe('noo-tei-gpu');
+    expect(doorBackendName('noo-stunnel-ollama-embed-cpu')).toBe('noo-ollama-embed-cpu');
     expect(doorBackendName('noo-stunnel-ollama-embed')).toBe('noo-ollama-embed');
     expect(doorBackendName('lab-stunnel-reranker')).toBe('lab-reranker');
   });
@@ -92,7 +92,7 @@ describe('groupBackendDoors — one row per backend', () => {
   });
 
   it('does not warn about a door when the backend itself is stopped', () => {
-    const [r] = groupBackendDoors([c('noo-tei-gpu', 'host3', 'exited')]);
+    const [r] = groupBackendDoors([c('noo-ollama-embed', 'host3', 'exited')]);
     expect(r.doorState).toBe('missing');
     expect(r.doorWarning).toBeNull();
   });

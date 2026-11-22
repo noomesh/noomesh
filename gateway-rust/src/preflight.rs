@@ -11,7 +11,7 @@
 //! Why this exists: the old startup path initialises DB, NATS, RAG, the
 //! autonomy engine, recall memory, etc. in sequence with try/except
 //! around each block. If the configured embedding backend (default:
-//! ollama/harrier; TEI is optional legacy) is down, steps 4-8 still
+//! ollama/harrier) is down, steps 4-8 still
 //! "succeed" but with broken assumptions — e.g. autonomy polls a
 //! location that queries a table it can't reach and logs at DEBUG.
 //! Nobody notices. Pre-flight converts that silent degradation into a
@@ -302,15 +302,13 @@ async fn check_nats(state: &Arc<AppState>) -> CheckResult {
 async fn check_embedding_service(_state: &Arc<AppState>) -> CheckResult {
     // Embedding URL from env/yaml — same resolution as every embed call
     // site (embedding_client). If no URL is configured the check passes
-    // as "not applicable". TEI_URL is a legacy env alias kept for parity
-    // with Python's embedding worker.
-    let has_url = std::env::var("TEI_URL").ok().filter(|v| !v.is_empty()).is_some()
-        || !crate::config::env_or_yaml(
-            "PAGEINDEX_EMBEDDING_URL",
-            |c| c.services.embedding_url.clone(),
-            "",
-        )
-        .is_empty();
+    // as "not applicable". (The TEI_URL alias is gone, i1182a.)
+    let has_url = !crate::config::env_or_yaml(
+        "PAGEINDEX_EMBEDDING_URL",
+        |c| c.services.embedding_url.clone(),
+        "",
+    )
+    .is_empty();
     if !has_url {
         return ok("embedding_service", false, "no URL configured (skipped)");
     }

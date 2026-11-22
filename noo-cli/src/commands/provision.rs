@@ -7716,8 +7716,8 @@ mod onboard_door_leaf_line_tests {
     #[test]
     fn first_issue_lines_are_quiet_under_onboard_only() {
         let first = reissue_reason(&LeafState::Missing, "ollama", None, 0).expect("a missing leaf is issued");
-        let issued = vec![("vllm", first.clone()), ("ollama", first), ("tei", "it expires in 3 days".to_string())];
-        assert_eq!(door_leaf_lines(&issued, true), vec!["backend door leaf tei: issued (it expires in 3 days)".to_string()]);
+        let issued = vec![("vllm", first.clone()), ("ollama", first), ("reranker", "it expires in 3 days".to_string())];
+        assert_eq!(door_leaf_lines(&issued, true), vec!["backend door leaf reranker: issued (it expires in 3 days)".to_string()]);
         let all = door_leaf_lines(&issued, false);
         assert_eq!(all.len(), 3, "a person running provision reads every leaf");
         assert_eq!(all[0], "backend door leaf vllm: issued (no leaf yet)");

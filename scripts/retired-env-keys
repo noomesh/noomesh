@@ -28,3 +28,6 @@ NOO_SELF_CALL_SHARED_SECRET|the self-call bridge is deleted: a shared secret nev
 NOO_CLUSTER_TOKEN_V1|the v1 cluster-token gate is deleted: a v1 token (the old replayable form) is always refused, and nodes sign v2 only. Nothing reads the line; the stored posture row is deleted at the next gateway start
 NOO_CONTROLLER_SSH_PUBKEY|the controller serves no SSH key: enrollment pins none, and the noo-gate lane it was for is retired (nodes collect CA-signed bundles over the pull rail)
 NOO_EGRESS_ALLOWLIST|it never restricted anything (its only reader had no caller). What bounds where a tool can reach is the noo-sandbox network (internal) and BROWSER_URL_ALLOWLIST: docs/security/networks-and-containers.md
+TEI_MODEL|TEI is removed (i1182a, 0.6.30): the embedding model is a property of the embedding space, and an Ollama embedder serves it: noo cluster place <node> ollama <model> --role embed
+TEI_URL|TEI is removed (i1182a, 0.6.30): set PAGEINDEX_EMBEDDING_URL if the embedder is outside the mesh; an Ollama embedder placed with noo cluster place <node> ollama <model> --role embed needs no URL
+TEI_IMAGE|TEI is removed (i1182a, 0.6.30): no node runs a TEI image; embeddings are served by an Ollama embedder

@@ -15,9 +15,7 @@
 //!   - POST /api/external/embeddings        → mesh-routed embedder via
 //!                                             node-agent (default: ollama/
 //!                                             harrier; OpenAI-shaped
-//!                                             response). TEI is an
-//!                                             optional/legacy wire format,
-//!                                             not the deployed default.
+//!                                             response).
 //!   - POST /api/external/embeddings/jobs   → a bulk batch claimed by workers
 //!                                             (or run by the gateway when none
 //!                                             pull); 202 {job_id, path, model}
@@ -25,9 +23,7 @@
 //!                                             vectors (the submitter's own jobs)
 //!   - POST /api/external/rerank            → mesh-routed reranker via
 //!                                             node-agent (hardened
-//!                                             llama.cpp is the current
-//!                                             default; TEI is a legacy
-//!                                             wire format still accepted)
+//!                                             llama.cpp is the default)
 //!   - POST /api/external/classify          → chat model + structured output
 //!   - POST /api/external/chat/completions  → vLLM (streaming passthrough)
 //!   - POST /api/external/inference         → typed multiplexer over the above
@@ -580,7 +576,7 @@ async fn do_rerank(
     let ordered = rerank_order(cands, wanted);
     let mut failures: Vec<String> = Vec::new();
     for (t, declared, stand_in) in &ordered {
-        match tei_rerank(query, &docs, &t.url, &t.headers).await {
+        match node_rerank(query, &docs, &t.url, &t.headers).await {
             Ok(results) => {
                 let n = results.len();
                 if !failures.is_empty() {
@@ -654,8 +650,9 @@ fn norm_rerank_rows(arr: &[Value]) -> Vec<Value> {
         .collect()
 }
 
-/// TEI-family reranker over HTTP (co-located stunnel or a node-agent proxy).
-async fn tei_rerank(
+/// The reranker over HTTP: a node-agent's `/rerank` proxy (the agent proxy
+/// contract: `{query, texts, return_text}` in, `[{index, score}]` out).
+async fn node_rerank(
     query: &str,
     docs: &[String],
     url: &str,
@@ -820,13 +817,13 @@ pub(crate) async fn mesh_targets(
 
 /// Mesh URL source for embeddings — the same mesh leg [`do_rerank`] walks,
 /// for the `embed` capability. Picks the least-loaded peer whose node-agent
-/// fronts a local embedding container (nodes advertise `embed` only when a
-/// TEI container is actually running) and returns the node-agent's `/embed`
+/// fronts a local embedding container (nodes advertise `embed` only when an
+/// embedder is actually running) and returns the node-agent's `/embed`
 /// proxy URL plus the HMAC auth header for the mTLS hop. The proxy speaks
 /// the OpenAI `/v1/embeddings` contract (POST OpenAI body → OpenAI reply).
 ///
 /// Deliberately does NOT consult `NOO_EMBEDDING_URL` — precedence between a
-/// co-located TEI and mesh routing is owned by the embedding client; this is
+/// co-located embedder and mesh routing is owned by the embedding client; this is
 /// just the "find me an embed-capable node" leg for it to use as a URL
 /// source. Use `crate::tls::cluster_client()` for the request (cluster-CA
 /// verified), attaching the returned headers.
@@ -1117,10 +1114,10 @@ async fn typed_inference(
             match do_embeddings(&state, &inner, space).await {
                 Ok((resp, n, model)) => {
                     audit(&state, &consumer.name, EP, Some("embedding"), Some(&model),
-                          Some("tei"), Some(json!({"inputs": n})), 200, started, None);
+                          Some("embedder"), Some(json!({"inputs": n})), 200, started, None);
                     (StatusCode::OK, Json(resp)).into_response()
                 }
-                Err(e) => refuse(&state, &consumer.name, EP, Some("embedding"), None, Some("tei"), started, e),
+                Err(e) => refuse(&state, &consumer.name, EP, Some("embedding"), None, Some("embedder"), started, e),
             }
         }
         "rerank" => {
@@ -1438,6 +1435,40 @@ mod usage_projection_tests {
         let src = include_str!("external.rs");
         let sig = src.split("fn usage_row_json(").nth(1).unwrap().split(") -> Value").next().unwrap();
         assert!(!sig.contains("error"), "{sig}");
+    }
+}
+
+#[cfg(test)]
+mod node_rerank_wire_tests {
+    use super::node_rerank;
+    use serde_json::{json, Value};
+    use std::sync::{Arc, Mutex};
+
+    /// i1182a: `tei_rerank` became `node_rerank`; the agent proxy contract is
+    /// unchanged. It POSTs `{query, texts, return_text:false}` and reads a
+    /// bare `[{index, score}]` array back.
+    #[tokio::test]
+    async fn node_rerank_keeps_the_agent_proxy_wire_shape() {
+        let seen: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let s2 = seen.clone();
+        let app = axum::Router::new().fallback(axum::routing::post(move |axum::Json(body): axum::Json<Value>| {
+            let s = s2.clone();
+            async move {
+                s.lock().unwrap().push(body);
+                axum::Json(json!([{"index": 1, "score": 0.9, "extra": "dropped"}, {"index": 0, "score": 0.1}]))
+            }
+        }));
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+        let docs = vec!["a".to_string(), "b".to_string()];
+        let rows = match node_rerank("q", &docs, &format!("http://{addr}/rerank"), &[]).await {
+            Ok(r) => r,
+            Err(e) => panic!("node_rerank failed: {}", e.detail),
+        };
+        assert_eq!(rows, vec![json!({"index": 1, "score": 0.9}), json!({"index": 0, "score": 0.1})]);
+        let body = seen.lock().unwrap()[0].clone();
+        assert_eq!(body, json!({"query": "q", "texts": ["a", "b"], "return_text": false}), "{body}");
     }
 }
 

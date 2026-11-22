@@ -824,8 +824,7 @@ fn apply_topology_env(ctx: &mut Ctx) {
         if ctx.state.tier == 2 {
             ctx.update_env("OLLAMA_URL", "https://stunnel-ollama:11434");
         }
-        // No PAGEINDEX_EMBEDDING_URL: tei is opt-in (tei-compose) and the
-        // embedding client resolves ollama-first / mesh-routed without it.
+        // No PAGEINDEX_EMBEDDING_URL: the embedding client resolves ollama-first / mesh-routed without it.
     }
 }
 
@@ -3113,7 +3112,7 @@ fn controller_services(ctx: &mut Ctx) -> Option<Vec<String>> {
 
 /// Externally-reachable services need the controller LAN IP in their SAN.
 pub(crate) const SVC_LIST: &[&str] = &[
-    "redis", "nats", "postgres", "vllm", "llamacpp", "ollama", "tei", "reranker", "loki",
+    "redis", "nats", "postgres", "vllm", "llamacpp", "ollama", "reranker", "loki",
     // The standalone profile's embedder, presented by its stunnel sidecar
     // (docker/stunnel-ollama-embed.conf). Its own leaf, not `ollama`'s:
     // `noo upgrade --stack` issues a MISSING leaf on its own
@@ -3189,7 +3188,6 @@ pub(crate) fn svc_extra_hostnames(svc: &str) -> Vec<String> {
         // container name (STANDALONE_OLLAMA_EMBED_URL) or compose alias.
         "ollama-embed" => &["noo-ollama-embed", "stunnel-ollama-embed", "noo-stunnel-ollama-embed"],
         "ollama-embed-cpu" => &["noo-ollama-embed-cpu", "stunnel-ollama-embed-cpu", "noo-stunnel-ollama-embed-cpu"],
-        "tei" => &["noo-tei", "stunnel-tei"],
         "reranker" => &["noo-reranker", "stunnel-reranker"],
         "redis" => &["noo-redis"],
         "nats" => &["noo-nats"],

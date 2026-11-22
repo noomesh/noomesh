@@ -45,7 +45,7 @@ pub fn memory_search(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     if let Some(u) = &user {
         path.push_str(&format!("&user_id={}", urlencode(u)));
     }
-    // Embeds the query via TEI first — allow more than the read default.
+    // Embeds the query via the embedder first — allow more than the read default.
     let body = get_json(g, &path, true, 30);
     if g.json {
         println!("{body}");
