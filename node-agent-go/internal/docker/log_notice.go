@@ -42,7 +42,7 @@ func logAnswerLooksCut(lines []string, running bool, startedAt time.Time) bool {
 // An empty string means nothing to say: a quiet container stays quiet.
 func unreadableLogNotice(name string, answer, probe []string, startedAt time.Time, since string, now time.Time) string {
 	probeNewest, ok := newestLogTime(probe)
-	if !ok || probeNewest.Before(startedAt) {
+	if !ok {
 		return ""
 	}
 	cut := "its start"
