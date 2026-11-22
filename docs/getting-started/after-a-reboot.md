@@ -52,9 +52,13 @@ Each one has a followup that removes the need for the step.
   for this boot (`noo stack start` if that does not bring it back). (i1160, #1507: 0.6.30's onboard turns it on, and verify gets
   a `hostd at boot` row.)
 - **A dedicated kiosk seat on a machine that also has a desktop installed
-  stays black.** Its display waits behind the boot splash, which nothing
-  tells to quit. At the seat: `sudo plymouth quit`. The display comes up at
-  once. (i1153: the fix is planned for 0.6.30; this step goes when it lands.)
+  stays black** (0.6.29 and earlier). Its display waits behind the boot
+  splash, which nothing tells to quit. At the seat: `sudo plymouth quit`; the
+  display comes up at once. From 0.6.30 a NEW seat comes back after a reboot
+  by itself. An EXISTING seat needs one command, once, on the seat, because
+  a seat runs nothing as root after it is enrolled: verify's `kiosk unit`
+  row for that seat shows it (`sudo <the seat's noo> kiosk seat-sync
+  --migrate`), or re-run kiosk setup. (i1153.)
 - **`noo stack start` failed with "image pull failed 3 times"** while the
   network was still coming up (0.6.29 and earlier): a start pulled images
   even when all of them were present. Run `noo stack restart` (it never
@@ -76,6 +80,13 @@ Each one has a followup that removes the need for the step.
   affected, and needs no address reservation in your router. The
   controller's own address is different: without a tailnet it must not move
   ([without-a-tailnet.md](without-a-tailnet.md)).
+  If verify instead shows the node's `agent address` row refused because
+  another node claims the address, the new address belongs to a stale
+  record, so the node keeps its old one and stays unreachable. Check that
+  other node (`noo cluster verify <other>`); if it is gone, remove its record
+  with `noo cluster forget <other>`, and the new address is accepted on the
+  node's next heartbeat. Do not push a certificate: `--prove` refuses an
+  address another node holds.
 - **A Mac node's Ollama is not running.** Nothing registers it to start at
   boot: it starts only if it was set up to start at the node user's login,
   and that user has logged in. As the node's user, run
