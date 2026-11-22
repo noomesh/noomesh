@@ -45,7 +45,12 @@ import re
 import subprocess
 import sys
 
+# The 4th field is whether the container carries the start-inputs label
+# (`noo.inputs`, 0.6.29 and later): L or -. It sits before depends_on, whose
+# value may be empty, so a split on spaces stays unambiguous; snap() writes the
+# row as `name id service depends_on L|-`.
 FMT = ('{{.Name}} {{.Id}} {{index .Config.Labels "com.docker.compose.service"}} '
+       '{{if index .Config.Labels "noo.inputs"}}L{{else}}-{{end}} '
        '{{index .Config.Labels "com.docker.compose.depends_on"}}')
 
 
@@ -65,9 +70,10 @@ def snap(path: str) -> int:
     rows = []
     if ids:
         for line in _docker(["inspect", "-f", FMT, *ids]).splitlines():
-            parts = line.replace("<no value>", "-").split(" ", 3)
+            parts = line.replace("<no value>", "-").split(" ", 4)
             if len(parts) >= 3 and parts[2] not in ("", "-"):
-                rows.append(" ".join(p.strip() or "-" for p in (parts + ["-"])[:4]))
+                name, cid, svc, lab, dep = [p.strip() or "-" for p in (parts + ["-", "-"])[:5]]
+                rows.append(" ".join((name, cid, svc, dep, lab if lab in ("L", "-") else "-")))
     with open(path, "w") as f:
         f.write("".join(r + "\n" for r in sorted(rows)))
     print(f"{len(rows)} compose containers recorded")
@@ -82,6 +88,18 @@ def read(path: str) -> dict[str, tuple[str, str, str]]:
             p = line.split()
             if len(p) >= 3:
                 out[p[0].lstrip("/")] = (p[1], p[2], p[3] if len(p) > 3 else "-")
+    return out
+
+
+def read_labelled(path: str) -> dict[str, bool]:
+    """name -> whether the container carried `noo.inputs` when it was recorded.
+    A row with no 5th column (a snapshot from before it existed) is left out."""
+    out = {}
+    with open(path) as f:
+        for line in f:
+            p = line.split()
+            if len(p) >= 5:
+                out[p[0].lstrip("/")] = p[4] == "L"
     return out
 
 
