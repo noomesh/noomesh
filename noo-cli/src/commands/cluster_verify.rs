@@ -543,6 +543,7 @@ pub(crate) fn node_checks(n: &Value, controller_tag: &str, cli_version: &str, no
     out.extend(llamacpp_offload_check(n));
     out.extend(docker_engine_check(n));
     out.extend(vllm_compute_check(n));
+    out.extend(removed_engine_check(n));
     out.extend(hardened_images_check(n));
 
     // 6c''. Vendor telemetry (docs/security/telemetry.md): no running
@@ -1843,6 +1844,94 @@ pub(crate) fn vllm_compute_check(n: &Value) -> Option<Check> {
     ))
 }
 
+/// The placements of a node's desired config that use the TEI engine, which
+/// 0.6.30 removes (i1182a): every `embedding` placement, and every `reranker`
+/// whose model is not a `.gguf` file or whose image is the TEI one. Each is
+/// `{"backend", "model"}`. The same rule as the gateway's refusal.
+pub(crate) fn removed_engine_placements(placements: &Value) -> Vec<Value> {
+    placements
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter(|p| {
+                    let model = p["model"].as_str().unwrap_or("").trim();
+                    let tei_image = p["image"].as_str().is_some_and(|i| i.to_ascii_lowercase().contains("text-embeddings-inference"));
+                    match p["backend"].as_str() {
+                        Some("embedding") => true,
+                        Some("reranker") => tei_image || (!model.is_empty() && !model.to_ascii_lowercase().ends_with(".gguf")),
+                        _ => false,
+                    }
+                })
+                .map(|p| serde_json::json!({"backend": p["backend"], "model": p["model"].as_str().unwrap_or("")}))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The `removed engine` row: the node's desired state holds a placement that
+/// uses the TEI engine (`removed_engine_placements`, injected by
+/// `with_harness_wanted` from desired-config). WARN for each, naming the
+/// replacement (an Ollama embedder, or the GGUF reranker) and the unplace of
+/// the old one; OK when none. No row when desired-config could not be read:
+/// "none" would then be a guess.
+pub(crate) fn removed_engine_check(n: &Value) -> Option<Check> {
+    const NAME: &str = "removed engine";
+    let id = n["id"].as_str().unwrap_or("?");
+    let found = n["removed_engine_placements"].as_array()?;
+    if found.is_empty() {
+        return Some(ok(NAME, "no placement uses a removed engine"));
+    }
+    let mut lines: Vec<String> = Vec::new();
+    let mut remedies: Vec<String> = Vec::new();
+    for p in found {
+        let backend = p["backend"].as_str().unwrap_or("?");
+        let model = p["model"].as_str().unwrap_or("");
+        let replace = if backend == "embedding" {
+            format!("noo cluster place {id} ollama <model> --role embed")
+        } else {
+            format!("noo cluster place {id} reranker <file>.gguf")
+        };
+        let who = if model.is_empty() { format!("{id} {backend}") } else { format!("{id} {backend} {model}") };
+        lines.push(format!("{who}: uses the TEI engine, which 0.6.30 removes; replace with: `{replace}`"));
+        remedies.push(format!("{replace} && noo cluster unplace {id} {backend}"));
+    }
+    remedies.dedup();
+    Some(warn(NAME, lines.join("; "), Some(remedies.join("; "))))
+}
+
+/// The `removed engine space` row: an embedding space whose model no node
+/// serves and that names a Hugging Face repo id (`org/name`), the shape a
+/// TEI-served model has and an Ollama tag does not. Searches over its existing
+/// vectors still work; embed writes are refused until a node serves the model
+/// or the space is migrated. WARN naming the migrate command. `body` is
+/// `/api/cluster/embedding-spaces`; unreadable (None) gives no row, as that
+/// is already the `embedding spaces` row's WARN. This is a heuristic on the
+/// recorded model name: the gateway does not record which engine served it.
+pub(crate) fn removed_engine_space_check(body: Option<&Value>) -> Option<Check> {
+    const NAME: &str = "removed engine space";
+    let spaces = body?["spaces"].as_array()?;
+    let stale: Vec<(&str, &str)> = spaces
+        .iter()
+        .filter(|s| s["live"].as_u64().unwrap_or(0) + s["static_live"].as_u64().unwrap_or(0) == 0)
+        .filter_map(|s| Some((s["space"].as_str()?, s["model"].as_str()?)))
+        .filter(|(_, m)| m.contains('/') && !m.starts_with("hf.co/"))
+        .collect();
+    if stale.is_empty() {
+        return Some(ok(NAME, "no embedding space is bound to a model only the removed engine served"));
+    }
+    let detail = stale
+        .iter()
+        .map(|(sp, m)| format!("space {sp} model {m}: no node serves it and it looks like a TEI-served Hugging Face model (0.6.30 removes that engine); embed writes are refused until it is migrated"))
+        .collect::<Vec<_>>()
+        .join("; ");
+    let remedy = stale
+        .iter()
+        .map(|(sp, _)| format!("noo cluster embedding-space migrate {sp} <model>"))
+        .collect::<Vec<_>>()
+        .join("; ");
+    Some(warn(NAME, detail, Some(remedy)))
+}
+
 /// The hardened image of ours that replaces an upstream backend image
 /// (noomesh-internal i323, operator decision 3): upstream `ollama/ollama` ->
 /// `<ns>/ollama:<tag>`, upstream `ghcr.io/ggml-org/llama.cpp` ->
@@ -2717,6 +2806,8 @@ fn with_harness_wanted(g: &Globals, n: &Value) -> Value {
     // The `vllm compute` row: the vLLM placements, judged against the node's
     // gpu_compute_cap.
     let vllm_placed = desired.as_ref().map(|d| vllm_placements(&d["placements"])).unwrap_or_default();
+    // The `removed engine` row: placements on the TEI engine (i1182a).
+    let removed_engines = desired.as_ref().map(|d| removed_engine_placements(&d["placements"]));
     // Control over the bus: a node that advertises it gets one health round
     // trip over NATS, run by the gateway (the only principal that may send).
     // Nothing is asked of a node that does not advertise, so its row reads
@@ -2757,6 +2848,9 @@ fn with_harness_wanted(g: &Globals, n: &Value) -> Value {
         }
         if !vllm_placed.is_empty() {
             obj.insert("vllm_placements".into(), serde_json::json!(vllm_placed));
+        }
+        if let Some(r) = removed_engines {
+            obj.insert("removed_engine_placements".into(), serde_json::json!(r));
         }
         if let Some(w) = wanted {
             obj.insert("harness_wanted".into(), Value::Bool(w));
@@ -9613,6 +9707,7 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         checks.push(embedding_spaces_check(spaces.as_ref()));
         // i1182a: with no reranker placed, rerank is the chat model's.
         checks.push(reranker_check(get_json_opt(g, "/api/external/capabilities", true, 15).as_ref()));
+        checks.extend(removed_engine_space_check(spaces.as_ref()));
         // Finding 126: a loaded model measured over its estimate or pool.
         let fit_ids: Vec<&str> = fleet.iter().filter_map(|n| n["id"].as_str()).collect();
         let fits: Vec<(String, Option<Value>)> = par_map(&fit_ids, |id| {
@@ -14110,6 +14205,63 @@ mod tests {
         let inject = crate::test_src::fn_body(&own, "fn with_harness_wanted(");
         assert!(inject.contains("gpu_targets_on_cpu_builds(&d[\"placements\"], &n)"), "fed from desired-config and the node's GPU facts");
         assert!(own.contains("out.extend(gpu_target_cpu_build_check(n));"), "the row is in the run");
+    }
+
+    /// i1182a: the `removed engine` row WARNs for every `embedding` placement
+    /// and every non-GGUF or TEI-image reranker, naming the replacement; a
+    /// GGUF reranker and an empty desired state are OK.
+    #[test]
+    fn removed_engine_row_warns_on_a_tei_placement_and_is_ok_otherwise() {
+        use serde_json::json;
+        let found = removed_engine_placements(&json!([
+            {"backend": "embedding", "model": "BAAI/bge-small-en-v1.5", "desired_state": "running"},
+            {"backend": "reranker", "model": "BAAI/bge-reranker-v2-m3", "desired_state": "running"},
+            {"backend": "reranker", "model": "x.gguf", "image": "ghcr.io/huggingface/text-embeddings-inference:cpu-1.9.4"},
+            {"backend": "reranker", "model": "bge-reranker-v2-m3-Q8_0.gguf", "desired_state": "running"},
+            {"backend": "ollama", "model": "harrier", "role": "embed", "desired_state": "running"},
+        ]));
+        assert_eq!(found.len(), 3, "{found:?}");
+        let n = json!({"id": "node-a", "removed_engine_placements": found});
+        let c = removed_engine_check(&n).expect("a row");
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.contains("node-a embedding BAAI/bge-small-en-v1.5: uses the TEI engine, which 0.6.30 removes; replace with: `noo cluster place node-a ollama <model> --role embed`"), "{}", c.detail);
+        assert!(c.detail.contains("`noo cluster place node-a reranker <file>.gguf`"), "{}", c.detail);
+        assert!(c.remedy.as_deref().unwrap().contains("noo cluster unplace node-a embedding"), "{:?}", c.remedy);
+        assert!(c.remedy.as_deref().unwrap().contains("noo cluster unplace node-a reranker"), "{:?}", c.remedy);
+
+        let gguf = removed_engine_placements(&json!([{"backend": "reranker", "model": "bge-reranker-v2-m3-Q8_0.gguf"}]));
+        let c = removed_engine_check(&json!({"id": "node-a", "removed_engine_placements": gguf})).expect("a row");
+        assert_eq!(c.verdict, Verdict::Ok);
+        assert_eq!(c.detail, "no placement uses a removed engine");
+        let c = removed_engine_check(&json!({"id": "node-a", "removed_engine_placements": []})).expect("a row");
+        assert_eq!(c.verdict, Verdict::Ok);
+        assert!(removed_engine_check(&json!({"id": "node-a"})).is_none(), "desired-config unread: no guess");
+        let own = crate::test_src::own_code(include_str!("cluster_verify.rs"));
+        let inject = crate::test_src::fn_body(&own, "fn with_harness_wanted(");
+        assert!(inject.contains("removed_engine_placements(&d[\"placements\"])"), "fed from desired-config");
+        assert!(own.contains("out.extend(removed_engine_check(n));"), "the row is in the run");
+    }
+
+    /// i1182a: a space bound to a Hugging Face model no node serves WARNs
+    /// naming `embedding-space migrate`; a served space, an Ollama tag and an
+    /// unread list do not.
+    #[test]
+    fn removed_engine_space_row_names_the_migrate_command() {
+        use serde_json::json;
+        let body = json!({"spaces": [
+            {"space": "knowledge", "model": "harrier", "default": true, "live": 2},
+            {"space": "old", "model": "BAAI/bge-small-en-v1.5", "default": false, "live": 0},
+            {"space": "served", "model": "org/served", "default": false, "live": 1},
+        ]});
+        let c = removed_engine_space_check(Some(&body)).expect("a row");
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.contains("space old model BAAI/bge-small-en-v1.5") && !c.detail.contains("org/served"), "{}", c.detail);
+        assert_eq!(c.remedy.as_deref(), Some("noo cluster embedding-space migrate old <model>"));
+        let fine = json!({"spaces": [{"space": "knowledge", "model": "harrier", "default": true, "live": 0}]});
+        assert_eq!(removed_engine_space_check(Some(&fine)).expect("a row").verdict, Verdict::Ok);
+        assert!(removed_engine_space_check(None).is_none());
+        let own = crate::test_src::own_code(include_str!("cluster_verify.rs"));
+        assert!(own.contains("checks.extend(removed_engine_space_check(spaces.as_ref()));"), "the row is in the run");
     }
 
     /// The `vllm compute` row FAILs when a vLLM placement sits on a node below
