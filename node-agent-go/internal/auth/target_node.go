@@ -232,7 +232,7 @@ func TargetNode(cfg *config.Config) func(http.Handler) http.Handler {
 					slog.Warn("wrong_node", "path", r.URL.Path, "target", r.Header.Get(TargetNodeHeader), "detail", why)
 					noteWrongNode(r, why)
 				} else {
-					noteMisaddressed(callerName(r), r)
+					noteMisaddressed(callerName(r), r); next.ServeHTTP(w, r); return
 				}
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusMisdirectedRequest)
