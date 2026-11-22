@@ -762,7 +762,7 @@ release's `stunnel@sha256:…` lock row; that costs one vLLM reload.
 
 **What a node must hold.** Each door serves with a service leaf under
 `$NOO_PKI_DIR/services/<x>/service.{crt,key}` (`vllm`, `llamacpp`,
-`ollama`, `tei`, `reranker`) that **names the door** in its SANs
+`ollama`, `reranker`) that **names the door** in its SANs
 (`noo-vllm`, `noo-stunnel-<x>`; the controller's own service leaves carry
 these — `onboard/steps.rs svc_extra_hostnames`). The agent checks the
 leaf, the CA and the SAN **before touching the running container**: a
@@ -790,11 +790,11 @@ spec hash, so the binary roll itself is the trigger — once the leaf is
 there).
 
 **The retired switches.** `NOO_VLLM_TLS`, `NOO_LLAMACPP_TLS`,
-`NOO_OLLAMA_TLS`, `NOO_RERANKER_TLS` select nothing (`NOO_TEI_TLS` went with the TEI engine and is ignored).
+`NOO_OLLAMA_TLS`, `NOO_RERANKER_TLS` select nothing (`NOO_TEI_TLS` went with the TEI engine, removed in 0.6.30, and is ignored).
 `provision` renders them empty; a `false`/`0`/`no`/`off` value **refuses
 the agent's start**, naming the line, like `NOO_MTLS_NODES`.
 
-**Leftover TEI containers.** The TEI engine is removed from core. On its first
+**Leftover TEI containers.** The TEI engine was removed in 0.6.30. On its first
 reconcile pass after an upgrade the agent stops and removes the TEI containers
 an older agent made: `noo-tei`, `noo-tei-gpu`, their `noo-stunnel-tei` and
 `noo-stunnel-tei-gpu` doors, and a `noo-reranker` running the TEI image. It
@@ -804,6 +804,12 @@ else's is never touched. Each removal logs one line naming the replacement. A
 placement still in desired state is refused (`backend_start`, shown by `noo
 cluster show`) with `noo cluster place <node> ollama <model> --role embed` (an
 embedder) or `noo cluster place <node> reranker <file>.gguf` (a reranker).
+`noo cluster verify` shows the placement in its `unsupported engine` row. An
+embedding space whose model was a TEI model keeps serving searches over its
+existing vectors and refuses embed writes until a node serves it or
+`noo cluster embedding-space migrate` moves it. The controller no longer issues a
+`tei` service leaf; a node that still holds one is not refused for it for one
+release.
 
 **The one plaintext hop that stays.** A host-native Ollama — the
 operator's own process outside Docker (macOS Metal, or a Linux install the
@@ -1288,7 +1294,7 @@ Those leaves reach a node on the rail, the same as its node certificate:
 | `svc-<x>.key` | `$NOO_PKI_DIR/nodes/<node>/services/<x>/service.key` (0600, the CLI only) | `/etc/noo/pki/services/<x>/service.key` | 0600, root on Linux (read by root inside the door's container); on a Mac the `~/noomesh` tree belongs to the enrolling user, who runs the agent and Docker Desktop |
 
 `<x>` is one of `vllm` (doors `noo-vllm`, `noo-vllm-secondary`), `llamacpp`,
-`ollama`, `tei`, `reranker` (door `noo-stunnel-<x>`). The table is
+`ollama`, `reranker` (door `noo-stunnel-<x>`). The table is
 `noo-cli/src/commands/node_leaves.rs` `NODE_DOOR_LEAVES`;
 `tests/test_node_backend_leaves_on_the_rail.py` pins it against the
 applier's install loop and the agent's own door table.
@@ -1347,8 +1353,8 @@ DNS SANs and NotAfter (unix seconds):
 
 ```json
 "backend_leaves": {
-  "vllm": {"dns": ["vllm", "localhost", "noo-vllm", "noo-vllm-secondary"], "not_after": 1790000000},
-  "tei":  {"dns": ["tei", "localhost", "noo-stunnel-tei"], "not_after": 1790000000}
+  "vllm":     {"dns": ["vllm", "localhost", "noo-vllm", "noo-vllm-secondary"], "not_after": 1790000000},
+  "reranker": {"dns": ["reranker", "localhost", "noo-stunnel-reranker"], "not_after": 1790000000}
 }
 ```
 

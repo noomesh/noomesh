@@ -34,7 +34,7 @@ func retiredBackendRefusal(backend, node string) string {
 	if backend != retiredBackendEmbedding {
 		return ""
 	}
-	return "the TEI embedding engine is no longer supported; nothing was started. " +
+	return "the TEI embedding engine was removed in 0.6.30; nothing was started. " +
 		"Replace the placement: noo cluster place " + node + " ollama <model> --role embed " +
 		"(then `noo cluster unplace " + node + " embedding`)"
 }
@@ -43,7 +43,7 @@ func retiredBackendRefusal(backend, node string) string {
 // GGUF file is refused: the reranker is always llama.cpp now.
 func retiredRerankerRefusal(node, model string) string {
 	return "the reranker is llama.cpp and loads a GGUF file, not a HuggingFace repo id (" + model + "); " +
-		"the TEI reranker is no longer supported. Replace the placement: noo cluster place " +
+		"the TEI reranker was removed in 0.6.30. Replace the placement: noo cluster place " +
 		node + " reranker <file>.gguf"
 }
 
@@ -51,12 +51,12 @@ func retiredRerankerRefusal(node, model string) string {
 func retiredTEIRemovalLine(rc dockerpkg.RetiredTEI, node string) string {
 	switch {
 	case rc.Reranker:
-		return "removed " + rc.Name + ": it ran the TEI engine, which is no longer supported; replace the placement: " +
+		return "removed " + rc.Name + ": it ran the TEI engine, which was removed in 0.6.30; replace the placement: " +
 			"noo cluster place " + node + " reranker <file>.gguf"
 	case rc.Name == "noo-stunnel-tei" || rc.Name == "noo-stunnel-tei-gpu":
-		return "removed " + rc.Name + ": the door of the TEI engine, which is no longer supported"
+		return "removed " + rc.Name + ": the door of the TEI engine, which was removed in 0.6.30"
 	}
-	return "removed " + rc.Name + ": the TEI engine is no longer supported; replace the placement: " +
+	return "removed " + rc.Name + ": the TEI engine was removed in 0.6.30; replace the placement: " +
 		"noo cluster place " + node + " ollama <model> --role embed"
 }
 

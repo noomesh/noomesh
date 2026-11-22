@@ -71,10 +71,11 @@ as much as on a worker.
 | `noo stack start --profile <p>` | one-off | an extra compose profile on top of the base: `vllm-secondary`, `ollama`, `llamacpp`, `gpu-tier2`, `monitoring` are additive; any other name *replaces* the base profile |
 
 How the add-ons are licensed and switched on is
-[getting-started/add-ons.md](../getting-started/add-ons.md). `tei-compose`
-(HuggingFace TEI embedders and reranker) and `sensors` (a second, tier-5
-node-agent container) exist in the compose file but no launcher flag
-selects them; embeddings resolve through Ollama or a node-agent by default.
+[getting-started/add-ons.md](../getting-started/add-ons.md). `sensors` (a second, tier-5
+node-agent container) exists in the compose file but no launcher flag
+selects it. Embeddings resolve through Ollama or a node-agent, and the
+reranker is the llama.cpp GGUF reranker (the TEI embedders and reranker
+profile was removed in 0.6.30).
 
 ### Where configuration lives
 

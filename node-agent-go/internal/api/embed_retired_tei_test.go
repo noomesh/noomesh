@@ -18,7 +18,7 @@ import (
 
 // The TEI engine is gone from core (0.6.30). /embed no longer falls back to
 // its dialect for an engine it has no dialect for: it says which engine, that
-// TEI is no longer supported, and what to place instead.
+// TEI was removed in 0.6.30, and what to place instead.
 
 // embedDockerWithContainer is a docker daemon that lists one container, so
 // the /embed guard sees an embedder container.
@@ -73,7 +73,7 @@ func TestEmbedForTheRemovedTEIBackendIsAClearError(t *testing.T) {
 		t.Errorf("no error code: %s", w.Body.String())
 	}
 	msg := errMessage(t, w.Body.String())
-	for _, want := range []string{`"embedding"`, "TEI", "no longer supported", "noo cluster place node-a ollama <model> --role embed"} {
+	for _, want := range []string{`"embedding"`, "TEI", "was removed in 0.6.30", "noo cluster place node-a ollama <model> --role embed"} {
 		if !strings.Contains(msg, want) {
 			t.Errorf("message lacks %q: %s", want, msg)
 		}

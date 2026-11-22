@@ -58,7 +58,7 @@ func TestAnEmbeddingPlacementIsRefusedWithTheReplacementAndStartsNothing(t *test
 		t.Fatalf("%d start(s) attempted for the removed TEI backend", starts)
 	}
 	got := embeddingRefusal()
-	for _, want := range []string{"TEI embedding engine is no longer supported", "nothing was started",
+	for _, want := range []string{"TEI embedding engine was removed in 0.6.30", "nothing was started",
 		"noo cluster place node-a ollama <model> --role embed"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("refusal %q lacks %q", got, want)
@@ -118,7 +118,7 @@ func TestARerankerWithARepoIDIsRefusedWithTheGGUFReplacement(t *testing.T) {
 			got = ref.Reason
 		}
 	}
-	for _, want := range []string{"TEI reranker is no longer supported", "noo cluster place node-a reranker <file>.gguf", "BAAI/bge-reranker-base"} {
+	for _, want := range []string{"TEI reranker was removed in 0.6.30", "noo cluster place node-a reranker <file>.gguf", "BAAI/bge-reranker-base"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("refusal %q lacks %q", got, want)
 		}
@@ -301,8 +301,8 @@ func TestRetiredTEIRemovalLines(t *testing.T) {
 		rc   dockerpkg.RetiredTEI
 		want []string
 	}{
-		{dockerpkg.RetiredTEI{Name: "noo-tei"}, []string{"removed noo-tei: the TEI engine is no longer supported; replace the placement:", "noo cluster place node-a ollama <model> --role embed"}},
-		{dockerpkg.RetiredTEI{Name: "noo-stunnel-tei"}, []string{"removed noo-stunnel-tei: the door of the TEI engine, which is no longer supported"}},
+		{dockerpkg.RetiredTEI{Name: "noo-tei"}, []string{"removed noo-tei: the TEI engine was removed in 0.6.30; replace the placement:", "noo cluster place node-a ollama <model> --role embed"}},
+		{dockerpkg.RetiredTEI{Name: "noo-stunnel-tei"}, []string{"removed noo-stunnel-tei: the door of the TEI engine, which was removed in 0.6.30"}},
 		{dockerpkg.RetiredTEI{Name: "noo-reranker", Reranker: true}, []string{"removed noo-reranker: it ran the TEI engine", "noo cluster place node-a reranker <file>.gguf"}},
 	} {
 		line := retiredTEIRemovalLine(tc.rc, "node-a")
