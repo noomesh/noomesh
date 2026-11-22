@@ -2703,7 +2703,7 @@ pub(crate) fn seat_checks(seat: &Value, controller_cli: &str, controller_tag: &s
             "the seat could not read kiosk.service, so whether it waits on the boot splash is unknown".into(), repair()));
     } else if unit_word.is_none() && dedicated {
         out.push(check("kiosk unit", Verdict::Ok,
-            "not reported: the seat's noo predates 0.6.30, so whether its unit waits on the boot splash is not known here".into(), None));
+            "not reported: this seat's noo does not report its kiosk unit yet, so whether its unit waits on the boot splash is not known here".into(), None));
     }
     // Where the display execs its scripts from (a 0.6.11+ seat reports it).
     match hb["kiosk_bins"].as_str() {
