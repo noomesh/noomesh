@@ -74,6 +74,13 @@ Each one has a followup that removes the need for the step.
   the disk holding its data is 90% full, with the same error it gives when
   shutting down. Free space on that disk; Loki resumes by itself within
   about 10 seconds (it checks the disk that often). (i1145.)
+- **A backend's log looks empty, or ends at the moment of the stop, after
+  an unclean stop** (a power cut, or the machine or VM killed): Docker can
+  stop reading a container's log at the point where the stop cut it off,
+  without an error, so a long tail shows only older lines and a `since`
+  shows nothing. The newest lines are still there: `noo cluster logs <node>
+  <backend>` with its default tail, or the logs in the console/Loki. It
+  clears when that log rotates or the container is recreated. (i1225.)
 - **A node came back on a new local address** (no tailnet): the
   `node_unreachable` alert, or verify's `agent certificate` row, says its
   certificate does not cover the address it now reports. Run
