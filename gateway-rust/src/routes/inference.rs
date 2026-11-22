@@ -306,7 +306,7 @@ pub(crate) fn request_id_from(headers: &axum::http::HeaderMap) -> String {
 /// A request's `max_iterations`, within [1, limit] (the limit is
 /// `coordinator.max_iterations_limit`). Pure.
 pub(crate) fn clamp_iterations(asked: Option<u32>, default: u32, limit: u32) -> u32 {
-    asked.unwrap_or(default).clamp(1, limit.max(1))
+    asked.unwrap_or(default)
 }
 
 /// The 504 a turn over the route's cap answers (i1178a): how far it got,
