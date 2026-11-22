@@ -1845,7 +1845,7 @@ pub(crate) fn vllm_compute_check(n: &Value) -> Option<Check> {
 }
 
 /// The placements of a node's desired config that use the TEI engine, which
-/// 0.6.30 removes (i1182a): every `embedding` placement, and every `reranker`
+/// 0.6.30 no longer supports (i1182a): every `embedding` placement, and every `reranker`
 /// whose model is not a `.gguf` file or whose image is the TEI one. Each is
 /// `{"backend", "model"}`. The same rule as the gateway's refusal.
 pub(crate) fn removed_engine_placements(placements: &Value) -> Vec<Value> {
@@ -1868,18 +1868,18 @@ pub(crate) fn removed_engine_placements(placements: &Value) -> Vec<Value> {
         .unwrap_or_default()
 }
 
-/// The `removed engine` row: the node's desired state holds a placement that
+/// The `unsupported engine` row: the node's desired state holds a placement that
 /// uses the TEI engine (`removed_engine_placements`, injected by
 /// `with_harness_wanted` from desired-config). WARN for each, naming the
 /// replacement (an Ollama embedder, or the GGUF reranker) and the unplace of
 /// the old one; OK when none. No row when desired-config could not be read:
 /// "none" would then be a guess.
 pub(crate) fn removed_engine_check(n: &Value) -> Option<Check> {
-    const NAME: &str = "removed engine";
+    const NAME: &str = "unsupported engine";
     let id = n["id"].as_str().unwrap_or("?");
     let found = n["removed_engine_placements"].as_array()?;
     if found.is_empty() {
-        return Some(ok(NAME, "no placement uses a removed engine"));
+        return Some(ok(NAME, "no placement uses an unsupported engine"));
     }
     let mut lines: Vec<String> = Vec::new();
     let mut remedies: Vec<String> = Vec::new();
@@ -1892,14 +1892,15 @@ pub(crate) fn removed_engine_check(n: &Value) -> Option<Check> {
             format!("noo cluster place {id} reranker <file>.gguf")
         };
         let who = if model.is_empty() { format!("{id} {backend}") } else { format!("{id} {backend} {model}") };
-        lines.push(format!("{who}: uses the TEI engine, which 0.6.30 removes; replace with: `{replace}`"));
+        // PR 5 of the TEI removal changes "no longer supported" to "removed" once the code is gone (i1182a).
+        lines.push(format!("{who}: uses the TEI engine, which is no longer supported; this placement keeps running until it is replaced or unplaced: {replace} && `noo cluster unplace {id} {backend}`"));
         remedies.push(format!("{replace} && noo cluster unplace {id} {backend}"));
     }
     remedies.dedup();
     Some(warn(NAME, lines.join("; "), Some(remedies.join("; "))))
 }
 
-/// The `removed engine space` row: an embedding space whose model no node
+/// The `unsupported engine space` row: an embedding space whose model no node
 /// serves and that names a Hugging Face repo id (`org/name`), the shape a
 /// TEI-served model has and an Ollama tag does not. Searches over its existing
 /// vectors still work; embed writes are refused until a node serves the model
@@ -1908,7 +1909,7 @@ pub(crate) fn removed_engine_check(n: &Value) -> Option<Check> {
 /// is already the `embedding spaces` row's WARN. This is a heuristic on the
 /// recorded model name: the gateway does not record which engine served it.
 pub(crate) fn removed_engine_space_check(body: Option<&Value>) -> Option<Check> {
-    const NAME: &str = "removed engine space";
+    const NAME: &str = "unsupported engine space";
     let spaces = body?["spaces"].as_array()?;
     let stale: Vec<(&str, &str)> = spaces
         .iter()
@@ -1917,11 +1918,12 @@ pub(crate) fn removed_engine_space_check(body: Option<&Value>) -> Option<Check> 
         .filter(|(_, m)| m.contains('/') && !m.starts_with("hf.co/"))
         .collect();
     if stale.is_empty() {
-        return Some(ok(NAME, "no embedding space is bound to a model only the removed engine served"));
+        return Some(ok(NAME, "no embedding space is bound to a model only an unsupported engine served"));
     }
     let detail = stale
         .iter()
-        .map(|(sp, m)| format!("space {sp} model {m}: no node serves it and it looks like a TEI-served Hugging Face model (0.6.30 removes that engine); embed writes are refused until it is migrated"))
+        // PR 5 of the TEI removal changes "no longer supported" to "removed" once the code is gone (i1182a).
+        .map(|(sp, m)| format!("space {sp} model {m}: was served by an engine that is no longer supported (TEI) and no node serves it; embed writes are refused until it is migrated: `noo cluster embedding-space migrate {sp} <model>`"))
         .collect::<Vec<_>>()
         .join("; ");
     let remedy = stale
@@ -2806,7 +2808,7 @@ fn with_harness_wanted(g: &Globals, n: &Value) -> Value {
     // The `vllm compute` row: the vLLM placements, judged against the node's
     // gpu_compute_cap.
     let vllm_placed = desired.as_ref().map(|d| vllm_placements(&d["placements"])).unwrap_or_default();
-    // The `removed engine` row: placements on the TEI engine (i1182a).
+    // The `unsupported engine` row: placements on the TEI engine (i1182a).
     let removed_engines = desired.as_ref().map(|d| removed_engine_placements(&d["placements"]));
     // Control over the bus: a node that advertises it gets one health round
     // trip over NATS, run by the gateway (the only principal that may send).
@@ -14207,11 +14209,11 @@ mod tests {
         assert!(own.contains("out.extend(gpu_target_cpu_build_check(n));"), "the row is in the run");
     }
 
-    /// i1182a: the `removed engine` row WARNs for every `embedding` placement
+    /// i1182a: the `unsupported engine` row WARNs for every `embedding` placement
     /// and every non-GGUF or TEI-image reranker, naming the replacement; a
     /// GGUF reranker and an empty desired state are OK.
     #[test]
-    fn removed_engine_row_warns_on_a_tei_placement_and_is_ok_otherwise() {
+    fn unsupported_engine_row_warns_on_a_tei_placement_and_is_ok_otherwise() {
         use serde_json::json;
         let found = removed_engine_placements(&json!([
             {"backend": "embedding", "model": "BAAI/bge-small-en-v1.5", "desired_state": "running"},
@@ -14224,15 +14226,15 @@ mod tests {
         let n = json!({"id": "node-a", "removed_engine_placements": found});
         let c = removed_engine_check(&n).expect("a row");
         assert_eq!(c.verdict, Verdict::Warn);
-        assert!(c.detail.contains("node-a embedding BAAI/bge-small-en-v1.5: uses the TEI engine, which 0.6.30 removes; replace with: `noo cluster place node-a ollama <model> --role embed`"), "{}", c.detail);
-        assert!(c.detail.contains("`noo cluster place node-a reranker <file>.gguf`"), "{}", c.detail);
+        assert!(c.detail.contains("node-a embedding BAAI/bge-small-en-v1.5: uses the TEI engine, which is no longer supported; this placement keeps running until it is replaced or unplaced: noo cluster place node-a ollama <model> --role embed && `noo cluster unplace node-a embedding`"), "{}", c.detail);
+        assert!(c.detail.contains("noo cluster place node-a reranker <file>.gguf"), "{}", c.detail);
         assert!(c.remedy.as_deref().unwrap().contains("noo cluster unplace node-a embedding"), "{:?}", c.remedy);
         assert!(c.remedy.as_deref().unwrap().contains("noo cluster unplace node-a reranker"), "{:?}", c.remedy);
 
         let gguf = removed_engine_placements(&json!([{"backend": "reranker", "model": "bge-reranker-v2-m3-Q8_0.gguf"}]));
         let c = removed_engine_check(&json!({"id": "node-a", "removed_engine_placements": gguf})).expect("a row");
         assert_eq!(c.verdict, Verdict::Ok);
-        assert_eq!(c.detail, "no placement uses a removed engine");
+        assert_eq!(c.detail, "no placement uses an unsupported engine");
         let c = removed_engine_check(&json!({"id": "node-a", "removed_engine_placements": []})).expect("a row");
         assert_eq!(c.verdict, Verdict::Ok);
         assert!(removed_engine_check(&json!({"id": "node-a"})).is_none(), "desired-config unread: no guess");
@@ -14246,7 +14248,7 @@ mod tests {
     /// naming `embedding-space migrate`; a served space, an Ollama tag and an
     /// unread list do not.
     #[test]
-    fn removed_engine_space_row_names_the_migrate_command() {
+    fn unsupported_engine_space_row_names_the_migrate_command() {
         use serde_json::json;
         let body = json!({"spaces": [
             {"space": "knowledge", "model": "harrier", "default": true, "live": 2},

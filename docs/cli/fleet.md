@@ -153,16 +153,17 @@ With no `--on`, a placement keeps the target it already has; otherwise
 `N_GPU_LAYERS=0` means cpu, and a node with a GPU defaults to gpu. `--on
 gpu` on a node that reports no GPU is refused.
 
-**The TEI engine is removed (0.6.30).** A new `embedding` placement is
-refused: place an Ollama embedder instead, `noo cluster place <node> ollama
-<model> --role embed`. The model is an embedding-space decision, so it is not
-mapped for you. A `reranker` placement whose model is a Hugging Face id (not a
-`.gguf` file), or that names the TEI image, is refused too: place a GGUF
-cross-encoder, `noo cluster place <node> reranker <file>.gguf` (for example
+**The TEI engine is no longer supported (0.6.30).** New placements of it are
+refused from 0.6.30: a new `embedding` placement is refused, so place an
+Ollama embedder instead, `noo cluster place <node> ollama <model> --role
+embed`. The model is an embedding-space decision, so it is not mapped for you.
+A `reranker` placement whose model is a Hugging Face id (not a `.gguf` file),
+or that names the TEI image, is refused too: place a GGUF cross-encoder,
+`noo cluster place <node> reranker <file>.gguf` (for example
 `bge-reranker-v2-m3-Q8_0.gguf`, shipped with `noo cluster sync-model-files
 <node> -m <file>`). A `.gguf` reranker is unchanged. A placement made before
-this stays as it is; `noo cluster verify` shows it in the `removed engine`
-row, with the command that replaces it.
+this keeps running until it is replaced or unplaced; `noo cluster verify`
+shows it in the `unsupported engine` row, with the command that replaces it.
 
 TEI takes its GPU image only on a usable NVIDIA runtime: an NVIDIA GPU the
 agent sees and the `nvidia` runtime registered with docker (a `/dev/dxg`
