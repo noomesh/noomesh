@@ -721,7 +721,7 @@ func checkFilesystems(r Roots) []fsFinding {
 		// Cannot tell which filesystem holds it: not checked, never refused
 		// (a failed read is not evidence of a different disk).
 		if err != nil {
-			noteNotChecked(p, fmt.Sprintf("cannot tell which filesystem holds %s: %v", p, err))
+			out = append(out, fsFinding{p, Problem{Code: "not_on_recorded_fs", Detail: fmt.Sprintf("cannot tell which filesystem holds %s: %v", p, err)}})
 			continue
 		}
 		onRootFS := rootDev != "" && now.Dev == rootDev
