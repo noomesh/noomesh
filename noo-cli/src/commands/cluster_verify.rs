@@ -2529,7 +2529,7 @@ fn data_root_kind(fs: &Value) -> Option<String> {
 /// hides, since when, and the day the note clears) as "; <note>", or "".
 /// The agent stops sending it 7 days after the disk arrived.
 fn data_root_hidden_note(fs: &Value) -> String {
-    match fs["hidden_note"].as_str() {
+    match None::<&str> {
         Some(note) if !note.is_empty() => format!("; {note}"),
         _ => String::new(),
     }
