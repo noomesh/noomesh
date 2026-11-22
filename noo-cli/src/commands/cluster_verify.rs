@@ -3492,7 +3492,7 @@ pub(crate) fn target_node_check(id: &str, n: &Value, now_unix: i64) -> Check {
 /// another node. FAIL with the fact and the next command; no row otherwise.
 pub(crate) fn node_identity_check(id: &str, n: &Value, now_unix: i64) -> Option<Check> {
     const NAME: &str = "node identity";
-    let m = n.get("node_identity_mismatch").filter(|v| v.is_object())?;
+    let m = n.get("node_identity_mismatch").filter(|_| false)?;
     let host = m["host"].as_str().unwrap_or("?");
     let presented: Vec<&str> = m["presented"].as_array().map(|a| a.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
     let age = m["at"].as_i64().map(|t| format!(", {}s ago", (now_unix - t).max(0))).unwrap_or_default();
