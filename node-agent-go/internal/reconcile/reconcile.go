@@ -32,6 +32,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"github.com/noomesh/noomesh/node-agent-go/internal/addonwl"
+	"github.com/noomesh/noomesh/node-agent-go/internal/ctrlreach"
 	"github.com/noomesh/noomesh/node-agent-go/internal/diskreclaim"
 	"io"
 	"log/slog"
@@ -574,9 +575,19 @@ func (r *Reconciler) Once(ctx context.Context) {
 func (r *Reconciler) fetchDesired(ctx context.Context, t *tick) bool {
 	desired, err := r.fetch(ctx)
 	if err != nil {
+		// No controller, no pass: nothing is started, stopped or changed
+		// until it answers. Said ONCE per outage (ctrlreach, shared with the
+		// heartbeat); each tick's failure at debug. An answer that is an
+		// error is not an outage and keeps its WARN.
+		if ctrlreach.Unreachable(err) {
+			ctrlreach.Failed("reconcile", r.cfg.ControllerURL, err, time.Now())
+			slog.Debug("reconcile.fetch_failed", "error", err)
+			return false
+		}
 		slog.Warn("reconcile.fetch_failed", "error", err)
 		return false
 	}
+	ctrlreach.Answered("reconcile", time.Now())
 	t.desired = desired
 	return true
 }

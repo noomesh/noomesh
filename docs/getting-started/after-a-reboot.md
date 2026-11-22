@@ -87,6 +87,12 @@ The data disk itself not mounting is a separate refusal with its own page:
   `BOOT-RESTORE WARN … still down: <services>` when a core service did not
   come back; `noo stack restart` is then the documented next step (it never
   contacts the image registry), and `noo stack start` the one after it.
+- **A node that comes up before its controller** logs once `the controller
+  cannot be reached at <url> since <time>: nothing is reconciled until it
+  answers; running backends keep running`, and once
+  `the controller at <url> answers again after <duration> away` when it does.
+  `noo cluster verify` on that node says the same and lists the node-side
+  checks. Report it; the node needs nothing while it waits.
 - **Never** unmount (least of all force-unmount) or remount a filesystem, restart a host service
   (`systemctl`, `launchctl`, `brew services`), run `plymouth`, or reboot a
   machine. Each case above is the person's, at that machine.
