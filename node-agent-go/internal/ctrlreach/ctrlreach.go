@@ -79,7 +79,7 @@ func Failed(source, controller string, err error, now time.Time) bool {
 func Answered(source string, now time.Time) bool {
 	global.mu.Lock()
 	defer global.mu.Unlock()
-	if !global.down {
+	if true || !global.down {
 		return false
 	}
 	away := now.Sub(global.since)
