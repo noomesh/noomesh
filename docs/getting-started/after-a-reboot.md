@@ -11,9 +11,9 @@ does not come back on its own yet. Done when `noo cluster verify` exits 0.
 | Machine | What restarts on its own |
 |---|---|
 | **The controller** | Docker restarts the stack's containers. Then `noo-hostd` runs a boot restore once: it rewrites the secret files (they live in memory and a reboot empties them), starts the containers that need them and any stopped core service, and retries for about two minutes while Docker is still starting. Where `noo-hostd` is a user service, it runs at boot only if that user has linger on (see below). |
-| **A Linux node** | Docker restarts the backends that were running, and the node agent starts at boot and reconnects. If the controller is not up yet, the backends keep serving; the agent logs once `the controller cannot be reached at <url> since <time>: nothing is reconciled until it answers; running backends keep running`, starts nothing new, and logs once more when the controller answers. A backend someone stopped stays stopped until then. |
+| **A Linux node** | Docker restarts the backends that were running, and the node agent starts at boot and reconnects. If the controller is not up yet, the backends keep serving; the agent logs once `the controller cannot be reached at <url> since <time>: nothing is reconciled until it answers; running backends keep running`, starts nothing new, and logs once more when the controller answers. A backend someone stopped stays stopped across the reboot; once the controller answers, the node starts it again if the cluster still places it there. |
 | **A Mac node** | Its node agent starts at boot. Its Ollama does not, yet: see below. |
-| **A kiosk seat** | Its display starts at boot, except a dedicated seat on a machine with a desktop installed: see below. |
+| **A kiosk seat** | Its display starts at boot, except, before 0.6.30, a dedicated seat on a machine with a desktop installed: see below. |
 
 Give it a few minutes, then:
 
@@ -24,7 +24,8 @@ noo cluster verify --wait
 It waits for the gateway and for rows that are still starting, then lists
 what is not right, each row with the command that fixes it. Exit 0 means
 everything came back. A node that reads "not reported yet" right after a
-restart is timing, not a fault: run it again after a minute (i1150).
+restart is timing, not a fault, and some rows, such as `ollama models`, may
+be missing for the first minute: run it again after a minute (i1150).
 
 ### Known cases that do not come back on their own yet
 
@@ -49,8 +50,8 @@ Each one has a followup that removes the need for the step.
     `loginctl show-user <user> -p Linger` says `Linger=yes`.
 
   Turn it on with `sudo loginctl enable-linger <user>`, then `noo stack restart`
-  for this boot (`noo stack start` if that does not bring it back). (i1160, #1507: 0.6.30's onboard turns it on, and verify gets
-  a `hostd at boot` row.)
+  for this boot (`noo stack start` if that does not bring it back). (i1160: once #1507 lands, onboard turns it on and verify
+  gets a `hostd at boot` row.)
 - **A dedicated kiosk seat on a machine that also has a desktop installed
   stays black** (0.6.29 and earlier). Its display waits behind the boot
   splash, which nothing tells to quit. At the seat: `sudo plymouth quit`; the
@@ -68,8 +69,8 @@ Each one has a followup that removes the need for the step.
 - **Logs stopped arriving and the gateway says `loki_down` while Loki is
   running** (only with monitoring turned on): Loki refuses every write once
   the disk holding its data is 90% full, with the same error it gives when
-  shutting down. Free space on that disk; Loki checks every ten seconds and
-  resumes by itself. (i1145.)
+  shutting down. Free space on that disk; Loki resumes by itself within
+  about 10 seconds (it checks the disk that often). (i1145.)
 - **A node came back on a new local address** (no tailnet): the
   `node_unreachable` alert, or verify's `agent certificate` row, says its
   certificate does not cover the address it now reports. Run
@@ -119,9 +120,10 @@ returns:
 
 - **A PC or server:** in its firmware (BIOS/UEFI) setup, set "restore on AC
   power loss" (the name varies) to on or to the last state.
-- **A Mac:** `sudo pmset autorestart 1`. With FileVault on, a Mac that
-  restarts stops at the unlock screen until someone types the password, so
-  it comes back only after that.
+- **A desktop Mac (mini, Studio, iMac):** `sudo pmset autorestart 1`;
+  laptops may ignore it. With FileVault on, a Mac that restarts stops at the
+  unlock screen until someone types the password, and nothing runs until
+  then, the node agent included.
 
 ## For agents
 
