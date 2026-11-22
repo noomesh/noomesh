@@ -2532,7 +2532,7 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
         &[
             ("Known facts about the user", temporal_ctx.as_deref()),
             (super::context::CLUSTER_FRAME_LABEL, Some(cluster_ctx.as_str())),
-            ("Knowledge base", rag_ctx.as_deref()),
+            (super::context::KB_FRAME_LABEL, rag_ctx.as_deref()),
             ("Memory", mem_ctx.as_deref()),
             ("Other channels", channel_ctx.as_deref()),
             ("Video recall", video_ctx.as_deref()),
@@ -2541,6 +2541,10 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
             ("Companion devices", companion_ctx.as_deref()),
         ],
     );
+    // The persona was built before the layers were fetched: when THIS turn's
+    // frame carries the knowledge base, tell the model it is already shown
+    // instead of "call noo_rag_query FIRST" (i1178a, half a).
+    super::context::mark_kb_shown(&mut session.messages, data_frame.as_deref(), rag_ctx.as_deref());
     super::context::place_clock(&mut session.messages, chrono::Utc::now());
     if let Some(f) = data_frame.as_deref() {
         record_layer_chars(rt.metrics(), "retrieved_data_frame", f).await;
@@ -2596,6 +2600,9 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
     // here; helper detects same-nudge-3x to escalate instead of looping
     // forever on a model that can't recover.
     let mut nudge_history: Vec<&'static str> = Vec::new();
+    // What this turn's retrieval tools returned (bounded), for the
+    // "answer ignored the retrieved material" stall rule (`retrieval_use`).
+    let mut retrieved_text = String::new();
 
     // The person's message is saved now, not after the loop: a turn that
     // ends badly (the deadline, a rail token that ran out) must not lose it.
@@ -3090,8 +3097,19 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
             // that landed in Drive as literal XML on 2026-05-21.
             let malformed_tool_call = !length_truncated
                 && looks_like_malformed_tool_call(trimmed);
+            // A post-tool answer that uses none of a relevant retrieval
+            // result nudges ONCE per turn (rule: `retrieval_use`, i1178a).
+            let unused_retrieval = !length_truncated
+                && !trivial_after_tool
+                && !malformed_tool_call
+                && super::retrieval_use::ignores_retrieval(
+                    &selection,
+                    &retrieved_text,
+                    trimmed,
+                    !nudge_history.is_empty(),
+                );
             let stalled_empty = !length_truncated
-                && (trimmed.is_empty() || trivial_after_tool || malformed_tool_call);
+                && (trimmed.is_empty() || trivial_after_tool || malformed_tool_call || unused_retrieval);
 
             if length_truncated && iteration < max_iterations {
                 tracing::info!(
@@ -3124,6 +3142,7 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
                     iteration,
                     had_reasoning,
                     reasoning_chars = full_reasoning.chars().count(),
+                    unused_retrieval,
                     "loop.stall_detected_empty_response"
                 );
                 let _ = writer.send_event("metadata", json!({
@@ -3144,6 +3163,8 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
                      via the structured tool_calls field, or write the final answer in plain text."
                 } else if trivial_after_tool {
                     SHORT_SYNTHESIS_NUDGE
+                } else if unused_retrieval {
+                    super::retrieval_use::RETRIEVAL_UNUSED_NUDGE
                 } else if had_reasoning {
                     "Your previous message had no user-visible content — only `<think>` reasoning. \
                      Every tool result you asked for is already in this conversation; nothing is \
@@ -3324,6 +3345,10 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
             if call.name == "noo_tool_search" && tool_result.success {
                 let all_schemas = rt.tool_schemas().await;
                 expand_tools_from_search(&mut tool_schemas, &all_schemas, &tool_result.output);
+            }
+
+            if tool_result.success && !repeated && super::retrieval_use::is_retrieval_tool(&call.name) {
+                super::retrieval_use::note_retrieval(&mut retrieved_text, &tool_result.output);
             }
 
             let sanitized_output = sanitize_tool_output(&tool_result.output);
@@ -3785,7 +3810,7 @@ async fn run_inner_bound<R: HarnessRuntime>(
         &[
             ("Known facts about the user", temporal_ctx.as_deref()),
             (super::context::CLUSTER_FRAME_LABEL, Some(cluster_ctx.as_str())),
-            ("Knowledge base", rag_ctx.as_deref()),
+            (super::context::KB_FRAME_LABEL, rag_ctx.as_deref()),
             ("Memory", mem_ctx.as_deref()),
             ("Other channels", channel_ctx.as_deref()),
             ("Video recall", video_ctx.as_deref()),
@@ -3794,6 +3819,10 @@ async fn run_inner_bound<R: HarnessRuntime>(
             ("Companion devices", companion_ctx.as_deref()),
         ],
     );
+    // The persona was built before the layers were fetched: when THIS turn's
+    // frame carries the knowledge base, tell the model it is already shown
+    // instead of "call noo_rag_query FIRST" (i1178a, half a).
+    super::context::mark_kb_shown(&mut session.messages, data_frame.as_deref(), rag_ctx.as_deref());
     super::context::place_clock(&mut session.messages, chrono::Utc::now());
     if let Some(f) = data_frame.as_deref() {
         record_layer_chars(rt.metrics(), "retrieved_data_frame", f).await;
@@ -3839,6 +3868,9 @@ async fn run_inner_bound<R: HarnessRuntime>(
 
     // Ralph-loop nudge history (see streaming-loop counterpart).
     let mut nudge_history: Vec<&'static str> = Vec::new();
+    // What this turn's retrieval tools returned (bounded), for the
+    // "answer ignored the retrieved material" stall rule (`retrieval_use`).
+    let mut retrieved_text = String::new();
 
     // An LLM transport failure that aborts the loop. Held rather than
     // returned immediately: an earlier iteration may already have produced
@@ -4058,8 +4090,18 @@ async fn run_inner_bound<R: HarnessRuntime>(
                 && trimmed_len < POST_TOOL_MIN_SYNTHESIS_CHARS
                 && !nudge_history.contains(&SHORT_SYNTHESIS_NUDGE);
             let malformed_tool_call = looks_like_malformed_tool_call(trimmed);
+            // A post-tool answer that uses none of a relevant retrieval
+            // result nudges ONCE per turn (rule: `retrieval_use`, i1178a).
+            let unused_retrieval = !trivial_after_tool
+                && !malformed_tool_call
+                && super::retrieval_use::ignores_retrieval(
+                    &selection,
+                    &retrieved_text,
+                    trimmed,
+                    !nudge_history.is_empty(),
+                );
 
-            if (trimmed.is_empty() || trivial_after_tool || malformed_tool_call)
+            if (trimmed.is_empty() || trivial_after_tool || malformed_tool_call || unused_retrieval)
                 && iteration < max_iterations
             {
                 tracing::warn!(
@@ -4068,6 +4110,7 @@ async fn run_inner_bound<R: HarnessRuntime>(
                     raw_chars = content.chars().count(),
                     had_prior_tool_result,
                     malformed_tool_call,
+                    unused_retrieval,
                     "loop.stall_detected_empty_response (non-streaming)"
                 );
                 // Short structural nudge — see streaming path comment.
@@ -4077,6 +4120,8 @@ async fn run_inner_bound<R: HarnessRuntime>(
                      via the structured tool_calls field, or write the final answer in plain text."
                 } else if trivial_after_tool {
                     SHORT_SYNTHESIS_NUDGE
+                } else if unused_retrieval {
+                    super::retrieval_use::RETRIEVAL_UNUSED_NUDGE
                 } else {
                     "Your previous message had no user-visible content — only `<think>` reasoning. \
                      Every tool result you asked for is already in this conversation; nothing is \
@@ -4228,6 +4273,10 @@ async fn run_inner_bound<R: HarnessRuntime>(
             if call.name == "noo_tool_search" && tool_result.success {
                 let all_schemas = rt.tool_schemas().await;
                 expand_tools_from_search(&mut tool_schemas, &all_schemas, &tool_result.output);
+            }
+
+            if tool_result.success && !repeated && super::retrieval_use::is_retrieval_tool(&call.name) {
+                super::retrieval_use::note_retrieval(&mut retrieved_text, &tool_result.output);
             }
 
             let sanitized_output = sanitize_tool_output(&tool_result.output);
