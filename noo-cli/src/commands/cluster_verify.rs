@@ -1672,7 +1672,7 @@ pub(crate) fn docker_engine_upgrade_remedy(id: &str, kind: &str) -> String {
     if kind == "docker-desktop" {
         return format!("update Docker Desktop on {id} until its engine is {min} or newer, then: noo cluster verify {id}");
     }
-    format!("upgrade Docker Engine on {id} to {min} or newer: from Docker's apt repository, sudo apt-get update && sudo apt-get install --only-upgrade docker-ce docker-ce-cli containerd.io docker-compose-plugin; or Docker's convenience script, downloaded then run (never piped): curl -fsSL --proto '=https' --tlsv1.2 https://get.docker.com -o get-docker.sh && sudo sh get-docker.sh (https://docs.docker.com/engine/install/); then: noo cluster verify {id}")
+    format!("upgrade Docker Engine on {id} to {min} or newer with the package manager, from the package that installed it: Docker's apt repository, sudo apt-get update && sudo apt-get install --only-upgrade docker-ce docker-ce-cli containerd.io docker-compose-plugin; or the distribution's own package, sudo apt-get update && sudo apt-get install --only-upgrade docker.io (only if the release ships {min} or newer); otherwise Docker's convenience script, downloaded then run (never piped): curl -fsSL --proto '=https' --tlsv1.2 https://get.docker.com -o get-docker.sh && sudo sh get-docker.sh (https://docs.docker.com/engine/install/); then: noo cluster verify {id}")
 }
 
 /// The oldest Docker Compose noomesh supports: 2.33.0, the Compose that Docker
@@ -18798,7 +18798,7 @@ mod docker_engine_tests {
         );
         assert_eq!(
             c.remedy.as_deref(),
-            Some("upgrade Docker Engine on node_a to 28 or newer: from Docker's apt repository, sudo apt-get update && sudo apt-get install --only-upgrade docker-ce docker-ce-cli containerd.io docker-compose-plugin; or Docker's convenience script, downloaded then run (never piped): curl -fsSL --proto '=https' --tlsv1.2 https://get.docker.com -o get-docker.sh && sudo sh get-docker.sh (https://docs.docker.com/engine/install/); then: noo cluster verify node_a")
+            Some("upgrade Docker Engine on node_a to 28 or newer with the package manager, from the package that installed it: Docker's apt repository, sudo apt-get update && sudo apt-get install --only-upgrade docker-ce docker-ce-cli containerd.io docker-compose-plugin; or the distribution's own package, sudo apt-get update && sudo apt-get install --only-upgrade docker.io (only if the release ships 28 or newer); otherwise Docker's convenience script, downloaded then run (never piped): curl -fsSL --proto '=https' --tlsv1.2 https://get.docker.com -o get-docker.sh && sudo sh get-docker.sh (https://docs.docker.com/engine/install/); then: noo cluster verify node_a")
         );
         let d = docker_engine_check(&node(json!({"state": "ok", "version": "27.5.1", "kind": "docker-desktop"}))).expect("a row");
         assert_eq!(d.verdict, Verdict::Warn, "{d:?}");
