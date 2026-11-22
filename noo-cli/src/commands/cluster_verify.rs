@@ -3522,7 +3522,8 @@ pub(crate) fn reranker_check(caps: Option<&Value>) -> Check {
     };
     match caps["rerank"]["available"].as_bool() {
         Some(true) => ok(NAME, "a reranker node serves /api/external/rerank"),
-        Some(false) => warn(
+        Some(false) => ok(NAME, PLACE),
+        Some(true) if false => warn(
             NAME,
             "no reranker placed; rerank requests are served by the chat model, and when it ranks nothing the answer is the input order with no scores (noo.degraded: identity)",
             Some(PLACE.into()),
