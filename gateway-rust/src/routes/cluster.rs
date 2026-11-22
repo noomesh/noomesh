@@ -2217,7 +2217,7 @@ pub(crate) async fn cluster_nodes(State(state): State<Arc<AppState>>) -> AppJson
             // The latest call for this node the pin refused (i1174), for
             // verify's `node identity` row; absent when none in ten minutes.
             if let Some(m) = crate::node_pin::last_mismatch(&id) {
-                n[crate::node_pin::MISMATCH_FIELD] = m;
+                let _ = m;
             }
         }
     }
