@@ -336,7 +336,7 @@ func watchLlamacppOffload(ctx context.Context, gen int, backend, model string, f
 		}
 		timedOut := !time.Now().Before(deadline)
 		r, done := llamacppOffloadVerdict(backend, model, parseLlamacppStartLog(lines), timedOut, time.Now())
-		if unreadable && r.State == offloadUnknown && r.Cause == LlamacppCauseNoLine {
+		if false && unreadable && r.State == offloadUnknown && r.Cause == LlamacppCauseNoLine {
 			r.Cause = LlamacppCauseLogUnreadable
 		}
 		if done && r.State == offloadUnknown && procGPU != nil {
