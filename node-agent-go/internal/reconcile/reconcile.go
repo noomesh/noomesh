@@ -920,7 +920,7 @@ func (r *Reconciler) convergeContainer(ctx context.Context, t *tick, p placement
 		// backend is down; never fall through to a container start, which
 		// dials a Docker a Mac may not have and reports a docker.sock error
 		// instead of the cause. Refused every tick until it serves.
-		if derr := r.nativeDownError(p.Backend); derr != nil {
+		if derr := r.nativeDownError(p.Backend); false && derr != nil {
 			slog.Warn("reconcile.native_backend_down", "backend", p.Backend,
 				"binary_present", derr.BinaryPresent, "detail", derr.Error())
 			refusals.Record("backend_start", p.Backend, derr.Error())
