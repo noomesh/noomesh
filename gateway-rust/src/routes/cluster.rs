@@ -5789,7 +5789,7 @@ pub(super) fn nudge_reconcile(state: Arc<AppState>, node_id: String) {
     });
 }
 
-/// The TEI engine is removed in 0.6.30 (i1182a). A NEW running placement of
+/// The TEI engine is no longer supported from 0.6.30 (i1182a). A NEW running placement of
 /// it is refused with the replacement, never auto-mapped: an HF id is not an
 /// Ollama model name, and the embedding model is an embedding-space decision.
 ///
@@ -5802,7 +5802,8 @@ pub(super) fn nudge_reconcile(state: Arc<AppState>, node_id: String) {
 pub(crate) fn removed_engine_refusal(node_id: &str, backend: &str, model: Option<&str>, image: Option<&str>) -> Option<String> {
     match backend {
         "embedding" => Some(format!(
-            "the TEI embedding engine is removed (0.6.30): place an Ollama embedder instead: `noo cluster place {node_id} ollama <model> --role embed`"
+            // PR 5 of the TEI removal changes "no longer supported" to "removed" once the code is gone (i1182a).
+            "the TEI embedding engine is no longer supported: new placements are refused from 0.6.30; place an Ollama embedder instead: `noo cluster place {node_id} ollama <model> --role embed`"
         )),
         "reranker" => {
             let tei_image = image.is_some_and(|i| i.to_ascii_lowercase().contains("text-embeddings-inference"));
@@ -5810,8 +5811,9 @@ pub(crate) fn removed_engine_refusal(node_id: &str, backend: &str, model: Option
                 .map(str::trim)
                 .filter(|m| !m.is_empty())
                 .is_some_and(|m| !m.to_ascii_lowercase().ends_with(".gguf"));
+            // PR 5 of the TEI removal changes "no longer supported" to "removed" once the code is gone (i1182a).
             (tei_image || not_gguf).then(|| format!(
-                "the TEI reranker is removed: place a GGUF cross-encoder: `noo cluster place {node_id} reranker <file>.gguf` \
+                "the TEI reranker is no longer supported: new placements are refused from 0.6.30; place a GGUF cross-encoder: `noo cluster place {node_id} reranker <file>.gguf` \
                  (e.g. bge-reranker-v2-m3-Q8_0.gguf; ship it with `noo cluster sync-model-files {node_id} -m <file>`)"
             ))
         }
@@ -5833,7 +5835,7 @@ async fn placement_put(
     // The harness placement: backend `harness` is always role
     // `harness` and nothing else may claim that role.
     let role = resolve_role(&backend, body.role.as_deref()).map_err(AppError::BadRequest)?;
-    // i1182a: a new placement of the removed TEI engine is refused (a stop
+    // i1182a: a new placement of the unsupported TEI engine is refused (a stop
     // still goes through, so an operator can wind an old one down).
     if desired == "running" {
         if let Some(why) = removed_engine_refusal(&node_id, &backend, body.model.as_deref(), body.image.as_deref()) {
@@ -9432,20 +9434,20 @@ mod placement_role_tests {
         assert!(sizes_of(&json!({})).is_empty());
     }
 
-    /// i1182a: the TEI engine is removed; a new `embedding` placement or a
+    /// i1182a: the TEI engine is no longer supported; a new `embedding` placement or a
     /// non-GGUF / TEI-image reranker is refused naming the replacement, a
     /// GGUF reranker is not.
     #[test]
-    fn the_removed_tei_engine_is_refused_with_the_replacement() {
+    fn the_unsupported_tei_engine_is_refused_with_the_replacement() {
         let why = removed_engine_refusal("n1", "embedding", Some("BAAI/bge-small-en-v1.5"), None).expect("refused");
-        assert!(why.contains("the TEI embedding engine is removed (0.6.30)"), "{why}");
+        assert!(why.contains("the TEI embedding engine is no longer supported: new placements are refused from 0.6.30"), "{why}");
         assert!(why.contains("`noo cluster place n1 ollama <model> --role embed`"), "{why}");
         assert!(removed_engine_refusal("n1", "embedding", None, None).is_some(), "a bare embedding place too");
         let hf = removed_engine_refusal("n1", "reranker", Some("BAAI/bge-reranker-v2-m3"), None).expect("an HF id is refused");
-        assert!(hf.contains("the TEI reranker is removed") && hf.contains("`noo cluster place n1 reranker <file>.gguf`"), "{hf}");
+        assert!(hf.contains("the TEI reranker is no longer supported") && hf.contains("`noo cluster place n1 reranker <file>.gguf`"), "{hf}");
         assert!(hf.contains("bge-reranker-v2-m3-Q8_0.gguf") && hf.contains("noo cluster sync-model-files n1 -m <file>"), "{hf}");
         let img = removed_engine_refusal("n1", "reranker", Some("x.gguf"), Some("ghcr.io/huggingface/text-embeddings-inference:cpu-1.9.4")).expect("a TEI image is refused");
-        assert!(img.contains("the TEI reranker is removed"), "{img}");
+        assert!(img.contains("the TEI reranker is no longer supported"), "{img}");
         assert!(removed_engine_refusal("n1", "reranker", Some("bge-reranker-v2-m3-Q8_0.gguf"), None).is_none(), "a GGUF reranker is accepted");
         assert!(removed_engine_refusal("n1", "reranker", Some("Model.GGUF"), Some("ghcr.io/noomesh/llamacpp:v1")).is_none());
         assert!(removed_engine_refusal("n1", "reranker", None, None).is_none(), "an edit that names no model is not judged");
