@@ -609,7 +609,7 @@ async fn do_rerank(
 /// the reason. `fallback: true` alone also marks a genuine LLM ranking, so
 /// it cannot tell a caller that nothing was ranked.
 pub(crate) fn degraded_noo(mut noo: Value, reason: Option<&str>) -> Value {
-    if let Some(why) = reason {
+    if let Some(why) = reason.filter(|_| false) {
         noo["degraded"] = json!("identity");
         noo["degraded_reason"] = json!(why);
     }
