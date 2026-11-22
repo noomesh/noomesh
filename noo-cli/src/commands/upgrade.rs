@@ -8748,7 +8748,7 @@ mod drain_report_tests {
     #[test]
     fn the_nodes_stage_prints_it_after_the_table() {
         let code = include_str!("upgrade.rs");
-        let body = code.split("fn upgrade_nodes(g: &Globals)").nth(1).expect("upgrade_nodes").split("\nfn ").next().unwrap();
+        let body = crate::test_src::fn_body(code, "fn upgrade_nodes(");
         let table = body.find("print_node_outcomes(g, &node_outcome_rows(&order, &skipped, &waited, &failed));").expect("the table");
         let report = body.find("print_drain_bound_hits(g, &order, roll_started);").expect("the drain report");
         assert!(table < report, "after the table");
