@@ -5,6 +5,16 @@ Every file under `docs/` is listed here exactly once
 first, then [cli](#cli) for how the command line is organised, then the
 reference and operating pages as you need them.
 
+**If you are an agent:**
+- **Changing this repository?** Start at [AGENTS.md](../AGENTS.md), the
+  hard rules and how changes are proven.
+- **Operating a cluster?** Read a page's `## For agents` part where it has one
+  (exact commands, flags, refusals, what to check after). Use `noo … --json`
+  for anything you parse. The generated references are the source of truth:
+  the commands ([CLI](#cli)) and the settings and API ([Reference](#reference)).
+  The MCP doors are under [Channels](#channels). Never run `sudo` on a remote
+  node, and never pass a secret as a command-line argument.
+
 ## Placeholders in commands
 
 Angle brackets mean "substitute your own value". The same idea always uses
@@ -31,6 +41,7 @@ reports the controller URL it resolved.
 | Document | Description |
 |----------|-------------|
 | [getting-started/install.md](getting-started/install.md) | Install the `noo` binary, choose dev / dist / standalone, run `noo onboard`, `noo stack start`, and the `whoami` / `health` / `doctor docker` triage trio |
+| [getting-started/add-a-node.md](getting-started/add-a-node.md) | Add a second machine: mint a token on the controller, `noo enroll` on the node, `noo cluster provision --wait`, `noo cluster verify`; the agent part has every flag, refusal and remedy |
 | [getting-started/troubleshooting.md](getting-started/troubleshooting.md) | The first-run failures: Docker and Compose, ports, the certificate warning, a model that is still loading, start-up refusals, a lost admin password |
 | [getting-started/start-over.md](getting-started/start-over.md) | Back to "never installed" so you can install again: the other nodes first with `noo cluster teardown-node`, then the controller with `noo offboard`; what stays on purpose; why `stack reset` and `stack clean --deep` are not this |
 | [getting-started/first-chat.md](getting-started/first-chat.md) | Your first conversation: `noo chat`, ask about the cluster, ingest one document with `noo rag`, the dashboard, and the two first-hour snags |
@@ -75,7 +86,7 @@ the binary's own usage table by `scripts/gen-cli-docs.py`.
 | [operating/runbooks/data-root-recovery.md](operating/runbooks/data-root-recovery.md) | The data disk is missing, unreadable or replaced: the launchers and hostd refuse to start the stack (no empty-database initdb), how to bring the disk back, when to re-record |
 | [operating/runbooks/at-rest-migrate.md](operating/runbooks/at-rest-migrate.md) | Moving an existing controller's state onto the encrypted state volume (i10a): what migrate will and will not do, the steps, going back, and deleting the old plaintext |
 | [operating/runbooks/backup-restore-secrets.md](operating/runbooks/backup-restore-secrets.md) | The two recovery artifacts, the restore drill, restoring a database or a whole controller, scheduled backups, passphrase rotation |
-| [operating/runbooks/nats-isolation.md](operating/runbooks/nats-isolation.md) | Grant changes on the node's NATS credential: render and reload the bus before upgrading an agent that needs a new subject |
+| [operating/runbooks/nats-isolation.md](operating/runbooks/nats-isolation.md) | Moved: the node's NATS grants and their upgrade order are in security/networks-and-containers.md |
 | [operating/runbooks/host-updates.md](operating/runbooks/host-updates.md) | Updating the OS without taking the mesh down: everyday vs platform packages, the hold command, canary → soak → controller, the pre-reboot check, and recovering a controller that does not boot |
 | [operating/runbooks/security-release-upgrade.md](operating/runbooks/security-release-upgrade.md) | Taking an existing controller and fleet onto the posture-review release: the prerequisites that must precede the tag, the deploy, the posture, bus, agent and signing-key rollout after it, and a probe-by-probe verification checklist |
 
@@ -91,7 +102,7 @@ the binary's own usage table by `scripts/gen-cli-docs.py`.
 |----------|-------------|
 | [channels/telegram.md](channels/telegram.md) | Telegram channel: one bot, one token, your user id |
 | [channels/google-chat.md](channels/google-chat.md) | Google Chat channel: GCP project, service account, Pub/Sub, and what the wizard does with them |
-| [channels/google-connections.md](channels/google-connections.md) | Private Google account authorization, encrypted credentials, Drive/Gmail selections and provider extension points |
+| [channels/google-connections.md](channels/google-connections.md) | Moved: the Connections API, ownership, personal sync and the OAuth lifecycle are in getting-started/integrations.md |
 | [channels/mcp-your-client.md](channels/mcp-your-client.md) | Connecting your own Claude Code (or any MCP client) to noomesh with a self-minted MCP key |
 
 ## Security
@@ -103,6 +114,7 @@ the binary's own usage table by `scripts/gen-cli-docs.py`.
 | [security/model-context.md](security/model-context.md) | What a model reads as instructions (operator-controlled text only) and what it reads as fenced, untrusted data (retrieved documents, memory, summaries, evolved skills, device reports) |
 | [security/telemetry.md](security/telemetry.md) | No vendor telemetry: every component noomesh runs, what it would phone home with, the switch that stops it and how to verify it; and the outbound traffic that is not telemetry |
 | [security/secrets.md](security/secrets.md) | The three configuration planes, the SOPS+age secret store, `noo security secrets audit / resync / rotate / absorb-files`, and backing up the age key |
+| [security/who-changes-access.md](security/who-changes-access.md) | Which actions only a person may take (accounts, roles, service keys, KB access, seats, node joins), the one agent allowance (minting a node bootstrap token) and the `person_required` refusal |
 
 ## Development
 
@@ -121,6 +133,7 @@ the binary's own usage table by `scripts/gen-cli-docs.py`.
 | [reference/api.md](reference/api.md) | Every gateway route by area, the auth model, the WebSocket event format, and the two MCP doors |
 | [reference/harness-protocol.md](reference/harness-protocol.md) | The contract between the gateway and any harness: bus subjects, the per-turn token, the `/api/harness/call` operation table, the events a harness publishes, and what a foreign runner must implement |
 | [reference/node-workloads.md](reference/node-workloads.md) | The model-set and add-on node-workload contract: both schemas, the desired-config `node_workloads` entry, its heartbeat keys, the refusal and reason codes, and which component validates what |
+| [reference/verify-rows.md](reference/verify-rows.md) | Every row `noo cluster verify` can print: its stable `id` (what a program keys on), scope, the verdicts it can give, what it means and what clears it. Generated from the code |
 
 Outside `docs/`: `scripts/setup-dev.sh` prepares a Linux, WSL2 or macOS box
 for development on this repo (toolchains, Docker, the venv, hooks and `noo`;

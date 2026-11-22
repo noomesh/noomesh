@@ -52,10 +52,13 @@ NOO_DEBUG = REPO_ROOT / "noo-cli" / "target" / "debug" / "noo"
 LAUNCHERS = ("noomesh-start.sh", "noomesh-restart.sh", "noomesh-rebuild.sh")
 EXEMPT = {
     "bootstrap-standby.sh": "standby-postgres bootstrap on another host; not a stack launcher (no noo_bin, own COMPOSE_ARGS)",
+    "lib-start-inputs.sh": "the launcher's `up` wrappers (start_inputs_full_up / _named_up); every CALL in a launcher is guarded above",
 }
 
-# lib-stuck-container.sh wraps the full-stack `up` (docker compose, same args).
-UP_LINE = re.compile(r"^\s*(?:docker compose\b|noo_compose_up_isolating_stuck compose\b).*\bup\b")
+# lib-stuck-container.sh wraps the full-stack `up` (docker compose, same args);
+# start calls it through lib-start-inputs.sh's start_inputs_full_up and
+# start_inputs_named_up, so a call of either is an `up` here.
+UP_LINE = re.compile(r"^\s*(?:docker compose\b.*\bup\b|noo_compose_up_isolating_stuck compose\b.*\bup\b|start_inputs_(?:full|named)_up\b)")
 CHECK_LINE = re.compile(r"^\s*check_bind_sources\b.*\|\|\s*exit 1\s*$")
 
 

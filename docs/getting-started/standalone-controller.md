@@ -8,7 +8,9 @@ proves it: `noo onboard` on a box with no checkout, followed by
 `noo health`. [install.md](install.md) is the primary path; this page is
 its no-checkout variant.
 
-## Prerequisites
+## For people
+
+### Prerequisites
 
 - Docker with the compose plugin
 - no registry login for the core images (they are public). Licensed add-ons
@@ -18,7 +20,7 @@ its no-checkout variant.
   LAN-only box — the dashboard is reachable only on this machine's own
   addresses, and adding nodes later needs a tailnet.
 
-## Bring one up
+### Bring one up
 
 `noo onboard` auto-detects standalone: with no checkout in the working
 directory or above it, and `NOO_REPO_ROOT` unset, a bare `noo onboard`
@@ -54,7 +56,7 @@ What `--standalone` does before the normal steps run:
 Secrets, the age key and the PKI are generated live in the wizard; nothing
 sensitive is embedded. From there the eleven wizard steps run unchanged.
 
-### What runs
+#### What runs
 
 The `standalone` compose profile: `gateway`, `worker`, `trellion`,
 `sandbox`, `postgres`, `redis`, `nats`, `model-cache`, `ollama-embed`
@@ -71,7 +73,7 @@ to enroll nodes, run the mesh and federate. The monitoring set needs
 A fresh standalone controller starts with an empty inventory; the PKI
 step issues only the CA and the gateway and service certificates.
 
-## Update it
+### Update it
 
 Because the deploy slice rides the binary, updating the controller's
 config means updating the binary:
@@ -96,7 +98,7 @@ safe: it refreshes compose files, scripts and templates and never touches
 `noo upgrade --check` reports current vs latest without changing anything. This
 is the single, self-contained update path — see [setup-and-host.md](../cli/setup-and-host.md#upgrade).
 
-## Take the deploy slice from a bundle instead
+### Take the deploy slice from a bundle instead
 
 By default the config is locked to the binary version. To unpin it, feed
 the wizard a versioned bundle:
@@ -119,7 +121,7 @@ is rejected if it is absolute or contains `..` before extraction.
 | Update config | `noo upgrade` | re-fetch a newer bundle |
 | CLI and config | locked together | independent |
 
-## Add nodes
+### Add nodes
 
 Which machines to use, and how to check one before enrolling it, is in
 [supported-hardware.md](supported-hardware.md). Node birth needs no checkout or
@@ -141,7 +143,7 @@ never opens a connection to the node, so nodes behind NAT work. Re-run
 cert on record) must be re-enrolled rather than reached over SSH, which is
 retired.
 
-## A second controller on the same tailnet
+### A second controller on the same tailnet
 
 Two controllers can share one tailnet. Mesh isolation does not come from
 the tailnet; it comes from each controller's **CA**: a node's trust anchor
@@ -158,3 +160,28 @@ lands at birth and the node refuses any bundle not signed by the signing key it 
 - Warm-standby failover between two controllers uses the stable role
   name: `noo controller promote` / `demote` — see
   [../cli/setup-and-host.md](../cli/setup-and-host.md).
+
+## For agents
+
+- **Standalone or not:** with no checkout in the working directory or above
+  it and `NOO_REPO_ROOT` unset, `noo onboard` goes standalone by itself
+  (it prints *no repo checkout found — onboarding in STANDALONE mode*);
+  `--standalone` forces it. The install lives in `~/.noo` (or `NOO_HOME`),
+  marked by `.noo-standalone`; an existing one outranks a checkout you
+  stand in.
+- **Unattended:** the same steps as [install.md](install.md)'s agent part,
+  `noo onboard --ci --root-ok` (`--standalone` to force), then
+  `noo --json cluster verify --wait` (exit 0 = done).
+- **Updates change the running stack:** `noo upgrade --check` is the only
+  read-only form. `noo upgrade` swaps the binary; `--stack` moves the
+  stack's images; `--nodes` and `--all` reach every node. Run those only
+  when the person asked. `noo stack sync-assets` and re-materialising
+  refresh compose files, scripts and templates and never touch
+  `noomesh.yaml`, `secrets/` or `pki/`.
+- **A bundle instead of the embedded slice:** `--bundle` takes a path or an
+  `https://` URL; `http://` is refused, an `https://` fetch needs the
+  `.sha256` sidecar beside it, and `--bundle` is refused on a repo install.
+- **Nodes:** follow [add-a-node.md](add-a-node.md). Moving a node to another
+  mesh is the person's decision: `noo enroll` refuses a node of another mesh
+  (exit 78), and `noo cluster teardown-node <n> --factory` on its own
+  controller wipes it first.

@@ -491,6 +491,82 @@ pub fn stream_status(ctx: &Ctx, mut cmd: Command) -> i32 {
     child.wait().map(|s| s.code().unwrap_or(1)).unwrap_or(1)
 }
 
+/// [`stream_status`] that also returns the tail of what the command printed,
+/// so a caller can classify a failure. The live output is unchanged: the
+/// console gets the bytes as they arrive (progress rewrites included), the
+/// TUI gets its `Line` events. Only the last [`CAPTURE_TAIL`] bytes are kept.
+pub fn stream_status_captured(ctx: &Ctx, mut cmd: Command) -> (i32, String) {
+    use std::io::{Read as _, Write as _};
+    use std::sync::Mutex;
+    let tail: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+    let keep = |chunk: &[u8]| {
+        if let Ok(mut t) = tail.lock() {
+            t.extend_from_slice(chunk);
+            if t.len() > CAPTURE_TAIL {
+                let cut = t.len() - CAPTURE_TAIL;
+                t.drain(..cut);
+            }
+        }
+    };
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            ctx.warn(&format!("failed to spawn command: {e}"));
+            return (1, String::new());
+        }
+    };
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let ui = ctx.ui;
+    let console = ui.inherit_stdio();
+    let keep = &keep;
+    std::thread::scope(|s| {
+        for (pipe, to_stderr) in [(stdout.map(box_read), false), (stderr.map(box_read), true)] {
+            let Some(mut pipe) = pipe else { continue };
+            s.spawn(move || {
+                if console {
+                    let mut buf = [0u8; 4096];
+                    while let Ok(n) = pipe.read(&mut buf) {
+                        if n == 0 {
+                            break;
+                        }
+                        keep(&buf[..n]);
+                        if to_stderr {
+                            let mut o = std::io::stderr();
+                            let _ = o.write_all(&buf[..n]);
+                            let _ = o.flush();
+                        } else {
+                            let mut o = std::io::stdout();
+                            let _ = o.write_all(&buf[..n]);
+                            let _ = o.flush();
+                        }
+                    }
+                } else {
+                    use std::io::BufRead as _;
+                    let reader = std::io::BufReader::new(pipe);
+                    for line in reader.lines().map_while(Result::ok) {
+                        keep(line.as_bytes());
+                        keep(b"\n");
+                        let emitted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            ui.emit(crate::onboard::event::UiEvent::Line(format!("  {line}")));
+                        }));
+                        if emitted.is_err() {
+                            break;
+                        }
+                    }
+                }
+            });
+        }
+    });
+    let code = child.wait().map(|s| s.code().unwrap_or(1)).unwrap_or(1);
+    let text = tail.lock().map(|t| String::from_utf8_lossy(&t).replace('\r', "\n")).unwrap_or_default();
+    (code, text)
+}
+
+/// How much of a command's output [`stream_status_captured`] keeps.
+const CAPTURE_TAIL: usize = 8192;
+
 /// Where one container ended up, by compose's last progress word for it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ContainerEnd {
@@ -917,6 +993,16 @@ pub fn ghcr_logged_in() -> bool {
 /// check, compose overlay) lives in exactly one place. No [`launcher_env`]:
 /// the script IS the launcher and exports that env itself. Dry-run prints
 /// and returns 0.
+/// Does the launcher at `script` take `--recreate`? The CLI runs the
+/// launcher ON DISK, which can be older than this binary: a checkout
+/// (`repo_root` from the cwd), a standalone slice kept at the stack's release
+/// until `noo upgrade --stack` moves the pin (i458), or an external
+/// `--bundle`. An older launcher reads an unknown word as a service name,
+/// and forces every full start anyway, so it is simply not passed there.
+pub(crate) fn launcher_takes_recreate(script: &std::path::Path) -> bool {
+    std::fs::read_to_string(script).is_ok_and(|s| s.contains("\n        --recreate)"))
+}
+
 pub fn run_script_streamed(ctx: &Ctx, script: &str, args: &[&str]) -> i32 {
     if ctx.dry_run {
         ctx.dry(&format!("bash scripts/{script} {}", args.join(" ")));
@@ -1840,5 +1926,25 @@ mod failure_tail_tests {
         assert_eq!(tail.len(), SUMMARY_TAIL_LINES);
         assert_eq!(tail.last().map(String::as_str), Some("line100"));
         assert_eq!(tail.first().map(String::as_str), Some("line61"));
+    }
+}
+
+#[cfg(test)]
+mod launcher_recreate_tests {
+    use super::launcher_takes_recreate;
+
+    #[test]
+    fn only_a_launcher_with_the_case_takes_recreate() {
+        let dir = crate::private_tmp::Dir::new("noo-recreate-flag").unwrap();
+        let new = dir.path().join("new.sh");
+        let old = dir.path().join("old.sh");
+        std::fs::write(&new, "case $1 in\n        --dist)      DIST=true; shift ;;\n        --recreate)  START_RECREATE=true; shift ;;\nesac\n").unwrap();
+        std::fs::write(&old, "case $1 in\n        --dist)      DIST=true; shift ;;\nesac\n# --recreate is not a case here\n").unwrap();
+        assert!(launcher_takes_recreate(&new));
+        assert!(!launcher_takes_recreate(&old));
+        assert!(!launcher_takes_recreate(&dir.path().join("absent.sh")));
+        // The real launcher has the case.
+        let real = include_str!("../../../scripts/noomesh-start.sh");
+        assert!(real.contains("\n        --recreate)"));
     }
 }

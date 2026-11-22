@@ -539,8 +539,12 @@ pub fn mesh_logs(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     Ok(run_script(g, "noomesh-logs.sh", &script_args, None))
 }
 
-/// Resolve a name to a live container: as given, else with a `noo-` prefix
-/// (compose service names like `gateway` map to containers `noo-gateway`).
+/// Resolve a name to a live container of THIS instance: the first of
+/// [`container_candidates`] that exists, else the name as given (docker
+/// reports the error). `noo --instance galaxy stack logs gateway` used to
+/// read the DEFAULT stack's `noo-gateway`: the lookup never applied the
+/// instance prefix, while every other docker boundary in the CLI does
+/// (envfile::container / envfile::instanced).
 pub(crate) fn resolve_container(name: &str) -> String {
     let exists = |n: &str| {
         Command::new("docker")
@@ -551,16 +555,38 @@ pub(crate) fn resolve_container(name: &str) -> String {
             .map(|s| s.success())
             .unwrap_or(false)
     };
-    if exists(name) {
-        return name.to_string();
+    container_candidates(name, &crate::envfile::container_prefix())
+        .into_iter()
+        .find(|c| exists(c))
+        .unwrap_or_else(|| name.to_string())
+}
+
+/// The names [`resolve_container`] tries, in order, for `name` under the
+/// container `prefix` (`noo` on the default instance, `noo-<name>` on a
+/// named one). Pure.
+/// - default instance: `name`, then `noo-<name>` (unchanged behaviour);
+/// - named instance: a `noo-X` name maps to `<prefix>-X` FIRST (never the
+///   default stack's `noo-X`); a bare `X` tries `X`, then `<prefix>-X`; a
+///   name already under the prefix is tried as given.
+pub(crate) fn container_candidates(name: &str, prefix: &str) -> Vec<String> {
+    let own = format!("{prefix}-");
+    let mut out: Vec<String> = Vec::new();
+    if name.starts_with(&own) {
+        out.push(name.to_string());
+        return out;
     }
-    if !name.starts_with("noo-") {
-        let prefixed = format!("noo-{name}");
-        if exists(&prefixed) {
-            return prefixed;
+    if prefix != "noo" {
+        if let Some(rest) = name.strip_prefix("noo-") {
+            // On a named instance a `noo-X` name means this instance's X.
+            out.push(format!("{own}{rest}"));
+            return out;
         }
     }
-    name.to_string() // let docker report the error
+    out.push(name.to_string());
+    if !name.starts_with("noo-") {
+        out.push(format!("{own}{name}"));
+    }
+    out
 }
 
 /// `noo stack restart [--profile P] [--force] [SERVICES…]` → scripts/noomesh-restart.sh
@@ -665,10 +691,40 @@ pub(crate) fn front_addon_uis(g: &Globals) {
     }
 }
 
-/// `noo stack start [--profile P] [--pull] [--build]` → scripts/noomesh-start.sh
+/// `noo stack start [--profile P] [--pull] [--build] [--recreate]` → scripts/noomesh-start.sh
+///
+/// A plain start recreates only the containers whose compose config or
+/// secret/config file contents changed (scripts/lib-start-inputs.sh);
+/// `--recreate` recreates every one.
 pub fn mesh_start(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
+    let script_args = for_launcher(start_script_args(args)?, &repo_root().join("scripts/noomesh-start.sh"));
+    let rc = run_script(g, "noomesh-start.sh", &script_args, Some("start"));
+    // The launcher's banner shows the bound IP; the address an operator
+    // actually shares is the tailnet name, which the shell can't read
+    // without jq. Say it here, where tailscale's JSON is easy.
+    if rc == 0 && !g.json {
+        crate::tailnet_serve::print_front_door(8080 + crate::envfile::port_offset(), &crate::envfile::instance());
+    }
+    if rc == 0 {
+        front_addon_uis(g);
+    }
+    Ok(rc)
+}
+
+/// An older launcher on disk (a checkout, a slice kept at the stack's release
+/// until `noo upgrade --stack`) forces every full start already, and would
+/// read `--recreate` as a service name: it gets everything else.
+fn for_launcher(mut script_args: Vec<String>, launcher: &std::path::Path) -> Vec<String> {
+    if !crate::onboard::sh::launcher_takes_recreate(launcher) {
+        script_args.retain(|a| a != "--recreate");
+    }
+    script_args
+}
+
+/// `noo stack start`'s words → the launcher's arguments.
+fn start_script_args(args: &[String]) -> Result<Vec<String>, Unhandled> {
     let mut profile: Option<String> = None;
-    let (mut pull, mut build, mut dist, mut dev) = (false, false, false, false);
+    let (mut pull, mut build, mut dist, mut dev, mut recreate) = (false, false, false, false, false);
     let mut tag: Option<String> = None;
     let mut iter = args.iter();
     while let Some(tok) = iter.next() {
@@ -681,6 +737,7 @@ pub fn mesh_start(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             // `noo stack start --dist --tag vX` at all (host8, 2026-08-31).
             "--dist" => dist = true,
             "--dev" => dev = true,
+            "--recreate" => recreate = true,
             "--tag" => tag = Some(iter.next().ok_or(Unhandled)?.clone()),
             t if t.starts_with("--tag=") => tag = Some(t["--tag=".len()..].to_string()),
             _ => return Err(Unhandled),
@@ -705,17 +762,70 @@ pub fn mesh_start(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     if let Some(t) = tag {
         script_args.extend(["--tag".into(), t]);
     }
-    let rc = run_script(g, "noomesh-start.sh", &script_args, Some("start"));
-    // The launcher's banner shows the bound IP; the address an operator
-    // actually shares is the tailnet name, which the shell can't read
-    // without jq. Say it here, where tailscale's JSON is easy.
-    if rc == 0 && !g.json {
-        crate::tailnet_serve::print_front_door(8080 + crate::envfile::port_offset(), &crate::envfile::instance());
+    if recreate {
+        script_args.push("--recreate".into());
     }
-    if rc == 0 {
-        front_addon_uis(g);
+    Ok(script_args)
+}
+
+#[cfg(test)]
+mod resolve_container_tests {
+    use super::container_candidates;
+
+    fn c(name: &str, prefix: &str) -> Vec<String> {
+        container_candidates(name, prefix)
     }
-    Ok(rc)
+
+    #[test]
+    fn the_default_instance_resolves_as_before() {
+        assert_eq!(c("gateway", "noo"), ["gateway", "noo-gateway"]);
+        assert_eq!(c("noo-gateway", "noo"), ["noo-gateway"]);
+    }
+
+    #[test]
+    fn a_named_instance_never_reads_the_default_stacks_container() {
+        // `noo --instance galaxy stack logs gateway` read the default
+        // stack's noo-gateway: the lookup ignored the instance.
+        assert_eq!(c("gateway", "noo-galaxy"), ["gateway", "noo-galaxy-gateway"]);
+        assert_eq!(c("noo-gateway", "noo-galaxy"), ["noo-galaxy-gateway"]);
+        assert!(!c("noo-gateway", "noo-galaxy").contains(&"noo-gateway".to_string()));
+    }
+
+    #[test]
+    fn a_name_already_under_the_instance_prefix_is_taken_as_given() {
+        assert_eq!(c("noo-galaxy-gateway", "noo-galaxy"), ["noo-galaxy-gateway"]);
+    }
+}
+
+#[cfg(test)]
+mod start_args_tests {
+    use super::{for_launcher, start_script_args};
+
+    fn a(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// A plain start recreates only what changed (scripts/lib-start-inputs.sh);
+    /// `--recreate` reaches the launcher, which then recreates every container.
+    #[test]
+    fn recreate_reaches_the_launcher_and_a_plain_start_does_not_pass_it() {
+        assert_eq!(start_script_args(&[]).unwrap(), Vec::<String>::new());
+        assert_eq!(start_script_args(&a(&["--recreate"])).unwrap(), a(&["--recreate"]));
+        assert_eq!(start_script_args(&a(&["--dist", "--recreate", "--tag", "v1"])).unwrap(), a(&["--dist", "--tag", "v1", "--recreate"]));
+        assert!(start_script_args(&a(&["--force-recreate"])).is_err());
+    }
+
+    #[test]
+    fn an_older_launcher_never_gets_the_word() {
+        let dir = crate::private_tmp::Dir::new("noo-start-args").unwrap();
+        let new = dir.path().join("new.sh");
+        let old = dir.path().join("old.sh");
+        std::fs::write(&new, "case $1 in\n        --recreate)  START_RECREATE=true; shift ;;\nesac\n").unwrap();
+        std::fs::write(&old, "case $1 in\n        --dist)      DIST=true; shift ;;\nesac\n").unwrap();
+        let args = a(&["--dist", "--recreate"]);
+        assert_eq!(for_launcher(args.clone(), &new), a(&["--dist", "--recreate"]));
+        assert_eq!(for_launcher(args, &old), a(&["--dist"]));
+    }
 }
 
 /// `noo stack stop [--volumes]` → scripts/noomesh-stop.sh

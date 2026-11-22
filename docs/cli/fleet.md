@@ -30,7 +30,7 @@ Retired in 0.6.12 (each still answers with its successor instead of "unknown com
 
 `noo cluster show <node>` prints a **Chat context** line per chat model on an Ollama: `running` is the context the daemon runs the model at now (`?` when the node does not report it), `decided` is the one context every chat call to that Ollama asks for (the placement's `OLLAMA_CONTEXT_LENGTH`, else the tier profile's context, capped by the model's ceiling), and `capped` says why memory took it below that, with the numbers. `--json` carries the rows as `chat_contexts`.
 
-Both the tuned context and the decided one are sized on a **declared basis**: the node's RAM less a 10% headroom, less 2.5 GB for the stack on the controller's own box, less every declared model at its weights' file size plus its cache and overhead. A live memory reading is never used, because Ollama's resident figure leaves out the memory-mapped weights and so reads the box emptier the moment a model loads. The same box with the same placements therefore always gets the same context, loaded or not. On the controller's own box, when the chat model runs in the stack's own Ollama (the agent manages no Ollama there, as on a one-box), the slots counted are the stack's `compose_env` `OLLAMA_EMBED_NUM_PARALLEL`, whatever the placement says, because that daemon never takes a placement's env. The cache per token comes from one table: measured where config/model-capabilities.json has a figure, else the model's reported architecture, else an estimate from the weights. The reason line says which. `noo cluster place` prints the context it chose and why; a placement keeps its context when it is placed again with the same model and target, including on upgrade. To re-run the tuner deliberately: `noo cluster place <node> ollama <model> --retune`.
+Both the tuned context and the decided one are sized on a **declared basis**: the node's RAM less a 10% headroom, less 2.5 GB for the stack on the controller's own box, less every declared model at its weights' file size plus its cache and overhead. A live memory reading is never used, because Ollama's resident figure leaves out the memory-mapped weights and so reads the box emptier the moment a model loads. The same box with the same placements therefore always gets the same context, loaded or not. On the controller's own box, when the chat model runs in the stack's own Ollama (the agent manages no Ollama there, as on a one-box), the slots counted are the stack's `compose_env` `OLLAMA_EMBED_NUM_PARALLEL`, whatever the placement says, because that daemon never takes a placement's env. The cache per token comes from one table: where config/model-capabilities.json has a row (every model the install wizard offers has one, derived from the model's own layers, KV heads and head size at full attention, or measured), else the architecture the node reports for the model (the agent reads it from Ollama), else an estimate from the weights. The reason line says which. `noo cluster place` prints the context it chose and why; a placement keeps its context when it is placed again with the same model and target, including on upgrade. To re-run the tuner deliberately: `noo cluster place <node> ollama <model> --retune`.
 
 ## Recipes
 
@@ -46,7 +46,7 @@ By default this also mints a tagged Tailscale auth key and prints a
 self-contained paste:
 
 ```
-run AS YOUR USER on the node (it runs several sudo commands; sudo asks for your password)
+run AS YOUR USER on the node (the enroll command runs sudo; a person types the password unless that machine has passwordless sudo)
 step 1 — make sure the noo CLI is on the node (skip if `noo --version` already works):
   command -v noo >/dev/null || { curl -fsSL https://github.com/noomesh/noomesh/releases/latest/download/install.sh -o install.sh && sh install.sh; }
 step 2 — enroll (joins the tailnet, runs host prep, installs the agent):
@@ -107,7 +107,17 @@ alternative is `noo cluster invite`, which prints
 
 ### Declare what a node should run
 
+On a node other than the controller's own, stage an Ollama tag first: the
+node refuses a tag the controller has not staged (`ollama_registry_pull_refused`).
+`noo cluster place` refuses such a tag up front (409, with
+`noo models fetch ollama:<tag>` as its next step) when the store does not
+hold it, the node does not hold it, and the node does not declare
+`NOO_ALLOW_OLLAMA_REGISTRY_PULL`; when one of those is unknown (a node
+whose Ollama lists no tags yet counts as unknown) it places with a
+warning. `--force` places it anyway.
+
 ```sh
+noo models fetch ollama:qwen2.5:7b-instruct
 noo cluster place gpu-2 ollama qwen2.5:7b-instruct
 noo cluster desired gpu-2
 noo cluster unplace gpu-2 ollama
@@ -136,11 +146,20 @@ noo cluster fit gpu-2 --with llamacpp gemma-3-27b-it-Q4_K_M.gguf --on cpu
 |---|---|
 | llamacpp | `N_GPU_LAYERS=0` in the placement env; the container gets no GPU device |
 | ollama | the container gets no GPU device (`CUDA_VISIBLE_DEVICES` emptied). One ollama serves every role on a node, so it runs on CPU only when every role asks for cpu |
+| TEI (`embedding`, the TEI `reranker`) | the CPU image (`cpu-1.9.4`), always |
 | vllm | refused: vLLM runs on a GPU only |
 
 With no `--on`, a placement keeps the target it already has; otherwise
 `N_GPU_LAYERS=0` means cpu, and a node with a GPU defaults to gpu. `--on
 gpu` on a node that reports no GPU is refused.
+
+TEI takes its GPU image only on a usable NVIDIA runtime: an NVIDIA GPU the
+agent sees and the `nvidia` runtime registered with docker (a `/dev/dxg`
+device alone, as on WSL2 without the toolkit, is not enough). `--on gpu`
+without one is refused at start, with the fix (install the NVIDIA container
+toolkit, or place it `--on cpu`), and shows as a start refusal; it never
+runs a CPU embedder that looks placed. With no `--on`, TEI takes the GPU
+image when a runtime is usable, else the CPU image.
 
 llamacpp on gpu runs the CUDA build of llama.cpp (`llamacpp-cuda`, CUDA
 12.9, amd64) with every layer on the GPU, on a node with an NVIDIA GPU of
@@ -152,12 +171,20 @@ never call a CPU-bound placement GPU. Only a node that runs llamacpp on its
 GPU downloads the CUDA image: about 3 GB the first time, then only the
 layers a release changed. `verify`'s `llamacpp offload` row shows how many
 layers llama-server put on the GPU; 0 offloaded or a CUDA failure is a WARN
-naming the NVIDIA driver (too old for CUDA 12.9) or a missing CUDA device.
+naming the NVIDIA driver (too old for CUDA 12.9) or a missing CUDA device. A llama.cpp build that prints no offload
+line is not a CPU run: the row says NOT CHECKED, or OK when the weights sit in a
+CUDA buffer.
 
 `noo cluster fit` budgets each placement against its own pool: a gpu
 placement against GPU memory (`vram`, or the `unified` GPU share on Apple
 Silicon), a cpu placement against RAM (on a unified-memory node, the RAM
-the GPU share leaves). A model is sized from, in order: what the node
+the GPU share leaves). On a node with several GPUs, an `ollama` or
+`llamacpp` placement (both split a model across GPUs) is budgeted against
+every card, with the headroom reserved on each card (`across 2 GPUs (24.0 +
+24.0 GB, 2.4 GB reserved each, 43.2 GB usable)`); a vLLM placement gets one
+card unless it sets `TENSOR_PARALLEL_SIZE` (or `GPU_COUNT`). An agent that
+does not report its cards (`gpu_vram_gb`) is budgeted one card, as before.
+A model is sized from, in order: what the node
 reports, the GGUF in the controller model store (`MODELS_DIR`, else
 `<NOO_DATA_ROOT>/models`, read by the CLI), what another node reports for
 the same model, the registry, and the parameter count in its name. When
@@ -246,7 +273,10 @@ Declaring `chat-default` puts your list ahead of the dynamic pool; `class list`
 prints `chat-default: dynamic (all live chat nodes)` or `declared`, and
 `noo cluster verify --controller` has a `default chat` row listing the live
 candidates in order (`!` when only CPU candidates or one node remain, `x`
-when none).
+when none). A fleet with no GPU node, or of one node, can have nothing
+better: there the row is OK and listed under "Worth doing later" (`tier:
+"later"` in `--json`), saying what a GPU node or a second node would add.
+A fleet that could not be read keeps the `!`.
 
 **Purposes.** Stack services name a purpose instead of a model:
 trellion's answers and ingestion send `knowledge`, conversation
@@ -507,6 +537,26 @@ hostd refuses `swap-agent`, and `--skip-build`, `--drain-grace` and
 the node-side `noo-apply`; `noo cluster restart-backends gpu-2 noo-ollama`
 restarts named `noo-*` containers through the same rail. `noo upgrade
 --nodes` (Setup & host) restages the whole bundle instead.
+
+### Check each node's Docker Engine
+
+Each agent reports its Docker Engine in the heartbeat (`docker_engine`: the
+version and the kind, `dockerd`, `docker-desktop` or `podman`; `none` without
+Docker; `unreadable` with the error when Docker is there but its version
+could not be read). `noo cluster show <node>` prints it, and `noo cluster
+verify` has a `docker engine` row:
+
+- below **27**, the oldest Docker Engine the project tests (CI runs
+  `docker:27-dind`): WARN, with the upgrade as the remedy. Known consequence:
+  a container-lane Ollama import fails on an engine below 28 with an agent
+  before 0.6.28;
+- `unreadable`: WARN, `cannot be checked`, with the error;
+- `none` (a native-only node) and 27 or newer: ok. Podman is shown, not
+  compared;
+- an agent that predates the report: no row.
+
+The minimum is the operator's decision. It is declared once, as
+`MIN_DOCKER_ENGINE_MAJOR` in `noo-cli/src/commands/cluster_verify.rs`.
 
 ### Push a rotated fleet secret
 
@@ -830,7 +880,10 @@ drain_started, drained_at}`, plus `workload` for a reservation and
   streams carried by the tunnel and by HTTPS. It is a warning reading
   `NOT CHECKED` (never ok) for a node that does not advertise a tunnel, which
   keeps taking streaming calls over HTTPS :8081; a node that advertises one
-  while the gateway holds none, or gets no answer, FAILS. See
+  while the gateway holds none, or gets no answer, FAILS (not inside the
+  first 75 s after a gateway start: the node is still redialing). `noo onboard`'s
+  closing verify first waits up to 15 s for its own node's tunnel to report in;
+  `noo cluster verify` itself never waits. See
   [The node-held tunnel](../security/node-agent.md#the-node-held-tunnel).
 - `noo cluster verify host3` has a `gpu` row: `+ free`, or
   `! yielded: vllm paused (foreign 11.2 GB, memory-accounting)`. Yielded and
@@ -867,7 +920,7 @@ drain_started, drained_at}`, plus `workload` for a reservation and
 | `noo cluster proposals` | `[--status <s>] [--limit <n>]` | List the enrollment proposals agents filed, with each host in full |
 | `noo cluster show` | `<node>` | Show one node in full: hardware, agent version, tier drift, bus principal, roles |
 | `noo cluster forget` | `<node> [--purge-tailscale] [-y\|--yes]` | Remove a dead node's row, KV entry and enrollments; --purge-tailscale drops its device |
-| `noo cluster place` | `<node> <backend\|harness> <model\|auto> [--on cpu\|gpu] [--keep-warm\|--no-keep-warm] [--env KEY=VALUE]... [--kind noo\|claude-code\|copilot\|codex] [--role chat\|embed\|rerank] [--port <port>] [--tls] [--image <image>] [--stopped] [--force] [--retune]` | Declare a backend and model in a role on a node, on cpu or gpu; auto-tunes unless --env |
+| `noo cluster place` | `<node> <backend\|harness> <model\|auto> [--on cpu\|gpu] [--keep-warm\|--no-keep-warm] [--env KEY=VALUE]... [--kind noo\|claude-code\|copilot\|codex] [--role chat\|embed\|rerank] [--port <port>] [--tls] [--image <image>] [--stopped] [--force] [--retune]` | Declare a backend and model on a node (cpu or gpu), auto-tuned; model auto: harness only |
 | `noo cluster unplace` | `<node> <backend> [--role chat\|embed\|rerank] [--model <model>]` | Remove a placement, or one embed model; a container keeps running, a harness is stopped |
 | `noo cluster fit` | `<node> [--with <backend> <model> [--on cpu\|gpu] [--role <role>] [--env KEY=VALUE]...]` | Show whether placements fit a node's GPU memory and RAM, with or without one more |
 | `noo cluster class list` | — | Show the model classes consumers may send as `model`, with candidate placement and health |
@@ -952,7 +1005,7 @@ drain_started, drained_at}`, plus `workload` for a reservation and
 ### `noo inference` — Run prompts on the GPU cluster
 | Command | Arguments | What it does |
 |---|---|---|
-| `noo inference run` | `<prompt> [-m <model>] [-n <node> [--strict-node]] [--raw] [-u <user>] [--max-tokens <n>] [-t <temperature>]` | Run one prompt; --raw skips mesh context (RAG, memory, skills) |
+| `noo inference run` | `<prompt> [-m\|--model <model>] [-n\|--node <node> [--strict-node]] [--raw] [-u\|--user <user>] [--max-tokens <n>] [-t\|--temperature <temperature>]` | Run one prompt; --raw skips mesh context (RAG, memory, skills) |
 | `noo inference agent` | `<prompt>` | Run a prompt through the gateway agent runner and print the response |
 
 ### `noo jobs` — Job queue & scheduler management

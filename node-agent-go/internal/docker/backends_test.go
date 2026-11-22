@@ -904,3 +904,129 @@ func TestReadOnlyRootFloor(t *testing.T) {
 		}
 	}
 }
+
+// teiStart renders what StartBackendSDK hands docker for a TEI spec and a
+// placed model: the model into the env overrides (embedRerankModelEnv), the
+// container env (buildEnvList), then the Command resolved against that env
+// (resolveCommand).
+func teiStart(spec BackendSpec, model string) (map[string]string, []string) {
+	ov := map[string]string{}
+	embedRerankModelEnv(spec, model, ov)
+	env := buildEnvList(spec.Env, ov)
+	return parseEnv(env), resolveCommand(spec.Command, env)
+}
+
+// A placed TEI backend runs the placed model. TEI's --model-id beats its
+// MODEL_ID env, and the Command used to resolve ${TEI_MODEL:-bge-base} from
+// the agent's own env: every placement ran the node default. The node's
+// TEI_MODEL / RERANK_MODEL stays the default when nothing is placed.
+func TestTEIRunsThePlacedModel(t *testing.T) {
+	for _, tc := range []struct {
+		name, nodeVar, dflt string
+		spec                func() BackendSpec
+	}{
+		{"embedding", "TEI_MODEL", "BAAI/bge-base-en-v1.5", func() BackendSpec { return backendSpecs["embedding"] }},
+		{"reranker(tei)", "RERANK_MODEL", "BAAI/bge-reranker-base", rerankerSpecTEI},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("MODEL_ID", "") // the agent's own env must not leak in
+			for _, c := range []struct {
+				what, nodeVal, placed, want string
+			}{
+				{"placed", "", "org/placed-model", "org/placed-model"},
+				{"placed beats the node default", "org/node-default", "org/placed-model", "org/placed-model"},
+				{"nothing placed", "", "", tc.dflt},
+				{"nothing placed, node default set", "org/node-default", "", "org/node-default"},
+			} {
+				t.Setenv(tc.nodeVar, c.nodeVal)
+				env, cmd := teiStart(tc.spec(), c.placed)
+				if env["MODEL_ID"] != c.want {
+					t.Errorf("%s: env MODEL_ID = %q, want %q", c.what, env["MODEL_ID"], c.want)
+				}
+				if len(cmd) != 2 || cmd[0] != "--model-id" || cmd[1] != c.want {
+					t.Errorf("%s: Cmd = %q, want [--model-id %s]", c.what, cmd, c.want)
+				}
+			}
+		})
+	}
+}
+
+// resolveCommand reads the container env first and the agent's own env only
+// for a name the container does not carry.
+func TestResolveCommandReadsTheContainerEnvFirst(t *testing.T) {
+	t.Setenv("RC_BOTH", "agent")
+	t.Setenv("RC_AGENT_ONLY", "agent-only")
+	t.Setenv("RC_NEITHER", "")
+	got := resolveCommand(
+		[]string{"${RC_BOTH}", "${RC_AGENT_ONLY}", "${RC_NEITHER:-dflt}", "plain", "${RC_EMPTY:-${RC_BOTH}}"},
+		[]string{"RC_BOTH=container", "RC_EMPTY="},
+	)
+	want := []string{"container", "agent-only", "dflt", "plain", "container"}
+	if strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Fatalf("resolveCommand = %q, want %q", got, want)
+	}
+}
+
+// StartBackendSDK takes the model and resolves the Command through the
+// helpers the tests above prove, against the env it hands the container.
+func TestStartBackendResolvesTheCommandAgainstTheContainerEnv(t *testing.T) {
+	src, err := os.ReadFile("backends.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := string(src)
+	start := strings.Index(body, "func (c *Client) StartBackendSDK(")
+	if start < 0 {
+		t.Fatal("StartBackendSDK not found")
+	}
+	fn := body[start:]
+	if end := strings.Index(fn, "\n}\n"); end > 0 {
+		fn = fn[:end]
+	}
+	for _, call := range []string{
+		`case "embedding", "reranker":` + "\n\t\tembedRerankModelEnv(spec, model, envOverrides)",
+		"env := buildEnvList(spec.Env, envOverrides)",
+		"cmd := resolveCommand(spec.Command, env)",
+		"Env:   env,",
+	} {
+		if !strings.Contains(fn, call) {
+			t.Errorf("StartBackendSDK lost %q", call)
+		}
+	}
+}
+
+// What runs is what RunningBackends reports: a TEI container's --model-id,
+// not its MODEL_ID env. A container an older agent created with the placed
+// model in MODEL_ID and the node default in --model-id reads as the default,
+// so the reconciler sees the mismatch and recreates it.
+func TestRunningBackendsReadsTEIModelFromItsFlag(t *testing.T) {
+	f := &listFakeDaemon{
+		listStatus: 200,
+		listBody: `[
+ {"Id":"ttt","Names":["/noo-tei"],"Image":"tei:test","Labels":{}},
+ {"Id":"rrr","Names":["/noo-reranker"],"Image":"tei:test","Labels":{}}
+]`,
+		inspectBody: map[string]string{
+			"ttt": `{"Id":"ttt","Config":{"Env":["MODEL_ID=org/placed-embed"],"Cmd":["--model-id","BAAI/bge-base-en-v1.5"]}}`,
+			"rrr": `{"Id":"rrr","Config":{"Env":["MODEL_ID=org/placed-rerank"],"Cmd":["--model-id","BAAI/bge-reranker-base"]}}`,
+		},
+	}
+	c := newFakeDaemon(t, f)
+	got, err := c.RunningBackends(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got["embedding"] != "BAAI/bge-base-en-v1.5" || got["reranker"] != "BAAI/bge-reranker-base" {
+		t.Fatalf("RunningBackends = %v, want the --model-id each container runs", got)
+	}
+	// No flag (a hand-started container): MODEL_ID still names it.
+	f.inspectBody["ttt"] = `{"Id":"ttt","Config":{"Env":["MODEL_ID=org/env-only"]}}`
+	f.inspectBody["rrr"] = `{"Id":"rrr","Config":{"Env":["MODEL_ID=org/env-only-rerank"]}}`
+	got, err = c.RunningBackends(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got["embedding"] != "org/env-only" || got["reranker"] != "org/env-only-rerank" {
+		t.Fatalf("RunningBackends = %v, want MODEL_ID when there is no --model-id", got)
+	}
+}

@@ -22,8 +22,15 @@
 set -uo pipefail
 : "${OUT:?}" "${CELL:?}" "${RUNNER:=?}" "${DOCKER:=preinstalled}" "${ONBOARD:=ci}" \
   "${MODEL:=default}" "${SCOPE:=full}" "${CLI_TAG:=latest}"
-TINY_MODEL="${TINY_MODEL:-qwen2.5:0.5b}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
+# CLI_TAG is a free-text dispatch input spliced into the install line below,
+# which runs under `sh -c`: hold it to the rule before ANY use, on its own
+# (the workflow refuses it first; this refuses it again). Exit 2: not run.
+# shellcheck source=scripts/install-cell/validate_tag.sh
+. "$HERE/validate_tag.sh"
+require_cli_tag "$CLI_TAG" || exit 2
+# ── end of the dispatch-input check ──
+TINY_MODEL="${TINY_MODEL:-qwen2.5:0.5b}"
 mkdir -p "$OUT"
 # shellcheck source=scripts/install-cell/lib.sh
 . "$HERE/lib.sh"
@@ -201,6 +208,7 @@ if [ "$SCOPE" = node-partial ]; then
     # and hosted Apple-silicon runners have no Docker. Install + CLI only.
     meta limits "macOS node path stops before join: no reachable controller from a hosted runner, no Docker on hosted Apple silicon"
     step cli-help 60 -- noo --help
+    step verify-ratchet 10 -- python3 "$HERE/ratchet.py" skip "$CELL" "a node-only cell: no controller to verify"
     finish
 fi
 
@@ -274,6 +282,7 @@ if [ "${EXPECT:-}" = refusal ]; then
       if [ -n "$why" ]; then echo "REFUSAL FAIL: $why"; exit 1; fi
       echo "REFUSAL OK: onboard refused this $(uname -m) machine, named the reason and the node alternative, and started nothing"'
     teardown
+    step verify-ratchet 10 -- python3 "$HERE/ratchet.py" skip "$CELL" "an arm64 controller is refused: no install to verify"
     finish
 fi
 
@@ -309,8 +318,40 @@ fi
 agent_dump model
 
 # ── 4. up, verified, answering ──────────────────────────────────────────
-step stack-start 1800 -- noo stack start || fail_onboarded
+# README step 3: the wizard leaves the stack running, and the stranger checks
+# it with `noo health` (`noo stack start` is for after a reboot or a stop).
 step health 600 -- sh -c 'for i in $(seq 1 40); do noo health >/dev/null 2>&1 && break; sleep 15; done; noo health' \
+    || fail_onboarded
+# Not the stranger's steps: three checks of the launcher's plain start
+# (scripts/lib-start-inputs.sh), each judged from the stack's container IDs
+# before and after (recreated.py) and each failing the cell. It used to run
+# every full start with --force-recreate: 13 containers recreated in every
+# cell right after onboard, config-less ones included, dropping the agent's
+# NATS link and tunnel.
+#   (a) nothing changed: a plain start recreates nothing;
+#   (b) one secret's CONTENT changed (TAVILY_API_KEY, which only the gateway
+#       reads, from one non-empty value to another, so compose's own config
+#       is unchanged): only the gateway, and what compose recreates because
+#       it depends on the gateway;
+#   (c) `--recreate`: every container.
+RC_PY="$HERE/recreated.py"
+step start-idempotent 1800 -- sh -c 'python3 "$1" snap "$2/start-a.before" && noo stack start && python3 "$1" snap "$2/start-a.after" \
+  && python3 "$1" judge START-IDEMPOTENT "$2/start-a.before" "$2/start-a.after" --none' _ "$RC_PY" "$OUT" || fail_onboarded
+step start-input-change 3600 -- sh -c 'set -e
+  printf %s start-input-probe-a | noo security secrets rotate TAVILY_API_KEY --set-from-stdin --yes
+  noo stack start   # the pointer env appears: the gateway is recreated here, not judged
+  python3 "$1" snap "$2/start-b.before"
+  printf %s start-input-probe-b | noo security secrets rotate TAVILY_API_KEY --set-from-stdin --yes
+  noo stack start
+  python3 "$1" snap "$2/start-b.after"
+  python3 "$1" judge START-INPUT-CHANGE "$2/start-b.before" "$2/start-b.after" --only gateway' _ "$RC_PY" "$OUT" || fail_onboarded
+# Restore: the key was absent; remove it again (best effort: a store that
+# refuses the removal keeps a key nothing uses, NOO_SEARCH_PROVIDER is unset).
+step start-input-restore 1800 -- sh -c 'noo security secrets remove TAVILY_API_KEY --yes || echo "kept TAVILY_API_KEY (the store refused the removal)"; noo stack start' \
+    || fail_onboarded
+step start-recreate 1800 -- sh -c 'python3 "$1" snap "$2/start-c.before" && noo stack start --recreate && python3 "$1" snap "$2/start-c.after" \
+  && python3 "$1" judge START-RECREATE "$2/start-c.before" "$2/start-c.after" --all' _ "$RC_PY" "$OUT" || fail_onboarded
+step health-after-starts 600 -- sh -c 'for i in $(seq 1 40); do noo health >/dev/null 2>&1 && break; sleep 15; done; noo health' \
     || fail_onboarded
 # PROBES: install.md:226 `noo whoami   # controller / node / both / client-only`
 # (an onboarded controller), and install.md:228 / troubleshooting.md:9
@@ -323,7 +364,7 @@ step probe-docs-whoami-onboarded 30 -- sh -c 'out="$(noo whoami 2>&1)"; rc=$?; p
 step probe-docs-doctor-docker 120 -- sh -c 'out="$(noo doctor docker 2>&1)"; rc=$?; printf "%s\n" "$out"
   if [ $rc = 0 ] && printf "%s" "$out" | grep -qi "no unclean-shutdown damage signature"; then echo "DOCTOR-DOCKER PASS: a clean daemon reads as setup-and-host.md says"
   else echo "DOCTOR-DOCKER FAIL: a fresh daemon should exit 0 with \"no unclean-shutdown damage signature\" (rc=$rc)"; exit 1; fi'
-# Not in the README's path (it is `stack start && health`, then chat): a red
+# Not in the README's path (it is `noo health` after onboard, then chat): a red
 # verify is recorded with every row, and the stranger still asks the question.
 if [ "$MODEL" = tiny ]; then
     # The declared OLLAMA_MODEL is pulled, but the default chat model stays the
@@ -363,6 +404,21 @@ step verify 900 -- bash -c 'fresh cluster verify --wait'
 # executor's "profile: 3.x form") is readable from the cell's artifacts. Same
 # redactor and upload scan as every log. Never the failed step.
 step probe-verify-json 300 -- bash -c 'fresh --json cluster verify'
+# THE WARN RATCHET (i1098): the JSON above, judged against this cell's
+# ceiling in warn-ratchet.json: more WARN rows than max_warn, or a WARN row
+# the ceiling does not name, FAILS the cell (a gate, not a probe; the cell
+# goes on so the probes after it still report). Counted by `verdict`, never
+# by text; an OK row tiered "later" is not a WARN. While the ceiling is
+# unmeasured it prints a NOTE with what it measured. Each WARN row prints
+# with its status (row_status: "awaiting operator decision" is NOT accepted).
+# A FAIL row fails the cell here (fail_rows_fail_the_cell). The one
+# exemption is `default chat` after a registry outage at onboard whose
+# retries were exhausted: it reads the onboard logs (one per mode: ci,
+# ci + tiny model, interactive attentive/literal; a missing one adds
+# nothing). ratchet.py says more.
+step verify-ratchet 60 -- python3 "$HERE/ratchet.py" judge "$CELL" "$OUT/logs/probe-verify-json.log" \
+    --onboard-log "$OUT/logs/onboard.log" --onboard-log "$OUT/logs/onboard-model.log" \
+    --onboard-log "$OUT/logs/onboard-attentive.log" --onboard-log "$OUT/logs/onboard-literal.log"
 # The container onboard pulled the chat model into, chosen the way onboard's
 # pull_ollama chooses it (noo-cli onboard/steps.rs): noo-ollama-embed on a
 # standalone install (NOO_STANDALONE=1 or a .noo-standalone marker in the
@@ -397,8 +453,10 @@ for n in j.get(\"nodes\") or []:
             sys.exit()
 print(\"verdict=absent detail=no ollama models row for \" + me)
 " "$(hostname)" 2>&1)"
+    # i1067: a held model the agent has not checked yet is an OK row that
+    # says "not yet checked": still pending, so wait for its check.
+    case "$out" in *"not yet checked"*|*"not checked yet"*|verdict=absent*) sleep 30; continue ;; esac
     case "$out" in verdict=ok*) break ;; esac
-    case "$out" in *"not checked yet"*|verdict=absent*) sleep 30; continue ;; esac
     break
   done
   echo "$out"
@@ -407,6 +465,8 @@ print(\"verdict=absent detail=no ollama models row for \" + me)
   # from the container onboard pulled into (noo-ollama-embed on a one-box).
   oc="$(onboard_ollama_container)"
   ov="$( { docker exec "$oc" ollama --version 2>/dev/null || sudo -n docker exec "$oc" ollama --version 2>/dev/null; } | sed -n "s/.*version is //p" | head -n 1)"
+  # Still not checked after the retries: not verified, so not a PASS.
+  case "$out" in *"not yet checked"*) out="verdict=pending (the agent had not checked it after 6 min) ${out}" ;; esac
   case "$out" in
     verdict=ok*) echo "OLLAMA-VERIFIED PASS (ollama ${ov:-?} in $oc): the model onboard pulled is verified against the controller'"'"'s record of its pull: ${out#*detail=}" ;;
     *) echo "OLLAMA-VERIFIED FAIL (ollama ${ov:-?} in $oc): a fresh install'"'"'s ollama models row should read verified, not: ${out}"; exit 1 ;;
@@ -652,6 +712,77 @@ if [ "$CELL" = "$CONTEXT_PIN_CELL" ] && [ -f "$CONTEXT_FIT" ]; then
     judged_ctx_continue context-fit-pinned-running 400 running --expect-decided 4096
     judged_ctx context-fit-pinned-check 600 pinned-check
     judged_ctx context-fit-doesnt-fit 300 doesnt-fit --expect-backend ollama
+fi
+
+# ── the real CLI's reload and forced restart (the release lead) ──────────
+# ONLY the default cell, and AFTER first-answer, the three start checks and
+# the probes that judge the fresh install: it rotates a live credential and
+# recreates the stack, so it must not touch what those judge, nor the
+# first-answer seconds compared across runs. Every other cell skips it with a
+# NOTE (a step of no time). Its output is prefixed (`rotate| `, …): the
+# rotation's own warnings are the harness's doing, not a stranger's, and stay
+# out of the summary's warning count.
+#
+# What the code does (noo-cli nats_users.rs rotate_controller_principals):
+# `noo cluster nats-creds rotate worker` mints the worker's password, re-
+# renders users.conf and HUPs nats (hup_nats); with --restart it then runs
+# `scripts/noomesh-restart.sh --force` with NO service named, which force-
+# recreates EVERY stack container (nats included), not only the holders it
+# names (noo-worker, noo-trellion, noo-trellion-intel). So a --restart
+# replaces the nats a reload record names, and the record is never used:
+# START-AFTER-PROVISION could not be judged after it. Two phases, then:
+#   1. rotate worker WITHOUT --restart (users.conf changes, nats is HUPed
+#      and the confirmed reload recorded), `noo cluster provision <self>
+#      --wait` (re-renders and HUPs again), then a plain start:
+#      START-AFTER-PROVISION: nats NOT recreated (PASS), recreated (FAIL
+#      with the launcher's reason lines), NOTE on a build that records no
+#      reload. The worker and trellion ARE recreated there (their input
+#      changed): what the plain start is for.
+#   2. rotate worker --restart (the stack recreated by noomesh-restart.sh
+#      --force, which labels what it recreates since #1462), then a plain
+#      start: START-AFTER-FORCED-RESTART: nothing the restart recreated
+#      (worker and trellion among them) is recreated again; FAIL names each
+#      with its reason line. No NOTE fallback.
+FORCED_RESTART_CELL=ubuntu-24.04-amd64-default
+if [ "$CELL" = "$FORCED_RESTART_CELL" ]; then
+step start-after-rotation 3600 -- bash -c '
+  rc_py="$1"; out="$2"; v=0
+  m="$(find "$HOME" -maxdepth 4 -name .noo-standalone -print -quit 2>/dev/null)"
+  inst="${m%/.noo-standalone}"; inst="${inst:-${NOO_REPO_ROOT:-$HOME/.noo}}"
+  conf="$inst/monitoring/nats/users.conf"
+  tmp="$(mktemp -d)"; trap "rm -rf $tmp" EXIT
+  sum() { python3 -c "import hashlib, sys; print(hashlib.sha256(open(sys.argv[1], \"rb\").read()).hexdigest())" "$1" 2>/dev/null; }
+  run() { local tag="$1" log="$2"; shift 2; "$@" > "$log" 2>&1; local rc=$?; sed "s/^/$tag| /" "$log"; return $rc; }
+  last() { grep -v "^[[:space:]]*$" "$1" | tail -n 1 | cut -c1-200; }
+  # phase 1
+  c0="$(sum "$conf")"
+  run rotate "$tmp/rotate.log" noo cluster nats-creds rotate worker --yes; rrc=$?
+  if [ "$rrc" != 0 ]; then
+    echo "START-AFTER-PROVISION FAIL: noo cluster nats-creds rotate worker exited $rrc: $(last "$tmp/rotate.log")"
+    echo "START-AFTER-FORCED-RESTART FAIL: not run: the rotation failed"; exit 1
+  fi
+  run provision "$tmp/provision.log" timeout 900 noo cluster provision "$(hostname)" --wait; prc=$?
+  c1="$(sum "$conf")"
+  if [ -z "$c0" ] || [ -z "$c1" ]; then ch=unknown; elif [ "$c0" = "$c1" ]; then ch=no; else ch=yes; fi
+  echo "users.conf changed by the rotation and the provision: $ch"
+  rec="$(python3 "$rc_py" reload-record "$inst/.noo-start-inputs.json")"
+  echo "nats reload record before the start: $rec"
+  python3 "$rc_py" snap "$out/start-d.before"
+  run start "$tmp/start.log" noo stack start; src=$?
+  python3 "$rc_py" snap "$out/start-d.after"
+  python3 "$rc_py" after-provision START-AFTER-PROVISION "$out/start-d.before" "$out/start-d.after" \
+    "$tmp/start.log" "$src" "$ch" "$rec" "$tmp/provision.log" "$prc" || v=1
+  # phase 2
+  run rotate-restart "$tmp/rotate2.log" noo cluster nats-creds rotate worker --restart --yes; r2=$?
+  python3 "$rc_py" snap "$out/start-e.restarted"
+  run start "$tmp/start2.log" noo stack start; s2=$?
+  python3 "$rc_py" snap "$out/start-e.after"
+  python3 "$rc_py" after-forced-restart START-AFTER-FORCED-RESTART "$out/start-d.after" "$out/start-e.restarted" \
+    "$out/start-e.after" "$tmp/start2.log" "$s2" "$r2" "$tmp/rotate2.log" || v=1
+  exit $v' _ "$RC_PY" "$OUT"
+else
+step start-after-rotation 10 -- sh -c 'echo "START-AFTER-PROVISION NOTE: runs in the $1 cell only (it rotates the worker NATS credential and recreates the stack)"
+  echo "START-AFTER-FORCED-RESTART NOTE: runs in the $1 cell only"' _ "$FORCED_RESTART_CELL"
 fi
 
 # PROBE (fa, rc.1 rehearsal A-reboot.status, i677): a container that joins

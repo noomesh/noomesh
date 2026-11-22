@@ -134,9 +134,13 @@ type NodeWorkloads struct {
 
 	api          provAPI
 	goos, arch   string
-	fetchTar     func(ctx context.Context, artifact string) (path string, cleanup func(), err error)
+	fetchTar     func(ctx context.Context, artifact, dockerRoot string) (path string, cleanup func(), err error)
 	doorImage    func(ctx context.Context) (string, error)
 	doorSelfName func() (string, error)
+
+	// dockerRoot is Docker's data root, for the image space check and for
+	// naming it in an out-of-space refusal; nil is "" (staging dir only).
+	dockerRoot func(ctx context.Context) string
 
 	// fetchBackoff spaces out image fetches that failed (unreachable rail).
 	fetchBackoff fetchBackoff
@@ -162,6 +166,9 @@ func NewNodeWorkloads(c *Client, sets SetSource) *NodeWorkloads {
 		goos:     runtime.GOOS,
 		arch:     runtime.GOARCH,
 		fetchTar: fetchRailTar,
+		dockerRoot: func(ctx context.Context) string {
+			return dockerRootDirFn(ctx, c)
+		},
 		doorImage: func(ctx context.Context) (string, error) {
 			return c.ensureSidecarImage(ctx, "")
 		},
@@ -169,6 +176,14 @@ func NewNodeWorkloads(c *Client, sets SetSource) *NodeWorkloads {
 		status:       map[string]WorkloadStatus{},
 		lc:           lifeCycle{doorCall: newDoorCaller()},
 	}
+}
+
+// noSpace refuses a workload whose image tar has no room on this node: reason
+// disk, never the fetch backoff. A REAL ENOSPC is remembered (noteNoSpace)
+// so the tar is not fetched again until that path has gained room.
+func (p *NodeWorkloads) noSpace(e nodewl.Entry, err error) error {
+	noteNoSpace(e.Image.Artifact, err)
+	return refuse(nodewl.ReasonDisk, "", "%v", err)
 }
 
 func wlKey(addon, name string) string { return addon + "/" + name }
@@ -619,13 +634,26 @@ func (p *NodeWorkloads) ensureImage(ctx context.Context, e nodewl.Entry) error {
 	if why, wait := p.fetchBackoff.blocked(e.Image.Artifact, time.Now()); wait > 0 {
 		return refuse(nodewl.ReasonImageUnavailable, "", "%s (next try in %s)", why, wait.Round(time.Second))
 	}
-	path, cleanup, err := p.fetchTar(ctx, e.Image.Artifact)
+	// A pull that REALLY ran out of space is not tried again until that path
+	// has gained room (noSpaceGate, image_source.go), as for a backend image.
+	if err := noSpaceGate(e.Image.Artifact); err != nil {
+		return refuse(nodewl.ReasonDisk, "", "%v", err)
+	}
+	dockerRoot := ""
+	if p.dockerRoot != nil {
+		dockerRoot = p.dockerRoot(ctx)
+	}
+	path, cleanup, err := p.fetchTar(ctx, e.Image.Artifact, dockerRoot)
 	if err != nil {
 		switch {
 		case errors.Is(err, ErrArtifactAbsent):
 			return refuse(nodewl.ReasonImageMissing, "", "%s is not on the rail", e.Image.Artifact)
 		case IsImageVerification(err):
 			return refuse(nodewl.ReasonImageDigestMismatch, "", "%v", err)
+		case IsNoSpace(err):
+			// Not transport: never on the fetch backoff. The next pass
+			// re-checks the space (a statfs) and fetches once there is room.
+			return p.noSpace(e, err)
 		}
 		// The rail knows the tar; this node cannot reach it. Name it, and do
 		// not hit an unreachable rail on every pass.
@@ -645,8 +673,13 @@ func (p *NodeWorkloads) ensureImage(ctx context.Context, e nodewl.Entry) error {
 	defer f.Close()
 	loaded, err := p.api.LoadImage(ctx, f)
 	if err != nil {
-		return fmt.Errorf("docker load: %w", err)
+		err = classifyNoSpace(e.Image.Artifact, "Docker's data root", dockerRoot, fmt.Errorf("docker load: %w", err))
+		if IsNoSpace(err) {
+			return p.noSpace(e, err)
+		}
+		return err
 	}
+	clearNoSpace(e.Image.Artifact)
 	distinct := map[string]bool{}
 	for _, id := range loaded {
 		distinct[strings.TrimPrefix(strings.ToLower(id), "sha256:")] = true

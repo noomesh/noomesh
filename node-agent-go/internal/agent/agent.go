@@ -10,6 +10,7 @@ package agent
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"github.com/noomesh/noomesh/node-agent-go/internal/diskreclaim"
@@ -440,6 +441,8 @@ func (a *Agent) Run() error {
 	a.hb.SetOllamaVerify(rec.OllamaVerifyReport)
 	a.hb.SetNodeLocal(nodelocal.Current)
 	if a.docker != nil {
+		a.hb.SetImageStoreFreeBytes(func() (int64, bool) { return a.docker.ImageStoreFreeBytes(a.lifeCtx()) })
+		a.hb.SetHeldImages(func() map[string]bool { return a.docker.HeldImages(a.lifeCtx()) })
 		a.hb.SetBackendCaps(dockerpkg.BackendCapsReport)
 		a.hb.SetLlamacppOffload(dockerpkg.LlamacppOffloadReport)
 	}
@@ -581,14 +584,7 @@ func (a *Agent) startTunnel(ctx context.Context) {
 		slog.Warn("node tunnel not started; control stays on HTTPS", "error", verr)
 		return
 	}
-	c, cerr := tunnel.New(tunnel.Options{
-		NodeID:        a.cfg.NodeID,
-		ControllerURL: a.cfg.ControllerURL,
-		TLS:           tr.TLSClientConfig,
-		Sign:          func(r *http.Request) error { return auth.SetClusterAuth(r, a.cfg.NodeID, a.cfg.ClusterSecret) },
-		Handler:       a.server.Handler(),
-		Verifier:      v,
-	})
+	c, cerr := tunnel.New(a.tunnelOptions(tr.TLSClientConfig, v, a.server.Handler()))
 	if cerr != nil {
 		slog.Warn("node tunnel not started; control stays on HTTPS", "error", cerr)
 		return
@@ -596,6 +592,23 @@ func (a *Agent) startTunnel(ctx context.Context) {
 	a.tun = c
 	a.hb.SetTunnel(c.Connected)
 	go c.Run(ctx)
+}
+
+// tunnelOptions is the tunnel's configuration. OnChange kicks a heartbeat on
+// every connect and every loss, so control_transports.tunnel on the
+// controller's record follows the tunnel at once: after a gateway restart the
+// node reads tunnel=false for seconds, not for up to a beat interval, and a
+// dropped tunnel is not advertised as up until the next tick.
+func (a *Agent) tunnelOptions(tlsCfg *tls.Config, v *ctrlrpc.Verifier, h http.Handler) tunnel.Options {
+	return tunnel.Options{
+		NodeID:        a.cfg.NodeID,
+		ControllerURL: a.cfg.ControllerURL,
+		TLS:           tlsCfg,
+		Sign:          func(r *http.Request) error { return auth.SetClusterAuth(r, a.cfg.NodeID, a.cfg.ClusterSecret) },
+		Handler:       h,
+		Verifier:      v,
+		OnChange:      func(bool) { a.hb.Kick() },
+	}
 }
 
 func (a *Agent) startMessaging(ctx context.Context) {

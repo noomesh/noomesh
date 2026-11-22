@@ -1116,7 +1116,7 @@ async fn v1_responses(
     use super::raw_chat::{self, Outcome};
     let (class, cands) = match raw_chat::resolve_candidates(&state, requested_model_hint(&body), None, false).await {
         Ok(r) => r,
-        Err(e) => return e.into_response("v1"),
+        Err(e) => return e.naming_model(requested_model_hint(&body)).into_response("v1"),
     };
     let stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
 

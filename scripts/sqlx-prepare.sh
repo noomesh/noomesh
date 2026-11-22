@@ -104,6 +104,8 @@ fi
 
 # The container writes as root; hand the cache back to the invoking user so the
 # working tree stays usable (and `git worktree remove` does not hit EPERM).
+# DEV-ONLY (a maintainer regenerating the sqlx cache; never on an install):
+# alpine only chowns the files the build container made.
 docker run --rm -v "$REPO_ROOT/gateway-rust":/w alpine \
   chown -R "$(id -u):$(id -g)" /w/.sqlx
 

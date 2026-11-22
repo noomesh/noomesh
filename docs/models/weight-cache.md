@@ -31,8 +31,8 @@ An empty list `[]` means the cache holds no models yet. A `404` means
 
 ## What the cache serves
 
-The `model-cache` compose service (`nginx:1.27-alpine`, profiles
-`controller` and `standalone`) listens on port **8443** (mTLS) and serves
+The `model-cache` compose service (`nginx:1.30.7-alpine`, pulled from our mirror
+`ghcr.io/noomesh/nginx`; profiles `controller` and `standalone`) listens on port **8443** (mTLS) and serves
 three read-only trees from the controller's data root:
 
 | URL path | Host directory | Content |
@@ -66,6 +66,11 @@ The store fills itself: any model the controller runs lands in
 by hand or with `noo models pull` (Ollama only — see below).
 
 ### `HF_CACHE_DIR` is an HF_HOME, not a hub directory
+
+On the controller, `<HF cache>/hub` must be owned like the HF cache itself, or
+the self node's agent cannot write the weights. `noo cluster verify`'s
+`hf-cache hub owner` row says whether it is. The self node's applier repairs it
+at its next apply.
 
 This is the one layout mistake that produces a silent empty cache, so it is
 worth being exact. `HF_CACHE_DIR` is an **HF_HOME**: the directory
@@ -523,6 +528,16 @@ file under its own `MODELS_DIR`/`HF_CACHE_DIR`. Success prints
 ```
 noo cluster place <node> llamacpp <file>
 ```
+
+When a placed `.gguf` is not on the node, the agent fetches it from the
+controller before the backend starts. While the controller is still hashing a
+large file the agent waits for it (up to 60 seconds per reconcile pass). If the file cannot be
+had (no manifest, still hashing after the wait, a failed copy), no container
+is created: `noo cluster status` shows a `gguf_unavailable` start refusal
+naming the file and the reason, and the agent retries on every reconcile pass.
+A file already on the node still starts. A running placement whose file has
+vanished is not treated as converged: the same refusal appears until the file
+is back.
 
 ## Pre-cache models on a schedule
 

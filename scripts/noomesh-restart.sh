@@ -25,6 +25,11 @@ _LIBDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$_LIBDIR/lib-bind-addr.sh"
 resolve_bind_addr || exit 1   # an unset NOO_BIND_MODE is a refusal (lib-bind-addr.sh); no set -e here, so check it
 resolve_location
+# The `noo.inputs` labels (lib-start-inputs.sh): every `up` below carries
+# the ones `noo stack start` computes, so what a restart recreates is not
+# recreated again by the next plain start. Sourced before load_secrets, whose
+# secret-file writer leaves the keyed digests the labels read.
+source "$_LIBDIR/lib-start-inputs.sh"
 # Load secrets (no-op unless NOO_SECRETS_BACKEND=sops; fails closed on decrypt error).
 source "$_LIBDIR/lib-secrets.sh"
 load_secrets || { echo "aborting: secrets load failed" >&2; exit 1; }
@@ -39,6 +44,10 @@ source "$_LIBDIR/lib-config.sh"
 # the add-on profiles recreates every core consumer and leaves the add-ons
 # on the old secrets (noo-trellion-intel, 2026-09-14 → 18).
 source "$_LIBDIR/lib-addons.sh"
+# The gateway's launcher-exported compose env, as start and rebuild set it:
+# without it a forced restart renders the gateway differently and the next
+# plain start recreates it.
+addons_export_launcher_env
 # A retired key left in .env or the sops store is inert; say so (start and
 # rebuild do the same).
 warn_retired_env_keys
@@ -307,9 +316,12 @@ if [ ${#SERVICES[@]} -eq 0 ]; then
         # service found stopped afterwards fails the start.
         addons_stop_leftovers addons_stop_disabled || exit 1
         # shellcheck disable=SC2086
+        start_inputs_label_for_up || exit 1
+        # shellcheck disable=SC2086
         check_bind_sources --no-deps $ACTIVE_SVCS || exit 1
         noo_compose_up_isolating_stuck compose $COMPOSE_FILES $PROFILE_ARGS up -d --no-build --force-recreate $GPU_SCALE $AGENT_SCALE $ADDON_HOLD_SCALE || _up_rc=$?
-        if [ "${_up_rc:-0}" -ne 0 ] && [ "${_up_rc:-0}" -ne "$NOO_EXIT_STACK_PARTIAL" ]; then exit "$_up_rc"; fi
+        if [ "${_up_rc:-0}" -ne 0 ] && [ "${_up_rc:-0}" -ne "$NOO_EXIT_STACK_PARTIAL" ]; then start_inputs_discard_state; exit "$_up_rc"; fi
+        start_inputs_commit_state
         # Report, never reap: a container no compose file of this install declares
         # (186b). Exit status unchanged; `--remove-orphans` is not passed to any `up`.
         compose_report_undeclared .
@@ -385,8 +397,10 @@ EOF_HELD
         # --no-deps: "restart THESE" must not recreate half the stack via
         # depends_on; --no-build: a restart never compiles anything.
         restart_require_lock || exit 1
+        start_inputs_label_for_up "${SERVICES[@]}" || exit 1
         check_bind_sources --no-deps "${SERVICES[@]}" || exit 1
         docker compose $COMPOSE_FILES $PROFILE_ARGS up -d --no-build --no-deps --force-recreate "${SERVICES[@]}" || RESTART_RC=$?
+        if [ "$RESTART_RC" -eq 0 ]; then start_inputs_commit_state; else start_inputs_discard_state; fi
         if [ "$RESTART_RC" -eq 0 ]; then
             NOO_CREATED_GUARD_SERVICES="${SERVICES[*]}" \
                 noo_created_guard $(docker compose $COMPOSE_FILES $PROFILE_ARGS ps -aq "${SERVICES[@]}")
@@ -405,9 +419,12 @@ EOF_HELD
             ui_note "no container for ${MISSING% } - creating it (up -d --no-deps)"
             restart_require_lock || exit 1
             # shellcheck disable=SC2086
+            start_inputs_label_for_up $MISSING || exit 1
+            # shellcheck disable=SC2086
             check_bind_sources --no-deps $MISSING || exit 1
             # shellcheck disable=SC2086
             docker compose $COMPOSE_FILES $PROFILE_ARGS up -d --no-build --no-deps $MISSING || RESTART_RC=$?
+            if [ "$RESTART_RC" -eq 0 ]; then start_inputs_commit_state; else start_inputs_discard_state; fi
             if [ "$RESTART_RC" -eq 0 ]; then
                 # shellcheck disable=SC2086
                 NOO_CREATED_GUARD_SERVICES="${MISSING% }" \

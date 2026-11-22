@@ -73,6 +73,35 @@ pub(crate) const THIRD_PARTY_LOCK_ROWS: &[&str] = &[
     "nats", "nginx", "redis", "loki", "tempo", "prometheus", "alertmanager", "grafana", "node-exporter", "tei", "tei-cpu", "vllm",
 ];
 
+/// Lock rows that pin an ARTIFACT image: files the CLI unpacks with `docker
+/// create` + `docker cp`, never a container anything runs. harrier, the
+/// default embedder, is published once under its own tag
+/// (publish-harrier.yml) and the release pins it by digest
+/// (scripts/harrier-artifact.json, written into the lock by the `lock` job),
+/// so every fetch is `<prefix>/harrier@sha256:…`. Never staged from the lock
+/// (`<prefix>/harrier:<release tag>` does not exist; nodes import the weights
+/// from the controller's store), and no compose service reads its
+/// `NOO_IMAGE_DIGEST_HARRIER`.
+pub(crate) const ARTIFACT_LOCK_ROWS: &[&str] = &["harrier"];
+
+/// The signed lock's line vouching for the GGUF inside the pinned harrier
+/// image: `# harrier-gguf-sha256 <64 hex>`, the sha256 the image's own
+/// `harrier.sha256` names, which a node's harrier model layer must equal.
+pub(crate) const HARRIER_GGUF_LINE: &str = "# harrier-gguf-sha256 ";
+
+/// What a stack lock pins harrier to: the artifact image digest
+/// (`sha256:…`) and, when the lock carries it, the GGUF's
+/// (`sha256:…`). None when the lock has no `harrier@sha256:` row (a release
+/// before harrier was locked).
+pub(crate) fn harrier_pin_in(lock: &str) -> Option<(String, Option<String>)> {
+    let image = parse_lock(lock).into_iter().find(|r| r.name == "harrier")?.digest;
+    let gguf = lock.lines().find_map(|l| {
+        let hex = l.trim_end().strip_prefix(HARRIER_GGUF_LINE)?.trim();
+        (hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit())).then(|| format!("sha256:{}", hex.to_ascii_lowercase()))
+    });
+    Some((image, gguf))
+}
+
 /// Backend doors pinned to their own image instead of the release
 /// (config/door-images.json; the node agent embeds a byte-equal copy). Each
 /// pin is staged on every lock stage under source [`DOOR_PIN_SOURCE`], which
@@ -190,12 +219,13 @@ pub(crate) fn parse_lock(text: &str) -> Vec<LockRow> {
 
 pub(crate) fn node_bound(name: &str) -> bool {
     !CONTROLLER_ONLY.contains(&name) && !name.starts_with("deps-") && !THIRD_PARTY_LOCK_ROWS.contains(&name) && !ON_DEMAND_LOCK_ROWS.contains(&name)
+        && !ARTIFACT_LOCK_ROWS.contains(&name)
 }
 
 /// Does `stage_lock` stage this lock row? Node-bound release images, or
-/// every release image with `--all-images`; a third-party row never.
+/// every release image with `--all-images`; a third-party or artifact row never.
 pub(crate) fn stages_from_lock(name: &str, all: bool) -> bool {
-    !THIRD_PARTY_LOCK_ROWS.contains(&name) && (all || node_bound(name))
+    !THIRD_PARTY_LOCK_ROWS.contains(&name) && !ARTIFACT_LOCK_ROWS.contains(&name) && (all || node_bound(name))
 }
 
 /// Docker/uname arch spellings → the two the rail serves.
@@ -364,6 +394,12 @@ pub(crate) struct StagedRecord {
     pub release_tag: String,
     #[serde(default)]
     pub staged_at: u64,
+    /// The image's unpacked size in bytes, `docker image inspect .Size` at
+    /// stage time (i1036): the gateway's GPU llama.cpp place check adds it to
+    /// the tar's size. Absent when it could not be read, or for an image
+    /// staged before noo recorded it; never estimated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unpacked_bytes: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Default, Clone)]
@@ -519,6 +555,22 @@ pub(crate) fn host_arch() -> String {
 /// Is the daemon on the containerd image store (multi-platform per tag)?
 fn containerd_store() -> bool {
     docker(&["info", "--format", "{{json .DriverStatus}}"]).map(|s| s.contains("io.containerd.snapshotter")).unwrap_or(false)
+}
+
+/// `docker image inspect --format '{{.Size}}'`'s answer as a byte count: a
+/// whole number above zero, else None (unknown is never recorded as 0).
+pub(crate) fn parse_unpacked_bytes(out: &str) -> Option<u64> {
+    out.trim().parse::<u64>().ok().filter(|b| *b > 0)
+}
+
+/// The unpacked size of `reference` (for `platform`, on the containerd
+/// store), or None when the daemon does not say.
+fn inspect_unpacked_bytes(platform: Option<&str>, reference: &str) -> Option<u64> {
+    let out = match platform {
+        Some(p) => docker(&["image", "inspect", "--platform", p, "--format", "{{.Size}}", reference]),
+        None => docker(&["image", "inspect", "--format", "{{.Size}}", reference]),
+    };
+    parse_unpacked_bytes(&out.ok()?)
 }
 
 fn inspect_id_arch(reference: &str) -> Option<(String, String)> {
@@ -747,7 +799,7 @@ pub(crate) fn stage_image(g: &Globals, image: &str, arch: &str, lock_digest: Opt
     let tar = image_tar_gz_name(image, arch);
     let platform = format!("linux/{arch}");
 
-    let image_id = if arch == host {
+    let (unpacked_bytes, image_id) = if arch == host {
         if inspect_id_arch(&src).is_none() {
             docker(&["pull", "-q", &src])?;
         }
@@ -766,7 +818,7 @@ pub(crate) fn stage_image(g: &Globals, image: &str, arch: &str, lock_digest: Opt
         } else {
             save_tar(&dir, &tar, &[id.as_str()], &id, g)?;
         }
-        id
+        (inspect_unpacked_bytes(None, &id), id)
     } else if containerd_store() {
         docker(&["pull", "-q", "--platform", &platform, &src]).map_err(|e| format!("{NO_VARIANT} {arch}? {e}"))?;
         if lock_digest.is_some() {
@@ -774,7 +826,7 @@ pub(crate) fn stage_image(g: &Globals, image: &str, arch: &str, lock_digest: Opt
         }
         let id = docker(&["image", "inspect", "--platform", &platform, "--format", "{{.Id}}", image]).unwrap_or_default();
         save_tar(&dir, &tar, &["--platform", &platform, image], &id, g)?;
-        id
+        (inspect_unpacked_bytes(Some(platform.as_str()), image), id)
     } else {
         let digest = match resolve_platform(&src, arch)? {
             PlatformPick::Missing => return Err(format!("{NO_VARIANT} {arch}: {src} publishes no linux/{arch} manifest")),
@@ -787,7 +839,7 @@ pub(crate) fn stage_image(g: &Globals, image: &str, arch: &str, lock_digest: Opt
             return Err(format!("{NO_VARIANT} {arch}: {image} publishes only {a}"));
         }
         save_tar(&dir, &tar, &[id.as_str()], &id, g)?;
-        id
+        (inspect_unpacked_bytes(None, &id), id)
     };
     Ok(StagedRecord {
         image: image.to_string(),
@@ -798,6 +850,7 @@ pub(crate) fn stage_image(g: &Globals, image: &str, arch: &str, lock_digest: Opt
         source: source.to_string(),
         release_tag: String::new(),
         staged_at: now_unix(),
+        unpacked_bytes,
     })
 }
 
@@ -1495,9 +1548,10 @@ mod tests {
 
     #[test]
     fn a_third_party_lock_row_is_never_staged() {
-        // `nats@sha256:` pins docker.io/library/nats:<version> for the
-        // controller's own start; it is not `<prefix>/nats:<tag>`, so a
-        // stage would ask the release registry for an image it never had.
+        // `nats@sha256:` pins our mirror ghcr.io/noomesh/nats:<upstream
+        // version> for the controller's own start; it is not
+        // `<prefix>/nats:<release tag>`, so a stage would ask the release
+        // registry for an image it never had.
         // `ollama` is OUR hardened image (docker/Dockerfile.ollama, i323) and
         // IS staged for the nodes.
         let lock = format!("# tag v0.6.5\ngateway@{D}\nnats@{D}\nollama@{D}\nllamacpp@{D}\n");
@@ -1509,6 +1563,38 @@ mod tests {
             assert!(staged.contains(&"llamacpp") && staged.contains(&"ollama"), "all={all}: {staged:?}");
         }
         assert!(stages_from_lock("gateway", true) && !stages_from_lock("gateway", false));
+    }
+
+    /// The harrier row pins an artifact, not a release image: it parses like
+    /// any row, is never staged (`--all-images` included) and never counts as
+    /// node-bound, and its gguf line is read beside it.
+    #[test]
+    fn the_harrier_artifact_row_is_never_staged() {
+        let lock = format!("# stack v0.6.29\ngateway@{D}\nharrier@{D}\nllamacpp@{D}\n");
+        let rows = parse_lock(&lock);
+        assert!(rows.iter().any(|r| r.name == "harrier"), "the row parses like any other");
+        for all in [false, true] {
+            let staged: Vec<&str> = rows.iter().map(|r| r.name.as_str()).filter(|n| stages_from_lock(n, all)).collect();
+            assert!(!staged.contains(&"harrier"), "all={all}: {staged:?}");
+            assert!(staged.contains(&"llamacpp"), "all={all}: {staged:?}");
+        }
+        assert!(!node_bound("harrier"));
+        assert!(!lock_pinned_refs(&lock, "ghcr.io/noomesh", "v0.6.29").iter().any(|r| r.contains("harrier")));
+        assert!(!lock_node_refs(&lock, "ghcr.io/noomesh", "v0.6.29").iter().any(|r| r.contains("harrier")));
+    }
+
+    #[test]
+    fn the_harrier_pin_is_read_from_the_lock() {
+        let img = "sha256:2fe41964a009bda0c55f299b632b122bcb4561ca4a833e3293c9f3cc685bab79";
+        let gguf = "5f26506ab57fd817ce4a8b9d24946a60d40bc76d82a2defa7cd754ae01e9de80";
+        let lock = format!("# stack v0.6.29\n{HARRIER_GGUF_LINE}{gguf}\ngateway@{D}\nharrier@{img}\n");
+        assert_eq!(harrier_pin_in(&lock), Some((img.to_string(), Some(format!("sha256:{gguf}")))));
+        // A lock with the row but no gguf line: the image is still pinned.
+        assert_eq!(harrier_pin_in(&format!("harrier@{img}\n")), Some((img.to_string(), None)));
+        // A release before harrier was locked: nothing pinned.
+        assert_eq!(harrier_pin_in(&format!("# stack v0.6.28\ngateway@{D}\n")), None);
+        // A malformed gguf line is not a pin.
+        assert_eq!(harrier_pin_in(&format!("{HARRIER_GGUF_LINE}xyz\nharrier@{img}\n")), Some((img.to_string(), None)));
     }
 
     #[test]
@@ -1538,7 +1624,7 @@ mod tests {
 
     fn rec(image: &str, arch: &str, tag: &str, at: u64) -> StagedRecord {
         StagedRecord { image: image.into(), arch: arch.into(), tar: image_tar_name(image, arch), image_id: String::new(),
-            lock_digest: D.into(), source: "lock".into(), release_tag: tag.into(), staged_at: at }
+            lock_digest: D.into(), source: "lock".into(), release_tag: tag.into(), staged_at: at, unpacked_bytes: None }
     }
 
     #[test]
@@ -1867,6 +1953,49 @@ gateway@{D}
         assert_eq!(rec.image_id, "sha256:hostid");
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    /// i1036: `docker image inspect .Size` is a byte count; anything else
+    /// (empty, not a number, zero, negative) is unknown, never 0.
+    #[test]
+    fn the_unpacked_size_parses_only_a_whole_positive_number() {
+        assert_eq!(parse_unpacked_bytes("4012345678\n"), Some(4_012_345_678));
+        for bad in ["", "0", "-5", "4.0e9", "sha256:hostid amd64", "<no value>"] {
+            assert_eq!(parse_unpacked_bytes(bad), None, "{bad:?}");
+        }
+    }
+
+    /// i1036: staging records the image's unpacked size (by the image ID it
+    /// saved) in the index, for the gateway's GPU llama.cpp place check; a
+    /// daemon that does not answer leaves it unrecorded.
+    #[test]
+    fn the_unpacked_size_is_recorded_at_stage_time() {
+        let _l = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = store("unpacked");
+        let d = daemon(move |l| match l {
+            l if l.starts_with("version") => Ok("amd64".into()),
+            "image inspect --format {{.Size}} sha256:hostid" => Ok("4000000000\n".into()),
+            l if l.starts_with("image inspect") => Ok("sha256:hostid amd64".into()),
+            l if l.starts_with("tag ") => Ok(String::new()),
+            other => Err(format!("unexpected: {other}")),
+        });
+        let rec = stage_image(&g(), &format!("{REPO}:v1"), "amd64", Some(D), "lock").expect("stage");
+        assert_eq!(rec.unpacked_bytes, Some(4_000_000_000), "{:?}", d.calls.borrow());
+        let json = serde_json::to_value(&rec).unwrap();
+        assert_eq!(json["unpacked_bytes"], 4_000_000_000u64, "written to the index: {json}");
+        drop(d);
+        let d = daemon(move |l| match l {
+            l if l.starts_with("version") => Ok("amd64".into()),
+            l if l.starts_with("image inspect --format {{.Size}}") => Err("no such image".into()),
+            l if l.starts_with("image inspect") => Ok("sha256:hostid amd64".into()),
+            l if l.starts_with("tag ") => Ok(String::new()),
+            other => Err(format!("unexpected: {other}")),
+        });
+        let rec = stage_image(&g(), &format!("{REPO}:v1"), "amd64", Some(D), "lock").expect("a size it cannot read never fails a stage");
+        assert_eq!(rec.unpacked_bytes, None);
+        assert!(serde_json::to_value(&rec).unwrap().get("unpacked_bytes").is_none(), "unknown is left out, not 0");
+        drop(d);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

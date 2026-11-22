@@ -1245,7 +1245,9 @@ services:
     # Pinned by digest (H-N4) — controller-only, x86. The signed stack lock carries the
     # release's digest (NOO_IMAGE_DIGEST_NATS, scripts/stack-lock-third-party.py); the
     # default digest below is the dev checkout's. Bump the tag deliberately.
-    image: ${NATS_IMAGE:-nats:2.14.3${NOO_IMAGE_DIGEST_NATS:-@sha256:7ff2e641c33dbdb0dd13a943ba0b70d841b71275c607baa53ef9b8661f0b2d8c}}
+    # Pulled from OUR mirror, never Docker Hub: mirror-images.yml copies the
+    # official nats:2.14.9 by this digest to ghcr.io/noomesh/nats (bump both).
+    image: ${NATS_IMAGE:-ghcr.io/noomesh/nats:2.14.9${NOO_IMAGE_DIGEST_NATS:-@sha256:f0e72e96696382cc1e5bc637befd3177bb2d5b07c37fb507f8edd09827a342a3}}
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-nats
     profiles: ["controller", "standalone"]
     ports:
@@ -1774,6 +1776,9 @@ services:
     build:
       context: .
       dockerfile: docker/Dockerfile.airllm
+    # `:latest` on purpose: airllm is built on the inference node itself
+    # (build: above, pull_policy: build), profile `airllm` only, never in a
+    # default install and never pulled from any registry.
     image: noomesh/airllm:latest
     pull_policy: build
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-airllm
@@ -2060,9 +2065,13 @@ services:
   # Runs on controller so embeddings work out of the box without a GPU.
   # Optional engine; nothing defaults to it anymore — point
   # PAGEINDEX_EMBEDDING_URL at it explicitly to use it.
+  # The TEI pins (CPU here and in the agent; GPU in tei-gpu, reranker and
+  # the agent) move per flavour, after a review of the new release's flags,
+  # env and request fields: tests/test_tei_image_contract.py holds the
+  # reviewed release of each.
   tei:
     logging: *default-logging
-    image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.6${NOO_IMAGE_DIGEST_TEI_CPU:-@sha256:66db77d7856c9319bbfaf2c5b80a6d0e0ac9ff128ade09eaca1d9c20213617a4}
+    image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.9.4${NOO_IMAGE_DIGEST_TEI_CPU:-@sha256:2538ea1c9640d3763b15af668039d24172d063b42337b0c27796fc2be180c78d}
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-tei
     # The agent's backend floor (node-agent-go StartBackendSDK; i301): no kernel
     # capability beyond the start-as-root, chown, drop-to-a-user entrypoint
@@ -2097,6 +2106,9 @@ services:
   # Use this on nodes with a GPU for faster embedding throughput.
   tei-gpu:
     logging: *default-logging
+    # held at 1.6: TEI 1.9.4's CUDA image requires cuda>=12.9 with no GeForce
+    # exemption (driver >= ~575, inferred from the image config); move after a
+    # GPU node proves it (#1444)
     image: ghcr.io/huggingface/text-embeddings-inference:1.6${NOO_IMAGE_DIGEST_TEI:-@sha256:25e35b0b266241a543c5ee305083eced4b6ac0772eb969c3fdaae2d4c2ef7266}
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-tei-gpu
     # The agent's backend floor (node-agent-go StartBackendSDK; i301): no kernel
@@ -2234,6 +2246,9 @@ services:
   # opt-in `tei-compose` profile; removing them is separate cleanup.
   reranker:
     logging: *default-logging
+    # held at 1.6: TEI 1.9.4's CUDA image requires cuda>=12.9 with no GeForce
+    # exemption (driver >= ~575, inferred from the image config); move after a
+    # GPU node proves it (#1444)
     image: ghcr.io/huggingface/text-embeddings-inference:1.6${NOO_IMAGE_DIGEST_TEI:-@sha256:25e35b0b266241a543c5ee305083eced4b6ac0772eb969c3fdaae2d4c2ef7266}
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-reranker
     # The agent's backend floor (node-agent-go StartBackendSDK; i301): no kernel
@@ -3317,7 +3332,13 @@ services:
   # of re-downloading from HuggingFace. No HF proxy, no CDN. See
   # docs/models/weight-cache.md.
   model-cache:
-    image: nginx:1.27-alpine${NOO_IMAGE_DIGEST_NGINX:-@sha256:65645c7bb6a0661892a8b03b89d0743208a18dd2f3f17a54ef4b76fb8e2f2a10}
+    # The official nginx image from OUR mirror, never Docker Hub
+    # (mirror-images.yml copies nginx:1.30.7-alpine by this digest; bump both).
+    # noo-cli also runs its throwaway helper container (bind-mount probe,
+    # data-dir chown, verify's du) from THIS image line, entrypoint
+    # overridden: noo-cli/src/helper_image.rs reads the repo, tag and digest
+    # from it. Keep it one `image: ghcr.io/noomesh/nginx:<tag>${NOO_IMAGE_DIGEST_NGINX:-@sha256:<hex>}` line.
+    image: ghcr.io/noomesh/nginx:1.30.7-alpine${NOO_IMAGE_DIGEST_NGINX:-@sha256:caf4e1e032a20f9c3c5e28fc7f25ffd768ad8677b4975c54193075997b3a97e3}
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-model-cache
     profiles: ["controller", "standalone"]
     ports:

@@ -1,0 +1,243 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026 PersonifAI LLC
+
+# lib-start-inputs.sh — a full `noo stack start` recreates only the containers
+# whose inputs changed, decided from the files, not from who called it.
+#
+# Compose's config hash covers the resolved compose config but NOT the
+# contents of bind-mounted files or of `secrets: file:` sources, so the
+# launcher used to pass --force-recreate on every full start: right after
+# `noo onboard` had started the stack, `noo stack start` recreated all 13
+# containers (25-32 s, in every install-matrix cell, config-less containers
+# included) and dropped the node agent's NATS link and tunnel.
+#
+# Now each service carries the label `noo.inputs`: ONE keyed digest of its
+# secret files and mounted config (scripts/noo-start-inputs.py says exactly
+# which mounts count). The label sits in a generated override
+# ($START_INPUTS_OVERRIDE) that the start's `up` includes, so compose's own
+# hash changes exactly when an input did: a rotated secret, an edited config
+# file or a new PKI leaf recreates its services, and nothing else moves.
+#
+# --force-recreate stays for:
+#   - `noo stack start --recreate` (the explicit force; `noo upgrade` and
+#     onboard's own Service Setup start pass it too);
+#   - a host where the fingerprint cannot be computed (no python3, an
+#     unrenderable config): today's behaviour, said.
+# A key that exists but cannot be read REFUSES the start (exit 1): there is no
+# unkeyed fallback, because the label is readable by anyone with docker read
+# access.
+#
+# The state file ($START_INPUTS_STATE, 0600) serves the message ("recreated
+# gateway: its inputs changed (secret noo_jwt_secret)"); it holds per-file
+# KEYED values, never a raw digest. The label is the mechanism. One exception
+# reads it: a file a running service has RELOADED (nats re-reads users.conf on
+# a SIGHUP; `noo` records a confirmed reload there, per container id): the
+# label keeps what that container was made on while the file still holds what
+# it loaded, so a provision's users.conf does not recreate nats (#1412 did:
+# every node's NATS link dropped once). --containers tells the helper which
+# container runs each service now; a recreated nats never inherits a record.
+[ -n "${_NOO_LIB_START_INPUTS_LOADED:-}" ] && return 0
+_NOO_LIB_START_INPUTS_LOADED=1
+
+_START_INPUTS_PY="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/noo-start-inputs.py"
+START_INPUTS_OVERRIDE="${NOO_START_INPUTS_OVERRIDE:-./.noo-start-inputs.yml}"
+START_INPUTS_STATE="${NOO_START_INPUTS_STATE:-./.noo-start-inputs.json}"
+# The keyed secret digests the launcher writes beside the secret files
+# (write_secret_files), before the files go to their containers' uids.
+START_INPUTS_SECRET_CACHE_NAME=".noo-inputs"
+START_UP_FORCE=""
+
+# The per-install HMAC key: 32 random bytes, 0600, in the operator's private
+# config dir beside the age key's home. Only its PATH is ever passed on.
+start_inputs_key_file() {
+    printf '%s' "${NOO_START_INPUTS_KEY_FILE:-$HOME/.config/noo/start-inputs.key}"
+}
+
+_start_inputs_usable() {
+    command -v python3 >/dev/null 2>&1 && [ -f "$_START_INPUTS_PY" ]
+}
+
+# start_inputs_secret_digests <rundir> <NAME=TMPNAME>... — called by
+# write_secret_files while the temp files are still ours to read. A failure
+# only drops the cache: fingerprint then cannot read those secrets and
+# recreates their services (the old behaviour), and says so.
+start_inputs_secret_digests() {
+    local d="$1"; shift
+    rm -f "$d/$START_INPUTS_SECRET_CACHE_NAME" 2>/dev/null
+    _start_inputs_usable || return 0
+    python3 "$_START_INPUTS_PY" secret-digests --key-file "$(start_inputs_key_file)" \
+        --dir "$d" --out "$d/$START_INPUTS_SECRET_CACHE_NAME" "$@" 2>/dev/null \
+        || rm -f "$d/$START_INPUTS_SECRET_CACHE_NAME" 2>/dev/null
+    return 0
+}
+
+# start_inputs_prepare — before an `up`, with $COMPOSE_FILES and $PROFILE_ARGS
+# final. Sets START_UP_FORCE ("" or --force-recreate) and, when the labels
+# were computed, appends the override to $COMPOSE_FILES. 1 = refused (the key
+# cannot be read); the caller exits before `up`.
+start_inputs_prepare() {
+    local _json _rc _dd _v _only _s _cs
+    START_UP_FORCE=""
+    if [ "${START_RECREATE:-false}" = true ]; then
+        START_UP_FORCE="--force-recreate"
+        ui_note "--recreate: every container is recreated"
+    fi
+    if ! _start_inputs_usable; then
+        START_UP_FORCE="--force-recreate"
+        ui_note "no python3: changed secret and config files cannot be detected, so every container is recreated"
+        return 0
+    fi
+    # shellcheck disable=SC2086  # word lists by design
+    if ! _json="$(docker compose $COMPOSE_FILES $PROFILE_ARGS config --format json 2>/dev/null)"; then
+        START_UP_FORCE="--force-recreate"
+        ui_note "could not render the compose config to fingerprint its inputs, so every container is recreated"
+        return 0
+    fi
+    _dd=()
+    for _v in NOO_DATA_ROOT NOO_STATE_ROOT MODELS_DIR IMAGES_DIR HF_CACHE_DIR OLLAMA_DATA_DIR; do
+        _v="$(_start_inputs_env "$_v")"
+        [ -n "$_v" ] && _dd+=(--data-dir "$(_start_inputs_abs "$_v")")
+    done
+    # A recreate outside a start records only the services it recreates.
+    _only=()
+    for _s in ${START_INPUTS_ONLY:-}; do _only+=(--only "$_s"); done
+    # Which container runs each service now: a reload record applies only to
+    # the container it was taken on. Only read when there is a record.
+    _cs=""
+    if [ -f "$START_INPUTS_STATE" ] && grep -q '"reloaded"' "$START_INPUTS_STATE" 2>/dev/null; then
+        _cs="$(mktemp)"
+        start_inputs_snapshot "$_cs"
+    fi
+    _rc=0
+    printf '%s' "$_json" | python3 "$_START_INPUTS_PY" fingerprint \
+        --key-file "$(start_inputs_key_file)" --root "$PWD" \
+        --pki-dir "$(_start_inputs_abs "$(_start_inputs_env NOO_PKI_DIR)")" \
+        "${_dd[@]+"${_dd[@]}"}" "${_only[@]+"${_only[@]}"}" ${_cs:+--containers "$_cs"} \
+        --secret-digests "${NOO_SECRET_RUNDIR:-/nonexistent}/$START_INPUTS_SECRET_CACHE_NAME" \
+        --old-state "$START_INPUTS_STATE" \
+        --override-out "$START_INPUTS_OVERRIDE" --state-out "$START_INPUTS_STATE.new" || _rc=$?
+    if [ -n "$_cs" ]; then rm -f "$_cs"; fi
+    case "$_rc" in
+        0) COMPOSE_FILES="$COMPOSE_FILES -f $START_INPUTS_OVERRIDE" ;;
+        3) echo "       Nothing was started. The key only lets the start tell which secret and config files changed." >&2
+           echo "       Fix its owner/mode (chmod 600 $(start_inputs_key_file)), or remove it: the next start makes a new one and recreates every container once." >&2
+           return 1 ;;
+        *) START_UP_FORCE="--force-recreate"
+           ui_note "could not fingerprint the services' inputs (exit $_rc), so every container is recreated" ;;
+    esac
+    return 0
+}
+
+_start_inputs_env() {  # environment first, then the last KEY= line in .env
+    local _x="${!1:-}"
+    if [ -z "$_x" ] && [ -f .env ]; then
+        _x="$(grep -E "^[[:space:]]*$1=" .env | tail -1 | cut -d= -f2- | tr -d ' \t\r"')"
+    fi
+    printf '%s' "$_x"
+}
+
+_start_inputs_abs() {
+    case "$1" in
+        "") ;;
+        /*) printf '%s' "$1" ;;
+        *) printf '%s/%s' "$PWD" "${1#./}" ;;
+    esac
+}
+
+# start_inputs_snapshot <file> — "service id status" for every container of
+# this install's compose project, before and after the `up`.
+start_inputs_snapshot() {
+    local _proj
+    _proj="$(_compose_project_name . 2>/dev/null || true)"
+    : > "$1"
+    [ -n "$_proj" ] || return 0
+    docker ps -aq --filter "label=com.docker.compose.project=$_proj" 2>/dev/null \
+        | xargs -r docker inspect -f '{{index .Config.Labels "com.docker.compose.service"}} {{.Id}} {{.State.Status}}' \
+        >> "$1" 2>/dev/null || true
+}
+
+# start_inputs_report <before> <after> — say what the start did ("13 running,
+# 0 recreated", or which services were recreated and which of their files
+# changed), then keep this start's state for the next message.
+start_inputs_report() {
+    local _line _first=1
+    _start_inputs_usable || return 0
+    while IFS= read -r _line; do
+        if [ "$_first" = 1 ]; then ui_kv "Containers" "$_line"; _first=0; else ui_note "$_line"; fi
+    done < <(python3 "$_START_INPUTS_PY" report --before "$1" --after "$2" \
+        --old-state "$START_INPUTS_STATE" --new-state "$START_INPUTS_STATE.new" \
+        --root "$PWD" --secret-dir "${NOO_SECRET_RUNDIR:-}" ${START_UP_FORCE:+--forced} 2>/dev/null)
+    if [ -f "$START_INPUTS_STATE.new" ]; then
+        mv -f "$START_INPUTS_STATE.new" "$START_INPUTS_STATE" 2>/dev/null || true
+    fi
+    rm -f "$1" "$2" 2>/dev/null
+    return 0
+}
+
+# start_inputs_label_for_up [SERVICE...] — an `up` OUTSIDE a start
+# (noomesh-restart.sh --force, a created missing container, noomesh-rebuild.sh)
+# carries the same labels: without them the container is made with no
+# noo.inputs label and the next plain start recreates it whatever changed
+# (0.6.29-rc.1 install matrix: onboard's `restart --force worker trellion`
+# and `restart --force gateway` made the first `noo stack start` recreate
+# them). Appends the override to $COMPOSE_FILES; never forces (the caller's
+# `up` says what it recreates). SERVICEs named: only those are recorded in
+# the state; none: every service. The caller then runs
+# start_inputs_commit_state after a good `up`, start_inputs_discard_state
+# otherwise. 1 = refused (the key cannot be read): the caller exits.
+start_inputs_label_for_up() {
+    local _rc=0
+    START_RECREATE=false START_INPUTS_ONLY="$*" start_inputs_prepare || _rc=1
+    START_UP_FORCE=""
+    return "$_rc"
+}
+
+start_inputs_commit_state() {
+    if [ -f "$START_INPUTS_STATE.new" ]; then
+        mv -f "$START_INPUTS_STATE.new" "$START_INPUTS_STATE" 2>/dev/null || true
+    fi
+    return 0
+}
+
+start_inputs_discard_state() {
+    rm -f "$START_INPUTS_STATE.new" 2>/dev/null
+    return 0
+}
+
+# start_inputs_full_up [up flags...] — the launcher's whole-stack `up`
+# (noomesh-start.sh, no service names), and the one CI drives against a real
+# compose (scripts/test-start-inputs/run.sh): label, snapshot,
+#   noo_compose_up_isolating_stuck compose $COMPOSE_FILES $PROFILE_ARGS up -d $START_UP_FORCE <flags>
+# snapshot, say what moved. Returns the `up`'s status (75 = partial, see
+# lib-stuck-container.sh), or 1 when start_inputs_prepare refused.
+start_inputs_full_up() {
+    local _b _a _rc=0
+    start_inputs_prepare || return 1
+    _b="$(mktemp)"; _a="$(mktemp)"
+    start_inputs_snapshot "$_b"
+    # shellcheck disable=SC2086  # word lists by design
+    noo_compose_up_isolating_stuck compose $COMPOSE_FILES $PROFILE_ARGS up -d $START_UP_FORCE "$@" || _rc=$?
+    if [ "$_rc" -ne 0 ] && [ "$_rc" -ne "${NOO_EXIT_STACK_PARTIAL:-75}" ]; then
+        rm -f "$_b" "$_a"
+        return "$_rc"
+    fi
+    start_inputs_snapshot "$_a"
+    start_inputs_report "$_b" "$_a"
+    return "$_rc"
+}
+
+# start_inputs_named_up SERVICE... — the launcher's `up` of named services,
+# with the same labels.
+start_inputs_named_up() {
+    local _b _a _rc=0
+    start_inputs_prepare || return 1
+    _b="$(mktemp)"; _a="$(mktemp)"
+    start_inputs_snapshot "$_b"
+    # shellcheck disable=SC2086
+    docker compose $COMPOSE_FILES $PROFILE_ARGS up -d $START_UP_FORCE "$@" || _rc=$?
+    if [ "$_rc" -ne 0 ]; then rm -f "$_b" "$_a"; return "$_rc"; fi
+    start_inputs_snapshot "$_a"
+    start_inputs_report "$_b" "$_a"
+    return 0
+}

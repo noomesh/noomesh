@@ -12,6 +12,17 @@ Checks:
       ships — a public reader gets a dead link; write the OSS version into
       docs/ or drop the citation)
   (d) scripts/gen-cli-docs.py --check passes (generated CLI blocks are fresh)
+      and scripts/gen-verify-rows.py --check (the verify-row registry matches
+      the rows the CLI builds; docs/reference/verify-rows.md is fresh)
+  (g) the agent-facing texts (AGENTS.md, prompts/*.md, the shipped core
+      skills under prompts/skills/core/): every `noo …` they name resolves
+      as in (f), and every `noo_*` tool they name is one the doors declare
+      (gateway-rust/mcp-tools.json, mcp-tools-local.json, config/tools.json)
+  (i) every repo path an agent text names (a backticked span under one of the
+      repo's top-level directories) exists; and the `noo …` commands named in
+      the MCP tool descriptions and the doors' source strings resolve as (f)
+  (h) every page outside cli/ and reference/ has `## For people` then
+      `## For agents`, except those still in SHAPE_PENDING (shrinks only)
   (f) every `noo …` invocation in a docs code block or backtick span
       resolves against the CLI registry (noo-cli/src/main.rs NATIVE):
       a group's subcommand must exist, a bare command may take any args,
@@ -171,6 +182,13 @@ def check_generated(errors: list[str]) -> None:
     )
     if r.returncode != 0:
         errors.append("scripts/gen-cli-docs.py --check failed:\n" + (r.stderr or r.stdout).rstrip())
+    r = subprocess.run(
+        [sys.executable, str(REPO / "scripts" / "gen-verify-rows.py"), "--check"],
+        capture_output=True,
+        text=True,
+    )
+    if r.returncode != 0:
+        errors.append("scripts/gen-verify-rows.py --check failed:\n" + (r.stderr or r.stdout).rstrip())
 
 
 def check_forbidden(errors: list[str]) -> None:
@@ -268,10 +286,114 @@ def _code_spans(text: str):
                 yield i, m.group(1)
 
 
+def agent_texts() -> list[Path]:
+    """The texts an agent is handed: AGENTS.md, the coordinator prompts and
+    the SHIPPED core skills (prompts/skills/evolved/ is written at runtime)."""
+    out = [REPO / AGENTS_MD] if (REPO / AGENTS_MD).exists() else []
+    out += sorted((REPO / "prompts").glob("*.md"))
+    out += sorted((REPO / "prompts" / "skills" / "core").rglob("*.md"))
+    return out
+
+
+TOOL_DECLARATIONS = ("gateway-rust/mcp-tools.json", "gateway-rust/mcp-tools-local.json", "config/tools.json")
+TOOL_NAME = re.compile(r"\bnoo_[a-z0-9_]+\b")
+
+
+def _declared_tools() -> set[str]:
+    import json
+
+    names: set[str] = set()
+
+    def walk(o):
+        if isinstance(o, dict):
+            n = o.get("name")
+            if isinstance(n, str) and n.startswith("noo_"):
+                names.add(n)
+            for v in o.values():
+                walk(v)
+        elif isinstance(o, list):
+            for v in o:
+                walk(v)
+
+    for rel_path in TOOL_DECLARATIONS:
+        f = REPO / rel_path
+        if f.exists():
+            walk(json.loads(f.read_text(encoding="utf-8")))
+    return names
+
+
+# A backticked span shaped like a path under one of the repo's own top-level
+# directories. Placeholders, globs and templates are skipped: they name no
+# one file.
+REPO_PATH = re.compile(r"^[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+/?$")
+BUILD_OUTPUT = {"node_modules", "target", "dist", "build", ".venv"}
+
+
+def check_agent_paths(errors: list[str]) -> None:
+    """(i) Every repo path an agent text names must exist (proposal 62, guard
+    item 4): a prompt that points at a moved or deleted file sends an agent
+    after nothing."""
+    tops = {p.name for p in REPO.iterdir() if p.is_dir() and not p.name.startswith(".")}
+    for path in agent_texts():
+        for i, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            for m in BACKTICK.finditer(line):
+                span = m.group(1).strip().split(":")[0].split("#")[0]
+                if not REPO_PATH.match(span) or span.split("/")[0] not in tops:
+                    continue
+                if BUILD_OUTPUT & set(span.split("/")):
+                    continue  # made by a build or an install, never committed
+                if not (REPO / span.rstrip("/")).exists():
+                    errors.append(f"{rel(path)}:{i}: `{span}` does not exist in this repo")
+
+
+def check_agent_tools(errors: list[str]) -> None:
+    """(g) A tool an agent text names must be a tool the doors declare: a
+    prompt that names a table, a retired tool or a guess sends an agent
+    after something that is not there."""
+    declared = _declared_tools()
+    if not declared:
+        errors.append("no tool declarations found (" + ", ".join(TOOL_DECLARATIONS) + ")")
+        return
+    for path in agent_texts():
+        for i, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            for m in TOOL_NAME.finditer(line):
+                if m.group(0) not in declared:
+                    errors.append(f"{rel(path)}:{i}: `{m.group(0)}` is not a tool the doors declare ({', '.join(TOOL_DECLARATIONS)})")
+
+
+# The texts an agent is handed that are not Markdown: the MCP tool
+# descriptions and the doors' instruction strings (proposal 62, guard item 2).
+DOOR_JSON = ("gateway-rust/mcp-tools.json", "gateway-rust/mcp-tools-local.json", "config/tools.json")
+DOOR_SOURCES = ("gateway-rust/src/mcp_external.rs", "gateway-rust/src/mcp_local.rs", "gateway-rust/src/agent_mailbox.rs")
+BACKTICK = re.compile(r"`([^`\n]+)`")
+
+
+def door_spans():
+    """(relpath, line, span) for every backticked span an agent can read in
+    the doors: each string in the tool JSON (line = the JSON line it is on),
+    and each backtick span in the door sources (their instruction strings and
+    the doc comments beside them)."""
+    for rel_path in DOOR_JSON:
+        f = REPO / rel_path
+        if not f.exists():
+            continue
+        for i, line in enumerate(f.read_text(encoding="utf-8").splitlines(), 1):
+            for m in BACKTICK.finditer(line):
+                yield rel_path, i, m.group(1)
+    for rel_path in DOOR_SOURCES:
+        f = REPO / rel_path
+        if not f.exists():
+            continue
+        for i, line in enumerate(f.read_text(encoding="utf-8").splitlines(), 1):
+            for m in BACKTICK.finditer(line):
+                yield rel_path, i, m.group(1)
+
+
 def check_commands(errors: list[str]) -> None:
     bare, groups, two = _registry()
-    for path in docs_md():
-        for i, span in _code_spans(path.read_text(encoding="utf-8")):
+    spans = [(rel(path), i, span) for path in docs_md() + agent_texts() for i, span in _code_spans(path.read_text(encoding="utf-8"))]
+    spans += list(door_spans())
+    for where, i, span in spans:
             for m in CMD_IN_CODE.finditer(span):
                 words = m.group(1).split()
                 head = words[0]
@@ -286,7 +408,7 @@ def check_commands(errors: list[str]) -> None:
                 ):
                     continue  # provided by an add-on's cli-piece (ADDON_CLI)
                 errors.append(
-                    f"{rel(path)}:{i}: `noo {m.group(1)}` is not in the CLI registry "
+                    f"{where}:{i}: `noo {m.group(1)}` is not in the CLI registry "
                     f"(noo-cli/src/main.rs NATIVE)"
                 )
 
@@ -398,6 +520,53 @@ def check_agents_pages(errors: list[str]) -> None:
             )
 
 
+# Pages not yet in the two-part shape (proposal 62, step 4). It only
+# shrinks: a page that gains both parts must leave this list, and no page
+# is ever added (a new page is written in the shape).
+SHAPE_PENDING = frozenset({
+    "docs/channels/google-chat.md",
+    "docs/channels/google-connections.md",
+    "docs/channels/mcp-your-client.md",
+    "docs/channels/telegram.md",
+    "docs/development/addons.md",
+    "docs/development/developer-guide.md",
+    "docs/development/principles.md",
+    "docs/models/weight-cache.md",
+    "docs/operating/monitoring.md",
+    "docs/operating/operator-manual.md",
+    "docs/operating/runbooks/at-rest-migrate.md",
+    "docs/operating/runbooks/at-rest-recovery.md",
+    "docs/operating/runbooks/backup-restore-secrets.md",
+    "docs/operating/runbooks/host-updates.md",
+    "docs/operating/runbooks/nats-isolation.md",
+    "docs/operating/runbooks/security-release-upgrade.md",
+    "docs/security/model-context.md",
+    "docs/security/networks-and-containers.md",
+    "docs/security/node-agent.md",
+    "docs/security/secrets.md",
+    "docs/security/telemetry.md",
+})
+
+
+def check_page_shape(errors: list[str]) -> None:
+    """(h) Every page outside cli/ and reference/ (and the index) has a
+    `## For people` part, then a `## For agents` part (operator 2026-11-14)."""
+    for path in docs_md():
+        r = rel(path)
+        if r.startswith(("docs/cli/", "docs/reference/")) or r == "docs/README.md":
+            continue
+        h2 = [l.strip() for l in path.read_text(encoding="utf-8").splitlines() if l.startswith("## ")]
+        shaped = TWO_PARTS[0] in h2 and TWO_PARTS[1] in h2 and h2.index(TWO_PARTS[0]) < h2.index(TWO_PARTS[1])
+        if r in SHAPE_PENDING:
+            if shaped:
+                errors.append(f"{r}: has both parts now; remove it from SHAPE_PENDING in scripts/docs-check.py")
+        elif not shaped:
+            errors.append(f"{r}: needs `{TWO_PARTS[0]}` then `{TWO_PARTS[1]}` (proposal 62; see docs/operating/disk-and-images.md)")
+    for r in sorted(SHAPE_PENDING):
+        if not (REPO / r).exists():
+            errors.append(f"SHAPE_PENDING names {r}, which does not exist; remove it")
+
+
 def main() -> int:
     errors: list[str] = []
     warnings: list[str] = []
@@ -407,8 +576,11 @@ def main() -> int:
     check_generated(errors)
     check_forbidden(errors)
     check_commands(errors)
+    check_agent_tools(errors)
+    check_agent_paths(errors)
     check_proposal_numbers(errors)
     check_agents_pages(errors)
+    check_page_shape(errors)
     for w in warnings:
         print(f"docs-check: WARNING {w}")
     for e in errors:

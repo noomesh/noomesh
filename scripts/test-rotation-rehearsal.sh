@@ -27,6 +27,8 @@ set -euo pipefail
 
 # A name no real install uses, so this can never touch the live stack.
 PROJECT="noorehearsal"
+# TEST-ONLY (CI rehearsal, not an install path): a pinned small image the
+# rehearsal runs its fixtures in; CI mirrors it (.github/hub-mirror.txt).
 IMAGE="${NOO_REHEARSAL_IMAGE:-alpine:3.20}"
 
 if ! command -v docker >/dev/null 2>&1; then

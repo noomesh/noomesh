@@ -35,3 +35,31 @@ pub fn fail(json: bool, code: ExitCode, kind: &str, msg: &str, hint: Option<&str
     crate::ui::pager_finish();
     std::process::exit(code as i32);
 }
+
+/// One `next` step in --json output: `{"kind": "command", "command": "<one
+/// shell-quoted line>"}`, with `"nodes": [...]` only when the command targets
+/// specific nodes. Every `next` field is an array of these (`[]` when there
+/// is nothing to do), built here so a later field is added in one place.
+pub(crate) fn next_cmd(cmd: &str, nodes: &[&str]) -> serde_json::Value {
+    let mut o = serde_json::json!({ "kind": "command", "command": cmd });
+    if !nodes.is_empty() {
+        o["nodes"] = serde_json::json!(nodes);
+    }
+    o
+}
+
+#[cfg(test)]
+mod next_cmd_tests {
+    use super::next_cmd;
+
+    /// The `next` object's shape: kind + one command string, nodes only
+    /// when named.
+    #[test]
+    fn next_cmd_is_a_command_object_with_nodes_only_when_named() {
+        assert_eq!(next_cmd("noo health", &[]), serde_json::json!({ "kind": "command", "command": "noo health" }));
+        assert_eq!(
+            next_cmd("noo cluster verify node_a --wait", &["node_a"]),
+            serde_json::json!({ "kind": "command", "command": "noo cluster verify node_a --wait", "nodes": ["node_a"] })
+        );
+    }
+}

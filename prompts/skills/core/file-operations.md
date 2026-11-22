@@ -20,11 +20,11 @@ You have direct filesystem access via `local_files`. Use it — do not tell the 
 
 ## Local Files
 
-- **List directory**: `local_files(action=list, path=<dir>)` — returns files with sizes and types
+- **List directory**: `local_files(action=list, path=<dir>)` — returns names, each marked `[D]` (directory) or `[F]` (file), first 100 sorted
 - **Read file**: `local_files(action=read, path=<file>)` — returns text content
-- **Glob search**: `local_files(action=list, path=<dir>, pattern=*.pdf)` — filter by extension
+- **Find by extension**: `list` takes no pattern; list the directory and pick the names that end in `.pdf` yourself
 
-Always use full absolute paths. Use the watched_folders config in noo-mesh.yaml to set document directories.
+Always use full absolute paths. Use the watched_folders config in noomesh.yaml to set document directories.
 
 ## Remote Files / URLs
 

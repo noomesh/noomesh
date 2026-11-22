@@ -234,3 +234,99 @@ func TestASuccessfulPullClearsTheNoSpaceRecord(t *testing.T) {
 		t.Fatal("a successful pull must clear the no-space record")
 	}
 }
+
+// stubStoreDisks makes diskStatFn answer from a table, a path not in it
+// being one that does not exist (fs.ErrNotExist, as unix.Stat says ENOENT),
+// and pins Docker's data root as on a Linux host.
+func stubStoreDisks(t *testing.T, disks map[string]diskStat, broken ...string) {
+	t.Helper()
+	pd, ph := diskStatFn, dockerRootOnHost
+	diskStatFn = func(p string) (diskStat, error) {
+		for _, b := range broken {
+			if p == b {
+				return diskStat{}, fmt.Errorf("statfs %s: %w", p, syscall.EIO)
+			}
+		}
+		st, ok := disks[p]
+		if !ok {
+			return diskStat{}, fmt.Errorf("stat %s: %w", p, syscall.ENOENT)
+		}
+		return st, nil
+	}
+	dockerRootOnHost = true
+	t.Cleanup(func() { diskStatFn, dockerRootOnHost = pd, ph })
+}
+
+// i1036: `image_store_free_bytes` is the LEAST free space over Docker's data
+// root, containerd's root and the staging dir — whichever is smallest.
+func TestImageStoreFreeIsTheMinimumOverThePaths(t *testing.T) {
+	for _, least := range []string{"/docker-root", containerdRootDir, "/stage"} {
+		disks := map[string]diskStat{
+			"/docker-root":    {dev: 1, free: 50 * gib},
+			containerdRootDir: {dev: 2, free: 40 * gib},
+			"/stage":          {dev: 3, free: 30 * gib},
+		}
+		disks[least] = diskStat{dev: 9, free: 3 * gib}
+		stubStoreDisks(t, disks)
+		if got, ok := imageStoreFreeBytes("/docker-root", "/stage"); !ok || got != int64(3*gib) {
+			t.Fatalf("least on %s: got %d ok=%v, want %d", least, got, ok, 3*gib)
+		}
+	}
+}
+
+// A path that does not exist (no containerd root, the usual case) is
+// skipped, not counted as 0; a staging dir not created yet is read at its
+// nearest existing parent, where the first fetch will write.
+func TestImageStoreFreeSkipsAMissingPath(t *testing.T) {
+	stubStoreDisks(t, map[string]diskStat{
+		"/docker-root": {dev: 1, free: 30 * gib},
+		"/stage":       {dev: 3, free: 50 * gib},
+	})
+	if got, ok := imageStoreFreeBytes("/docker-root", "/stage"); !ok || got != int64(30*gib) {
+		t.Fatalf("no containerd root: got %d ok=%v, want %d", got, ok, 30*gib)
+	}
+	stubStoreDisks(t, map[string]diskStat{"/var/lib": {dev: 4, free: 7 * gib}})
+	if got, ok := imageStoreFreeBytes("/docker-root", "/var/lib/noo-node-agent/staging"); !ok || got != int64(7*gib) {
+		t.Fatalf("staging not created yet: got %d ok=%v, want its parent's %d", got, ok, 7*gib)
+	}
+}
+
+// Unknown is omitted (ok=false), never 0: an unreadable path, no readable
+// path at all, or a Docker data root that is not on this host.
+func TestImageStoreFreeIsUnknownNotZero(t *testing.T) {
+	stubStoreDisks(t, map[string]diskStat{
+		"/docker-root": {dev: 1, free: 50 * gib},
+		"/stage":       {dev: 3, free: 30 * gib},
+	}, containerdRootDir)
+	if got, ok := imageStoreFreeBytes("/docker-root", "/stage"); ok {
+		t.Fatalf("an unreadable containerd root reported %d", got)
+	}
+	stubStoreDisks(t, map[string]diskStat{})
+	if got, ok := imageStoreFreeBytes("/docker-root", "/stage"); ok {
+		t.Fatalf("no readable path reported %d", got)
+	}
+	stubStoreDisks(t, map[string]diskStat{"/docker-root": {dev: 1, free: 50 * gib}, "/stage": {dev: 1, free: 50 * gib}})
+	dockerRootOnHost = false
+	if got, ok := imageStoreFreeBytes("/docker-root", "/stage"); ok {
+		t.Fatalf("a Docker data root off this host reported %d", got)
+	}
+	// A full disk is a fact.
+	stubStoreDisks(t, map[string]diskStat{"/docker-root": {dev: 1, free: 0}, containerdRootDir: {dev: 1, free: 0}, "/stage": {dev: 1, free: 0}})
+	if got, ok := imageStoreFreeBytes("/docker-root", "/stage"); !ok || got != 0 {
+		t.Fatalf("a full disk: got %d ok=%v, want 0 known", got, ok)
+	}
+}
+
+// i1036: the agent's same-filesystem need for the CUDA llama.cpp image
+// (tar 2.6 GB, unpacked 4.0 GB): tar + imageLoadNeed(tar) + margin. The
+// gateway's place check (routes/cluster.rs image_space_tests) needs the same
+// 8336870912 bytes for it; change the two together.
+func TestImageLoadNeedFixedExample(t *testing.T) {
+	const tar = uint64(2_600_000_000)
+	if got := tar + imageLoadNeed(tar) + imageSpaceMargin; got != 8_336_870_912 {
+		t.Fatalf("need = %d, want 8336870912 (the gateway's number)", got)
+	}
+	if got := imageLoadNeed(1 * gib); got != 3*gib {
+		t.Fatalf("a small tar: the tar + 2 GiB arm: %d", got)
+	}
+}

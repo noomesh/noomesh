@@ -247,7 +247,8 @@ compose creates anything:
   default `CAP_DAC_OVERRIDE` (a test fails if such a service drops it); two
   different non-root uids on one secret are refused at launch. As root the
   launcher `chown`s; as the operator it runs a throwaway container
-  (`alpine`, no network, only `CAP_CHOWN`) over a bind of the directory, the
+  (the stack's own nginx image by digest, never Docker Hub; no network, read-only
+  root, `CAP_CHOWN` and `CAP_DAC_READ_SEARCH` only) over a bind of the directory, the
   pattern `lib-reown.sh` uses, which sees file names and uids but never a value;
 * the directory is `0700`, owned by the launcher's user, not a symlink, and
   must report `tmpfs` (or `ramfs`) for `stat -f -c %T`. Anything else is refused
@@ -541,6 +542,9 @@ changed secret *value* is not part of it (the source variable's name did not
 change), so `up -d` leaves the running container — and its old file — in
 place. Use `noo security secrets rotate` (it recreates the consumers) or
 `noo stack restart --force <service>` after changing a value by hand.
+On Docker Compose 2.24.x a recreate also recreates the service's
+dependents (newer Compose leaves them running), so a rotation there can
+restart more containers; nothing fails.
 
 Verify what a container actually received with `docker inspect`, not
 `docker exec … printenv` (the gateway image has no shell, so `printenv`
@@ -1045,6 +1049,18 @@ When a release widens what an add-on asks for, the key already minted keeps
 its old grant, and the new calls are refused. `noo cluster verify` warns on
 its **service-key grants** row, naming the missing words and the `provision`
 command that re-grants them.
+
+Two kinds of key are wider than any service needs: one bound (`--user`) to an
+admin account acts as that admin for as long as it lives, and one carrying the
+`identity` scope mints agent tokens through the identity exchange. `noo
+cluster verify --controller` warns on its **service key bindings** row
+(`service_key_bindings`, findings `bound_to_admin` and `identity_scope`),
+naming each such key by consumer only. Re-issue an admin-bound key under a new
+consumer bound to an account with only the access it needs, then revoke the
+old one; revoke an identity key unless you use the identity add-on. Both are
+done by a person signed in as an admin. The keys an install mints for itself
+are unbound and never carry `identity`, so a fresh install reads OK. See
+[verify rows](../reference/verify-rows.md).
 
 If you mint by hand instead, the four steps are
 `service-key issue svc:trellion-intel --scopes …`,

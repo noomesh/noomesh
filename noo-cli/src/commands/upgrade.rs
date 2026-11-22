@@ -1829,7 +1829,11 @@ fn launch_stack(g: &Globals, roll: &Roll, staging: crate::commands::image_stage:
     let stuck_report = stuck_dir.path().join("stuck");
     let build_launch = || {
         let mut c = std::process::Command::new("bash");
-        c.arg(root.join("scripts/noomesh-start.sh")).arg("--dist")
+        // `--recreate`: a roll recreates every container (new images, new
+        // config, files replaced under their bind mounts). Always this
+        // binary's own launcher: refresh_deploy_slice materialised it just
+        // before (upgrade_stack), so it knows the flag.
+        c.arg(root.join("scripts/noomesh-start.sh")).arg("--dist").arg("--recreate")
             .env("NOO_IMAGE_TAG", tag)
             .env("NOO_STUCK_REPORT", &stuck_report)
             .env("NOO_CLI_BIN", &cli_bin)
@@ -3292,7 +3296,7 @@ fn outcome_of(end: &super::provision::ApplyEnd) -> (Outcome, String) {
     use super::provision::ApplyEnd;
     match end {
         ApplyEnd::Applied { rc: 0, .. } => (Outcome::Applied, "applied (exit 0)".into()),
-        ApplyEnd::Applied { rc, .. } => (Outcome::Refused, format!("the applier refused the bundle (exit {rc})")),
+        ApplyEnd::Applied { rc, refusal, .. } => (Outcome::Refused, format!("the applier refused the bundle (exit {rc}): {}", super::provision::apply_refusal_for(*rc, refusal.as_deref()).why)),
         ApplyEnd::LegacyUnconfirmed => (Outcome::Unconfirmed, "applied without confirmation (legacy fetcher)".into()),
         ApplyEnd::NotReported { fetched: true } => (Outcome::NotReported, "fetched, but no apply report".into()),
         ApplyEnd::NotReported { fetched: false } => (Outcome::NotFetched, "never fetched the bundle".into()),
@@ -3505,7 +3509,7 @@ enum Settled {
 fn settle_end(g: &Globals, n: &str, end: super::provision::ApplyEnd, is_self: bool) -> (serde_json::Value, Settled) {
     use super::provision::ApplyEnd;
     match end {
-        ApplyEnd::Applied { rc: 0, msg } => {
+        ApplyEnd::Applied { rc: 0, msg, .. } => {
             ui::blank();
             ui::say(&ui::item(n));
             if is_self {
@@ -3515,17 +3519,22 @@ fn settle_end(g: &Globals, n: &str, end: super::provision::ApplyEnd, is_self: bo
             }
             (serde_json::json!({"node": n, "outcome": "applied", "rc": 0}), Settled::Applied)
         }
-        ApplyEnd::Applied { rc, msg } => {
+        ApplyEnd::Applied { rc, msg, refusal } => {
             let tail: String = msg.chars().rev().take(400).collect::<Vec<_>>().into_iter().rev().collect();
             ui::blank();
             ui::say(&ui::item(n));
             ui::capture("applier output", tail.trim());
+            // One row renders both: the line and guide here, the JSON row below.
+            let r = super::provision::apply_refusal_for(rc, refusal.as_deref());
             ui::say_err(&ui::sub(&ui::status_line(Glyph::Err,
-                &format!("{n}: the applier refused the bundle (exit {rc}); the node kept its previous state"))));
+                &format!("{}; the node kept its previous state", r.headline(n, rc)))));
             if !g.json {
-                ui::guide(&[(&format!("noo cluster provision {n} --wait"), "fix the cause above, then re-stage")]);
+                ui::guide(&[(&r.next_command(n), r.guide_why())]);
             }
-            (serde_json::json!({"node": n, "outcome": "refused", "rc": rc}), Settled::Failed)
+            let mut row = r.json(n, rc);
+            row["node"] = serde_json::json!(n);
+            row["outcome"] = serde_json::json!("refused");
+            (row, Settled::Failed)
         }
         ApplyEnd::LegacyUnconfirmed => {
             (serde_json::json!({"node": n, "outcome": "unconfirmed"}), Settled::Unconfirmed)
@@ -6046,9 +6055,9 @@ mod tests {
     fn a_restaged_macs_end_maps_onto_the_existing_outcomes() {
         use super::super::provision::ApplyEnd;
         use super::{mac_leaves_outcome, MacLeaves};
-        assert_eq!(mac_leaves_outcome(&ApplyEnd::Applied { rc: 0, msg: "applied: svc-x".into() }), MacLeaves::Restaged);
+        assert_eq!(mac_leaves_outcome(&ApplyEnd::Applied { rc: 0, msg: "applied: svc-x".into(), refusal: None }), MacLeaves::Restaged);
         assert_eq!(mac_leaves_outcome(&ApplyEnd::LegacyUnconfirmed), MacLeaves::Restaged);
-        assert_eq!(mac_leaves_outcome(&ApplyEnd::Applied { rc: 76, msg: String::new() }), MacLeaves::RestageFailed);
+        assert_eq!(mac_leaves_outcome(&ApplyEnd::Applied { rc: 76, msg: String::new(), refusal: None }), MacLeaves::RestageFailed);
         assert_eq!(mac_leaves_outcome(&ApplyEnd::NotReported { fetched: true }), MacLeaves::RestageFailed);
         assert_eq!(mac_leaves_outcome(&ApplyEnd::NotReported { fetched: false }), MacLeaves::RestageFailed);
     }
@@ -7892,7 +7901,7 @@ mod json_stdout_tests {
         for end in [
             ApplyEnd::NotReported { fetched: false },
             ApplyEnd::NotReported { fetched: true },
-            ApplyEnd::Applied { rc: 2, msg: "applier: refused the bundle".to_string() },
+            ApplyEnd::Applied { rc: 2, msg: "applier: refused the bundle".to_string(), refusal: None },
             ApplyEnd::LegacyUnconfirmed,
         ] {
             rows.push(super::settle_end(&g, "rh-node", end, false).0);
@@ -8046,6 +8055,26 @@ mod stage_before_launch_tests {
 }
 
 #[cfg(test)]
+mod roll_recreates_tests {
+    /// A plain `noo stack start` recreates only the containers whose config
+    /// or secret / config file contents changed (scripts/lib-start-inputs.sh).
+    /// A roll replaces images and files under their bind mounts, so it still
+    /// asks the launcher to recreate every container, on argv: the launcher
+    /// is this binary's own, materialised by refresh_deploy_slice first.
+    #[test]
+    fn the_roll_asks_the_launcher_to_recreate_every_container() {
+        let src = crate::test_src::own_code(include_str!("upgrade.rs"));
+        let launch = crate::test_src::fn_body(&src, "fn launch_stack(");
+        assert!(launch.contains(".arg(root.join(\"scripts/noomesh-start.sh\")).arg(\"--dist\").arg(\"--recreate\")"));
+        assert!(!src.contains("NOO_START_RECREATE"), "no environment switch");
+        let up = crate::test_src::fn_body(&src, "fn upgrade_stack(");
+        let slice = up.find("refresh_deploy_slice(g, &roll);").expect("the slice is refreshed");
+        let go = up.find("launch_stack(g, &roll, staging, stops)").expect("then launched");
+        assert!(slice < go, "the launcher that gets --recreate is this binary's own");
+    }
+}
+
+#[cfg(test)]
 mod embedder_after_roll_tests {
     /// i545 finding 53 and the rc.3 rehearsal: only onboard and `noo migrate
     /// import` created the embedder, so a box whose onboard embedder step
@@ -8087,8 +8116,8 @@ mod nodes_stage_nonblocking_tests {
     #[test]
     fn the_full_bundle_follows_the_applier_unless_the_node_never_fetched() {
         for end in [
-            ApplyEnd::Applied { rc: 0, msg: String::new() },
-            ApplyEnd::Applied { rc: 2, msg: String::new() },
+            ApplyEnd::Applied { rc: 0, msg: String::new(), refusal: None },
+            ApplyEnd::Applied { rc: 2, msg: String::new(), refusal: None },
             ApplyEnd::LegacyUnconfirmed,
             ApplyEnd::NotReported { fetched: true },
         ] {
@@ -8099,10 +8128,17 @@ mod nodes_stage_nonblocking_tests {
 
     #[test]
     fn every_end_has_an_outcome_and_a_reason() {
-        assert_eq!(outcome_of(&ApplyEnd::Applied { rc: 0, msg: "ok".into() }).0, Outcome::Applied);
-        let (o, why) = outcome_of(&ApplyEnd::Applied { rc: 3, msg: String::new() });
+        assert_eq!(outcome_of(&ApplyEnd::Applied { rc: 0, msg: "ok".into(), refusal: None }).0, Outcome::Applied);
+        let (o, why) = outcome_of(&ApplyEnd::Applied { rc: 3, msg: String::new(), refusal: None });
         assert_eq!(o, Outcome::Refused);
         assert!(why.contains("exit 3"), "{why}");
+        // A named refusal gives that refusal's reason; a name of another code does not.
+        let (_, why) = outcome_of(&ApplyEnd::Applied { rc: 76, msg: String::new(), refusal: Some("payload_for_other_node".into()) });
+        assert_eq!(why, format!("the applier refused the bundle (exit 76): {}",
+            crate::commands::provision::apply_refusal_for(76, Some("payload_for_other_node")).why));
+        assert!(why.contains("names another node"), "{why}");
+        let (_, why) = outcome_of(&ApplyEnd::Applied { rc: 76, msg: String::new(), refusal: Some("bundle_shape".into()) });
+        assert!(why.ends_with(crate::commands::provision::apply_refusal(76).why), "{why}");
         assert_eq!(outcome_of(&ApplyEnd::LegacyUnconfirmed).0, Outcome::Unconfirmed);
         assert_eq!(outcome_of(&ApplyEnd::NotReported { fetched: true }).0, Outcome::NotReported);
         assert_eq!(outcome_of(&ApplyEnd::NotReported { fetched: false }).0, Outcome::NotFetched);

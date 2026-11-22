@@ -63,7 +63,9 @@ resolve_location() {
             return
         fi
     fi
-    _say_kv "Location" "unset — the collector will show 'tailnet'" "node location: (unset — collector will show 'tailnet')"
+    # An unset location is a note for a person reading the launcher; under
+    # `noo onboard` (NOO_ONBOARD=1) it is not said.
+    [ "${NOO_ONBOARD:-}" = 1 ] || _say_kv "Location" "unset — the collector will show 'tailnet'" "node location: (unset — collector will show 'tailnet')"
 }
 
 # One key out of .env.

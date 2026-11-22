@@ -157,7 +157,7 @@ type BackendSpec struct {
 	Image string
 	// CPUImage, when set, is used instead of Image on nodes WITHOUT an
 	// NVIDIA GPU. Lets a single backend type (e.g. embedding/reranker, which
-	// ship distinct CUDA `:1.6` and `:cpu-1.6` TEI images) auto-select the
+	// ship distinct CUDA `:1.6` and `:cpu-1.9.4` TEI images) auto-select the
 	// right image per node — GPU where available, CPU otherwise. The GPU
 	// device reservation is independently guarded by hasNvidiaGPU(), so the
 	// two stay in sync. Empty → Image is used on every node (LLM backends).
@@ -448,13 +448,17 @@ var backendSpecs = map[string]BackendSpec{
 		MemoryLimit: 16 * 1024 * 1024 * 1024, // 16GB
 	},
 	// Embedding — TEI serving a sentence embedder (POST /embed). GPU where
-	// available (CUDA :1.6), CPU otherwise (:cpu-1.6) — auto-selected per
-	// node via CPUImage + hasNvidiaGPU(). GPUCount "1" is a no-op on CPU
-	// nodes (the reservation is GPU-guarded). Start with:
+	// available (CUDA :1.6), CPU otherwise (:cpu-1.9.4) — chosen by the
+	// placement's target and teiGPUUsable (image_choice.go): cpu = CPU image,
+	// gpu without a usable NVIDIA runtime = refused, unset = GPU only when
+	// usable. GPUCount "1" is a no-op on CPU (the reservation is GPU-guarded). Start with:
 	//   noo cluster up embedding BAAI/bge-base-en-v1.5 --node <node>
 	"embedding": {
+		// held at 1.6: TEI 1.9.4's CUDA image requires cuda>=12.9 with no GeForce
+		// exemption (driver >= ~575, inferred from the image config); move after a
+		// GPU node proves it (#1444)
 		Image:         "${TEI_GPU_IMAGE:-ghcr.io/huggingface/text-embeddings-inference:1.6}",
-		CPUImage:      "${TEI_CPU_IMAGE:-ghcr.io/huggingface/text-embeddings-inference:cpu-1.6}",
+		CPUImage:      "${TEI_CPU_IMAGE:-ghcr.io/huggingface/text-embeddings-inference:cpu-1.9.4}",
 		ContainerName: "noo-tei",
 		Env: map[string]string{
 			"HUGGING_FACE_HUB_TOKEN": "${HF_TOKEN:-}",
@@ -475,7 +479,11 @@ var backendSpecs = map[string]BackendSpec{
 		},
 		GPUCount: "1",
 		Network:  "noo-cluster",
-		Command:  []string{"--model-id", "${TEI_MODEL:-BAAI/bge-base-en-v1.5}"},
+		// TEI's --model-id beats its MODEL_ID env, so the flag must name the
+		// model the container env names: ${MODEL_ID} is resolved against the
+		// CONTAINER env (resolveCommand) — the placement's model when one is
+		// placed, else TEI_MODEL, else bge-base (the MODEL_ID default above).
+		Command: []string{"--model-id", "${MODEL_ID}"},
 	},
 	// Reranker — engine-selectable via RERANK_ENGINE, spec built by
 	// rerankerSpec() below. Default: hardened llama.cpp (llama-server
@@ -490,10 +498,11 @@ var backendSpecs = map[string]BackendSpec{
 // rerankEntrypointScript translates the hardened llamacpp image's stable env
 // interface (MODEL_PATH/N_GPU_LAYERS/N_CTX/N_THREADS/HOST/PORT) into
 // llama-server flags with reranking enabled. Uses $VAR (NOT ${VAR}) so
-// substitution happens in the CONTAINER shell — resolveEnvSlice expands
-// ${...} from the node-agent's own env at create time, which would clobber
-// these. `command -v` covers the hardened image (llama-server on PATH);
-// /app/llama-server covers the upstream ghcr multi-arch image (ARM nodes).
+// substitution happens in the CONTAINER shell — resolveCommand expands
+// ${...} at create time (from the container env, else the node-agent's),
+// which would clobber these. `command -v` covers the hardened image
+// (llama-server on PATH); /app/llama-server covers the upstream ghcr
+// multi-arch image (ARM nodes).
 const rerankEntrypointScript = `
 BIN="$(command -v llama-server 2>/dev/null || echo /app/llama-server)"
 exec "$BIN" --model "$MODEL_PATH" --reranking \
@@ -520,8 +529,11 @@ func rerankerSpec() BackendSpec {
 //	RERANK_ENGINE=tei; noo cluster up reranker BAAI/bge-reranker-base --node <node>
 func rerankerSpecTEI() BackendSpec {
 	return BackendSpec{
+		// held at 1.6: TEI 1.9.4's CUDA image requires cuda>=12.9 with no GeForce
+		// exemption (driver >= ~575, inferred from the image config); move after a
+		// GPU node proves it (#1444)
 		Image:         "${TEI_GPU_IMAGE:-ghcr.io/huggingface/text-embeddings-inference:1.6}",
-		CPUImage:      "${TEI_CPU_IMAGE:-ghcr.io/huggingface/text-embeddings-inference:cpu-1.6}",
+		CPUImage:      "${TEI_CPU_IMAGE:-ghcr.io/huggingface/text-embeddings-inference:cpu-1.9.4}",
 		ContainerName: "noo-reranker",
 		Env: map[string]string{
 			"HUGGING_FACE_HUB_TOKEN": "${HF_TOKEN:-}",
@@ -538,7 +550,8 @@ func rerankerSpecTEI() BackendSpec {
 		},
 		GPUCount: "1",
 		Network:  "noo-cluster",
-		Command:  []string{"--model-id", "${RERANK_MODEL:-BAAI/bge-reranker-base}"},
+		// The placed model, as for the embedding backend (resolveCommand).
+		Command: []string{"--model-id", "${MODEL_ID}"},
 	}
 }
 
@@ -746,6 +759,28 @@ func llamacppCPULimit(specLimit float64, threads string, cores int) float64 {
 	return float64(n)
 }
 
+// embedRerankModelEnv puts a placed embedding/reranker model into the
+// container env overrides. A TEI spec (the embedding backend, the reranker
+// with RERANK_ENGINE=tei: both carry MODEL_ID) takes the HF repo id as
+// MODEL_ID, which its Command passes on as --model-id (resolveCommand). The
+// llama.cpp reranker takes a gguf filename under the /models mount (same
+// bare-filename handling as the llamacpp backend). No model: the spec's own
+// default stands.
+func embedRerankModelEnv(spec BackendSpec, model string, envOverrides map[string]string) {
+	if model == "" {
+		return
+	}
+	if spec.Env["MODEL_ID"] != "" {
+		envOverrides["MODEL_ID"] = model
+		return
+	}
+	mp := model
+	if !strings.HasPrefix(mp, "/") {
+		mp = "/models/" + mp
+	}
+	envOverrides["MODEL_PATH"] = mp
+}
+
 // SpecHashLabel names the container label that carries the desired-spec
 // fingerprint (StartOverrides.SpecHash). Read back by the reconciler to
 // detect spec drift. Absent on containers created before this feature.
@@ -766,8 +801,8 @@ func (c *Client) StartBackendSDK(ctx context.Context, backend, model string, gpu
 	defer cancel()
 
 	// ONE image choice (image_choice.go, shared with BackendImageRef):
-	// CPU/GPU auto-select (an embedding/reranker CPUImage on a node without an
-	// NVIDIA GPU; the GPU device reservation is independently gated by
+	// CPU/GPU choice (an embedding/reranker CPUImage by the placement's target
+	// and teiGPUUsable; the GPU device reservation is independently gated by
 	// hasNvidiaGPU() below), then the controller's override, else
 	// ${VLLM_IMAGE:-default} env substitution - and the policy that refuses a
 	// floating or digest-less third-party ref.
@@ -779,6 +814,9 @@ func (c *Client) StartBackendSDK(ctx context.Context, backend, model string, gpu
 		return err
 	}
 	spec.Image = choice.Ref
+	if choice.Why != "" {
+		slog.Info("backend image: CPU chosen", "backend", backend, "why", choice.Why)
+	}
 
 	// Reranker engine correction: a placement/RERANK_IMAGE override can point
 	// at the other engine's image than RERANK_ENGINE selected (e.g. desired
@@ -853,25 +891,8 @@ func (c *Client) StartBackendSDK(ctx context.Context, backend, model string, gpu
 		if model != "" {
 			envOverrides["MODEL_PATH"] = model
 		}
-	case "embedding":
-		if model != "" {
-			envOverrides["MODEL_ID"] = model
-		}
-	case "reranker":
-		if model != "" {
-			if spec.Env["MODEL_ID"] != "" {
-				// TEI engine: HF repo id.
-				envOverrides["MODEL_ID"] = model
-			} else {
-				// llama.cpp engine: gguf filename under the /models mount
-				// (same bare-filename handling as the llamacpp backend).
-				mp := model
-				if !strings.HasPrefix(mp, "/") {
-					mp = "/models/" + mp
-				}
-				envOverrides["MODEL_PATH"] = mp
-			}
-		}
+	case "embedding", "reranker":
+		embedRerankModelEnv(spec, model, envOverrides)
 	}
 
 	// GPU count override
@@ -940,7 +961,9 @@ func (c *Client) StartBackendSDK(ctx context.Context, backend, model string, gpu
 	// An UNPLACED node (no NOO_MODEL_CACHE_URL: the controller's own agent, a
 	// dev box) has no store to preseed from; it runs online as before.
 	// GGUF weights (llama.cpp) are a flat file; copy from the store if present.
-	if _, err := c.preseedGGUF(ctx, backend, model); err != nil {
+	// A GGUF that cannot be fetched AND is not on the node stops the start
+	// here, before any container exists (ggufStartGate).
+	if err := c.ggufStartGate(ctx, backend, model, overrides.ModelsDir); err != nil {
 		return err
 	}
 
@@ -1022,8 +1045,9 @@ func (c *Client) StartBackendSDK(ctx context.Context, backend, model string, gpu
 		sidecarImage = img
 	}
 
-	// Build command
-	cmd := resolveEnvSlice(spec.Command)
+	// Build command: resolved against the container env just built, so a
+	// ${VAR} in it follows the placement (TEI's --model-id ${MODEL_ID}).
+	cmd := resolveCommand(spec.Command, env)
 	entrypoint := spec.Entrypoint
 
 	// Container config
@@ -1245,8 +1269,11 @@ func (c *Client) StopBackendSDK(ctx context.Context, backend string) error {
 // starts, so an edge node that lacks the file pulls it over the LAN instead of
 // requiring manual placement. Unlike HF weights, a GGUF is one flat file and
 // llama.cpp loads it by path — no offline env flag needed, just presence.
-// Best-effort: on a miss, StartBackendSDK proceeds and llama.cpp fails exactly
-// as it would today if the file were absent. Requires NOO_MODEL_CACHE_URL.
+// A fetch that cannot be done (manifest absent, still hashing past the wait,
+// refused, a transport error) is a *GGUFUnavailableError, never (false, nil):
+// "unverifiable means refused" stays, but the caller can tell it from success
+// and ggufStartGate decides whether a local file lets the start go on.
+// Requires NOO_MODEL_CACHE_URL (unset = not a placed node = nothing to do).
 // In-process, against the host path: the agent is a host process (the
 // disposable helper container it once ran in is retired).
 func (c *Client) preseedGGUF(ctx context.Context, backend, model string) (bool, error) {
@@ -1283,17 +1310,28 @@ func (c *Client) preseedGGUF(ctx context.Context, backend, model string) (bool, 
 	// {name}) landed in gateway stack-v0.2.25. A node agent carrying this
 	// change against an OLDER gateway never preseeds GGUFs — ship the file
 	// with `noo cluster sync-model-files` instead, or roll the gateway first.
-	sha := fetchArtifactDigest(ctx, "gguf", model)
-	if sha == "" {
-		slog.Warn("gguf preseed refused: no artifact manifest for these bytes",
-			"model", model,
+	// A 202 (the controller is still hashing the file) is waited out within
+	// ggufStartManifestBudget, not read as "no manifest": that read left a first
+	// placement without its file and never retried it. The wait is short
+	// because it holds the reconcile tick; past it the start is refused and
+	// the next tick asks again. That converges: the gateway hashes in the
+	// BACKGROUND, single-flight, and caches the digest in memory and in
+	// /data/artifact-digests.json (gateway-rust/src/routes/artifacts.rs:31-49,
+	// HASH_WAIT_SECS :294, in_flight() :308, mem_cache() :301), so each tick
+	// re-joins the one running hash and the first tick after it ends gets 200.
+	man, merr := awaitArtifactManifestWithin(ctx, "gguf", model, ggufStartManifestBudget)
+	if merr != nil {
+		reason := ggufManifestReason(model, merr)
+		slog.Warn("gguf preseed refused: no verified artifact manifest for these bytes",
+			"model", model, "reason", reason,
 			"detail", "the controller could not state a sha256 for this file, so the "+
 				"copy would be unverified; refusing rather than loading bytes nothing vouched for",
 			"fix", "roll a gateway >= stack-v0.2.25 (which serves /api/artifacts/manifest), "+
 				"confirm the file is in the controller's model store, or place it on the node "+
 				"with `noo cluster sync-model-files`")
-		return false, nil
+		return false, &GGUFUnavailableError{Model: model, Reason: reason, Cause: merr}
 	}
+	sha := man.SHA256
 	slog.Info("gguf preseed will verify against controller manifest",
 		"model", model, "sha256", sha[:12]+"…")
 	fctx, cancel := context.WithTimeout(ctx, 15*time.Minute)
@@ -1303,15 +1341,17 @@ func (c *Client) preseedGGUF(ctx context.Context, backend, model string) (bool, 
 		return false, refusal
 	}
 	if err != nil {
+		reason := "the copy from the controller's store failed: " + err.Error()
 		if isPermissionErr(err) {
 			slog.Error("gguf preseed cannot write the node's models dir — expecting local file or manual placement",
 				"model", model, "dest", dest, "error", err,
 				"fix", "make "+modelsHost+" writable by the agent's user (it is a declared host root; prep-host owns it)")
+			reason = "this node cannot write " + modelsHost + " (" + err.Error() + ")"
 		} else {
 			slog.Info("gguf preseed miss; expecting local file or manual placement",
 				"model", model, "src", src, "err", err)
 		}
-		return false, nil
+		return false, &GGUFUnavailableError{Model: model, Reason: reason, Cause: err}
 	}
 	slog.Info("gguf preseeded from controller store", "model", model, "wrote", wrote, "dest", dest)
 	return true, nil
@@ -1360,6 +1400,70 @@ func (e *GGUFMismatchError) Error() string {
 	return fmt.Sprintf("gguf_mismatch: %s needs %s, but %s does not match the controller's record and could not be re-fetched (%s); "+
 		"%s. Once this node reaches the controller, re-fetch it with `noo cluster sync-model-files %s -m %s`; the next start loads the verified file",
 		e.Backend, e.Model, e.Path, e.Detail, where, nodeIDOrPlaceholder(), e.Model)
+}
+
+// GGUFUnavailableError: a placed GGUF could not be fetched from the
+// controller's store (no manifest, still hashing past the wait, refused, a
+// failed copy). The start path returns it only when the file is not already
+// on the node (ggufStartGate); the reconciler records it as a backend_start
+// refusal and tries again on the next tick.
+type GGUFUnavailableError struct {
+	Model, Reason string
+	Cause         error
+}
+
+func (e *GGUFUnavailableError) Error() string {
+	return fmt.Sprintf("gguf_unavailable: %s is not on this node and cannot be fetched from the controller yet: %s; "+
+		"no container was started, and the agent retries on the next reconcile tick (or ship it with `noo cluster sync-model-files %s -m %s`)",
+		e.Model, e.Reason, nodeIDOrPlaceholder(), e.Model)
+}
+
+func (e *GGUFUnavailableError) Unwrap() error { return e.Cause }
+
+// ggufStartManifestBudget caps how long the start path holds the reconcile
+// tick waiting for the controller's hash (the other callers keep the ten
+// minutes of manifestAwaitBudget). A variable so a test waits seconds.
+var ggufStartManifestBudget = 60 * time.Second
+
+// ggufManifestReason words why the manifest did not arrive, naming the model.
+func ggufManifestReason(model string, err error) string {
+	switch {
+	case errors.Is(err, ErrArtifactHashing) || errors.Is(err, ErrArtifactManifestTimeout):
+		return "the controller is still hashing " + model + "; retrying on the next reconcile pass"
+	case errors.Is(err, ErrArtifactRefused):
+		return "the controller refused to vouch for " + model + ": " + err.Error()
+	case errors.Is(err, ErrArtifactAbsent):
+		return "the controller has no artifact manifest for " + model + " (it is not in the controller's model store, or the gateway predates stack-v0.2.25)"
+	default:
+		return "the controller's manifest request for " + model + " failed: " + err.Error()
+	}
+}
+
+// ggufStartGate runs the preseed and decides whether the start may go on. A
+// GGUFUnavailableError with the file already in the effective models dir
+// (the controller-declared one, else the node's own) lets the start load the
+// local file as before; with no file there it is returned, so NO container is
+// created for a backend that would crash-loop without its weights. Any other
+// preseed error (a proven mismatch) is returned as it always was.
+func (c *Client) ggufStartGate(ctx context.Context, backend, model, modelsDir string) error {
+	_, err := c.preseedGGUF(ctx, backend, model)
+	if err == nil {
+		return nil
+	}
+	var un *GGUFUnavailableError
+	if !errors.As(err, &un) {
+		return err
+	}
+	dir := modelsDir
+	if dir == "" {
+		dir = resolveEnv(modelsSource)
+	}
+	if _, serr := os.Stat(filepath.Join(dir, model)); serr == nil {
+		slog.Warn("gguf preseed unavailable; the file is already on the node, starting with it",
+			"model", model, "dir", dir, "reason", un.Reason)
+		return nil
+	}
+	return err
 }
 
 // isPermissionErr tells "this process may not write here" from every other
@@ -1464,6 +1568,32 @@ func fetchArtifactManifest(ctx context.Context, kind, name string) *artifactMani
 // resolveEnv performs ${VAR:-default} substitution from os.Environ.
 // Supports nested expressions like ${OUTER:-${INNER}/cache}.
 func resolveEnv(s string) string {
+	return resolveEnvWith(s, os.Getenv)
+}
+
+// resolveCommand resolves a spec Command against the CONTAINER env (the
+// KEY=value list buildEnvList rendered: spec env, then the placement's
+// overrides, then the pinned keys), falling back to the agent's own env for
+// a name the container env does not carry. A Command ${VAR} resolved from
+// the agent's env alone ignored the placement: TEI's --model-id (which beats
+// its MODEL_ID env) named the node default whatever model was placed.
+func resolveCommand(cmd []string, containerEnv []string) []string {
+	have := parseEnv(containerEnv)
+	lookup := func(name string) string {
+		if v, ok := have[name]; ok {
+			return v
+		}
+		return os.Getenv(name)
+	}
+	out := make([]string, len(cmd))
+	for i, s := range cmd {
+		out[i] = resolveEnvWith(s, lookup)
+	}
+	return out
+}
+
+// resolveEnvWith is resolveEnv with the variables read through lookup.
+func resolveEnvWith(s string, lookup func(string) string) string {
 	if !strings.Contains(s, "${") {
 		return s
 	}
@@ -1491,9 +1621,9 @@ func resolveEnv(s string) string {
 			fallback = ""
 		}
 
-		val := os.Getenv(name)
+		val := lookup(name)
 		if val == "" {
-			val = resolveEnv(fallback) // recursive for nested ${...}
+			val = resolveEnvWith(fallback, lookup) // recursive for nested ${...}
 		}
 
 		result = result[:start] + val + result[end+1:]
@@ -1519,20 +1649,12 @@ func findMatchingBrace(s string, pos int) int {
 	return -1
 }
 
-func resolveEnvSlice(ss []string) []string {
-	out := make([]string, len(ss))
-	for i, s := range ss {
-		out[i] = resolveEnv(s)
-	}
-	return out
-}
-
 // teiHubCache is the TEI images' hub cache, pointed at the hub/ level of the
 // node's HF_CACHE_DIR (mounted at /data).
 //
 // The TEI images (ghcr.io/huggingface/text-embeddings-inference:1.6 and
-// :cpu-1.6, the digests docker-compose.cluster.yml pins) set
-// HUGGINGFACE_HUB_CACHE=/data in their config, and TEI 1.6 hands that
+// :cpu-1.9.4, the digests docker-compose.cluster.yml pins) set
+// HUGGINGFACE_HUB_CACHE=/data in their config, and TEI (1.6 and 1.9.4 alike) hands that
 // straight to hf-hub (router/src/lib.rs: ApiBuilder::with_cache_dir), whose
 // layout is <cache>/models--org--name. The agent stages and VERIFIES a placed
 // model at HF_CACHE_DIR/hub/models--org--name (stageHFModel, i675 F13), the

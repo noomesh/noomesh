@@ -15,7 +15,9 @@
 //! coordination needed.
 //!
 //! Agent contract (applies to every native command):
-//!   - `--json` prints the gateway's JSON to stdout, nothing else.
+//!   - `--json` prints the result as JSON on stdout, nothing else: the
+//!     gateway's body, plus `next` / `warnings` / `summary` fields wherever
+//!     the text prints guidance (`next` via `output::next_cmd`).
 //!   - Errors go to stderr — as JSON (`{"error","code","hint"}`) in json mode.
 //!   - Exit codes: 0 ok, 1 generic, 2 usage, 3 gateway unreachable,
 //!     4 auth failed, 5 gateway returned an error status,
@@ -64,6 +66,7 @@ mod config_readers;
 mod entitlement;
 mod entitlement_terms;
 mod harness_kinds;
+mod helper_image;
 mod harness_profiles;
 mod model_set;
 mod registry;
@@ -1062,6 +1065,14 @@ const GROUP_SECTIONS: &[(&str, &[&str])] = &[
     ("Security", &["security", "auth"]),
 ];
 
+/// The first-run tip: the ways in for a box with no install. Every line is
+/// a form the verb accepts (`noo enroll` takes a `noo1.` blob, not a URL).
+pub(crate) const FIRST_RUN_HINTS: &[(&str, &str)] = &[
+    ("noo onboard", "set this machine up as a controller (the setup wizard)"),
+    ("noo onboard --ci --root-ok", "the same, unattended (scripts and agents; needs Docker and passwordless sudo)"),
+    ("noo enroll noo1.<blob>", "join a fleet: paste the line `noo cluster bootstrap-token create --node <name>` prints on the controller"),
+];
+
 fn print_native_help(g: &Globals) {
     // The wordmark carries the tagline + version itself; the one-line
     // title is the plain-mode (and --quiet/--json-less) equivalent.
@@ -1079,10 +1090,7 @@ fn print_native_help(g: &Globals) {
     // ways in, before the group list.
     let role = role::detect();
     if role.controller.is_none() && role.node.is_none() && !ui::quiet() {
-        ui::guide(&[
-            ("noo onboard", "set this machine up as a controller (the setup wizard)"),
-            ("noo enroll <controller-url>", "join an existing fleet as a worker node"),
-        ]);
+        ui::guide(FIRST_RUN_HINTS);
     }
     println!("{}", ui::section("usage"));
     println!("  noo <group> <command> [args]     noo <group> --help     noo <group> <command> --help");
@@ -1123,7 +1131,7 @@ fn print_native_help(g: &Globals) {
     print!(
         "{}",
         ui::kv(&[
-            ("--json", format!("raw gateway JSON on stdout  {}", ui::muted("scripts and agents"))),
+            ("--json", format!("the result as JSON on stdout (the gateway body, plus next / warnings / summary)  {}", ui::muted("scripts and agents"))),
             ("--quiet, -q", format!("captured values only  {}", ui::muted("ids, secrets, paths"))),
             ("--color MODE", format!("auto | always | never  {}", ui::muted("persist: noo config set cli '{\"color\":\"never\"}'"))),
             ("--watch [S]", format!("redraw a status command every S seconds  {}", ui::muted("stack status, cluster status, jobs list"))),
@@ -1289,7 +1297,7 @@ fn print_native_help_for(words: &[String]) {
         .unwrap_or("");
 
     if let Some(entry) = exact {
-        let (syntax, about) = usage::lookup(entry).unwrap_or(("", ""));
+        let (syntax, about) = usage::help_lookup(entry).unwrap_or(("", ""));
         let joined = entry.join(" ");
         println!("{}", ui::header_as_is(&format!("noo {joined}"), if about.is_empty() { None } else { Some(about) }));
         println!("{}", ui::section("usage"));
@@ -1310,9 +1318,15 @@ fn print_native_help_for(words: &[String]) {
     println!();
     println!(
         "{}",
-        ui::muted("Globals: --json  --quiet  --color <mode>  --watch [s]  -v  -G/--gateway <url>  --timeout <s>  --token <jwt>  --instance <name>")
+        ui::muted(GLOBALS_HELP)
     );
 }
+
+/// The globals line under every command's `--help`. Long and short forms
+/// both, as `resolve_with` accepts them: `--verbose` was accepted (by
+/// `noo cluster status`, by every command) but the line showed only `-v`.
+const GLOBALS_HELP: &str =
+    "Globals: --json  -q/--quiet  --color <mode>  --watch [s]  -v/--verbose  -G/--gateway <url>  --timeout <s>  --token <jwt>  --instance <name>";
 
 /// Two-column rows: `noo <words> <syntax>` left, description right, wrapped
 /// so a long syntax never squeezes the description off the terminal.
@@ -1794,7 +1808,7 @@ fn main() {
 /// parser's "bad args" signal).
 fn usage_error(json: bool, prefix: &[&str]) -> ! {
     let joined = prefix.join(" ");
-    let (syntax, about) = usage::lookup(prefix).unwrap_or(("", ""));
+    let (syntax, about) = usage::help_lookup(prefix).unwrap_or(("", ""));
     // The parser's own reason (`--node needs a value`), when it gave one.
     let detail = args::take_message();
     let usage_line = if syntax.is_empty() { format!("noo {joined}") } else { format!("noo {joined} {syntax}") };
@@ -2103,6 +2117,38 @@ const SOURCES: &[(&str, &str)] = &[
             "cluster issue-token printed a token nothing validates; it was removed"
         );
         assert!(!is_hidden_native(&["cluster", "status"]));
+    }
+
+    /// Flags the parsers accept show in `--help`: the usage line
+    /// (`noo <words> <syntax>`, as `print_native_help_for` prints it) and the
+    /// globals line. `inference run` showed only `-n`, the globals line only
+    /// `-v`, and the dev-only `test run`/`test coverage` had no syntax at all.
+    #[test]
+    fn help_shows_every_flag_the_parser_accepts() {
+        let line = |w: &[&str]| {
+            let (syntax, _) = usage::help_lookup(w).unwrap_or_else(|| panic!("no help syntax for {w:?}"));
+            format!("noo {} {syntax}", w.join(" "))
+        };
+        let run = line(&["inference", "run"]);
+        for f in ["--node", "-n", "--model", "--user", "--temperature", "--strict-node"] {
+            assert!(run.contains(f), "{f} missing: {run}");
+        }
+        // A global: printed under every command's help, `cluster status` and
+        // `cluster verify` (whose guidance names `noo cluster verify --verbose`) alike.
+        assert!(GLOBALS_HELP.contains("-v/--verbose"), "{GLOBALS_HELP}");
+        let test_run = line(&["test", "run"]);
+        for f in ["--no-failfast", "--integration", "--failfast", "-k <pattern>"] {
+            assert!(test_run.contains(f), "{f} missing: {test_run}");
+        }
+        assert!(line(&["test", "coverage"]).contains("--html"));
+        // Still off the customer surface: no USAGE row, so no docs or completion.
+        for w in [&["test", "run"][..], &["test", "coverage"][..]] {
+            assert!(usage::lookup(w).is_none() && HIDDEN_NO_USAGE.contains(&w), "{w:?}");
+        }
+        // Every DEV_USAGE row is a hidden native command, never a customer one.
+        for (w, _, _) in usage::DEV_USAGE {
+            assert!(HIDDEN_NO_USAGE.contains(w), "{w:?}");
+        }
     }
 
     #[test]
@@ -2612,5 +2658,29 @@ mod offboard_tagline_tests {
         let d = super::GROUP_DESC.iter().find(|(n, _)| *n == "offboard").map(|(_, d)| *d).unwrap();
         assert!(d.contains("standalone controller"), "{d}");
         assert!(!d.to_lowercase().contains("leave the fleet"), "{d}");
+    }
+}
+
+#[cfg(test)]
+mod first_run_hint_tests {
+    use super::{FIRST_RUN_HINTS, NATIVE};
+
+    fn is_native(words: &[&str]) -> bool {
+        NATIVE.iter().any(|(w, _)| *w == words)
+    }
+
+    /// Every first-run hint is a form its verb accepts: enroll takes a
+    /// `noo1.` blob (there is no `noo enroll <controller-url>`), the blob
+    /// comes from `cluster bootstrap-token create --node`, and the
+    /// unattended onboard names `--ci --root-ok`.
+    #[test]
+    fn first_run_hints_name_forms_that_exist() {
+        let cmds: Vec<&str> = FIRST_RUN_HINTS.iter().map(|(c, _)| *c).collect();
+        assert_eq!(cmds, ["noo onboard", "noo onboard --ci --root-ok", "noo enroll noo1.<blob>"]);
+        assert!(FIRST_RUN_HINTS.iter().all(|(c, _)| !c.contains("<controller-url>")));
+        let (_, why) = FIRST_RUN_HINTS[2];
+        assert!(why.contains("`noo cluster bootstrap-token create --node <name>`"), "{why}");
+        assert!(FIRST_RUN_HINTS[1].1.contains("passwordless sudo"));
+        assert!(is_native(&["enroll"]) && is_native(&["onboard"]) && is_native(&["cluster", "bootstrap-token", "create"]));
     }
 }

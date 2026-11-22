@@ -35,6 +35,10 @@ NODE="$(cat "$CONF_DIR/node-name" 2>/dev/null || true)"
 URL="$(cat "$CONF_DIR/controller-url" 2>/dev/null || true)"
 KEY="$CONF_DIR/birth.key"
 LAST="$CONF_DIR/last-bundle.sha256"
+# The refusal name the report carries (noo-apply.sh `refusal_table`); empty =
+# none. Set by the gzip and decrypt steps here, or read from the applier's
+# last line.
+NOO_REFUSAL=""
 
 [ -n "$NODE" ] || { echo "noo-fetch: no $CONF_DIR/node-name — not birth-enrolled" >&2; exit 0; }
 [ -n "$URL" ]  || { echo "noo-fetch: no $CONF_DIR/controller-url" >&2; exit 0; }
@@ -197,14 +201,6 @@ if [ -f "$LAST" ] && [ "$(cat "$LAST")" = "$SUM" ]; then
     exit 0  # already applied this exact bundle
 fi
 
-echo "noo-fetch: new bundle staged ($SUM) — decrypting"
-if ! openssl smime -decrypt -binary -inform DER \
-        -inkey "$KEY" -in "$TMP/blob" -out "$TMP/bundle.tar" 2>"$TMP/err"; then
-    echo "noo-fetch: DECRYPT FAILED — bundle not encrypted to this node's birth key?" >&2
-    cat "$TMP/err" >&2
-    exit 1
-fi
-
 # noo-apply verifies the CA signature and refuses anything else — exactly
 # the push lane's guarantee. Applying may restart the agent; that is the
 # point. (noo-apply takes the bundle as a FILE argument, same as the gate's
@@ -282,6 +278,10 @@ report() {
     REPORT_STEP="${NOO_REPORT_STEP:-10}"
     _msg="$(tail -c 1500 "$TMP/apply.log" 2>/dev/null | tr -d '\000' | sed 's/\\/\\\\/g; s/"/\\"/g' | tr '\n\r\t' '   ')"
     _rc="$1"
+    # The refusal name rides only with a refusal, and only in its own shape:
+    # a success's body is byte for byte what it always was.
+    REPORT_REFUSAL=""
+    if [ "$_rc" != 0 ] && refusal_ok "${NOO_REFUSAL:-}"; then REPORT_REFUSAL="$NOO_REFUSAL"; fi
     _proof=""
     _proof="$(birth_proof apply "$SUM")" || _proof=""
     _hdrs=""
@@ -361,7 +361,9 @@ report_post() {
     # only thing that distinguishes "controller said no" from "no route".
     _errf="${TMP:-/tmp}/report.err"
     _path="/bootstrap/bundle/$NODE/applied"
-    _body="{\"sha\":\"$SUM\",\"rc\":$_r,\"msg\":\"$_m\"}"
+    _rf=""
+    [ -z "${REPORT_REFUSAL:-}" ] || _rf=",\"refusal\":\"$REPORT_REFUSAL\""
+    _body="{\"sha\":\"$SUM\",\"rc\":$_r,\"msg\":\"$_m\"$_rf}"
     # v2 always. There is no v1 form left to sign: the controller refuses it.
     # A stale NOO_CLUSTER_TOKEN_SIGN=v1 line in the agent env is ignored. A
     # v2 refusal is reported as the 401 it is, never re-sent.
@@ -388,6 +390,100 @@ report_post() {
     case "$REPORT_CODE" in 2??) return 0 ;; esac
     return 1
 }
+# ── refusal names ────────────────────────────────────────────
+#
+# refusal_ok NAME — a name as the report may carry it: [a-z][a-z0-9_]{0,47}.
+# The report puts it in its JSON body verbatim, so nothing else gets through.
+refusal_ok() {
+    case "$1" in ''|[!a-z]*|*[!a-z0-9_]*) return 1 ;; esac
+    [ "${#1}" -le 48 ]
+}
+# applier_refusal RC LOG — the name on the applier's LAST
+# `noo-apply: refusal=<name> (exit RC)` line in LOG, for THIS rc only;
+# nothing when there is none (an older applier, or a code with no name).
+applier_refusal() {
+    sed -n "s/^noo-apply: refusal=\([a-z][a-z0-9_]*\) (exit $1)\$/\1/p" "$2" 2>/dev/null | tail -n 1
+}
+
+# ── decrypt, and what a failure means ────────────────────────
+#
+# A failed decrypt is reported like a refusal (it used to exit before the
+# report, silently, and re-fail every tick). Its sha goes into $LAST — so the
+# node stops retrying that ciphertext — ONLY for a cryptographic mismatch:
+# the key file was read, the ciphertext is still the bytes we hashed, and it
+# still does not open with that key. That answer is the same on every tick
+# (bundle_decrypt_failed, 65). Anything that says nothing about the bundle is
+# reported under its own name and NOT recorded, so the next tick retries:
+# a birth key that cannot be read (birth_key_unreadable, 78), or a write or
+# read error around a ciphertext that does open (bundle_decrypt_io, 73).
+#
+# What un-sticks a recorded failure: any re-stage. The controller encrypts
+# every staging afresh (`openssl smime -encrypt`: a new random content key),
+# so the ciphertext's sha differs from $LAST even for the same bundle; a
+# re-enroll mints a new birth key, and the next staging is encrypted to it.
+# plaintext_is_bundle FILE — the decrypted plaintext is shaped like a bundle:
+# gzip (a controller >= 0.6.5 gzips before encrypting) or a plain tar. A
+# wrong key can "decrypt" to garbage: on an RSA padding error OpenSSL carries
+# on with a random key (its defence against padding oracles), and AES-CBC's
+# padding then validates about 1 time in 256. Exit 0 from openssl alone is
+# therefore no proof that this node's key opened the bundle.
+plaintext_is_bundle() {
+    _pm="$(head -c 2 "$1" 2>/dev/null | od -An -tx1 | tr -d ' \n')"
+    [ "$_pm" = "1f8b" ] && return 0
+    [ "$(dd if="$1" bs=1 skip=257 count=5 2>/dev/null)" = "ustar" ]
+}
+
+decrypt_bundle() {  # sets NOO_REFUSAL and DECRYPT_RECORD; 0 or the report's rc
+    DECRYPT_RECORD=0
+    # $SUM was computed from this blob right after the download: a blob that
+    # no longer hashes to it changed on disk. I/O, never a key problem, and
+    # checked first so the answer does not depend on what openssl does.
+    if [ "$(sha256sum "$TMP/blob" 2>/dev/null | cut -d' ' -f1)" != "$SUM" ]; then
+        NOO_REFUSAL=bundle_decrypt_io; return 73
+    fi
+    if openssl smime -decrypt -binary -inform DER \
+            -inkey "$KEY" -in "$TMP/blob" -out "$TMP/bundle.tar" 2>"$TMP/err" \
+        && plaintext_is_bundle "$TMP/bundle.tar"; then
+        return 0
+    fi
+    if ! openssl pkey -in "$KEY" -noout >/dev/null 2>&1; then
+        NOO_REFUSAL=birth_key_unreadable; return 78
+    fi
+    # Once more into a scratch file: a bundle there means the first try only
+    # failed writing its output (I/O, retried). Anything else, an error or
+    # garbage, is this key not opening this bundle (recorded).
+    if openssl smime -decrypt -binary -inform DER \
+            -inkey "$KEY" -in "$TMP/blob" -out "$TMP/bundle.check" 2>/dev/null \
+        && plaintext_is_bundle "$TMP/bundle.check"; then
+        rm -f "$TMP/bundle.check"
+        NOO_REFUSAL=bundle_decrypt_io; return 73
+    fi
+    rm -f "$TMP/bundle.check"
+    NOO_REFUSAL=bundle_decrypt_failed; DECRYPT_RECORD=1; return 65
+}
+# decrypt_refused RC — say it, record $LAST only for a mismatch, report RC.
+decrypt_refused() {
+    case "$NOO_REFUSAL" in
+        bundle_decrypt_failed) _dn="the bundle does not decrypt with this node's birth key — recorded; a newly staged bundle is tried" ;;
+        birth_key_unreadable) _dn="$KEY cannot be read as a key — not recorded; the next tick retries" ;;
+        *) _dn="the bundle opens with this node's birth key but could not be read or written here (a disk or file error) — not recorded; the next tick retries" ;;
+    esac
+    {
+        echo "noo-fetch: DECRYPT FAILED — bundle not encrypted to this node's birth key?"
+        head -c 400 "$TMP/err" 2>/dev/null || true
+        echo "noo-fetch: $_dn"
+    } > "$TMP/apply.log" 2>/dev/null || true
+    cat "$TMP/apply.log" >&2 2>/dev/null || echo "noo-fetch: DECRYPT FAILED — $_dn" >&2
+    if [ "$DECRYPT_RECORD" = 1 ]; then printf '%s\n' "$SUM" > "$LAST"; fi
+    report "$1"
+}
+
+echo "noo-fetch: new bundle staged ($SUM) — decrypting"
+if decrypt_bundle; then :; else
+    decrypt_refused "$?"
+    exit 1
+fi
+
 # ── gzip-wrapped bundles ─────────────────────────────────────
 #
 # A controller at noo-cli >= 0.6.5 gzips bundle.tar BEFORE encrypting it
@@ -408,11 +504,11 @@ unwrap_gzip() {
     [ "$_magic" = "1f8b" ] || return 0
     if ! command -v gzip >/dev/null 2>&1; then
         echo "noo-fetch: bundle is gzip-compressed but gzip is not installed on this node — install gzip, then re-stage" | tee "$TMP/apply.log" >&2
-        return 69
+        NOO_REFUSAL=tool_missing; return 69
     fi
     if ! gzip -dc < "$TMP/bundle.tar" > "$TMP/bundle.tar.plain" 2>"$TMP/err"; then
         echo "noo-fetch: gzip could not decompress the bundle ($(head -c 200 "$TMP/err" | tr '\n' ' ')) — re-stage" | tee "$TMP/apply.log" >&2
-        return 69
+        NOO_REFUSAL=bundle_gzip_failed; return 69
     fi
     mv "$TMP/bundle.tar.plain" "$TMP/bundle.tar"
     echo "noo-fetch: bundle was gzip-compressed — decompressed"
@@ -444,6 +540,7 @@ else
     # unit's journal.
     printf '%s\n' "$SUM" > "$LAST"
     echo "noo-fetch: noo-apply failed (exit $rc) — journal has details; re-stage to retry" >&2
+    NOO_REFUSAL="$(applier_refusal "$rc" "$TMP/apply.log")"
     report "$rc"
     exit "$rc"
 fi

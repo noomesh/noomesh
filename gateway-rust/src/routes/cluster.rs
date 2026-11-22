@@ -337,6 +337,53 @@ pub(crate) fn carry_reported(data: &mut Value, body: &Value, key: &str) {
     }
 }
 
+/// The routing fields a registration body does not carry but selection reads
+/// (`classes::node_facts_from_kv`): `lanes` (i403; a node that reports them
+/// is routed on them alone), `running_backends` (the fallback for an agent
+/// that predates lanes) and `available_models` (a declared candidate whose
+/// model the node holds but has not loaded is `available`). Registration
+/// rebuilds the record from scratch, so without these every agent restart
+/// left the node unroutable until its first beat: an instant 503 for every
+/// chat to a class only it serves (~30 s on every roll and upgrade).
+pub(crate) const REGISTER_KEEPS_FROM_STORED: &[&str] = &["lanes", "running_backends", "available_models"];
+
+/// How old the stored record's last beat (or registration) may be for a
+/// registration to keep its routing fields: an agent restart, not a node
+/// that was away. The `mesh_nodes` bucket's own TTL (120 s) usually removed
+/// an older record already; this does not depend on that TTL being set.
+pub(crate) const STORED_CARRY_MAX_AGE_SECS: f64 = 4.0 * crate::coordinator::classes::HEARTBEAT_INTERVAL_SECS;
+
+/// Carry one field from the node's STORED record onto a registration's
+/// rebuilt one, when the registration body does not carry it (a body that
+/// does is written as it is, and wins): what the node
+/// offered a second ago, kept until its next beat replaces it (a beat sets
+/// `lanes` and `running_backends` every time; a lane that turned out gone
+/// fails over as any dead lane does). `stored` is `None` when there is no
+/// record (first registration, or `noo cluster forget` purged it) or it is
+/// too old ([`stored_for_carry`]): then nothing is carried.
+pub(crate) fn carry_stored(data: &mut Value, stored: Option<&Value>, body: &Value, key: &str) {
+    // What the registration itself says wins, and is written: a body that
+    // carries the field (`lanes: []` included: "no lanes") is the newest fact.
+    if let Some(v) = body.get(key).filter(|v| !v.is_null()) {
+        data[key] = v.clone();
+        return;
+    }
+    if let Some(v) = stored.and_then(|s| s.get(key)).filter(|v| !v.is_null()) {
+        data[key] = v.clone();
+    }
+}
+
+/// The stored record a registration may carry from: present, for the same
+/// node id, and beaten (or registered) within [`STORED_CARRY_MAX_AGE_SECS`].
+pub(crate) fn stored_for_carry<'a>(stored: Option<&'a Value>, node_id: &str, now: f64) -> Option<&'a Value> {
+    let s = stored?;
+    if s.get("id").and_then(Value::as_str).is_some_and(|id| id != node_id) {
+        return None;
+    }
+    let last = s.get("last_heartbeat").or_else(|| s.get("ts")).and_then(Value::as_f64)?;
+    (now - last <= STORED_CARRY_MAX_AGE_SECS).then_some(s)
+}
+
 /// The agent's `lanes` (proposal i403), stored on every beat so the class
 /// table reads them (`node_facts_from_kv`). An agent that reports lanes
 /// sends the key on EVERY beat (`[]` included: "no lanes"; the agent's
@@ -389,6 +436,12 @@ enum BeatShape {
     OneOf(&'static [&'static str]),
     /// A list of objects, at most this many.
     Objects(usize),
+    /// One small object: its `state` is one of these, and every value is a
+    /// string of at most 256 bytes (at most 8 keys).
+    StateObject(&'static [&'static str]),
+    /// An object of at most this many keys, each a non-empty string of at
+    /// most 512 bytes mapped to a bool.
+    BoolMap(usize),
 }
 
 /// The A4 keys. Placement (i300 H3) reads only what this stores: a key left
@@ -407,6 +460,15 @@ const I300_BEAT_KEYS: &[(&str, BeatShape)] = &[
     // reads (<models dir>/sets). Placement prefers it to data_root_free_gb.
     // An old gateway drops it, and the preflight then falls back.
     ("model_sets_free_bytes", BeatShape::NonNegInt),
+    // i1036: the least free bytes over Docker's data root, containerd's root
+    // and the agent's staging dir. The GPU llama.cpp place check reads it; an
+    // agent that does not send it is unknown there (a warning, no refusal).
+    ("image_store_free_bytes", BeatShape::NonNegInt),
+    // i1036: {ref: held} for the release's own backend images (the agent's
+    // `docker image inspect` of each; a ref it could not judge is absent).
+    // The GPU llama.cpp place check refuses only a node that does NOT hold
+    // the CUDA image.
+    ("held_images", BeatShape::BoolMap(16)),
     ("addon_workloads_policy", BeatShape::OneOf(&["none", "approve", "auto"])),
     ("addon_workloads_approvals", BeatShape::Objects(256)),
     ("model_sets", BeatShape::Objects(256)),
@@ -421,6 +483,11 @@ const I300_BEAT_KEYS: &[(&str, BeatShape)] = &[
     // node-agent-go docker/llamacpp_offload.go), read by the `llamacpp
     // offload` verify row: 0 offloaded on a GPU start is a WARN.
     ("llamacpp_offload", BeatShape::Objects(8)),
+    // i1058: the node's Docker Engine, `{state: ok, version, kind}` (kind
+    // dockerd | docker-desktop | podman), `{state: none}` (no Docker) or
+    // `{state: unreadable, error}`; read by the `docker engine` verify row.
+    // Absent is an agent that predates it.
+    ("docker_engine", BeatShape::StateObject(&["ok", "none", "unreadable"])),
 ];
 
 fn beat_shape_ok(v: &Value, shape: BeatShape) -> bool {
@@ -433,6 +500,14 @@ fn beat_shape_ok(v: &Value, shape: BeatShape) -> bool {
         BeatShape::Objects(max) => v
             .as_array()
             .is_some_and(|a| a.len() <= max && a.iter().all(Value::is_object)),
+        BeatShape::StateObject(states) => v.as_object().is_some_and(|o| {
+            o.len() <= 8
+                && o.get("state").and_then(Value::as_str).is_some_and(|s| states.contains(&s))
+                && o.values().all(|x| x.as_str().is_some_and(|s| s.len() <= 256))
+        }),
+        BeatShape::BoolMap(max) => v
+            .as_object()
+            .is_some_and(|o| o.len() <= max && o.iter().all(|(k, b)| !k.is_empty() && k.len() <= 512 && b.is_boolean())),
     }
 }
 
@@ -645,6 +720,11 @@ async fn node_heartbeat(
     if let Some(v) = body.get("cpu_cores") { if !v.is_null() { data["cpu_cores"] = v.clone(); } }
     if let Some(v) = body.get("ram_gb") { if !v.is_null() { data["ram_gb"] = v.clone(); } }
     if let Some(v) = body.get("vram_gb") { if !v.is_null() { data["vram_gb"] = v.clone(); } }
+    // vram_gb is ONE card; every card (gpu_vram_gb) and their sum
+    // (vram_total_gb) budget a placement that splits across GPUs
+    // (placement_fit::gpu_pool_spanning). Omitted = keep the stored value.
+    if let Some(v) = body.get("vram_total_gb") { if !v.is_null() { data["vram_total_gb"] = v.clone(); } }
+    if let Some(v) = body.get("gpu_vram_gb") { if !v.is_null() { data["gpu_vram_gb"] = v.clone(); } }
     // Node-broadcast network identity: geographic/site label and the interface
     // the node published its control API on (surfaced for the eval report +
     // dashboard; see NODE_LOCATION and the H-N5 bind_addr broadcast).
@@ -893,6 +973,13 @@ async fn node_heartbeat(
     {
         data["gpu_model"] = json!(gm);
         data["vram_gb"] = json!(vg);
+        // The override declares ONE card's VRAM: a detected per-card list or
+        // total must not outweigh it in the placement fit (the operator set
+        // the override because detection is wrong).
+        if let Some(o) = data.as_object_mut() {
+            o.remove("vram_total_gb");
+            o.remove("gpu_vram_gb");
+        }
     }
 
     // No VRAM → no GPU. Drops a stale gpu_model (e.g. a Pi carrying a
@@ -1255,6 +1342,10 @@ async fn node_register_body(
 
     // Flatten capabilities into top-level fields for dashboard compatibility
     let caps = body.get("capabilities").cloned().unwrap_or(json!({}));
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64();
     let data = json!({
         "id": node_id,
         "hostname": body.get("hostname").and_then(|h| h.as_str()).unwrap_or(node_id),
@@ -1263,6 +1354,8 @@ async fn node_register_body(
         "gpu_model": caps.get("gpu_model"),
         "gpu_count": caps.get("gpu_count"),
         "vram_gb": caps.get("vram_gb"),
+        "vram_total_gb": caps.get("vram_total_gb"),
+        "gpu_vram_gb": caps.get("gpu_vram_gb"),
         "cpu_cores": caps.get("cpu_cores"),
         "ram_gb": caps.get("ram_gb"),
         "is_arm": caps.get("is_arm"),
@@ -1279,10 +1372,12 @@ async fn node_register_body(
         "capabilities": caps,
         "status": "online",
         "running_backends": {},
-        "ts": std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs_f64(),
+        // When this registration was written. With no `last_heartbeat`
+        // after it, the node has not beaten since its (re)start: selection
+        // holds a request for it briefly instead of refusing at once
+        // (`classes::first_beat_wait`).
+        "registered_at": now,
+        "ts": now,
     });
 
     // No VRAM → no GPU (drops a stale/copied GPU_MODEL at registration too).
@@ -1320,13 +1415,24 @@ async fn node_register_body(
     data[crate::node_link::TRANSPORTS_FIELD] = crate::node_link::reported_transports(&body);
     crate::node_agent_auth::note(node_id, &data);
 
-    // Write full registration to NATS KV
+    // Write full registration to NATS KV, keeping the routing fields the
+    // node offered a second ago (`carry_stored`). A forgotten node's record
+    // was purged (`node_forget`), so a re-enrolled one inherits nothing.
+    let mut kept: Vec<&str> = Vec::new();
     if let Ok(kv) = state.js.get_key_value("mesh_nodes").await {
+        let stored = kv.get(node_id).await.ok().flatten().and_then(|v| serde_json::from_slice::<Value>(&v).ok());
+        let from = stored_for_carry(stored.as_ref(), node_id, now);
+        for &key in REGISTER_KEEPS_FROM_STORED {
+            carry_stored(&mut data, from, &body, key);
+            if body.get(key).is_none_or(Value::is_null) && from.is_some_and(|s| s.get(key).is_some_and(|v| !v.is_null())) {
+                kept.push(key);
+            }
+        }
         let payload = serde_json::to_vec(&data).unwrap_or_default();
         let _ = kv.put(node_id, payload.into()).await;
     }
 
-    tracing::info!(node_id = %node_id, "node registered");
+    tracing::info!(node_id = %node_id, kept_from_stored = ?kept, "node registered");
     Ok(Json(json!({"status": "registered", "node_id": node_id})))
 }
 
@@ -3206,8 +3312,10 @@ async fn proposals_list(
 /// (`status='approved' AND executed_at IS NULL`).
 async fn proposals_decide(
     State(state): State<Arc<AppState>>,
+    ctx: Option<axum::Extension<crate::auth::RequesterCtx>>,
     Json(body): Json<Value>,
 ) -> AppResult {
+    crate::person_gate::require_person(&state.db, ctx.as_deref(), "deciding a node join proposal").await?;
     let id = body.get("id").and_then(|v| v.as_str()).unwrap_or("");
     let decision = body.get("decision").and_then(|v| v.as_str()).unwrap_or("");
     if id.is_empty() {
@@ -4754,6 +4862,235 @@ pub(crate) fn validate_vllm_compute(node_id: &str, backend: &str, desired: &str,
     }
 }
 
+/// The node agent's image-pull space constants (node-agent-go
+/// `docker/image_space.go`): the headroom kept on each filesystem
+/// (`imageSpaceMargin`), and the floor of its load estimate's tar + N GiB arm
+/// (`imageLoadExtraFloor`). A place-time check that disagreed with the agent
+/// would either refuse what the node can pull or pass what it refuses.
+pub(crate) const IMAGE_SPACE_MARGIN: u64 = 512 << 20;
+pub(crate) const IMAGE_LOAD_EXTRA_FLOOR: u64 = 2 << 30;
+
+/// Twin of the agent's `imageLoadNeed`: what it assumes `docker load` of a
+/// tar of `tar` bytes needs in Docker's data root, the larger of 2 × the tar
+/// or the tar + 2 GiB.
+pub(crate) fn agent_image_load_estimate(tar: u64) -> u64 {
+    tar.saturating_mul(2).max(tar.saturating_add(IMAGE_LOAD_EXTRA_FLOOR))
+}
+
+/// What pulling one staged image needs on a node whose staging dir and Docker
+/// data root are one filesystem (the agent's same-filesystem formula): the
+/// tar, plus the load, plus the margin. The load is the image's recorded
+/// unpacked size, or the agent's own estimate when that is larger: the
+/// gateway never passes what the agent's same-filesystem check refuses, and
+/// is stricter only when the image really unpacks to more than that estimate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ImageSpaceNeed {
+    pub tar: u64,
+    pub unpacked: u64,
+    pub load: u64,
+    pub margin: u64,
+    pub total: u64,
+}
+
+pub(crate) fn image_space_need(tar: u64, unpacked: u64) -> ImageSpaceNeed {
+    let load = unpacked.max(agent_image_load_estimate(tar));
+    ImageSpaceNeed { tar, unpacked, load, margin: IMAGE_SPACE_MARGIN, total: tar.saturating_add(load).saturating_add(IMAGE_SPACE_MARGIN) }
+}
+
+/// The staged image a placement would pull, as the place-time space check
+/// reads it: its ref, its image ID and tar size (the staging index and the
+/// store), and its unpacked size (`docker image inspect .Size` at stage
+/// time; None for an image staged before that was recorded).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ImageSpaceFacts {
+    pub image: String,
+    pub image_id: Option<String>,
+    pub tar_bytes: Option<u64>,
+    pub unpacked_bytes: Option<u64>,
+}
+
+/// Whether a node holds an image, as its heartbeat says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Holding {
+    /// It holds it: a pull moves no tar.
+    Held,
+    /// Its agent inspected the ref and Docker does not have it.
+    NotHeld,
+    /// Nothing says: an agent older than `held_images`, or one whose release
+    /// tag (so whose ref) differs from the staged one.
+    Unknown,
+}
+
+/// Does the node already hold `image`?
+/// - Held: `held_images[ref]` is true (the agent's own `docker image
+///   inspect`, i1036), or a row of `image_sources` (each image this agent run
+///   started a container from) has the staged image ID (the agent then
+///   retags, moving no tar) or, when an ID is unknown on either side, the
+///   same ref.
+/// - NotHeld: `held_images[ref]` is false.
+/// - Unknown: neither says.
+pub(crate) fn node_holds_image(node: &Value, image: &str, staged_id: Option<&str>) -> Holding {
+    use crate::routes::artifacts::staged_ref;
+    let want = staged_ref(image);
+    let staged_id = staged_id.filter(|i| !i.is_empty());
+    let started = node.get("image_sources").and_then(Value::as_array).is_some_and(|rows| {
+        rows.iter().any(|r| {
+            let id = r.get("image_id").and_then(Value::as_str).filter(|i| !i.is_empty());
+            match (staged_id, id) {
+                (Some(s), Some(i)) => s == i,
+                _ => r.get("image").and_then(Value::as_str).is_some_and(|i| staged_ref(i) == want),
+            }
+        })
+    });
+    if started {
+        return Holding::Held;
+    }
+    match node.get("held_images").and_then(|h| h.get(want)).and_then(Value::as_bool) {
+        Some(true) => Holding::Held,
+        Some(false) => Holding::NotHeld,
+        None => Holding::Unknown,
+    }
+}
+
+/// Tenths of a GB (10^8 bytes) for the texts: the need's parts rounded UP, so
+/// the parts shown add up to the total shown and never understate it; the
+/// free figure rounded down.
+fn gb_tenths_up(bytes: u64) -> u64 {
+    bytes.div_ceil(100_000_000)
+}
+
+fn gb(tenths: u64) -> String {
+    format!("{}.{}", tenths / 10, tenths % 10)
+}
+
+/// "X GB free" and "about Y GB to pull and unpack (tar A + unpacked B +
+/// margin C; …)": Y is the sum of the parts as shown.
+fn image_space_figures(free: u64, need: &ImageSpaceNeed) -> (String, String) {
+    let (tar, load, margin) = (gb_tenths_up(need.tar), gb_tenths_up(need.load), gb_tenths_up(need.margin));
+    let total = tar + load + margin;
+    let free = format!("{} GB free", gb(free / 100_000_000));
+    let need = format!(
+        "about {} GB to pull and unpack (tar {} + unpacked {} + margin {}; the unpacked figure is the larger of the image's \
+         recorded size, {} GB, and the node agent's own estimate, which its pull check uses)",
+        gb(total),
+        gb(tar),
+        gb(load),
+        gb(margin),
+        gb(gb_tenths_up(need.unpacked)),
+    );
+    (free, need)
+}
+
+/// noo's own reclaim first, never a raw docker command.
+fn image_space_reclaim(node_id: &str) -> String {
+    format!(
+        "free space with noo's reclaim: `noo autonomy decisions -l disk_watermark` shows what it would free on {node_id}; \
+         `noo autonomy live disk_watermark` lets it act (an operator decision; see docs/operating/disk-and-images.md)"
+    )
+}
+
+/// The refusal for a GPU llama.cpp placement on a node that does not hold
+/// the CUDA image and is known to lack the room to pull it.
+pub(crate) fn image_space_refusal(node_id: &str, model: Option<&str>, image: &str, free: u64, need: &ImageSpaceNeed) -> String {
+    let (free, need) = image_space_figures(free, need);
+    format!(
+        "{node_id} has {free} in its image store and does not hold {image}, which needs {need}, so the llamacpp start would \
+         wait on the node for space (the image store is the least free of Docker's data root, containerd's root and the agent's \
+         staging dir). To place it: {reclaim}. Or place it on cpu: `noo cluster place {node_id} llamacpp {model} --on cpu`. \
+         --force places it anyway",
+        reclaim = image_space_reclaim(node_id),
+        model = model.map(str::trim).filter(|m| !m.is_empty()).unwrap_or("<model>"),
+    )
+}
+
+/// i1036: a running llama.cpp placement on the node's GPU starts the CUDA
+/// image (~2.6 GB tar, ~4 GB unpacked, sharing no layers with the CPU one).
+/// When the node does NOT hold it ([`Holding::NotHeld`]) and is KNOWN to have
+/// less free space (`image_store_free_bytes`) than the pull needs
+/// ([`image_space_need`]), it is refused (Err), naming the numbers and the
+/// remedy. Unknown on any side (whether it holds the image, its free space,
+/// the image's unpacked size) proceeds with one warning (Ok(Some)) saying
+/// what is unknown; no guessed ratio stands in for a missing size. A node
+/// that holds it, any other backend, or llama.cpp on cpu is not judged.
+pub(crate) fn validate_image_space(node_id: &str, backend: &str, on_gpu: bool, model: Option<&str>, img: &ImageSpaceFacts, node: &Value) -> Result<Option<String>, String> {
+    if backend != "llamacpp" || !on_gpu {
+        return Ok(None);
+    }
+    let holding = node_holds_image(node, &img.image, img.image_id.as_deref());
+    if holding == Holding::Held {
+        return Ok(None);
+    }
+    let image = img.image.as_str();
+    let Some(free) = node.get("image_store_free_bytes").and_then(Value::as_u64) else {
+        return Ok(Some(format!(
+            "{backend} on {node_id}: whether {image} fits on this node is unknown: it does not report image_store_free_bytes \
+             (an agent older than this release, or its disks could not be read). Pulling it needs about the tar plus its unpacked \
+             size plus 512 MiB free; `noo cluster show {node_id}` shows its disks"
+        )));
+    };
+    let (Some(tar), Some(unpacked)) = (img.tar_bytes.filter(|b| *b > 0), img.unpacked_bytes.filter(|b| *b > 0)) else {
+        return Ok(Some(format!(
+            "{backend} on {node_id}: whether {image} fits in the {} GB free there is unknown: its unpacked size was not recorded \
+             when it was staged (staged by an older noo). Restage it to record it: `noo cluster sync-images {node_id} -i {}`",
+            gb(free / 100_000_000),
+            crate::routes::artifacts::staged_ref(image)
+        )));
+    };
+    let need = image_space_need(tar, unpacked);
+    if free >= need.total {
+        return Ok(None);
+    }
+    if holding == Holding::NotHeld {
+        return Err(image_space_refusal(node_id, model, image, free, &need));
+    }
+    let (free_s, need_s) = image_space_figures(free, &need);
+    Ok(Some(format!(
+        "{backend} on {node_id}: {node_id} has {free_s} in its image store, and {image} needs {need_s}, but \
+         whether the node already holds it is unknown (its agent does not report held_images for it: an agent older than this \
+         release, or one on another release tag). If it does not, the start will wait on the node for space; {}",
+        image_space_reclaim(node_id)
+    )))
+}
+
+/// The facts [`validate_image_space`] reads about the image a llama.cpp
+/// placement on the GPU pulls (`placement_required_image`, the CUDA build),
+/// from the image store `dir` and its staging index: None when there is
+/// nothing the gateway can judge (not on the GPU, no store mounted, the
+/// node's arch unknown, or the image not staged — the staging check speaks
+/// for that).
+fn staged_image_space_facts(dir: &std::path::Path, node: &Value, backend: &str, body_image: Option<&str>, on_gpu: bool) -> Option<ImageSpaceFacts> {
+    use crate::routes::artifacts as art;
+    if backend != "llamacpp" || !on_gpu {
+        return None;
+    }
+    if !dir.is_dir() {
+        return None;
+    }
+    let arch = node["capabilities"]["arch"].as_str().or_else(|| node["arch"].as_str()).unwrap_or("");
+    if arch.is_empty() {
+        return None;
+    }
+    let index = art::read_staged_index(dir);
+    let image = art::placement_required_image(backend, body_image, arch, index.release.as_ref(), &index.own_roots, true)?;
+    if !art::image_is_staged(dir, &image, arch) {
+        return None;
+    }
+    let staged = art::staged_ref(&image);
+    let rec = index.images.iter().find(|i| i.image == staged && i.arch == arch);
+    let tar_bytes = rec
+        .map(|r| r.tar.clone())
+        .into_iter()
+        .chain([art::image_tar_gz_name(staged, arch), art::image_tar_name(staged, arch)])
+        .filter(|t| !t.is_empty())
+        .find_map(|t| std::fs::metadata(dir.join(t)).ok().filter(|m| m.is_file()).map(|m| m.len()));
+    Some(ImageSpaceFacts {
+        image_id: rec.map(|r| r.image_id.clone()).filter(|i| !i.is_empty()),
+        tar_bytes,
+        unpacked_bytes: rec.and_then(|r| r.unpacked_bytes).filter(|b| *b > 0),
+        image,
+    })
+}
+
 /// The roles a placement may name.
 pub const PLACEMENT_ROLES: &[&str] = &["chat", "embed", "rerank", "harness"];
 
@@ -5104,6 +5441,108 @@ async fn placement_staging_refusal(state: &AppState, node_id: &str, backend: &st
     Some((art::not_staged_refusal(node_id, &image, &arch), true))
 }
 
+/// What the place-time ollama tag check concluded ([`ollama_tag_check`]).
+#[derive(Debug, PartialEq)]
+pub(crate) enum OllamaTagCheck {
+    /// Nothing to say: the store or the node holds the tag, or the node may
+    /// pull it from the registry itself.
+    Fine,
+    /// Something it needs is unknown: placed, with this warning.
+    Warn(String),
+    /// Known not deliverable: a 409 unless `force`.
+    Refuse(String),
+}
+
+/// Does the place-time ollama tag check apply? A running ollama placement on
+/// a node that is not the controller's own: the controller's own agent is
+/// unplaced (no store URL) and pulls from the registry as it always did.
+/// `self_node` is either this gateway's `NOO_SELF_NODE` or the node's own
+/// heartbeat saying so (`self_node: true`). Pure.
+pub(crate) fn ollama_tag_check_applies(backend: &str, desired: &str, self_node: bool) -> bool {
+    backend == "ollama" && desired == "running" && !self_node
+}
+
+/// An ollama model name as `ollama list` names it: case-folded, the
+/// registry host and `library/` dropped, `:latest` explicit. Pure.
+fn ollama_listed_name(m: &str) -> String {
+    let m = m.trim().to_ascii_lowercase();
+    let m = m.strip_prefix("ollama:").unwrap_or(&m);
+    let m = m.strip_prefix("registry.ollama.ai/").unwrap_or(m);
+    let m = m.strip_prefix("library/").unwrap_or(m);
+    let tagged = m.rfind(':').is_some_and(|i| !m[i..].contains('/'));
+    if tagged { m.to_string() } else { format!("{m}:latest") }
+}
+
+/// Does the node already hold `tag`? From its heartbeat's
+/// `available_models`: the tags its ollama lists (`/api/tags`, always
+/// `name:tag`) and the GGUF files in its MODELS_DIR (bare stems), as strings
+/// or `{name}`. Listed = yes. NOT listed is a known "no" only when the same
+/// list shows the node's ollama answered: it carries at least one ollama tag
+/// (a name with a `:`). An ollama that is down, still starting, or holds
+/// nothing yet reports no tag at all, and the heartbeat has no field that
+/// tells "answered with none" from "did not answer", so an empty list is
+/// unknown, never "no". None when the record or the list is absent. Pure.
+pub(crate) fn node_holds_ollama_tag(node: Option<&Value>, tag: &str) -> Option<bool> {
+    let want = ollama_listed_name(tag);
+    let list = node?["available_models"].as_array()?;
+    let names: Vec<&str> = list.iter().filter_map(|v| v.as_str().or_else(|| v.get("name").and_then(Value::as_str))).collect();
+    if names.iter().any(|n| ollama_listed_name(n) == want) {
+        return Some(true);
+    }
+    let ollama_answered = names.iter().any(|n| n.contains(':'));
+    ollama_answered.then_some(false)
+}
+
+/// May the node's agent pull an ollama tag from the public registry
+/// (`NOO_ALLOW_OLLAMA_REGISTRY_PULL`, node-agent-go/internal/preseed)? From
+/// its `node_local` report: the key in `declared` = it may (the report names
+/// the key, not its value, and the key exists to say 1); a report without it
+/// = it may not. None when the node sends no report (an older agent, or no
+/// record): unknown. Pure.
+pub(crate) fn node_may_pull_ollama_registry(node: Option<&Value>) -> Option<bool> {
+    let report = node?.get("node_local").filter(|r| r.is_object())?;
+    Some(report["declared"].as_array().is_some_and(|d| d.iter().any(|k| k["key"].as_str() == Some("NOO_ALLOW_OLLAMA_REGISTRY_PULL"))))
+}
+
+/// The 409 code of the ollama tag refusal: `noo cluster place` reads it
+/// (noo-cli `OLLAMA_TAG_NOT_STAGED`) to show `next` instead of retrying.
+pub(crate) const OLLAMA_TAG_NOT_STAGED: &str = "ollama_tag_not_staged";
+
+/// The refusal for an ollama tag a node cannot get.
+pub(crate) fn ollama_tag_refusal(node_id: &str, tag: &str) -> String {
+    format!(
+        "{node_id} cannot pull {tag} from the public registry (nodes pull models only from the controller's store); \
+         stage it first: `noo models fetch ollama:{tag}`, then place again; --force places it anyway"
+    )
+}
+
+/// The place-time ollama tag check: refuse ONLY on known facts (the store
+/// does not hold the tag, the node does not hold it, and the node may not
+/// pull from the registry); anything unknown is a warning. Pure.
+pub(crate) fn ollama_tag_check(node_id: &str, tag: &str, store_holds: Option<bool>, node_holds: Option<bool>, may_pull: Option<bool>) -> OllamaTagCheck {
+    if store_holds == Some(true) || node_holds == Some(true) || may_pull == Some(true) {
+        return OllamaTagCheck::Fine;
+    }
+    if store_holds == Some(false) && node_holds == Some(false) && may_pull == Some(false) {
+        return OllamaTagCheck::Refuse(ollama_tag_refusal(node_id, tag));
+    }
+    let mut unknown: Vec<String> = Vec::new();
+    if store_holds.is_none() {
+        unknown.push("whether the controller's store holds it".into());
+    }
+    if node_holds.is_none() {
+        unknown.push(format!("whether {node_id} holds it"));
+    }
+    if may_pull.is_none() {
+        unknown.push("whether the node may pull from the registry (NOO_ALLOW_OLLAMA_REGISTRY_PULL)".into());
+    }
+    OllamaTagCheck::Warn(format!(
+        "could not confirm {node_id} can get {tag} (unknown: {}): a node pulls ollama models only from the controller's store; \
+         if it is not staged there, stage it: `noo models fetch ollama:{tag}`",
+        unknown.join("; ")
+    ))
+}
+
 /// PUT /api/cluster/nodes/{node_id}/placements/{backend} — upsert.
 ///
 /// Keyed (node, backend, ROLE). The role comes from the body (`role`); the
@@ -5286,6 +5725,49 @@ async fn placement_put(
             // A node still on NOO_IMAGE_SOURCE=legacy (the rollout default)
             // takes images the pre-rail way: say it, do not refuse.
             fit_warnings.push(if rail { format!("forced past an unstaged image: {msg}") } else { format!("legacy image source on this node: {msg}") });
+        }
+    }
+
+    // An ollama tag the node cannot get: a node other than the controller's
+    // own pulls ollama models only from the controller's store
+    // (`ollama_registry_pull_refused` on the node), so a tag nobody staged
+    // was accepted here and then never arrived. Refused on known facts only;
+    // unknown is a warning.
+    if let Some(tag) = body.model.as_deref().map(str::trim).filter(|m| !m.is_empty()) {
+        let record = if backend == "ollama" { node_record(&state, &node_id).await } else { None };
+        let self_node = crate::self_node::is_self_node(&node_id) || record.as_ref().is_some_and(|r| r["self_node"].as_bool() == Some(true));
+        if ollama_tag_check_applies(&backend, &desired, self_node) {
+            let store = crate::routes::artifacts::ollama_tag_in_store(&crate::routes::artifacts::gguf_dir(), tag);
+            let check = ollama_tag_check(&node_id, tag, store, node_holds_ollama_tag(record.as_ref(), tag), node_may_pull_ollama_registry(record.as_ref()));
+            match check {
+                OllamaTagCheck::Fine => {}
+                OllamaTagCheck::Warn(w) => fit_warnings.push(w),
+                OllamaTagCheck::Refuse(msg) if !body.force => {
+                    tracing::warn!(node = %node_id, tag = %tag, "placement.ollama_tag_not_staged");
+                    let fetch = format!("noo models fetch ollama:{tag}");
+                    return Err(AppError::ConflictNext { code: OLLAMA_TAG_NOT_STAGED, msg, next: json!([super::bootstrap::next_cmd(&fetch, &[])]) });
+                }
+                OllamaTagCheck::Refuse(msg) => fit_warnings.push(format!("forced past an unstaged ollama tag: {msg}")),
+            }
+        }
+    }
+
+    // i1036: room on the node for the CUDA image a GPU llama.cpp pulls. A
+    // known shortfall is a 409 here, not a start that fails on the node
+    // minutes later; unknown (an older agent, no recorded unpacked size)
+    // proceeds with a warning. Same target reading as the staging check.
+    if desired == "running" && backend == "llamacpp" {
+        let node = node_fit_facts(&state, &node_id).await?;
+        let space_target = body.target.as_deref().map(str::trim).filter(|t| !t.is_empty());
+        let on_gpu = crate::placement_fit::llamacpp_runs_on_gpu(space_target, &node);
+        let store = crate::routes::artifacts::image_store_dir();
+        if let Some(img) = staged_image_space_facts(&store, &node, &backend, body.image.as_deref(), on_gpu) {
+            match validate_image_space(&node_id, &backend, on_gpu, body.model.as_deref(), &img, &node) {
+                Ok(None) => {}
+                Ok(Some(warning)) => fit_warnings.push(warning),
+                Err(msg) if !body.force => return Err(AppError::Conflict(msg)),
+                Err(msg) => fit_warnings.push(format!("forced past a disk shortfall: {msg}")),
+            }
         }
     }
 
@@ -6344,6 +6826,7 @@ async fn mint_join_key(
     perspective: Option<axum::Extension<crate::perspective::RequesterPerspective>>,
     body: Option<Json<Value>>,
 ) -> AppResult {
+    crate::person_gate::require_person_or_agent(&state.db, ctx.as_deref(), &crate::person_gate::NODE_ENROLMENT_AGENTS, "minting a Tailscale join key").await?;
     // i538: a join key is a fleet credential; never under a perspective.
     crate::perspective::refuse_mint(perspective.as_ref(), "join key")?;
     let body = body.map(|Json(v)| v).unwrap_or_else(|| json!({}));
@@ -9261,6 +9744,8 @@ mod i300_beat_tests {
             "controller_host": false,
             "data_root_free_gb": 412.5,
             "model_sets_free_bytes": 442_986_717_184u64,
+            "image_store_free_bytes": 7_100_000_000u64,
+            "held_images": {"reg.example/acme/llamacpp-cuda:v1": false, "reg.example/acme/ollama:v1": true},
             "addon_workloads_policy": "approve",
             "addon_workloads_approvals": [{"addon": "rhaddon", "digest": format!("sha256:{}", "a".repeat(64))}],
             "model_sets": [
@@ -9272,7 +9757,38 @@ mod i300_beat_tests {
             "ollama_verify": [{"model": "harrier", "state": "verified", "anchor": "gguf", "model_layer": "sha256:5f26", "reason": "", "checked_at": "t"}],
             "llamacpp_offload": [{"backend": "llamacpp", "model": "m.gguf", "target": "gpu", "state": "gpu", "offloaded": 33, "total": 33,
                 "cuda_devices": 1, "device": "NVIDIA GeForce GTX 1080", "compute_cap": "6.1", "checked_at": "t"}],
+            "docker_engine": {"state": "ok", "version": "27.5.1", "kind": "dockerd"},
         })
+    }
+
+    /// i1058: each `docker_engine` state reaches the record as sent; a beat
+    /// without it removes it (an agent that predates it), and an unknown
+    /// state, a non-string value or a non-object is unknown, not stored.
+    #[test]
+    fn docker_engine_is_carried_in_each_state_and_removed_when_absent_or_misshapen() {
+        let mut data = json!({"id": "n1"});
+        for good in [
+            json!({"state": "ok", "version": "26.1.4", "kind": "docker-desktop"}),
+            json!({"state": "none"}),
+            json!({"state": "unreadable", "error": "Cannot connect to the Docker daemon"}),
+        ] {
+            carry_i300(&mut data, &json!({"docker_engine": good.clone()}));
+            assert_eq!(data["docker_engine"], good, "{data}");
+        }
+        carry_i300(&mut data, &json!({"running_backends": {}}));
+        assert!(data.get("docker_engine").is_none(), "absent from the beat, so gone: {data}");
+        for bad in [
+            json!({"state": "broken"}),
+            json!({"version": "27.0.1"}),
+            json!({"state": "ok", "version": 27}),
+            json!({"state": "unreadable", "error": "x".repeat(257)}),
+            json!("27.0.1"),
+            json!([{"state": "none"}]),
+        ] {
+            carry_i300(&mut data, &json!({"docker_engine": {"state": "none"}}));
+            carry_i300(&mut data, &json!({"docker_engine": bad.clone()}));
+            assert!(data.get("docker_engine").is_none(), "{bad} is unknown, never kept: {data}");
+        }
     }
 
     /// The agent's `llamacpp_offload` (a GPU llamacpp start's offload, read
@@ -9314,6 +9830,8 @@ mod i300_beat_tests {
             "nvidia_runtime": "yes",
             "data_root_free_gb": "lots",
             "model_sets_free_bytes": -1,
+            "image_store_free_bytes": "lots",
+            "held_images": {"reg.example/acme/llamacpp-cuda:v1": "yes"},
             "addon_workloads_policy": "always",
             "model_sets": [1, 2],
             "node_workloads": {"addon": "rhaddon"},
@@ -9321,7 +9839,7 @@ mod i300_beat_tests {
         });
         carry_i300(&mut data, &full_beat());
         carry_i300(&mut data, &bad);
-        for key in ["gpu_compute_cap", "os", "nvidia_runtime", "data_root_free_gb", "model_sets_free_bytes", "addon_workloads_policy", "model_sets", "node_workloads", "addon_workloads_approvals"] {
+        for key in ["gpu_compute_cap", "os", "nvidia_runtime", "data_root_free_gb", "model_sets_free_bytes", "image_store_free_bytes", "held_images", "addon_workloads_policy", "model_sets", "node_workloads", "addon_workloads_approvals"] {
             assert!(data.get(key).is_none(), "{key}: a misshapen value is unknown, never kept: {data}");
         }
         // An empty list is a fact (no sets, no workloads), not unknown.
@@ -9344,6 +9862,43 @@ mod i300_beat_tests {
             carry_i300(&mut data, &json!({"model_sets_free_bytes": 5}));
             carry_i300(&mut data, &json!({"model_sets_free_bytes": bad.clone()}));
             assert!(data.get("model_sets_free_bytes").is_none(), "{bad}: unknown, never kept: {data}");
+        }
+    }
+
+    /// i1036: `image_store_free_bytes` is stored like `model_sets_free_bytes`:
+    /// a whole byte count, zero included (a full disk); anything else is
+    /// unknown and an earlier value is not kept.
+    #[test]
+    fn image_store_free_bytes_keeps_a_whole_number_and_drops_anything_else() {
+        let mut data = json!({"id": "n1"});
+        for good in [json!(0), json!(7_100_000_000u64), json!(i64::MAX)] {
+            carry_i300(&mut data, &json!({"image_store_free_bytes": good.clone()}));
+            assert_eq!(data["image_store_free_bytes"], good, "kept");
+        }
+        for bad in [json!(-1), json!(1.5), json!("9"), json!(true), json!(null), json!(u64::MAX)] {
+            carry_i300(&mut data, &json!({"image_store_free_bytes": 5}));
+            carry_i300(&mut data, &json!({"image_store_free_bytes": bad.clone()}));
+            assert!(data.get("image_store_free_bytes").is_none(), "{bad}: unknown, never kept: {data}");
+        }
+        carry_i300(&mut data, &json!({"image_store_free_bytes": 5}));
+        carry_i300(&mut data, &json!({"running_backends": {}}));
+        assert!(data.get("image_store_free_bytes").is_none(), "an agent that stops sending it is unknown: {data}");
+    }
+
+    /// i1036: `held_images` is stored when it is an object of refs to bools
+    /// (16 at most, an empty object included); a non-bool value, an empty
+    /// ref, too many refs or a non-object is unknown, and is removed.
+    #[test]
+    fn held_images_keeps_a_map_of_bools_and_drops_anything_else() {
+        let mut data = json!({"id": "n1"});
+        let good = json!({"reg.example/acme/llamacpp-cuda:v1": false, "reg.example/acme/ollama:v1": true});
+        carry_i300(&mut data, &json!({"held_images": good.clone()}));
+        assert_eq!(data["held_images"], good);
+        let many: serde_json::Map<String, Value> = (0..17).map(|i| (format!("r{i}"), json!(true))).collect();
+        for bad in [json!({"r": "yes"}), json!({"r": 1}), json!({"": true}), json!([{"r": true}]), json!(true), Value::Object(many)] {
+            carry_i300(&mut data, &json!({"held_images": good.clone()}));
+            carry_i300(&mut data, &json!({"held_images": bad.clone()}));
+            assert!(data.get("held_images").is_none(), "{bad}: unknown, never kept: {data}");
         }
     }
 
@@ -10098,5 +10653,456 @@ mod vllm_compute_floor_tests {
         assert!(put.contains("let mut fit_warnings: Vec<String> = compute_warning.into_iter().collect();"), "the place answer carries it");
         let fit = crate::test_src::fn_body(&own, "async fn placement_fit_post(");
         assert!(fit.contains("ws.push(json!(w));"), "and the fit answer");
+    }
+}
+
+#[cfg(test)]
+mod image_space_tests {
+    use super::*;
+
+    const CUDA: &str = "reg.example/acme/llamacpp-cuda:v1";
+    const TAR: u64 = 2_600_000_000;
+    const UNPACKED: u64 = 4_000_000_000;
+    /// TAR + the agent's estimate (2 × TAR, larger than TAR + 2 GiB and than
+    /// UNPACKED) + 512 MiB. node-agent-go TestImageLoadNeedFixedExample pins
+    /// the agent to the same number.
+    const NEED: u64 = 8_336_870_912;
+
+    fn cuda(unpacked: Option<u64>) -> ImageSpaceFacts {
+        ImageSpaceFacts { image: CUDA.into(), image_id: Some("sha256:cuda".into()), tar_bytes: Some(TAR), unpacked_bytes: unpacked }
+    }
+
+    /// A node whose agent inspected the CUDA ref and does not hold it.
+    fn node(free: u64) -> Value {
+        json!({"image_store_free_bytes": free, "held_images": {"reg.example/acme/llamacpp-cuda:v1": false}})
+    }
+
+    /// The tenths of a GB written right after `pat` in `msg` ("8.6" → 86).
+    fn gbs_after(msg: &str, pat: &str, n: usize) -> Vec<u64> {
+        let tail = msg.split_once(pat).unwrap_or_else(|| panic!("no {pat:?} in {msg}")).1;
+        tail.split(|c: char| !(c.is_ascii_digit() || c == '.'))
+            .filter(|t| t.contains('.') && t.chars().next().is_some_and(|c| c.is_ascii_digit()))
+            .take(n)
+            .map(|t| {
+                let (whole, tenth) = t.split_once('.').unwrap();
+                whole.parse::<u64>().unwrap() * 10 + tenth.parse::<u64>().unwrap()
+            })
+            .collect()
+    }
+
+    /// The need is the agent's same-filesystem formula: tar + load + 512 MiB,
+    /// the load being the unpacked size or the agent's estimate when larger.
+    #[test]
+    fn the_need_formula_is_the_agents() {
+        let n = image_space_need(TAR, UNPACKED);
+        assert_eq!(agent_image_load_estimate(TAR), 5_200_000_000, "2 × the tar beats the tar + 2 GiB");
+        assert_eq!((n.tar, n.unpacked, n.load, n.margin), (TAR, UNPACKED, 5_200_000_000, 512 << 20));
+        assert_eq!(n.total, NEED);
+        assert_eq!(n.total, TAR + agent_image_load_estimate(TAR) + IMAGE_SPACE_MARGIN, "what the agent's own check needs");
+        // An image that unpacks to more than the estimate: its real size.
+        let big = image_space_need(1 << 30, 5 << 30);
+        assert_eq!((big.load, big.total), (5 << 30, 6_979_321_856));
+        // A small tar: the tar + 2 GiB arm.
+        assert_eq!(agent_image_load_estimate(1 << 30), 3 << 30);
+    }
+
+    /// NotHeld and known short: refused, naming the node, that it does not
+    /// hold the image, the numbers and noo's reclaim before anything else;
+    /// exactly enough passes.
+    #[test]
+    fn a_known_shortfall_on_a_node_without_the_image_is_refused() {
+        let e = validate_image_space("node_a", "llamacpp", true, Some("m.gguf"), &cuda(Some(UNPACKED)), &node(7_100_000_000)).unwrap_err();
+        assert!(e.starts_with("node_a has 7.1 GB free in its image store and does not hold reg.example/acme/llamacpp-cuda:v1, which needs about"), "{e}");
+        let reclaim = e.find("noo autonomy decisions -l disk_watermark").expect("the reclaim preview");
+        assert!(e.contains("noo autonomy live disk_watermark") && e.contains("docs/operating/disk-and-images.md"), "{e}");
+        let cpu = e.find("noo cluster place node_a llamacpp m.gguf --on cpu").expect("the cpu alternative");
+        assert!(reclaim < cpu, "noo's reclaim first: {e}");
+        assert!(!e.contains("docker "), "never a raw docker command: {e}");
+        assert!(e.contains("--force"), "{e}");
+        let need = image_space_need(TAR, UNPACKED).total;
+        assert_eq!(validate_image_space("node_a", "llamacpp", true, None, &cuda(Some(UNPACKED)), &node(need)), Ok(None), "exactly enough fits");
+        assert_eq!(validate_image_space("node_a", "llamacpp", true, None, &cuda(Some(UNPACKED)), &node(need - 1)).map_err(|_| ()), Err(()));
+    }
+
+    /// The refusal's numbers add up: the total shown is tar + unpacked +
+    /// margin as shown, each a part rounded up to 0.1 GB, and the free figure
+    /// shown is below it. (A tar whose parts round up by more than the total
+    /// does, so a total rounded on its own would not add up.)
+    #[test]
+    fn the_refusals_numbers_add_up() {
+        let need = image_space_need(2_650_000_000, UNPACKED);
+        let e = image_space_refusal("node_a", None, CUDA, 7_100_000_000, &need);
+        let parts = gbs_after(&e, "needs about ", 4);
+        let [total, tar, unpacked, margin] = parts[..] else { panic!("{e}") };
+        assert_eq!(total, tar + unpacked + margin, "{e}");
+        assert_eq!((tar, unpacked, margin), (27, 53, 6), "each part rounded up: {e}");
+        let free = gbs_after(&e, "node_a has ", 1)[0];
+        assert_eq!(free, 71, "{e}");
+        assert!(free < total, "{e}");
+        assert!(e.contains("<model>"), "no model named: a placeholder: {e}");
+    }
+
+    /// Whether the node holds the image is unknown (no `held_images` for the
+    /// ref: an older agent, or another release tag) and it is short: a
+    /// warning with the numbers, never a refusal.
+    #[test]
+    fn an_unknown_holding_and_a_shortfall_warns_with_the_numbers() {
+        for n in [json!({"image_store_free_bytes": 7_100_000_000u64}), json!({"image_store_free_bytes": 7_100_000_000u64, "held_images": {"reg.example/acme/llamacpp-cuda:v0": false}})] {
+            let w = validate_image_space("node_a", "llamacpp", true, None, &cuda(Some(UNPACKED)), &n)
+                .expect("unknown is not refused")
+                .expect("one warning");
+            assert!(w.contains("node_a has 7.1 GB free") && w.contains("needs about 8.4 GB") && w.contains("whether the node already holds it is unknown"), "{w}");
+            assert!(w.contains("held_images") && w.contains("noo autonomy decisions -l disk_watermark"), "{w}");
+        }
+    }
+
+    /// An agent that does not report the free key (older than this release,
+    /// or its disks unreadable) is unknown: a warning, never a refusal, and
+    /// never read as 0 free.
+    #[test]
+    fn an_agent_without_the_key_warns_and_places() {
+        let w = validate_image_space("node_a", "llamacpp", true, None, &cuda(Some(UNPACKED)), &json!({"vram_gb": 8.0, "held_images": {"reg.example/acme/llamacpp-cuda:v1": false}}))
+            .expect("unknown is not refused")
+            .expect("one warning");
+        assert!(w.contains("node_a") && w.contains("image_store_free_bytes") && w.contains("unknown"), "{w}");
+    }
+
+    /// No unpacked size recorded (staged by an older noo): unknown, a warning
+    /// naming the restage, never a guessed ratio standing in for it.
+    #[test]
+    fn an_unknown_unpacked_size_warns_and_places() {
+        let w = validate_image_space("node_a", "llamacpp", true, None, &cuda(None), &node(1 << 30))
+            .expect("unknown is not refused")
+            .expect("one warning");
+        assert!(w.contains("unpacked size was not recorded") && w.contains("noo cluster sync-images node_a -i reg.example/acme/llamacpp-cuda:v1"), "{w}");
+        let no_tar = ImageSpaceFacts { tar_bytes: None, ..cuda(Some(UNPACKED)) };
+        assert!(matches!(validate_image_space("node_a", "llamacpp", true, None, &no_tar, &node(1 << 30)), Ok(Some(_))));
+    }
+
+    /// A node that holds the CUDA image moves no tar: no check, however
+    /// short. Held is `held_images[ref] == true`, or an `image_sources` row
+    /// with the staged image ID (under any tag: the agent retags) or, when an
+    /// ID is unknown, the same ref (a digest-pinned one included). The same
+    /// ref at ANOTHER image ID is not held by that row.
+    #[test]
+    fn a_node_already_holding_the_cuda_image_is_not_checked() {
+        assert_eq!(node_holds_image(&json!({"held_images": {"reg.example/acme/llamacpp-cuda:v1": true}}), CUDA, Some("sha256:cuda")), Holding::Held);
+        assert_eq!(node_holds_image(&json!({"held_images": {"reg.example/acme/llamacpp-cuda:v1": false}}), CUDA, Some("sha256:cuda")), Holding::NotHeld);
+        assert_eq!(node_holds_image(&json!({}), CUDA, Some("sha256:cuda")), Holding::Unknown);
+        let short = |held: Value, rows: Value| json!({"image_store_free_bytes": 1u64 << 20, "held_images": held, "image_sources": rows});
+        let check = |n: Value| validate_image_space("node_a", "llamacpp", true, None, &cuda(Some(UNPACKED)), &n);
+        assert_eq!(check(short(json!({"reg.example/acme/llamacpp-cuda:v1": true}), json!([]))), Ok(None), "held_images says held");
+        let not = || json!({"reg.example/acme/llamacpp-cuda:v1": false});
+        assert_eq!(check(short(not(), json!([{"image": CUDA, "source": "rail", "image_id": "sha256:cuda"}]))), Ok(None), "same ref, same id");
+        assert_eq!(check(short(not(), json!([{"image": "reg.example/acme/llamacpp-cuda:v0", "source": "rail", "image_id": "sha256:cuda"}]))), Ok(None), "same id, another tag");
+        assert_eq!(check(short(not(), json!([{"image": CUDA, "source": "local"}]))), Ok(None), "same ref, no id reported");
+        assert_eq!(check(short(not(), json!([{"image": format!("{CUDA}@sha256:{}", "d".repeat(64)), "source": "rail"}]))), Ok(None), "a digest-pinned ref");
+        assert_ne!(check(short(not(), json!([{"image": CUDA, "source": "rail", "image_id": "sha256:older"}]))), Ok(None), "same ref, another id: a pull");
+        assert_ne!(check(short(not(), json!([{"image": "reg.example/acme/llamacpp:v1", "source": "rail", "image_id": "sha256:cpu"}]))), Ok(None), "the cpu image is not it");
+        assert_ne!(check(short(not(), json!([]))), Ok(None), "none held: checked");
+    }
+
+    /// llama.cpp on cpu pulls the cpu image, and no other backend pulls the
+    /// CUDA one: neither is judged, however short the node.
+    #[test]
+    fn a_cpu_llamacpp_or_another_backend_is_not_checked() {
+        assert_eq!(validate_image_space("node_a", "llamacpp", false, None, &cuda(Some(UNPACKED)), &node(0)), Ok(None), "llamacpp on cpu");
+        for backend in ["ollama", "vllm", "harness"] {
+            assert_eq!(validate_image_space("node_a", backend, true, None, &cuda(Some(UNPACKED)), &node(0)), Ok(None), "{backend}");
+        }
+    }
+
+    /// The facts come from the store: the release's CUDA image for the node's
+    /// arch, its tar's size on disk, and the image ID and unpacked size the
+    /// staging index recorded (None from an index written before it was).
+    #[test]
+    fn the_facts_are_read_from_the_staging_index_and_the_store() {
+        let dir = std::env::temp_dir().join(format!("noo-i1036-facts-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let tar = crate::routes::artifacts::image_tar_gz_name(CUDA, "amd64");
+        std::fs::write(dir.join(&tar), vec![0u8; 1234]).unwrap();
+        let index = |unpacked: &str| {
+            format!(r#"{{"release":{{"prefix":"reg.example/acme","tag":"v1"}},"images":[{{"ref":"{CUDA}","arch":"amd64","tar":"{tar}","image_id":"sha256:cuda"{unpacked}}}]}}"#)
+        };
+        std::fs::write(dir.join(crate::routes::artifacts::STAGED_INDEX), index(r#","unpacked_bytes":4000000000"#)).unwrap();
+        let node = json!({"capabilities": {"arch": "amd64"}});
+        let f = staged_image_space_facts(&dir, &node, "llamacpp", None, true).expect("the CUDA image is staged");
+        assert_eq!((f.image.as_str(), f.image_id.as_deref(), f.tar_bytes, f.unpacked_bytes), (CUDA, Some("sha256:cuda"), Some(1234), Some(UNPACKED)));
+        assert!(staged_image_space_facts(&dir, &node, "llamacpp", None, false).is_none(), "on cpu: the cpu image, not judged");
+        assert!(staged_image_space_facts(&dir, &json!({}), "llamacpp", None, true).is_none(), "arch unknown");
+        std::fs::write(dir.join(crate::routes::artifacts::STAGED_INDEX), index("")).unwrap();
+        let old = staged_image_space_facts(&dir, &node, "llamacpp", None, true).expect("still staged");
+        assert_eq!((old.tar_bytes, old.unpacked_bytes), (Some(1234), None), "an index from before: unknown, never guessed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The place route runs the check for a running llamacpp, reading the GPU
+    /// the way the staging check does, and carries an unknown as a warning.
+    #[test]
+    fn the_place_route_runs_the_check() {
+        let own = crate::test_src::own_code(include_str!("cluster.rs"));
+        let put = crate::test_src::fn_body(&own, "async fn placement_put(");
+        assert!(put.contains("let on_gpu = crate::placement_fit::llamacpp_runs_on_gpu(space_target, &node);"), "the GPU rule");
+        assert!(put.contains("match validate_image_space(&node_id, &backend, on_gpu, body.model.as_deref(), &img, &node) {"), "the check");
+        assert!(put.contains("Ok(Some(warning)) => fit_warnings.push(warning),"), "an unknown warns in the answer");
+    }
+
+    /// --force places past a known shortfall, the refusal kept as a warning;
+    /// without it the shortfall is a 409.
+    #[test]
+    fn force_places_past_a_shortfall_with_a_warning() {
+        let own = crate::test_src::own_code(include_str!("cluster.rs"));
+        let put = crate::test_src::fn_body(&own, "async fn placement_put(");
+        assert!(put.contains("Err(msg) if !body.force => return Err(AppError::Conflict(msg)),"), "a 409 without --force");
+        assert!(put.contains("Err(msg) => fit_warnings.push(format!(\"forced past a disk shortfall: {msg}\")),"), "a warning with it");
+    }
+}
+
+#[cfg(test)]
+mod register_keeps_lanes_tests {
+    //! An agent restart re-registers the node; the registration must keep the
+    //! routing fields the node offered a second ago, or every chat to a class
+    //! only it serves gets an instant 503 until its first beat.
+    use super::{carry_stored, stored_for_carry, REGISTER_KEEPS_FROM_STORED};
+    use crate::coordinator::classes::{
+        build_table, first_beat_wait, node_facts_from_kv, select_with, DeclaredCandidate, DeclaredClass, Declarations, Refusal, Selection,
+        FIRST_BEAT_MARGIN,
+    };
+    use serde_json::{json, Value};
+    use std::time::Duration;
+
+    fn decl() -> Declarations {
+        Declarations {
+            classes: vec![DeclaredClass {
+                name: "fast".into(),
+                candidates: vec![DeclaredCandidate { node_id: "node_a".into(), backend: "ollama".into(), model: Some("gemma4:12b".into()), degraded: false }],
+                pool: false,
+            }],
+            aliases: vec![],
+        }
+    }
+
+    /// The node's record as its last beat left it.
+    fn stored(last: f64) -> Value {
+        json!({
+            "id": "node_a", "ip_address": "100.64.0.2", "status": "online", "last_heartbeat": last, "ts": last,
+            "running_backends": {"ollama": "gemma4:12b"},
+            "available_models": ["gemma4:12b"],
+            "lanes": [{"backend": "ollama", "model": "gemma4:12b", "role": "chat", "state": "serving", "reason": ""}],
+        })
+    }
+
+    /// The routing part of what `node_register_body` writes for `body`.
+    fn registered(stored: Option<&Value>, body: &Value, now: f64) -> Value {
+        let mut data = json!({"id": "node_a", "ip_address": "100.64.0.2", "status": "online", "running_backends": {}, "registered_at": now, "ts": now});
+        let from = stored_for_carry(stored, "node_a", now);
+        for &key in REGISTER_KEEPS_FROM_STORED {
+            carry_stored(&mut data, from, body, key);
+        }
+        data
+    }
+
+    fn body() -> Value {
+        json!({"node_id": "node_a", "hostname": "node_a"})
+    }
+
+    fn table(data: &Value, now: f64) -> crate::coordinator::classes::ClassTable {
+        build_table(&[node_facts_from_kv("node_a", data, &[], now)], &[], &decl())
+    }
+
+    fn select_fast(data: &Value, now: f64) -> Result<Selection, Refusal> {
+        select_with(&table(data, now), Some("fast"), None, false, &|_| false, &|_| 0, &|_| false)
+    }
+
+    #[test]
+    fn a_re_registration_keeps_the_lanes_and_the_class_resolves_to_the_node() {
+        let data = registered(Some(&stored(1000.0)), &body(), 1010.0);
+        assert_eq!(data["lanes"], stored(1000.0)["lanes"], "the lanes the node offered a second ago");
+        assert_eq!(data["running_backends"], json!({"ollama": "gemma4:12b"}));
+        let sel = select_fast(&data, 1011.0).expect("a chat right after the re-registration is served");
+        assert_eq!(sel.candidates[0].node_id, "node_a");
+    }
+
+    #[test]
+    fn a_registration_with_no_stored_record_carries_nothing() {
+        let data = registered(None, &body(), 1010.0);
+        assert!(data.get("lanes").is_none(), "{data}");
+        assert_eq!(data["running_backends"], json!({}));
+        assert!(data.get("available_models").is_none(), "{data}");
+        assert!(matches!(select_fast(&data, 1011.0), Err(Refusal::NoCandidates(_))));
+    }
+
+    #[test]
+    fn an_old_or_foreign_stored_record_is_not_carried_and_the_body_wins() {
+        // A node away longer than the carry window (not a restart).
+        let data = registered(Some(&stored(1000.0)), &body(), 1000.0 + super::STORED_CARRY_MAX_AGE_SECS + 1.0);
+        assert!(data.get("lanes").is_none(), "{data}");
+        // A record under another id.
+        let mut other = stored(1000.0);
+        other["id"] = json!("node_b");
+        assert!(registered(Some(&other), &body(), 1010.0).get("lanes").is_none());
+        // What the registration itself says is never replaced.
+        let b = json!({"node_id": "node_a", "lanes": []});
+        assert_eq!(registered(Some(&stored(1000.0)), &b, 1010.0)["lanes"], json!([]));
+    }
+
+    #[test]
+    fn a_just_registered_node_is_waited_for_and_an_old_one_is_not() {
+        // Registered at 1000 with nothing to carry, no beat since: the
+        // refusal is the registration's gap, held to the expected beat.
+        let data = registered(None, &body(), 1000.0);
+        let t = table(&data, 1005.0);
+        assert_eq!(first_beat_wait(&t, Some("fast"), None), Some(Duration::from_secs(25) + FIRST_BEAT_MARGIN));
+        assert_eq!(first_beat_wait(&t, Some("fast"), Some("node_a")), Some(Duration::from_secs(25) + FIRST_BEAT_MARGIN));
+        // Never past the restart wait's cap.
+        let t = table(&data, 1000.0);
+        assert!(first_beat_wait(&t, Some("fast"), None).unwrap() <= crate::node_restart::MAX_WAIT);
+        // Registered long ago: refused at once, as before.
+        assert_eq!(first_beat_wait(&table(&data, 1000.0 + 31.0), Some("fast"), None), None);
+        // Beaten since the registration: refused at once.
+        let mut beaten = data.clone();
+        beaten["last_heartbeat"] = json!(1001.0);
+        assert_eq!(first_beat_wait(&table(&beaten, 1005.0), Some("fast"), None), None);
+        // A record no registration wrote (no `registered_at`).
+        assert_eq!(first_beat_wait(&table(&json!({"id": "node_a", "ts": 1000.0}), 1005.0), Some("fast"), None), None);
+    }
+}
+
+#[cfg(test)]
+mod ollama_tag_check_tests {
+    use super::*;
+
+    /// Unknown store, unknown node, unknown pull: every way a fact can be
+    /// missing; each is a warning, never a refusal.
+    const UNKNOWNS: [(Option<bool>, Option<bool>, Option<bool>); 3] =
+        [(None, Some(false), Some(false)), (Some(false), None, Some(false)), (Some(false), Some(false), None)];
+
+    /// Known not in the store, not on the node, and the node may not pull:
+    /// a refusal naming the node, the tag and the command.
+    #[test]
+    fn an_unstaged_tag_the_node_cannot_get_is_refused() {
+        match ollama_tag_check("node_a", "gemma4:12b", Some(false), Some(false), Some(false)) {
+            OllamaTagCheck::Refuse(m) => {
+                assert!(m.starts_with("node_a cannot pull gemma4:12b from the public registry (nodes pull models only from the controller's store)"), "{m}");
+                assert!(m.contains("stage it first: `noo models fetch ollama:gemma4:12b`, then place again"), "{m}");
+                assert!(m.contains("--force"), "{m}");
+            }
+            other => panic!("known facts refuse, got {other:?}"),
+        }
+    }
+
+    /// The route turns the refusal into a 409 with the agreed `next` unless
+    /// `--force`, which places it with the refusal kept as a warning.
+    #[test]
+    fn the_route_refuses_with_next_unless_forced() {
+        let own = crate::test_src::own_code(include_str!("cluster.rs"));
+        let put = crate::test_src::fn_body(&own, "async fn placement_put(");
+        assert!(put.contains("OllamaTagCheck::Refuse(msg) if !body.force => {"), "a 409 without --force");
+        assert!(put.contains("let fetch = format!(\"noo models fetch ollama:{tag}\");"), "the fetch command");
+        assert!(put.contains("return Err(AppError::ConflictNext { code: OLLAMA_TAG_NOT_STAGED, msg, next: json!([super::bootstrap::next_cmd(&fetch, &[])]) });"), "next in the agreed shape");
+        assert_eq!(OLLAMA_TAG_NOT_STAGED, "ollama_tag_not_staged", "the code the CLI reads");
+        assert!(put.contains("OllamaTagCheck::Refuse(msg) => fit_warnings.push(format!(\"forced past an unstaged ollama tag: {msg}\")),"), "--force: a warning");
+        assert!(put.contains("OllamaTagCheck::Warn(w) => fit_warnings.push(w),"), "unknown: a warning in the answer");
+        let next = json!([super::super::bootstrap::next_cmd("noo models fetch ollama:gemma4:12b", &[])]);
+        assert_eq!(next, json!([{"kind": "command", "command": "noo models fetch ollama:gemma4:12b"}]));
+    }
+
+    /// The 409 body carries `next` beside `error`.
+    #[tokio::test]
+    async fn conflict_next_answers_409_with_next() {
+        use axum::response::IntoResponse;
+        let r = AppError::ConflictNext { code: "k", msg: "m".into(), next: json!([{"kind": "command", "command": "c"}]) }.into_response();
+        assert_eq!(r.status(), axum::http::StatusCode::CONFLICT);
+        let bytes = axum::body::to_bytes(r.into_body(), usize::MAX).await.expect("the body reads");
+        let body: Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(body, json!({"error": "m", "code": "k", "next": [{"kind": "command", "command": "c"}]}));
+        assert_eq!(AppError::ConflictNext { code: "k", msg: "m".into(), next: Value::Null }.to_string(), "m");
+    }
+
+    #[test]
+    fn an_unknown_fact_warns_never_refuses() {
+        for (store, node, pull) in UNKNOWNS {
+            match ollama_tag_check("node_a", "gemma4:12b", store, node, pull) {
+                OllamaTagCheck::Warn(w) => {
+                    assert!(w.contains("could not confirm node_a can get gemma4:12b"), "{w}");
+                    assert!(w.contains("noo models fetch ollama:gemma4:12b"), "{w}");
+                }
+                other => panic!("{store:?}/{node:?}/{pull:?}: unknown warns, got {other:?}"),
+            }
+        }
+        match ollama_tag_check("node_a", "t", None, Some(false), Some(false)) {
+            OllamaTagCheck::Warn(w) => assert!(w.contains("unknown: whether the controller's store holds it)"), "{w}"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// The store or the node holding the tag, or a node allowed to pull it
+    /// itself: nothing to say, whatever else is unknown.
+    #[test]
+    fn a_tag_that_can_arrive_is_fine() {
+        assert_eq!(ollama_tag_check("n", "t", Some(true), Some(false), Some(false)), OllamaTagCheck::Fine, "staged");
+        assert_eq!(ollama_tag_check("n", "t", Some(false), Some(true), Some(false)), OllamaTagCheck::Fine, "the node holds it");
+        assert_eq!(ollama_tag_check("n", "t", None, Some(true), None), OllamaTagCheck::Fine, "the node holds it, the rest unknown");
+        assert_eq!(ollama_tag_check("n", "t", Some(false), Some(false), Some(true)), OllamaTagCheck::Fine, "registry pull allowed");
+    }
+
+    /// The node holds it when its ollama lists it (`available_models`);
+    /// `library/` and `:latest` do not matter. Not listed is a "no" only
+    /// while the list shows its ollama answered (an ollama tag in it).
+    #[test]
+    fn the_node_holds_a_tag_its_heartbeat_lists() {
+        let n = json!({"available_models": ["gemma4:12b", {"name": "someone/m:latest"}, "harrier"]});
+        assert_eq!(node_holds_ollama_tag(Some(&n), "gemma4:12b"), Some(true));
+        assert_eq!(node_holds_ollama_tag(Some(&n), "library/Gemma4:12b"), Some(true));
+        assert_eq!(node_holds_ollama_tag(Some(&n), "someone/m"), Some(true));
+        assert_eq!(node_holds_ollama_tag(Some(&n), "gemma4:27b"), Some(false), "its ollama answered and does not list it");
+        // The LISTED side is normalised too: an untagged, mixed-case listing
+        // is the same model as the asked `qwen3` (= qwen3:latest).
+        let n = json!({"available_models": ["gemma4:12b", "Qwen3"]});
+        assert_eq!(node_holds_ollama_tag(Some(&n), "qwen3"), Some(true), "a listed name is normalised before comparing");
+    }
+
+    /// An ollama that is down or still starting lists nothing while the tag
+    /// may sit on its disk: an empty list, or one with only GGUF files, is
+    /// unknown (a warning), never a refusal.
+    #[test]
+    fn an_empty_list_is_unknown_not_no() {
+        assert_eq!(node_holds_ollama_tag(Some(&json!({"available_models": []})), "gemma4"), None, "empty: unknown");
+        assert_eq!(node_holds_ollama_tag(Some(&json!({"available_models": ["harrier", {"name": "qwen-7b"}]})), "gemma4"), None, "GGUF files only: ollama did not answer");
+        let held = node_holds_ollama_tag(Some(&json!({"available_models": []})), "gemma4");
+        assert!(matches!(ollama_tag_check("node_a", "gemma4", Some(false), held, Some(false)), OllamaTagCheck::Warn(_)), "never refused");
+        assert_eq!(node_holds_ollama_tag(Some(&json!({})), "gemma4"), None, "no list: unknown");
+        assert_eq!(node_holds_ollama_tag(None, "gemma4"), None, "no record: unknown");
+    }
+
+    /// `NOO_ALLOW_OLLAMA_REGISTRY_PULL` in the node's `node_local` report:
+    /// declared = may pull; a report without it = may not; no report = unknown.
+    #[test]
+    fn the_registry_pull_comes_from_the_node_local_report() {
+        let allowed = json!({"node_local": {"state": "read", "declared": [{"key": "NOO_ALLOW_OLLAMA_REGISTRY_PULL", "source": "local file", "trust": true}]}});
+        assert_eq!(node_may_pull_ollama_registry(Some(&allowed)), Some(true));
+        let other = json!({"node_local": {"state": "read", "declared": [{"key": "NOO_GPU_YIELD", "source": "local file", "trust": false}]}});
+        assert_eq!(node_may_pull_ollama_registry(Some(&other)), Some(false));
+        let absent = json!({"node_local": {"state": "absent", "declared": []}});
+        assert_eq!(node_may_pull_ollama_registry(Some(&absent)), Some(false));
+        assert_eq!(node_may_pull_ollama_registry(Some(&json!({}))), None, "an older agent sends no report");
+        assert_eq!(node_may_pull_ollama_registry(None), None);
+    }
+
+    /// Only a running ollama placement on a node other than the controller's
+    /// own is checked.
+    #[test]
+    fn only_a_running_ollama_placement_off_the_controller_is_checked() {
+        assert!(ollama_tag_check_applies("ollama", "running", false));
+        assert!(!ollama_tag_check_applies("ollama", "running", true), "the controller's own node pulls from the registry");
+        assert!(!ollama_tag_check_applies("llamacpp", "running", false), "not an ollama tag");
+        assert!(!ollama_tag_check_applies("vllm", "running", false), "not an ollama tag");
+        assert!(!ollama_tag_check_applies("ollama", "stopped", false), "a stopped placement pulls nothing");
+        let own = crate::test_src::own_code(include_str!("cluster.rs"));
+        let put = crate::test_src::fn_body(&own, "async fn placement_put(");
+        assert!(put.contains("let self_node = crate::self_node::is_self_node(&node_id) || record.as_ref().is_some_and(|r| r[\"self_node\"].as_bool() == Some(true));"),
+            "self is this gateway's NOO_SELF_NODE or the node's own heartbeat");
+        assert!(put.contains("if ollama_tag_check_applies(&backend, &desired, self_node) {"), "the route asks");
     }
 }

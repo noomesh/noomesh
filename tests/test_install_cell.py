@@ -211,7 +211,7 @@ def test_the_agent_state_is_saved_after_the_model_step_even_when_it_passes():
     full = text.index("step onboard 3600")
     call = text.index("\nagent_dump model\n")
     assert call > model and call > full, "after both model paths"
-    assert call < text.index("step stack-start"), "before anything else moves the stack"
+    assert call < text.index("step health 600"), "before anything else moves the stack"
     body = text[text.index("agent_dump() {"):text.index("ON_STEP_FAIL=agent_dump")]
     assert 'noo --json cluster show "$(hostname)"' in body
     assert 'grep -E "reconcile_nudge|placement"' in body
@@ -874,3 +874,380 @@ def test_the_ollama_verified_probe_reads_the_container_onboard_pulled_into(tmp_p
     assert "export -f onboard_ollama_container" in text
     lines = [ln for ln in probe.splitlines() if "OLLAMA-VERIFIED " in ln]
     assert len(lines) == 2 and all("(ollama ${ov:-?} in $oc)" in ln for ln in lines), lines
+
+
+# ── the plain start after onboard (recreated.py) ───────────────────────────
+RC = _load("install_cell_recreated", ROOT / "scripts" / "install-cell" / "recreated.py")
+
+
+def _rc_files(tmp_path, before: dict, after: dict):
+    b, a = tmp_path / "before", tmp_path / "after"
+    b.write_text("".join(f"{n} {i} {s} {d}\n" for n, (i, s, d) in before.items()))
+    a.write_text("".join(f"{n} {i} {s} {d}\n" for n, (i, s, d) in after.items()))
+    return str(b), str(a)
+
+
+STACK = {"noo-gateway": ("g1", "gateway", "postgres:service_healthy:false"),
+         "noo-postgres": ("p1", "postgres", "-"),
+         "noo-trellion": ("t1", "trellion", "gateway:service_started:true,postgres:service_healthy:false")}
+
+
+def _run_judge(tmp_path, after: dict, *mode: str):
+    b, a = _rc_files(tmp_path, STACK, after)
+    r = subprocess.run([sys.executable, str(ROOT / "scripts/install-cell/recreated.py"), "judge", "X", b, a, *mode],
+                       capture_output=True, text=True)
+    return r.returncode, r.stdout.strip()
+
+
+def test_start_idempotent_passes_only_when_no_id_moved(tmp_path):
+    assert _run_judge(tmp_path, dict(STACK), "--none") == (0, "X PASS: 0 containers recreated (3 unchanged)")
+    moved = dict(STACK, **{"noo-postgres": ("p2", "postgres", "-")})
+    assert _run_judge(tmp_path, moved, "--none") == (1, "X FAIL: 1 recreated: noo-postgres")
+    gone = {k: v for k, v in STACK.items() if k != "noo-trellion"}
+    rc, out = _run_judge(tmp_path, gone, "--none")
+    assert rc == 1 and "removed: noo-trellion" in out
+
+
+def test_start_input_change_allows_only_the_service_and_its_dependents(tmp_path):
+    only_gw = dict(STACK, **{"noo-gateway": ("g2", "gateway", "postgres:service_healthy:false")})
+    rc, out = _run_judge(tmp_path, only_gw, "--only", "gateway")
+    assert rc == 0 and out.startswith("X PASS: only gateway recreated;"), out
+    with_dep = dict(only_gw, **{"noo-trellion": ("t2", "trellion", STACK["noo-trellion"][2])})
+    rc, out = _run_judge(tmp_path, with_dep, "--only", "gateway")
+    assert rc == 0 and "1 that depend on it: noo-trellion" in out, out
+    stray = dict(only_gw, **{"noo-postgres": ("p2", "postgres", "-")})
+    rc, out = _run_judge(tmp_path, stray, "--only", "gateway")
+    assert rc == 1 and "do not depend on gateway: noo-postgres" in out, out
+    rc, out = _run_judge(tmp_path, dict(STACK), "--only", "gateway")
+    assert rc == 1 and "gateway was not recreated" in out, out
+
+
+def test_start_recreate_needs_every_container_recreated(tmp_path):
+    every = {n: (i + "x", s, d) for n, (i, s, d) in STACK.items()}
+    assert _run_judge(tmp_path, every, "--all") == (0, "X PASS: all 3 containers recreated")
+    one_kept = dict(every, **{"noo-postgres": STACK["noo-postgres"]})
+    assert _run_judge(tmp_path, one_kept, "--all") == (1, "X FAIL: 1 not recreated: noo-postgres")
+
+
+def test_an_empty_before_is_never_a_pass(tmp_path):
+    b, a = _rc_files(tmp_path, {}, {})
+    ok, line = RC.judge("X", RC.read(b), RC.read(a), "none")
+    assert not ok and "no stack container was recorded" in line
+
+
+def test_the_stranger_checks_health_and_the_three_start_checks_fail_the_cell():
+    text = (ROOT / "scripts/install-cell/run.sh").read_text()
+    health = text.index("step health 600 ")
+    assert "step stack-start " not in text, "README step 3 is `noo health`: the wizard leaves the stack running"
+    order = [text.index(f"step {n} ") for n in ("start-idempotent", "start-input-change", "start-input-restore",
+                                                 "start-recreate", "health-after-starts")]
+    assert health < order[0] and order == sorted(order)
+    for name, verdict, mode in [("start-idempotent", "START-IDEMPOTENT", "--none"),
+                                ("start-input-change", "START-INPUT-CHANGE", "--only gateway"),
+                                ("start-recreate", "START-RECREATE", "--all")]:
+        body = text[text.index(f"step {name} "):]
+        body = body[:body.index("|| fail_onboarded") + len("|| fail_onboarded")]
+        assert f"judge {verdict} " in body and body.rstrip().endswith(f"{mode}' _ \"$RC_PY\" \"$OUT\" || fail_onboarded"), name
+        assert not name.startswith("probe-"), "a probe never fails the cell"
+    assert "noo stack start --recreate" in text[order[3]:order[4]]
+
+
+def test_a_failed_start_check_is_the_cells_failure(tmp_path):
+    rec = {"step": "start-idempotent", "rc": 1, "seconds": 1, "first_error": "START-IDEMPOTENT FAIL: 13 recreated",
+           "prompts": [], "warnings": [], "tail": []}
+    (tmp_path / "steps.jsonl").write_text(json.dumps(rec) + "\n")
+    (tmp_path / "meta.json").write_text("{}")
+    out = C.summarize(tmp_path)
+    assert out["result"] == "fail" and out["failed_step"] == "start-idempotent"
+
+
+# ── the upload scan: key=value judged on the line WITH its masks ───────────
+# 0.6.27 -> rc.1 upgrade cell, run 44709015537: the applier's summary
+# `applied: … node.key=unchanged …` was masked to `node.key=[REDACTED]`, the
+# scan stripped the mask, read `node.key= agent-env` and withheld the artifact.
+APPLIED = "applied: node.crt=unchanged node.key=unchanged agent-env"
+
+
+@pytest.mark.parametrize("line", ["key=abcd1234", "key= abcd1234", "token: wxyz5678",
+                                  "node.key=[REDACTED] token=wxyz5678",
+                                  "token=wxyz5678 node.key=[REDACTED]",
+                                  "a=[REDACTED] b: [REDACTED] password=hunter22"])
+def test_an_unmasked_key_value_is_a_hit(line):
+    assert C.secret_hits(line), line
+
+
+@pytest.mark.parametrize("line", ["node.key=[REDACTED] agent-env",
+                                  "node.key=[REDACTED]  token: [REDACTED]  agent-env",
+                                  'password: "[REDACTED]" next'])
+def test_a_masked_pair_is_clean(line):
+    assert not C.secret_hits(line), (line, C.secret_hits(line))
+
+
+def test_the_applier_summary_is_redacted_then_clean():
+    out = _redact(APPLIED + "\n")
+    assert out == "applied: node.crt=unchanged node.key=[REDACTED] agent-env\n", out
+    assert not C.secret_hits(out), C.secret_hits(out)
+
+
+# Every shape the scan detects, in lines a cell could print: the redactor
+# masks each, so its output always passes the scan (the release lead).
+SHAPE_CORPUS = SECRET_LINES + [
+    "key=abcd1234", "key= abcd1234", "token: wxyz5678", APPLIED,
+    "applied: a=b node.key=unchanged token=wxyz5678 secret: s3cr3tval",
+    'PASSWORD="hunter2222" api_key=ABCDEFGH private-key: zzzz9999',
+    "url?token=noo1.QUJDREVGR0hJSktM&x=1 and key=xyz-noo1.abcdef",
+    "Bearer " + JWT + " token=" + JWT,
+    "x ghp_abcdefghijklmnopqrstuvwxyz0123456789 GHO_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123",
+    "run QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVowMTIzNDU2Nzg5YWJjZGVmZ2hpams= end",
+    "-----BEGIN RSA PRIVATE KEY-----\nMIIEvQIBADANBg\n-----END RSA PRIVATE KEY-----",
+    "  NOO_ADMIN_PASSWORD\n  hunter2",
+    "secret=[REDACTED]tail key=[REDACTED]",
+]
+
+
+@pytest.mark.parametrize("raw", SHAPE_CORPUS)
+def test_redacted_output_always_passes_the_scan(raw):
+    assert C.secret_hits(raw), ("the corpus line must be secret-shaped", raw)
+    out = _redact(raw + "\n")
+    assert not C.secret_hits(out), (raw, out, C.secret_hits(out))
+
+
+def test_the_redactor_and_the_scan_share_one_shape_list():
+    src = CELL.read_text()
+    redact = src[src.index("def redact_line"):src.index("def secret_hits")]
+    scan = src[src.index("def secret_hits"):src.index("def cmd_run")]
+    for k in range(len(C.SECRET_SHAPES)):
+        assert f"SECRET_SHAPES[{k}]" in redact, k
+    assert "SECRET_SHAPES[:3]" in scan and "SECRET_SHAPES[3].finditer(line)" in scan
+    assert len(C.SECRET_SHAPES) == 4
+
+
+# ── (d) the plain start after a provision (START-AFTER-PROVISION) ──────────
+PROV_SNAP = {"noo-gateway": ("g1", "gateway", "nats:service_started:false"),
+             "noo-nats": ("n1", "nats", "-"),
+             "noo-postgres": ("p1", "postgres", "-")}
+PROV_OK = "  bundle carries this node's own NATS credential; 4 users rendered and noo-nats reloaded\n+ applied\n"
+START_0 = "  Containers          3 running, 0 recreated\n"
+START_NATS = ("  Containers          3 running, 2 recreated\n"
+              "    recreated gateway: its compose config or image changed\n"
+              "    recreated nats: its inputs changed (config monitoring/nats/users.conf)\n")
+NATS_MOVED = dict(PROV_SNAP, **{"noo-nats": ("n2", "nats", "-"), "noo-gateway": ("g2", "gateway", "nats:service_started:false")})
+
+
+def _after_prov(tmp_path, after, start_log, changed="yes", record="confirmed", start_rc="0", prov_rc="0", prov=PROV_OK):
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    b, a = _rc_files(tmp_path, PROV_SNAP, after)
+    (tmp_path / "start.log").write_text(start_log)
+    (tmp_path / "prov.log").write_text(prov)
+    r = subprocess.run([sys.executable, str(ROOT / "scripts/install-cell/recreated.py"), "after-provision",
+                        "START-AFTER-PROVISION", b, a, str(tmp_path / "start.log"), start_rc, changed, record,
+                        str(tmp_path / "prov.log"), prov_rc], capture_output=True, text=True)
+    return r.returncode, r.stdout.strip()
+
+
+def test_after_provision_passes_when_nats_is_not_recreated(tmp_path):
+    rc, out = _after_prov(tmp_path, dict(PROV_SNAP), START_0)
+    assert rc == 0 and out.startswith("START-AFTER-PROVISION PASS: nats not recreated"), out
+
+
+def test_after_provision_fails_naming_nats_and_its_reason(tmp_path):
+    rc, out = _after_prov(tmp_path, NATS_MOVED, START_NATS)
+    assert rc == 1 and out.startswith("START-AFTER-PROVISION FAIL: 2 recreated"), out
+    assert "noo-nats (recreated nats: its inputs changed (config monitoring/nats/users.conf))" in out, out
+    assert "noo-gateway (recreated gateway: its compose config or image changed)" in out, out
+    rc, out = _after_prov(tmp_path / "u", NATS_MOVED, START_NATS, record="unconfirmed")
+    assert rc == 1 and "(record: unconfirmed)" in out, out
+
+
+def test_after_provision_notes_an_unchanged_users_conf(tmp_path):
+    rc, out = _after_prov(tmp_path, dict(PROV_SNAP), START_0, changed="no")
+    assert (rc, out) == (0, "START-AFTER-PROVISION NOTE: users.conf unchanged by the provision; nothing to reload")
+    # nothing changed, yet nats moved: that is not a note
+    rc, out = _after_prov(tmp_path / "m", NATS_MOVED, START_NATS, changed="no")
+    assert rc == 1 and " FAIL: users.conf unchanged by the provision, yet nats was recreated" in out, out
+
+
+def test_after_provision_notes_a_build_that_records_no_reload(tmp_path):
+    rc, out = _after_prov(tmp_path, NATS_MOVED, START_NATS, record="none")
+    assert rc == 0 and out.startswith("START-AFTER-PROVISION NOTE: this build does not record nats reloads"), out
+
+
+def test_after_provision_fails_a_failed_start_or_an_unreadable_users_conf(tmp_path):
+    rc, out = _after_prov(tmp_path, dict(PROV_SNAP), "x the stack did not start\n", start_rc="1")
+    assert rc == 1 and "FAIL: noo stack start exited 1: x the stack did not start" in out, out
+    rc, out = _after_prov(tmp_path / "u", dict(PROV_SNAP), START_0, changed="unknown")
+    assert rc == 1 and "users.conf could not be read" in out, out
+
+
+def test_the_reload_record_is_read_from_the_start_inputs_state(tmp_path):
+    st = tmp_path / "state.json"
+    rec = lambda: subprocess.run([sys.executable, str(ROOT / "scripts/install-cell/recreated.py"), "reload-record",  # noqa: E731
+                                  str(st)], capture_output=True, text=True).stdout.strip()
+    assert rec() == "none"
+    st.write_text(json.dumps({"version": 1, "services": {}}))
+    assert rec() == "none"
+    st.write_text(json.dumps({"reloaded": {"nats": {"container": "n1", "paths": {"/i/monitoring/nats/users.conf": None}}}}))
+    assert rec() == "unconfirmed"
+    st.write_text(json.dumps({"reloaded": {"nats": {"container": "n1", "paths": {"/i/monitoring/nats/users.conf": "ab12"}}}}))
+    assert rec() == "confirmed"
+
+
+# ── the rotation in the default cell (START-AFTER-FORCED-RESTART) ──────────
+RESTART_BEFORE = {"noo-gateway": ("g1", "gateway", "-"), "noo-nats": ("n1", "nats", "-"),
+                  "noo-worker": ("w1", "worker", "nats:service_started:false"),
+                  "noo-trellion": ("t1", "trellion", "gateway:service_started:true")}
+RESTARTED = {n: (i + "r", sv, d) for n, (i, sv, d) in RESTART_BEFORE.items()}
+
+
+def _forced(tmp_path, after, start_log=START_0, start_rc="0", restart_rc="0", restarted=None,
+            restart_log="+ stack recreated — the holders now present the new credential\n"):
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    files = {}
+    for k, d in (("b", RESTART_BEFORE), ("r", RESTARTED if restarted is None else restarted), ("a", after)):
+        files[k] = tmp_path / k
+        files[k].write_text("".join(f"{n} {i} {sv} {dd}\n" for n, (i, sv, dd) in d.items()))
+    (tmp_path / "start.log").write_text(start_log)
+    (tmp_path / "restart.log").write_text(restart_log)
+    r = subprocess.run([sys.executable, str(ROOT / "scripts/install-cell/recreated.py"), "after-forced-restart",
+                        "START-AFTER-FORCED-RESTART", str(files["b"]), str(files["r"]), str(files["a"]),
+                        str(tmp_path / "start.log"), start_rc, restart_rc, str(tmp_path / "restart.log")],
+                       capture_output=True, text=True)
+    return r.returncode, r.stdout.strip()
+
+
+def test_forced_restart_passes_when_nothing_it_recreated_moves_again(tmp_path):
+    rc, out = _forced(tmp_path, dict(RESTARTED), start_log="  Containers          4 running, 0 recreated\n")
+    assert rc == 0 and out.startswith("START-AFTER-FORCED-RESTART PASS: none of the 4 containers"), out
+    assert "noo-trellion" in out and "noo-worker" in out and "4 running, 0 recreated" in out, out
+
+
+def test_forced_restart_fails_naming_worker_and_trellion_with_their_reasons(tmp_path):
+    after = dict(RESTARTED, **{"noo-worker": ("w9", "worker", "-"), "noo-trellion": ("t9", "trellion", "-")})
+    log = ("  Containers          4 running, 2 recreated\n"
+           "    recreated trellion: its compose config or image changed\n"
+           "    recreated worker: its inputs changed (secret nats_worker_password)\n")
+    rc, out = _forced(tmp_path, after, start_log=log)
+    assert rc == 1 and "FAIL: 2 of the 4 containers the --restart recreated were recreated again" in out, out
+    assert "noo-worker (recreated worker: its inputs changed (secret nats_worker_password))" in out, out
+    assert "noo-trellion (recreated trellion: its compose config or image changed)" in out, out
+
+
+def test_forced_restart_has_no_note_fallback(tmp_path):
+    rc, out = _forced(tmp_path, dict(RESTARTED), restart_rc="1", restart_log="! stack recreate FAILED\n")
+    assert rc == 1 and "FAIL: the rotation's --restart exited 1: ! stack recreate FAILED" in out, out
+    rc, out = _forced(tmp_path / "s", dict(RESTARTED), start_rc="1", start_log="x up failed\n")
+    assert rc == 1 and "FAIL: noo stack start exited 1: x up failed" in out, out
+    rc, out = _forced(tmp_path / "n", dict(RESTART_BEFORE), restarted=dict(RESTART_BEFORE))
+    assert rc == 1 and "the --restart did not recreate the worker" in out, out
+
+
+ROTATION_CELL = "ubuntu-24.04-amd64-default"
+
+
+def _rotation_block() -> str:
+    text = (ROOT / "scripts/install-cell/run.sh").read_text()
+    start = text.index("FORCED_RESTART_CELL=")
+    return text[start:text.index("\nfi\n", start) + 4]
+
+
+def test_the_rotation_runs_after_first_answer_the_start_checks_and_the_probes():
+    text = (ROOT / "scripts/install-cell/run.sh").read_text()
+    at = text.index("step start-after-rotation ")
+    for before in ("step start-idempotent ", "step start-input-change ", "step start-recreate ",
+                   "step health-after-starts ", "step first-answer ", "step context-pin-restart "):
+        assert text.index(before) < at, before
+    assert at < text.index("step probe-docker-restart-namespace-joiners ") < text.index("\nteardown\nfinish")
+    block = _rotation_block()
+    for cmd in ("noo cluster nats-creds rotate worker --yes", "noo cluster nats-creds rotate worker --restart --yes"):
+        assert text.count(cmd) == 1 and block.index(cmd) < block.index("\nelse\n"), "only in the default cell's branch"
+    assert f"FORCED_RESTART_CELL={ROTATION_CELL}\n" in text
+
+
+def _fake_cli(d: Path, inst: Path, record: bool, nats_moves: bool, forced_moves: bool):
+    d.mkdir()
+    ids, calls, starts = d / "ids", d / "calls", d / "starts"
+    ids.write_text("g1 n1 w1 t1")
+    starts.write_text("0")
+    conf, state = inst / "monitoring" / "nats" / "users.conf", inst / ".noo-start-inputs.json"
+    rec = json.dumps({"reloaded": {"nats": {"container": "n1", "paths": {str(conf): "ab12"}}}}) if record else "{}"
+    (d / "docker").write_text(f"""#!/bin/sh
+case "$1" in
+  ps) echo "c1 c2 c3 c4" ;;
+  inspect) set -- $(cat {ids}); echo "noo-gateway $1 gateway <no value>"; echo "noo-nats $2 nats <no value>"
+           echo "noo-worker $3 worker nats:service_started:false"; echo "noo-trellion $4 trellion gateway:service_started:true" ;;
+esac
+""")
+    (d / "noo").write_text(f"""#!/bin/bash
+echo "$*" >> {calls}
+set -- $*
+read g n w t < {ids}
+case "$1 $2 $3 $4" in
+  "cluster nats-creds rotate worker")
+    echo "worker-$RANDOM" >> {conf}; echo '{rec}' > {state}
+    echo "+ noo-nats reloaded (SIGHUP) — the server now verifies the NEW digest"
+    echo "! noo-worker, noo-trellion, noo-trellion-intel hold the OLD password"
+    if [ "$5" = --restart ]; then echo "${{g}}r ${{n}}r ${{w}}r ${{t}}r" > {ids}; echo "+ stack recreated"; fi ;;
+  "cluster provision "*) echo "bundle carries this node's own NATS credential; 4 users rendered and noo-nats reloaded" ;;
+  "stack start  ")
+    k=$(( $(cat {starts}) + 1 )); echo $k > {starts}
+    if [ $k = 1 ]; then
+      {'n=${n}x;' if nats_moves else ''} echo "$g $n ${{w}}x ${{t}}x" > {ids}
+      echo "  Containers          4 running, 2 recreated"
+      echo "    recreated worker: its inputs changed (secret nats_worker_password)"
+      {'echo "    recreated nats: its inputs changed (config monitoring/nats/users.conf)"' if nats_moves else ''}
+    else
+      {'echo "$g $n ${w}y $t" > ' + str(ids) + '; echo "    recreated worker: its compose config or image changed"' if forced_moves else 'echo "  Containers          4 running, 0 recreated"'}
+    fi ;;
+esac
+""")
+    (d / "hostname").write_text("#!/bin/sh\necho node-a\n")
+    for f in ("docker", "noo", "hostname"):
+        (d / f).chmod(0o755)
+    return calls
+
+
+def _run_rotation_block(tmp_path, cell, record=True, nats_moves=False, forced_moves=False):
+    home = tmp_path / "home"
+    inst = home / ".noo"
+    (inst / "monitoring" / "nats").mkdir(parents=True)
+    (inst / ".noo-standalone").write_text("")
+    (inst / "monitoring" / "nats" / "users.conf").write_text("accounts {}\n")
+    calls = _fake_cli(tmp_path / "bin", inst, record, nats_moves, forced_moves)
+    out = tmp_path / "out"
+    out.mkdir()
+    script = ('step() { shift 2; [ "$1" = -- ] && shift; "$@"; }\n'
+              f'RC_PY={ROOT / "scripts/install-cell/recreated.py"}; OUT={out}; CELL={cell}\n' + _rotation_block())
+    env = dict(os.environ, HOME=str(home), PATH=f"{tmp_path / 'bin'}:{os.environ['PATH']}")
+    r = subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=env, timeout=120)
+    verdicts = {l.split()[0]: l for l in r.stdout.splitlines() if l.startswith("START-AFTER-")}
+    return r, verdicts, (calls.read_text() if calls.exists() else "")
+
+
+def test_the_default_cell_rotates_then_judges_both_starts(tmp_path):
+    r, v, calls = _run_rotation_block(tmp_path, ROTATION_CELL)
+    assert r.returncode == 0, (r.stdout, r.stderr)
+    assert v["START-AFTER-PROVISION"].startswith("START-AFTER-PROVISION PASS: nats not recreated"), v
+    assert "also recreated: noo-trellion" in v["START-AFTER-PROVISION"] and "noo-worker (recreated worker" in v["START-AFTER-PROVISION"]
+    assert v["START-AFTER-FORCED-RESTART"].startswith("START-AFTER-FORCED-RESTART PASS: none of the 4"), v
+    assert [c.split()[:5] for c in calls.splitlines()] == [
+        ["cluster", "nats-creds", "rotate", "worker", "--yes"], ["cluster", "provision", "node-a", "--wait"],
+        ["stack", "start"], ["cluster", "nats-creds", "rotate", "worker", "--restart"], ["stack", "start"]]
+    assert "rotate| ! noo-worker" in r.stdout, "the rotation's warning is prefixed, not a stranger's warning"
+    assert not re.search(r"(?m)^\s*(!|⚠)", r.stdout)
+
+
+def test_the_default_cell_fails_each_assert_by_name(tmp_path):
+    r, v, _ = _run_rotation_block(tmp_path, ROTATION_CELL, nats_moves=True)
+    assert r.returncode == 1 and " FAIL: " in v["START-AFTER-PROVISION"] and "noo-nats (recreated nats:" in v["START-AFTER-PROVISION"], v
+    r, v, _ = _run_rotation_block(tmp_path / "f", ROTATION_CELL, forced_moves=True)
+    assert r.returncode == 1 and " PASS: " in v["START-AFTER-PROVISION"], v
+    assert "noo-worker (recreated worker: its compose config or image changed)" in v["START-AFTER-FORCED-RESTART"], v
+    r, v, _ = _run_rotation_block(tmp_path / "n", ROTATION_CELL, record=False, nats_moves=True)
+    assert r.returncode == 0 and "NOTE: this build does not record nats reloads" in v["START-AFTER-PROVISION"], v
+
+
+def test_another_cell_never_rotates_and_says_where_it_runs(tmp_path):
+    r, v, calls = _run_rotation_block(tmp_path, "ubuntu-22.04-amd64")
+    assert r.returncode == 0 and calls == "", calls
+    assert v["START-AFTER-PROVISION"] == f"START-AFTER-PROVISION NOTE: runs in the {ROTATION_CELL} cell only (it rotates the worker NATS credential and recreates the stack)"
+    assert v["START-AFTER-FORCED-RESTART"] == f"START-AFTER-FORCED-RESTART NOTE: runs in the {ROTATION_CELL} cell only"

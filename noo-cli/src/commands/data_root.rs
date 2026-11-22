@@ -450,7 +450,7 @@ pub(crate) fn mount_row_from(code: Option<i32>, evidence: &str) -> crate::comman
             None,
         ),
     };
-    Check { name: MOUNT_ROW, verdict, detail, remedy }
+    Check { name: MOUNT_ROW, verdict, detail, remedy }.checked()
 }
 
 /// `noo cluster verify --controller` row: is the data root on the filesystem

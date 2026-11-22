@@ -251,6 +251,8 @@ type Reconciler struct {
 	// goroutine only. ggufExists checks the file; nil = r.docker's.
 	ggufMissing map[string]string
 	ggufExists  func(ctx context.Context, dir, file string) (bool, error)
+	// startBackendFn: nil = r.docker.StartBackend. A seam for tests only.
+	startBackendFn func(ctx context.Context, backend, model string, gpuCount int, o dockerpkg.StartOverrides) error
 
 	// ollamaPulls tracks the registry pull an ollama placement needs, per
 	// model: one in flight at a time, and a failed pull waits before it is
@@ -279,6 +281,10 @@ type Reconciler struct {
 	// registry pull for a model already known to be import-only.
 	// Guarded by pullMu.
 	knownImportOnly map[string]bool
+
+	// pullSleep is the wait between in-pull retries of a registry pull;
+	// nil means sleepCtx. Tests set it so they do not wait.
+	pullSleep func(context.Context, time.Duration) error
 
 	// nudges counts Nudge calls (taken or coalesced), for tests.
 	nudges atomic.Uint64
@@ -891,7 +897,16 @@ func (r *Reconciler) convergeContainer(ctx context.Context, t *tick, p placement
 		// Converged when running with the placement's model (compare
 		// basenames — detection may report a bare filename) AND the
 		// stamped spec hash matches the desired one.
-		if isRunning && modelname.Matches(curModel, p.Model) {
+		// A .gguf placement is converged only while its FILE is on the node:
+		// "running" includes a container Docker's restart policy keeps
+		// cycling without its weights (a first placement whose preseed was
+		// refused, 2026-11: Running for 17 h). A vanished file is not
+		// converged, so it falls through to the start path below: that
+		// re-asks the controller's store (ggufPresent, then StartBackend's
+		// preseed), records the backend_start refusal when the file still
+		// cannot be had, and leaves the running container alone (no stop
+		// is added here: the ggufMissing path never stopped one either).
+		if isRunning && modelname.Matches(curModel, p.Model) && r.ggufFileOnNode(ctx, t, p) {
 			// Running as asked: an earlier start failure no longer
 			// applies, unless its gguf is still missing (a container
 			// left running on a refused start): re-check that one.
@@ -1031,7 +1046,13 @@ func (r *Reconciler) convergeContainer(ctx context.Context, t *tick, p placement
 			Target:      dockerpkg.StartTarget(p.Backend, p.Target, p.Env),
 			MemoryLimit: p.MemoryLimitBytes,
 		}
-		if err := r.docker.StartBackend(ctx, p.Backend, p.Model, 0, overrides); err != nil {
+		startErr := error(nil)
+		if r.startBackendFn != nil {
+			startErr = r.startBackendFn(ctx, p.Backend, p.Model, 0, overrides)
+		} else {
+			startErr = r.docker.StartBackend(ctx, p.Backend, p.Model, 0, overrides)
+		}
+		if err := startErr; err != nil {
 			slog.Error("reconcile.start_failed",
 				"backend", p.Backend, "error", err)
 			// A drift recreate that never happened must be retried:
@@ -1143,6 +1164,8 @@ func (r *Reconciler) ensureOllamaModel(
 	if err != nil {
 		// Could not ask: unknown, not absent.
 		modelpresence.Clear(key)
+		// The verify row says why after repeated failures (i1067).
+		r.ollamaVerify.notePresenceErr(model, err)
 		slog.Warn("reconcile.ollama_model_check_failed", "model", model, "error", err)
 		return
 	}
@@ -1182,7 +1205,14 @@ func (r *Reconciler) ensureOllamaModel(
 	go func() {
 		// ctx is the Run context (agent lifetime), not the tick: the pull
 		// outlives the pass but still stops at shutdown.
-		out, err := pull(ctx, model)
+		// A short in-pull retry for a registry blip first (both lanes, docker
+		// and native, pass through here); only what still fails takes the
+		// ollamaPullRetryAfter backoff below.
+		sleep := r.pullSleep
+		if sleep == nil {
+			sleep = sleepCtx
+		}
+		out, err := pullWithRetry(ctx, model, pull, sleep)
 		r.pullMu.Lock()
 		defer r.pullMu.Unlock()
 		st.inFlight = false

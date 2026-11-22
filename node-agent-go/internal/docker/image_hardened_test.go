@@ -100,6 +100,7 @@ func TestNoReleasePinKeepsTheUpstreamDefault(t *testing.T) {
 // container is ever started in its place.
 func TestOurImageNotStagedIsRefusedLoudlyWithoutFallback(t *testing.T) {
 	pinRelease(t)
+	poseGPUFacts(t, GPUFacts{}) // a node with no GPU: the start reaches the image
 	for _, backend := range []string{"ollama", "llamacpp", "reranker"} {
 		var asked []string
 		prev := ensureImageFn

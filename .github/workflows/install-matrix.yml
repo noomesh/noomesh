@@ -34,7 +34,12 @@ on:
         default: latest
       cells:
         description: 'all (every fresh-install cell and the upgrade cell), fresh (the fresh-install cells only) or upgrade (the upgrade cell only)'
+        type: choice
+        options: [all, fresh, upgrade]
         default: all
+      prev_tag:
+        description: 'The upgrade cell only: the final it starts from (exactly noo-cli-vX.Y.Z, a published non-prerelease release below cli_tag). Empty: the newest final below cli_tag'
+        default: ''
   schedule:
     - cron: '13 2 * * *'   # 02:13 UTC, away from the merge-queue peak
   push:
@@ -84,6 +89,20 @@ jobs:
           # reach, and hosted Apple silicon has no Docker. Install + CLI.
           - {cell: macos-15-node, runner: macos-15, docker: preinstalled, onboard: ci, model: tiny, scope: node-partial, experimental: false}
     steps:
+      # FIRST, before anything else touches it: the free-text dispatch input
+      # cli_tag, whole-string, as scripts/install-cell/validate_tag.sh holds it
+      # (run.sh and upgrade.sh refuse it again on their own). run.sh splices it
+      # into an install line it runs with `sh -c`
+      # (tests/test_dispatch_inputs_never_reach_a_shell_raw.py).
+      - name: Validate dispatch inputs
+        shell: bash
+        env:
+          CLI_TAG: ${{ inputs.cli_tag || 'latest' }}
+        run: |
+          export LC_ALL=C
+          re='^(latest|noo-cli-v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?)$'
+          [[ $CLI_TAG =~ $re ]] || {
+            printf '::error::cli_tag %q refused: must be exactly latest or noo-cli-vX.Y.Z with an optional -rc.N\n' "$CLI_TAG"; exit 1; }
       - name: Checkout (the cell harness only)   # actions/checkout@v7.0.1
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -94,6 +113,9 @@ jobs:
             docs/getting-started/install.md
             scripts/install-cell
             scripts/ci-free-disk.sh
+            # the verify row registry: ratchet.py maps a row name to its id
+            # when the installed CLI prints none (before #1411)
+            noo-cli/src/commands/cluster_verify/rows.rs
           sparse-checkout-cone-mode: false
       - name: Free disk (the runner's preinstalled toolchains; reported)
         if: runner.os == 'Linux'
@@ -132,6 +154,20 @@ jobs:
     timeout-minutes: 120
     continue-on-error: true
     steps:
+      # FIRST, before anything else touches it: the free-text dispatch input
+      # cli_tag, whole-string, as scripts/install-cell/validate_tag.sh holds it
+      # (run.sh and upgrade.sh refuse it again on their own). run.sh splices it
+      # into an install line it runs with `sh -c`
+      # (tests/test_dispatch_inputs_never_reach_a_shell_raw.py).
+      - name: Validate dispatch inputs
+        shell: bash
+        env:
+          CLI_TAG: ${{ inputs.cli_tag || 'latest' }}
+        run: |
+          export LC_ALL=C
+          re='^(latest|noo-cli-v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?)$'
+          [[ $CLI_TAG =~ $re ]] || {
+            printf '::error::cli_tag %q refused: must be exactly latest or noo-cli-vX.Y.Z with an optional -rc.N\n' "$CLI_TAG"; exit 1; }
       - name: Checkout (the cell harness only)   # actions/checkout@v7.0.1
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -141,6 +177,7 @@ jobs:
             docs/getting-started/first-chat.md
             docs/getting-started/install.md
             scripts/install-cell
+            noo-cli/src/commands/cluster_verify/rows.rs
           sparse-checkout-cone-mode: false
       - name: WSL2 + Ubuntu 24.04   # Vampire/setup-wsl v7.2.0
         # Run 1 (2026-11-12) never finished this step in 45 min: cap it so a
@@ -186,8 +223,9 @@ jobs:
   # they fail (a cell without memory.json is reported "not measured: why").
   # THE UPGRADE CELL (fa, 2026-11-18): the first roll a real fleet makes. A
   # box on the previous final (resolved from the releases API: the newest
-  # noo-cli-vX.Y.Z final below cli_tag) takes cli_tag with `noo upgrade
-  # --all`, then a same-tag `noo upgrade --stack`. systemd is PID 1 here,
+  # noo-cli-vX.Y.Z final below cli_tag, or the final prev_tag chooses) takes
+  # cli_tag with `noo upgrade --all`, then a same-tag `noo upgrade --stack`.
+  # systemd is PID 1 here,
   # which the rehearsal's dind cannot give: its self node never collects or
   # applies a bundle. One `UPGRADE <id> PASS|FAIL` line per assert (i908's
   # release check, i907 1b's netns unit, the agent's hold, the verify rows,
@@ -198,6 +236,24 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 150
     steps:
+      # FIRST, before anything else touches them: the free-text dispatch
+      # inputs cli_tag and prev_tag, whole-string, as
+      # scripts/install-cell/validate_tag.sh holds them (upgrade.sh and
+      # upgrade_judge.py resolve refuse them again on their own)
+      # (tests/test_dispatch_inputs_never_reach_a_shell_raw.py).
+      - name: Validate dispatch inputs
+        shell: bash
+        env:
+          CLI_TAG: ${{ inputs.cli_tag || 'latest' }}
+          PREV_TAG: ${{ inputs.prev_tag }}
+        run: |
+          export LC_ALL=C
+          re='^(latest|noo-cli-v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?)$'
+          [[ $CLI_TAG =~ $re ]] || {
+            printf '::error::cli_tag %q refused: must be exactly latest or noo-cli-vX.Y.Z with an optional -rc.N\n' "$CLI_TAG"; exit 1; }
+          re='^(noo-cli-v[0-9]+\.[0-9]+\.[0-9]+)?$'
+          [[ $PREV_TAG =~ $re ]] || {
+            printf '::error::prev_tag %q refused: must be empty or exactly noo-cli-vX.Y.Z (a final)\n' "$PREV_TAG"; exit 1; }
       - name: Checkout (the cell harness only)   # actions/checkout@v7.0.1
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -206,6 +262,9 @@ jobs:
             README.md
             scripts/install-cell
             scripts/ci-free-disk.sh
+            # the verify row registry: ratchet.py maps a row name to its id
+            # when the installed CLI prints none (before #1411)
+            noo-cli/src/commands/cluster_verify/rows.rs
           sparse-checkout-cone-mode: false
       - name: Free disk (the runner's preinstalled toolchains; reported)
         run: df -h / && bash scripts/ci-free-disk.sh && df -h /
@@ -215,6 +274,9 @@ jobs:
           CELL: upgrade-24.04
           RUNNER: ubuntu-24.04
           CLI_TAG: ${{ inputs.cli_tag || 'latest' }}
+          # the chosen start, through env only (never interpolated into run:);
+          # upgrade_judge.py resolve holds it to the strict rules
+          PREV_TAG: ${{ inputs.prev_tag }}
           # read-only: the releases list (the previous final); never written
           GH_TOKEN: ${{ github.token }}
         run: bash scripts/install-cell/upgrade.sh
@@ -264,6 +326,16 @@ jobs:
             --memory "ubuntu-24.04-amd64-default=$M/install-cell-ubuntu-24.04-amd64-default/memory.json" \
                      "ubuntu-22.04-amd64=$M/install-cell-ubuntu-22.04-amd64/memory.json" \
             | tee -a "$GITHUB_STEP_SUMMARY"
+      # The run's ratchet line: how many cells reported default chat NOT
+      # JUDGED (a registry outage at onboard), so a run of them is noticed.
+      - name: Every cell's report (the ratchet's NOT JUDGED count)   # actions/download-artifact@v8.0.2
+        continue-on-error: true
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          pattern: install-cell-*
+          path: ${{ runner.temp }}/cells
+      - name: Ratchet NOT JUDGED cells
+        run: python3 scripts/install-cell/ratchet.py run-summary "$RUNNER_TEMP/cells" | tee -a "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: release-size

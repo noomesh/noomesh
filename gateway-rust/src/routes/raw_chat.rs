@@ -125,11 +125,24 @@ pub struct RawChatError {
     /// Seconds a well-behaved client should wait before retrying; rendered
     /// as a `Retry-After` header. Set by load-shedding refusals only.
     pub retry_after: Option<u64>,
+    /// What the caller does instead (`next` steps); with it the body also
+    /// carries `code`. Set by the inline-media refusals.
+    pub next: Option<Value>,
 }
 
 impl RawChatError {
     pub fn new(status: StatusCode, kind: &'static str, detail: impl Into<String>) -> Self {
-        Self { status, kind, detail: detail.into(), public: None, reference: crate::egress::new_ref(), retry_after: None }
+        Self { status, kind, detail: detail.into(), public: None, reference: crate::egress::new_ref(), retry_after: None, next: None }
+    }
+
+    /// A content part named a remote media URL, or inline media that is not
+    /// allowed (`inline_media`): 400 (413 over a size cap) with the code as
+    /// `type` and `code`, the public message, and `next`. The detail names
+    /// the code and the part type, never the URL or the data.
+    pub fn media_refused(r: &crate::inline_media::MediaRefusal) -> Self {
+        let status = StatusCode::from_u16(r.status()).unwrap_or(StatusCode::BAD_REQUEST);
+        let detail = format!("{} on a '{}' content part", r.code, r.part_type);
+        Self { public: Some(r.message.clone()), next: Some(r.next()), ..Self::new(status, r.code, detail) }
     }
 
     /// A refusal about the caller's own request (400): the message IS the
@@ -173,6 +186,24 @@ impl RawChatError {
         Self::new(status, "backend_error", format!("backend at {url} answered {status}: {}", crate::text::clip(body, 500)))
     }
 
+    /// A `model_not_found` 404 about the model the caller asked for: the
+    /// public message names it (the caller's own input, through
+    /// [`public_model_name`]) and says where to list what is served. Any
+    /// other error, an error that already set its own public message, and a
+    /// request with no model keep the general wording.
+    pub fn naming_model(mut self, requested: Option<&str>) -> Self {
+        if self.status != StatusCode::NOT_FOUND || self.kind != MODEL_NOT_FOUND || self.public.is_some() {
+            return self;
+        }
+        if let Some(name) = requested.map(public_model_name).filter(|n| !n.is_empty()) {
+            self.public = Some(format!(
+                "model '{name}' is not served: no model, class or alias by that name. \
+                 GET /v1/models lists what is served (an operator: {SERVED_MODELS_CMD})"
+            ));
+        }
+        self
+    }
+
     /// What the consumer reads. General by status unless the error set its own.
     pub fn public_message(&self) -> String {
         if let Some(p) = &self.public {
@@ -181,13 +212,24 @@ impl RawChatError {
         public_message_for(self.status)
     }
 
-    /// The OpenAI-shaped body: `{"error": {"message", "type", "ref"}}`.
+    /// The OpenAI-shaped body: `{"error": {"message", "type", "ref"}}`,
+    /// plus `code` and `param` on a `model_not_found` (OpenAI's own shape for
+    /// an unknown model: `code: "model_not_found"`, `param: "model"`).
     pub fn body(&self) -> Value {
-        json!({"error": {
+        let mut b = json!({"error": {
             "message": self.public_message(),
             "type": self.kind,
             "ref": self.reference,
-        }})
+        }});
+        if self.kind == MODEL_NOT_FOUND {
+            b["error"]["code"] = json!(MODEL_NOT_FOUND);
+            b["error"]["param"] = json!("model");
+        }
+        if let Some(next) = &self.next {
+            b["error"]["code"] = json!(self.kind);
+            b["error"]["next"] = next.clone();
+        }
+        b
     }
 
     /// Log the detail under the reference. Called once, by whoever renders.
@@ -214,6 +256,31 @@ impl RawChatError {
         }
         resp
     }
+}
+
+/// The `type` (and OpenAI `code`) of a request for a model nothing serves.
+pub const MODEL_NOT_FOUND: &str = "model_not_found";
+
+/// The operator command that lists what the mesh serves, named in the
+/// `model_not_found` message beside `GET /v1/models`.
+pub const SERVED_MODELS_CMD: &str = "noo cluster class list";
+
+/// The longest model name echoed back in a `model_not_found` message, in
+/// characters; a longer one is cut with `…`.
+pub const MAX_ECHOED_MODEL_CHARS: usize = 128;
+
+/// The requested model name as it may appear in a public message: the
+/// caller's own input, trimmed, control characters dropped, and cut to
+/// [`MAX_ECHOED_MODEL_CHARS`] so a hostile name cannot forge lines or bloat
+/// the body.
+pub fn public_model_name(raw: &str) -> String {
+    let clean: String = raw.trim().chars().filter(|c| !c.is_control()).collect();
+    if clean.chars().count() <= MAX_ECHOED_MODEL_CHARS {
+        return clean;
+    }
+    let mut cut: String = clean.chars().take(MAX_ECHOED_MODEL_CHARS).collect();
+    cut.push('…');
+    cut
 }
 
 /// The general wording for a status. No node, address, URL or upstream text
@@ -339,9 +406,70 @@ pub async fn resolve_candidates(state: &AppState, hint: Option<&str>, node: Opti
         );
         return Ok((classes::CHAT_DEFAULT.to_string(), vec![cand]));
     }
-    let sel = classes::select(&table, hint, node, strict, &|_| false).map_err(refusal_error)?;
+    let sel = match classes::select(&table, hint, node, strict, &|_| false) {
+        Ok(sel) => sel,
+        Err(r @ classes::Refusal::NoCandidates(_)) => hold_for_first_beat(state, &table, hint, node, strict, r).await?,
+        Err(r) => return Err(refusal_error(r)),
+    };
     log_selection(&sel, node, strict);
     Ok((sel.class, sel.candidates))
+}
+
+/// How often a request held for a just-registered node re-reads the table.
+const FIRST_BEAT_POLL: Duration = Duration::from_millis(500);
+
+/// A `NoCandidates` refusal whose every candidate is on a node that
+/// registered moments ago and has not beaten since (an agent restart: its
+/// record has no lanes until the beat, see `classes::first_beat_wait`):
+/// hold the request until the beat lands, re-selecting, for at most the
+/// time left to the expected beat plus a margin (never past
+/// `node_restart::MAX_WAIT`). Still nothing, or too many already waiting:
+/// the 503 with a `Retry-After`. Any other refusal, or a node that
+/// registered long ago, is answered at once as before.
+async fn hold_for_first_beat(
+    state: &AppState,
+    table: &classes::ClassTable,
+    hint: Option<&str>,
+    node: Option<&str>,
+    strict: bool,
+    refusal: classes::Refusal,
+) -> Result<classes::Selection, RawChatError> {
+    let Some(wait) = classes::first_beat_wait(table, hint, node) else {
+        return Err(refusal_error(refusal));
+    };
+    let secs = |d: Duration| d.as_secs_f64().ceil().max(1.0) as u64;
+    let key = format!("first_beat:{}", hint.unwrap_or(classes::CHAT_DEFAULT));
+    let Some(_waiter) = crate::node_restart::try_wait(&key) else {
+        return Err(first_beat_refusal(refusal, secs(wait)));
+    };
+    tracing::info!(hint = ?hint, node_pin = ?node, wait_ms = wait.as_millis() as u64, "raw_chat_first_beat_hold");
+    let deadline = Instant::now() + wait;
+    let mut last = refusal;
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        tokio::time::sleep(left.min(FIRST_BEAT_POLL)).await;
+        let Ok(t) = classes::load_table(state).await else { continue };
+        match classes::select(&t, hint, node, strict, &|_| false) {
+            Ok(sel) => {
+                tracing::info!(hint = ?hint, waited_ms = (wait - deadline.saturating_duration_since(Instant::now())).as_millis() as u64, "raw_chat_first_beat_hold_served");
+                return Ok(sel);
+            }
+            Err(r @ classes::Refusal::NoCandidates(_)) => last = r,
+            Err(r) => return Err(refusal_error(r)),
+        }
+    }
+    Err(first_beat_refusal(last, secs(classes::FIRST_BEAT_MARGIN)))
+}
+
+/// The `NoCandidates` 503 for a node awaiting its first beat: as before,
+/// plus a `Retry-After` of `secs` (when the beat is expected).
+fn first_beat_refusal(r: classes::Refusal, secs: u64) -> RawChatError {
+    let mut e = refusal_error(r);
+    e.retry_after = Some(secs);
+    e
 }
 
 /// A selection refusal on the raw surfaces. A node pin is the caller's own
@@ -847,6 +975,18 @@ where
 {
     use coordinator::expected_wait::{self, Plan};
     let mut build = build;
+    // Before anything is planned or sent: a content part that names a
+    // remote media URL (the model server would fetch it, from its own
+    // network) or inline media that is not allowed is refused here, where
+    // every caller-shaped chat body passes (`inline_media`). The renderer
+    // logs it once (`raw_chat_refused`: the surface, the code as `kind`, the
+    // part type in the detail).
+    if let Some(first) = candidates.first() {
+        let (_, probe) = build(first);
+        if let Err(r) = crate::inline_media::check_body(&probe) {
+            return Err(RawChatError::media_refused(&r));
+        }
+    }
     // A key set to refuse (i802, operator 2026-11-15): an Ollama whose
     // context this prompt overflows is not tried; nothing left is a 413.
     let fitted: Vec<Candidate>;
@@ -1027,7 +1167,9 @@ pub async fn chat_completions_with(
     budget_fits_thinking(body)?;
     let pin = node_pin(body, pin)?;
     let hint = coordinator::model_hint(body.get("model").and_then(Value::as_str)).map(str::to_string);
-    let (class, cands) = resolve_candidates(state, hint.as_deref(), pin.node.as_deref(), pin.strict).await?;
+    let (class, cands) = resolve_candidates(state, hint.as_deref(), pin.node.as_deref(), pin.strict)
+        .await
+        .map_err(|e| e.naming_model(hint.as_deref()))?;
     let stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
     if stream {
         body["stream_options"] = json!({"include_usage": true});
@@ -1040,6 +1182,7 @@ pub async fn chat_completions_with(
         ("/v1/chat/completions".to_string(), b)
     })
     .await
+    .map_err(|e| e.naming_model(hint.as_deref()))
 }
 
 /// The smallest `max_tokens` a structured-output request may carry while
@@ -1253,6 +1396,11 @@ mod node_pin_tests {
         assert!(e.detail.contains("e2b"), "the detail keeps it for the operator");
         assert_eq!(refusal_error(Refusal::UnknownModel("m".into())).status, StatusCode::NOT_FOUND);
         assert_eq!(refusal_error(Refusal::NoCandidates("m".into())).status, StatusCode::SERVICE_UNAVAILABLE);
+        // A refusal for a node awaiting its first beat says when to retry;
+        // the plain one (a node that registered long ago) does not.
+        assert_eq!(refusal_error(Refusal::NoCandidates("m".into())).retry_after, None);
+        let e = first_beat_refusal(Refusal::NoCandidates("m".into()), 27);
+        assert_eq!((e.status, e.kind, e.retry_after), (StatusCode::SERVICE_UNAVAILABLE, "backend_unavailable", Some(27)));
     }
 }
 
@@ -1393,6 +1541,65 @@ mod tests {
             }
         }
         assert_eq!(public_message_for(StatusCode::NOT_FOUND), "no model, class or alias by that name is served");
+    }
+
+    /// A `/v1` request for a model nothing serves names the model the caller
+    /// sent (cleaned and capped), says where to list what is served, and
+    /// carries OpenAI's `code` and `param` beside the unchanged `type`.
+    #[test]
+    fn a_model_not_found_names_the_requested_model_and_carries_code_and_param() {
+        let e = RawChatError::from_resolve(&anyhow::Error::new(coordinator::ModelNotServed(
+            "model 'gemma9:1b' is not served by any node; nodes serve: host3=vllm:HF".into())))
+            .naming_model(Some("gemma9:1b"));
+        let b = e.body();
+        let msg = b["error"]["message"].as_str().unwrap();
+        assert!(msg.contains("'gemma9:1b'"), "the requested model is named: {msg}");
+        assert!(msg.contains("GET /v1/models") && msg.contains(SERVED_MODELS_CMD), "{msg}");
+        assert!(!msg.contains("host3"), "the operator detail stays out: {msg}");
+        assert_eq!(b["error"]["type"], "model_not_found");
+        assert_eq!(b["error"]["code"], "model_not_found");
+        assert_eq!(b["error"]["param"], "model");
+        assert_clean(&b);
+
+        // The caller's own input, but cleaned: no control characters (no
+        // forged lines), and cut at the cap with an ellipsis.
+        let hostile = format!("evil\n\r\u{1b}[31m{}", "x".repeat(500));
+        let e = RawChatError::from_resolve(&anyhow::Error::new(coordinator::ModelNotServed("m".into())))
+            .naming_model(Some(&hostile));
+        let msg = e.public_message();
+        assert!(!msg.chars().any(char::is_control), "{msg:?}");
+        let echoed = public_model_name(&hostile);
+        assert!(msg.contains(&format!("'{echoed}'")), "{msg}");
+        assert_eq!(echoed.chars().count(), MAX_ECHOED_MODEL_CHARS + 1, "cut to the cap plus the ellipsis");
+        assert!(echoed.starts_with("evil[31m") && echoed.ends_with('…'), "{echoed}");
+        assert_eq!(public_model_name("  gemma4:12b  "), "gemma4:12b");
+
+        // No model named (or a blank one after cleaning): the general wording.
+        for none in [None, Some(""), Some("\u{7}")] {
+            let e = RawChatError::from_resolve(&anyhow::Error::new(coordinator::ModelNotServed("m".into()))).naming_model(none);
+            assert_eq!(e.public_message(), public_message_for(StatusCode::NOT_FOUND));
+            assert_eq!(e.body()["error"]["code"], "model_not_found", "code and param ride on every model_not_found");
+        }
+        // Any other error stays general and gains no code/param, and an
+        // error with its own public message keeps it.
+        let e = RawChatError::new(StatusCode::SERVICE_UNAVAILABLE, "backend_unavailable", "d").naming_model(Some("gemma9:1b"));
+        assert_eq!(e.public_message(), public_message_for(StatusCode::SERVICE_UNAVAILABLE));
+        assert!(e.body()["error"].get("code").is_none() && e.body()["error"].get("param").is_none());
+        let e = RawChatError::request_refused(StatusCode::NOT_FOUND, "not_found", "no such record").naming_model(Some("gemma9:1b"));
+        assert_eq!(e.public_message(), "no such record");
+    }
+
+    /// The `/v1` paths that can answer `model_not_found` pass the caller's
+    /// model through `naming_model`: both exits of `chat_completions_with`
+    /// (resolve, failover) and the `/v1/responses` resolve.
+    #[test]
+    fn the_v1_paths_name_the_requested_model() {
+        let code = crate::test_src::own_code(include_str!("raw_chat.rs"));
+        let with = crate::test_src::fn_body(&code, "pub async fn chat_completions_with");
+        assert_eq!(with.matches(".map_err(|e| e.naming_model(hint.as_deref()))").count(), 2, "{with}");
+        let inf = crate::test_src::own_code(include_str!("inference.rs"));
+        let responses = crate::test_src::fn_body(&inf, "async fn v1_responses(");
+        assert!(responses.contains("e.naming_model(requested_model_hint(&body)).into_response(\"v1\")"), "{responses}");
     }
 
     #[test]

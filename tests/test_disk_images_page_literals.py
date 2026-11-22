@@ -8,7 +8,7 @@ The 2026-11-18 launch audit found quoted output nothing compared. This page's
 the keep file's `why`), so its quotes are pinned by rule, not by a list: every
 backtick literal there with at least three words that is not a command or a
 path is output, and each part of it between placeholders (`<…>`, `…`) must
-occur in the CLI's or the node agent's source.
+occur in the CLI's, the gateway's or the node agent's source.
 """
 import re
 from pathlib import Path
@@ -68,7 +68,8 @@ def _without_test_modules(text: str) -> str:
 
 def _source() -> str:
     parts = []
-    for base, ext in ((ROOT / "noo-cli" / "src", "*.rs"), (ROOT / "node-agent-go", "*.go")):
+    # The gateway too: the page quotes its place-time refusals (i1036).
+    for base, ext in ((ROOT / "noo-cli" / "src", "*.rs"), (ROOT / "gateway-rust" / "src", "*.rs"), (ROOT / "node-agent-go", "*.go")):
         for p in base.rglob(ext):
             if "_test" in p.name:
                 continue

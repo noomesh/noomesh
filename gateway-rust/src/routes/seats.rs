@@ -201,6 +201,7 @@ async fn seat_token_create(
     perspective: Option<axum::Extension<crate::perspective::RequesterPerspective>>,
     Json(body): Json<CreateSeatTokenBody>,
 ) -> AppResult {
+    crate::person_gate::require_person(&state.db, op.0.as_ref(), "minting a seat token").await?;
     // i538: a seat enrolment token is a credential; never under a perspective.
     crate::perspective::refuse_mint(perspective.as_ref(), "seat token")?;
     let by = seat_admin_guard(&op, &cluster)?;
@@ -292,6 +293,7 @@ async fn seat_token_revoke(
     op: OperatorOrInternal,
     cluster: Option<Extension<ClusterNode>>,
 ) -> AppResult {
+    crate::person_gate::require_person(&state.db, op.0.as_ref(), "revoking a seat token").await?;
     let by = seat_admin_guard(&op, &cluster)?;
     let id: uuid::Uuid = id.parse().map_err(|_| AppError::BadRequest("invalid token id (expected a UUID)".into()))?;
     let updated = sqlx::query("UPDATE noo_seat_tokens SET revoked = true WHERE id = $1")
@@ -1046,6 +1048,7 @@ async fn seat_bind(
     perspective: Option<axum::Extension<crate::perspective::RequesterPerspective>>,
     Json(body): Json<BindBody>,
 ) -> AppResult {
+    crate::person_gate::require_person(&state.db, Some(&ctx), "binding a seat").await?;
     // i538: binding decides which device mints a kiosk token.
     crate::perspective::refuse_mint(perspective.as_ref(), "seat bind")?;
     if !valid_node_name(&seat) {
@@ -1079,6 +1082,7 @@ async fn seat_revoke(
     Path(seat): Path<String>,
     perspective: Option<axum::Extension<crate::perspective::RequesterPerspective>>,
 ) -> AppResult {
+    crate::person_gate::require_person(&state.db, Some(&ctx), "revoking a seat").await?;
     crate::perspective::refuse_mint(perspective.as_ref(), "seat revoke")?;
     if !valid_node_name(&seat) {
         return Err(AppError::BadRequest("invalid seat name".into()));

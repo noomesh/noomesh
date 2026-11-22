@@ -5,7 +5,9 @@ today, which are expected to work, which are not supported yet, and how to
 check a box before spending an enrollment token on it. Versions as of
 2026-10-10: stack v0.2.102, CLI 0.5.89.
 
-## Tested
+## For people
+
+### Tested
 
 These are the combinations the maintainers test on, on current releases.
 
@@ -19,7 +21,7 @@ These are the combinations the maintainers test on, on current releases.
 The tier is derived from the facts a node reports; see
 [../cli/fleet.md](../cli/fleet.md) for the rule and the override.
 
-## Expected to work, not regularly tested
+### Expected to work, not regularly tested
 
 - Ubuntu 22.04 and 24.04 on bare metal.
 - Debian 12 (bookworm) and 13 (trixie).
@@ -32,7 +34,7 @@ The tier is derived from the facts a node reports; see
 - NVIDIA Jetson (unified memory): tier 1 when CUDA is available and at least
   10 GB is usable.
 
-## Not supported yet
+### Not supported yet
 
 - Fedora, RHEL, Rocky and Arch. Prep falls back to Docker's convenience
   script and prints a warning. It may work, but it is not tested.
@@ -43,7 +45,7 @@ The tier is derived from the facts a node reports; see
 - Devices whose only accelerator is an NPU: there is no runtime for one yet.
 - Intel Macs.
 
-## Requirements for every Linux node
+### Requirements for every Linux node
 
 - systemd.
 - A user with sudo.
@@ -57,23 +59,23 @@ The tier is derived from the facts a node reports; see
   restarts unattended will not see them: add an `/etc/fstab` entry and point
   `--data-root` at the mount.
 
-## What fits where
+### What fits where
 
-Advisory. Place with `noo cluster place <node> <backend|harness>
-<model|auto>`; add `--role chat|embed|rerank` to choose the role, and see
-[../cli/fleet.md](../cli/fleet.md) for the rest. A placement that is too big
-for the node is refused.
+Advisory. Three steps: pick a model with `noo models recommended` (it
+suggests models for the cluster's hardware tier, or `--tier <n>`), check it
+with `noo cluster fit <node> --with <backend> <model>`, then place it with
+`noo cluster place <node> <backend> <model>`; add `--role chat|embed|rerank`
+to choose the role, and see [../cli/fleet.md](../cli/fleet.md) for the
+rest. A placement that is too big for the node is refused. Name a model:
+`auto` stands for a model only with the `harness` backend.
 
 | Memory | Place | Example |
 |---|---|---|
-| 16 GB or more of CUDA VRAM | vLLM, a 12B 4-bit chat model | `noo cluster place <node> vllm auto` |
-| 8 to 12 GB VRAM | Ollama, a 12B model | `noo cluster place <node> ollama auto` |
-| 6 GB VRAM or less | Ollama, a 2B to 4B model, or embeddings only | `noo cluster place <node> ollama auto --role embed` |
-| Pi class (4 GB, CPU only) | Embeddings only | `noo cluster place <node> ollama auto --role embed` |
-| Apple unified memory | Ollama, up to roughly three quarters of RAM | `noo cluster place <node> ollama auto` |
-
-`auto` picks a model the node can hold. Name one explicitly if you want a
-particular model.
+| 16 GB or more of CUDA VRAM | vLLM, a 12B 4-bit chat model | `noo cluster place <node> vllm <model>` |
+| 8 to 12 GB VRAM | Ollama, a 12B model | `noo cluster place <node> ollama <model>` |
+| 6 GB VRAM or less | Ollama, a 2B to 4B model, or embeddings only | `noo cluster place <node> ollama <model> --role embed` |
+| Pi class (4 GB, CPU only) | Embeddings only | `noo cluster place <node> ollama <model> --role embed` |
+| Apple unified memory | Ollama, up to roughly three quarters of RAM | `noo cluster place <node> ollama <model>` |
 
 vLLM also needs a GPU of compute capability 7.5 or newer: the pinned image
 (vLLM v0.25.0) is built on CUDA 13.0, which dropped older GPUs such as the
@@ -84,7 +86,16 @@ capability cannot be read (an agent older than 0.6.18, no heartbeat yet, or
 nvidia-smi failed), the place goes ahead with a warning, the verify row
 warns, and onboarding offers vLLM without recommending it.
 
-## Check a machine before you enroll it
+Text Embeddings Inference (TEI: the opt-in `embedding` backend and the
+`RERANK_ENGINE=tei` reranker) runs one image on CPU nodes and another on GPU
+nodes. CPU nodes run `cpu-1.9.4`, which needs no driver. GPU nodes stay on
+the CUDA `1.6` image for now. TEI 1.9.4's CUDA image will need an NVIDIA
+driver that reports CUDA 12.9 or newer (about driver 575 and up): the image
+requires `cuda>=12.9` and exempts no GeForce driver. That floor is
+**inferred from the image, to be confirmed** on a GPU node before GPU TEI
+moves to 1.9.4.
+
+### Check a machine before you enroll it
 
 `noo enroll` runs a preflight before it spends the token. It prints
 `prep-check:` lines, one per check, in the form
@@ -105,7 +116,7 @@ nvidia-smi --query-gpu=name,memory.total --format=csv    # GPU boxes only
 `UBUNTU_CODENAME` is what prep uses to pick Docker's repository for an
 Ubuntu derivative.
 
-## Known issue: Docker from the wrong repository
+### Known issue: Docker from the wrong repository
 
 Fixed in this release for new enrollments. A Pop!_OS box prepped by an older
 CLI may have Docker from Docker's **Debian trixie** repository, because
@@ -131,7 +142,32 @@ sudo apt-get install --only-upgrade docker-ce docker-ce-cli containerd.io
 Check the `grep` output again afterwards. A node that is working does not
 need this.
 
-## Getting a device added to the tested list
+### Getting a device added to the tested list
 
 Open an issue with the `prep-check:` output and your `/etc/os-release`, or
 write to `contact@noomesh.ai`.
+
+## For agents
+
+- **Before an enrollment, read; change nothing:** the machine's
+  `/etc/os-release` (`ID`, `ID_LIKE`, `VERSION_CODENAME`,
+  `UBUNTU_CODENAME`) and, on a GPU box,
+  `nvidia-smi --query-gpu=name,memory.total --format=csv`. A machine in
+  "Not supported yet" is reported, not attempted.
+- **The enroll preflight is the check:** `noo enroll` prints
+  `prep-check: ok|warn|FAIL <what> — <remedy>` lines and a closing
+  `prep-check: platform=… codename=… pkg=…`. A `FAIL` stops before the
+  token is redeemed, so the same paste works once it is fixed; a `warn`
+  stops nothing. `--skip-prep` skips the preflight and host prep: only on
+  the person's word.
+- **Placing:** pick with `noo models recommended`, check with
+  `noo cluster fit <node> --with <backend> <model>`, then
+  `noo cluster place <node> <backend> <model>` (`--role embed` for
+  embeddings only). Always name the model: `auto` is a model only for the
+  `harness` backend, and for any other backend it would place a model
+  literally named "auto". A placement too big for the node is refused.
+  vLLM also needs compute capability 7.5 or newer: a known older GPU is refused (place Ollama or llama.cpp instead),
+  an unknown one goes ahead with a warning.
+- **The Docker-repository fix** in the known issue rewrites apt sources
+  with `sudo` on the node and restarts Docker: the person's, in a
+  maintenance window, and only on a node that shows the wrong base.

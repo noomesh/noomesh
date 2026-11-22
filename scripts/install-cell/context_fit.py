@@ -237,12 +237,56 @@ def parse_log_line(line: str) -> dict | None:
     return out
 
 
+AUTH_FAILED_MSG = "ws_coordinator auth failed"
+ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def auth_failure_reasons(lines: list[str] | None) -> list[str]:
+    """The `error=` reason of every `ws_coordinator auth failed` gateway line:
+    why the socket said "Authentication failed". Tracing JSON (fields.error)
+    or text (`... auth failed error=<reason>`, the reason to the line's end)."""
+    out = []
+    for raw in lines or []:
+        line = ANSI.sub("", raw).strip()
+        if AUTH_FAILED_MSG not in line:
+            continue
+        reason = None
+        if line.startswith("{"):
+            try:
+                obj = json.loads(line)
+            except ValueError:
+                obj = None
+            fields = obj.get("fields") if isinstance(obj, dict) and isinstance(obj.get("fields"), dict) else obj
+            if isinstance(fields, dict) and fields.get("error") is not None:
+                reason = str(fields["error"])
+        else:
+            m = re.search(re.escape(AUTH_FAILED_MSG) + r"\s+error=(.*)$", line)
+            if m:
+                reason = m.group(1).strip().strip('"')
+        out.append(reason or "(no error= field on the line)")
+    return out
+
+
+def with_auth_reason(error: str | None, facts: dict) -> str | None:
+    """A turn error of "Authentication failed" (the socket's own words, which
+    hide why) gets the gateway's reason appended. NOT reclassified: after the
+    ws-ticket expiry fix this must not happen, and if it does it is a finding."""
+    if not error or "Authentication failed" not in error:
+        return error
+    if not facts.get("readable"):
+        return f"{error} [gateway reason: the gateway log could not be read]"
+    why = facts.get("auth_failures") or []
+    if not why:
+        return f"{error} [gateway reason: no `{AUTH_FAILED_MSG}` line in the turn's log window]"
+    return f"{error} [gateway reason: {'; '.join(why)}]"
+
+
 def log_facts(lines: list[str] | None) -> dict:
     """What a turn's gateway log says. `readable` False when the log could
     not be read at all (every other figure is then unknown)."""
     if lines is None:
         return {"readable": False, "request_size": [], "backend_calls": [], "cuts": 0, "too_small": 0,
-                "tiers": [], "has_tier": False, "prefill_s": None}
+                "tiers": [], "has_tier": False, "prefill_s": None, "auth_failures": []}
     ev = [e for e in (parse_log_line(l) for l in lines) if e]
     sizes = [e for e in ev if e["event"] == "request_size"]
     calls = [e for e in ev if e["event"] == "backend_call"]
@@ -252,7 +296,8 @@ def log_facts(lines: list[str] | None) -> dict:
             "cuts": sum(e["event"] == "context_truncated_by_backend" for e in ev),
             "too_small": sum(e["event"] == "context_too_small_for_instructions" for e in ev),
             "tiers": tiers, "has_tier": bool(tiers),
-            "prefill_s": round(sum(prefills) / 1000, 3) if prefills else None}
+            "prefill_s": round(sum(prefills) / 1000, 3) if prefills else None,
+            "auth_failures": auth_failure_reasons(lines)}
 
 
 def pick_contexts(items: list[dict], model: str | None) -> list[dict]:
@@ -697,7 +742,9 @@ def timed_turn(prompt: str, base: str, timeout: float) -> tuple[dict, dict, floa
     chat = chat_turn(prompt, base, timeout)
     t1 = time.time()
     time.sleep(1)  # the turn's last lines reach docker's log
-    return chat, log_facts(gateway_log(t0 - 0.5, t1)), t1 - t0
+    facts = log_facts(gateway_log(t0 - 0.5, t1))
+    chat["error"] = with_auth_reason(chat.get("error"), facts)
+    return chat, facts, t1 - t0
 
 
 def cluster_show(node: str) -> tuple[dict | None, str | None]:

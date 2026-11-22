@@ -27,7 +27,7 @@ pub const USAGE: &[(&[&str], &str, &str)] = &[
         (&["cluster", "proposals"], "[--status <s>] [--limit <n>]", "List the enrollment proposals agents filed, with each host in full"),
         (&["cluster", "show"], "<node>", "Show one node in full: hardware, agent version, tier drift, bus principal, roles"),
         (&["cluster", "forget"], "<node> [--purge-tailscale] [-y|--yes]", "Remove a dead node's row, KV entry and enrollments; --purge-tailscale drops its device"),
-        (&["cluster", "place"], "<node> <backend|harness> <model|auto> [--on cpu|gpu] [--keep-warm|--no-keep-warm] [--env KEY=VALUE]... [--kind noo|claude-code|copilot|codex] [--role chat|embed|rerank] [--port <port>] [--tls] [--image <image>] [--stopped] [--force] [--retune]", "Declare a backend and model in a role on a node, on cpu or gpu; auto-tunes unless --env"),
+        (&["cluster", "place"], "<node> <backend|harness> <model|auto> [--on cpu|gpu] [--keep-warm|--no-keep-warm] [--env KEY=VALUE]... [--kind noo|claude-code|copilot|codex] [--role chat|embed|rerank] [--port <port>] [--tls] [--image <image>] [--stopped] [--force] [--retune]", "Declare a backend and model on a node (cpu or gpu), auto-tuned; model auto: harness only"),
         (&["cluster", "unplace"], "<node> <backend> [--role chat|embed|rerank] [--model <model>]", "Remove a placement, or one embed model; a container keeps running, a harness is stopped"),
         (&["cluster", "fit"], "<node> [--with <backend> <model> [--on cpu|gpu] [--role <role>] [--env KEY=VALUE]...]", "Show whether placements fit a node's GPU memory and RAM, with or without one more"),
         (&["cluster", "class", "list"], "", "Show the model classes consumers may send as `model`, with candidate placement and health"),
@@ -211,7 +211,7 @@ pub const USAGE: &[(&[&str], &str, &str)] = &[
     (&["stack", "status"], "[-w|--watch [<secs>]]", "Show stack container status (from docker ps)"),
     (&["stack", "logs"], "[<service>...] [-f|--follow] [--tail <n>]", "Show container logs for one service or compose logs for many"),
     (&["stack", "restart"], "[--profile <p>] [--force] [<service>...]", "Restart services by status name or add-on key; --force recreates (reloads env, secrets)"),
-    (&["stack", "start"], "[--profile <p>] [--pull] [--build] [--dist] [--dev] [--tag <tag>]", "Start the stack via scripts/noomesh-start.sh"),
+    (&["stack", "start"], "[--profile <p>] [--pull] [--build] [--dist] [--dev] [--tag <tag>] [--recreate]", "Start the stack; recreates only the containers whose inputs changed, --recreate all"),
     (&["stack", "stop"], "[--volumes [-y|--yes]]", "Stop the stack; --volumes deletes the database and every volume, after a typed confirm"),
     (&["stack", "rebuild"], "[<service>...] [-q|--quick] [--no-cache] [--profile <p>] [--gateway-engine <e>] [--node-engine <e>] [-b|--background]", "Rebuild stack images in the foreground, or queue it for noo-hostd with --background"),
     (&["stack", "rebuild-status"], "[--follow]", "Show the latest background stack-rebuild result and log"),
@@ -251,7 +251,7 @@ pub const USAGE: &[(&[&str], &str, &str)] = &[
     (&["models", "switch"], "<model> [--backend <b>] [-y|--yes]", "Switch the active model: rewrites .env/noomesh.yaml, restarts; asks (-y)"),
     (&["models", "refresh"], "[--backend <b>] [--llm]", "Rebuild the model catalog cache from HuggingFace, bypassing the TTL"),
     (&["health"], "", "Probe gateway /health and report per-dependency state; exit 5 if degraded"),
-    (&["inference", "run"], "<prompt> [-m <model>] [-n <node> [--strict-node]] [--raw] [-u <user>] [--max-tokens <n>] [-t <temperature>]", "Run one prompt; --raw skips mesh context (RAG, memory, skills)"),
+    (&["inference", "run"], "<prompt> [-m|--model <model>] [-n|--node <node> [--strict-node]] [--raw] [-u|--user <user>] [--max-tokens <n>] [-t|--temperature <temperature>]", "Run one prompt; --raw skips mesh context (RAG, memory, skills)"),
     (&["db", "status"], "", "Show gateway health and every migration stamp (mesh/trellion/evolve); --json supported"),
     (&["doctor", "docker"], "", "Detect unclean-shutdown docker damage (ghosts, empty names) and print recovery"),
     (&["doctor", "privileges"], "", "Report standing power on this box: sudoers drop-ins, gate binaries, SSH keys"),
@@ -259,7 +259,7 @@ pub const USAGE: &[(&[&str], &str, &str)] = &[
     (&["doctor", "secrets"], "", "Report containers running a secret value that .env has moved past"),
     (&["doctor", "exposure"], "", "Report which published ports are reachable from outside the tailnet"),
     (&["doctor", "strangers"], "[--minutes N]", "Gateway callers the tailnet does not account for, and any caller in a refusal storm"),
-    (&["enroll"], "<noo1.blob> | --url <u> --token <t> | --via-tailnet <u> [--ca-sha256 <hex>] [--ts-authkey <k>] [--node <name>] [--skip-tailscale] [--skip-prep] [--data-root <dir>] [--controller-approvals] [--resume]", "Enroll this machine as a worker of the given controller"),
+    (&["enroll"], "<noo1.blob> | --url <u> --token <t> | --via-tailnet <u> [--ca-sha256 <hex>] [--ts-authkey <k>] [--node <name>] [--skip-tailscale] [--skip-prep] [--data-root <dir>] [--controller-approvals] [--root-ok] [--resume]", "Enroll this machine as a worker of the given controller"),
     (&["db", "verify-plane"], "[<db>]", "Run scripts/verify-privilege-plane.sh against a database (default noo)"),
     (&["db", "current"], "", "Show the migration stamp of each system (mesh runner, trellion alembic, evolve)"),
     (&["db", "history"], "", "List the mesh runner's ported chain with applied/pending markers, plus other stamps"),
@@ -472,6 +472,22 @@ pub fn is_command(words: &[&str]) -> bool {
 }
 
 /// (syntax, description) for exactly these command words.
+/// Syntax for the dev-checkout pytest runners (main.rs `HIDDEN_NO_USAGE`):
+/// shown by their own `--help` and usage error only. Kept out of [`USAGE`]
+/// so customer help, completion and the generated CLI docs never list
+/// commands that fail on a shipped install. Every flag here is `noo`'s own;
+/// neither command passes other arguments through to pytest.
+pub const DEV_USAGE: &[(&[&str], &str, &str)] = &[
+    (&["test", "run"], "[-x|--failfast | --no-failfast] [-k <pattern>] [--integration]", "In a dev checkout: run the repo's pytest suite; --integration adds tests/integration"),
+    (&["test", "coverage"], "[--html]", "In a dev checkout: run pytest with coverage; --html also writes an HTML report"),
+];
+
+/// [`lookup`], then [`DEV_USAGE`]: what a command's own `--help` and usage
+/// error show.
+pub fn help_lookup(words: &[&str]) -> Option<(&'static str, &'static str)> {
+    lookup(words).or_else(|| DEV_USAGE.iter().find(|(w, _, _)| *w == words).map(|(_, s, d)| (*s, *d)))
+}
+
 pub fn lookup(words: &[&str]) -> Option<(&'static str, &'static str)> {
     USAGE
         .iter()
@@ -537,7 +553,7 @@ mod tests {
             assert!(!line.contains("break-glass") && !line.contains("BREAK_GLASS"), "{line}");
         }
         let main = include_str!("main.rs");
-        let banner = main.split("ui::muted(\"Globals:").nth(1).expect("the globals banner").split('\n').next().unwrap();
+        let banner = main.split("\"Globals:").nth(1).expect("the globals banner").split('\n').next().unwrap();
         assert!(!banner.contains("break-glass"), "{banner}");
     }
 

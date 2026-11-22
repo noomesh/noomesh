@@ -3808,7 +3808,10 @@ async fn action_write_log(
 /// `startup_tasks::stage_pki` copies the `/app/pki` mount to `/tmp/pki`
 /// (and fixes modes); `/app/pki` is the mount itself. Same order as
 /// `routes/admin.rs::security_pki_status` and `certs_expiring_within`.
-const STAGED_PKI_DIRS: [&str; 2] = ["/tmp/pki", "/app/pki"];
+/// The staged copy is frozen at start, so its `nodes/` and `services/` are
+/// never read: the scans take those from the live mount
+/// (`tls::PkiMount::public_root`).
+const STAGED_PKI_DIRS: [&str; 2] = [crate::tls::STAGED_PKI_DIR, crate::tls::LIVE_PKI_MOUNT];
 
 /// Candidate PKI directories, in preference order: `NOO_PKI_DIR`, then the
 /// staged container paths. `NOO_PKI_DIR` is kept first because it is right
@@ -3869,16 +3872,21 @@ fn cert_lines(certs: &[crate::cert_expiry::CertInfo]) -> Vec<String> {
 }
 
 async fn action_cert_rotation_check(config: &Value) -> Result<String, String> {
-    cert_rotation_check_in(config, &pki_dir_candidates()).await
+    cert_rotation_check_in(config, &pki_dir_candidates(), crate::tls::PkiMount::container()).await
 }
 
-async fn cert_rotation_check_in(config: &Value, candidates: &[String]) -> Result<String, String> {
+async fn cert_rotation_check_in(
+    config: &Value,
+    candidates: &[String],
+    mount: crate::tls::PkiMount<'_>,
+) -> Result<String, String> {
     let Some(pki_dir) = resolve_pki_dir_in(config, candidates) else {
         return Err(no_pki_dir_error("Cert rotation check", candidates));
     };
     let warn = warn_days(config);
     let now = jiff::Timestamp::now().as_second();
     let dir = std::path::Path::new(&pki_dir);
+    let public = mount.public_root(dir);
 
     // A configured PKI dir that holds no readable certificate is a BROKEN
     // check, not a clean bill of health. Python reported "all certificates
@@ -3887,7 +3895,7 @@ async fn cert_rotation_check_in(config: &Value, candidates: &[String]) -> Result
     // permissions change all produced a daily all-clear while nothing was
     // being monitored. The failure mode of expiry monitoring is silence, so
     // silence must not be the success message.
-    let found = crate::cert_expiry::find_certs(dir);
+    let found = crate::cert_expiry::find_certs_in(dir, &public);
     if found.is_empty() {
         return Err(format!(
             "Cert rotation check: no certificates found under {pki_dir} — the \
@@ -3896,7 +3904,7 @@ async fn cert_rotation_check_in(config: &Value, candidates: &[String]) -> Result
         ));
     }
 
-    let expiring = crate::cert_expiry::expiring_certs(dir, warn, now);
+    let expiring = crate::cert_expiry::expiring_certs_in(dir, &public, warn, now);
 
     if expiring.is_empty() {
         return Ok(format!(
@@ -3924,32 +3932,48 @@ fn is_rotatable_leaf(c: &crate::cert_expiry::CertInfo) -> bool {
 }
 
 async fn action_cert_auto_rotate(config: &Value) -> Result<String, String> {
-    cert_auto_rotate_in(config, &pki_dir_candidates()).await
+    cert_auto_rotate_in(config, &pki_dir_candidates(), crate::tls::PkiMount::container()).await
 }
 
-async fn cert_auto_rotate_in(config: &Value, candidates: &[String]) -> Result<String, String> {
-    let Some(pki_dir) = resolve_pki_dir_in(config, candidates) else {
-        return Err(no_pki_dir_error("Cert auto-rotate", candidates));
-    };
-    let warn = warn_days(config);
-    let now = jiff::Timestamp::now().as_second();
-
+/// The auto-rotate pre-scan: the leaf certificates expiring within `warn`
+/// days. Read-only, so a host-side run is not queued for nothing. The
+/// selection rule is unchanged; only where `nodes/`/`services/` are listed
+/// from moved to the live mount (`PkiMount::public_root`).
+fn auto_rotate_leaves(
+    pki_dir: &str,
+    mount: crate::tls::PkiMount<'_>,
+    warn: i64,
+    now: i64,
+) -> Result<Vec<crate::cert_expiry::CertInfo>, String> {
     // Same reasoning as cert_rotation_check: a configured directory holding
     // no readable certificate means the pre-scan saw nothing, which must not
     // be reported as "nothing needs rotating". Otherwise a wrong path silently
     // disables auto-rotation until certificates actually expire.
-    let dir = std::path::Path::new(&pki_dir);
-    if crate::cert_expiry::find_certs(dir).is_empty() {
+    let dir = std::path::Path::new(pki_dir);
+    let public_root = mount.public_root(dir);
+    if crate::cert_expiry::find_certs_in(dir, &public_root).is_empty() {
         return Err(format!(
             "Cert auto-rotate: no certificates found under {pki_dir} — the \
              directory is missing, empty, or unreadable by the gateway. The \
              pre-scan checked nothing; this is NOT an all-clear."
         ));
     }
+    let expiring = crate::cert_expiry::expiring_certs_in(dir, &public_root, warn, now);
+    Ok(expiring.into_iter().filter(is_rotatable_leaf).collect())
+}
 
-    // Read-only pre-scan so a host-side run is not queued for nothing.
-    let expiring = crate::cert_expiry::expiring_certs(dir, warn, now);
-    let leaves: Vec<_> = expiring.into_iter().filter(is_rotatable_leaf).collect();
+async fn cert_auto_rotate_in(
+    config: &Value,
+    candidates: &[String],
+    mount: crate::tls::PkiMount<'_>,
+) -> Result<String, String> {
+    let Some(pki_dir) = resolve_pki_dir_in(config, candidates) else {
+        return Err(no_pki_dir_error("Cert auto-rotate", candidates));
+    };
+    let warn = warn_days(config);
+    let now = jiff::Timestamp::now().as_second();
+
+    let leaves = auto_rotate_leaves(&pki_dir, mount, warn, now)?;
     if leaves.is_empty() {
         return Ok(format!(
             "Cert auto-rotate: no leaf certificates expiring within {warn} days."
@@ -4131,11 +4155,11 @@ mod cert_action_tests {
             resolve_pki_dir_in(&json!({}), &cands).as_deref(),
             Some(staged.to_str().unwrap())
         );
-        let out = cert_rotation_check_in(&json!({}), &cands)
+        let out = cert_rotation_check_in(&json!({}), &cands, crate::tls::PkiMount::container())
             .await
             .expect("staged PKI must be checked");
         assert!(out.contains("2 certificate(s) checked"), "got: {out}");
-        let out = cert_auto_rotate_in(&json!({}), &cands)
+        let out = cert_auto_rotate_in(&json!({}), &cands, crate::tls::PkiMount::container())
             .await
             .expect("staged PKI must be pre-scanned");
         assert!(out.contains("no leaf certificates expiring"), "got: {out}");
@@ -4151,14 +4175,35 @@ mod cert_action_tests {
             "/home/nobody/.noo/pki-that-does-not-exist".to_string(),
             "/definitely/not/staged/pki".to_string(),
         ];
-        let err = cert_rotation_check_in(&json!({}), &cands)
+        let err = cert_rotation_check_in(&json!({}), &cands, crate::tls::PkiMount::container())
             .await
             .expect_err("no PKI anywhere must fail");
         assert!(err.contains("no certificates found") && err.contains("NOT an all-clear"), "got: {err}");
-        let err = cert_auto_rotate_in(&json!({}), &cands)
+        let err = cert_auto_rotate_in(&json!({}), &cands, crate::tls::PkiMount::container())
             .await
             .expect_err("no PKI anywhere must fail");
         assert!(err.contains("no certificates found"), "got: {err}");
+    }
+
+    // i1118: a node enrolled after the gateway started (its cert is in the
+    // live mount only) is checked by cert_rotation_check and selected by the
+    // cert_auto_rotate pre-scan, through the staged dir the container
+    // resolves to.
+    #[tokio::test]
+    async fn a_node_enrolled_after_start_is_checked_and_selected_for_rotation() {
+        let pki = crate::cert_expiry::test_pki::started("hb", 3650);
+        pki.enrol_late("late", 5);
+        let cands = vec![pki.staged.to_string_lossy().into_owned()];
+        let out = cert_rotation_check_in(&json!({}), &cands, pki.mount())
+            .await
+            .expect("the staged PKI is checked");
+        assert!(out.contains("1 certificate(s) expiring within 30 days"), "got: {out}");
+        assert!(out.contains("nodes/late/node.crt"), "got: {out}");
+        let now = jiff::Timestamp::now().as_second();
+        let leaves = auto_rotate_leaves(&cands[0], pki.mount(), 30, now).expect("pre-scan");
+        let names: Vec<&str> = leaves.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["nodes/late/node.crt"]);
+        assert_eq!(leaves[0].role, "node");
     }
 
     #[test]

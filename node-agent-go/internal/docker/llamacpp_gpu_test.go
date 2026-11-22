@@ -25,7 +25,7 @@ func poseGPUFacts(t *testing.T, f GPUFacts) {
 	})
 }
 
-var usablePascal = GPUFacts{NvidiaGPU: true, NvidiaRuntime: true, MinComputeCap: "6.1"}
+var usablePascal = GPUFacts{NvidiaGPU: true, NvidiaRuntime: true, NvidiaRuntimeRead: true, MinComputeCap: "6.1"}
 
 func llamacppStart(t *testing.T, target string) (backendImageChoice, string, []string) {
 	t.Helper()
@@ -83,7 +83,7 @@ func TestLlamacppOnAUsableGPUNodeRunsTheCUDAImageWithTheDeviceAndEveryLayer(t *t
 func TestLlamacppBelowTheMinComputeCapRunsTheCPUImageAsCPU(t *testing.T) {
 	pinRelease(t)
 	for _, cc := range []string{"5.2", "6.0", ""} {
-		poseGPUFacts(t, GPUFacts{NvidiaGPU: true, NvidiaRuntime: true, MinComputeCap: cc})
+		poseGPUFacts(t, GPUFacts{NvidiaGPU: true, NvidiaRuntime: true, NvidiaRuntimeRead: true, MinComputeCap: cc})
 		ch, reserve, env := llamacppStart(t, "gpu")
 		if ch.Ref != "ghcr.io/noomesh/llamacpp:v0.6.15" {
 			t.Fatalf("compute %q: image %q, want the CPU build", cc, ch.Ref)
@@ -101,7 +101,7 @@ func TestLlamacppBelowTheMinComputeCapRunsTheCPUImageAsCPU(t *testing.T) {
 // the CPU image, as cpu.
 func TestLlamacppWithoutTheNvidiaRuntimeRunsTheCPUImageAsCPU(t *testing.T) {
 	pinRelease(t)
-	poseGPUFacts(t, GPUFacts{NvidiaGPU: true, NvidiaRuntime: false, MinComputeCap: "8.6"})
+	poseGPUFacts(t, GPUFacts{NvidiaGPU: true, NvidiaRuntime: false, NvidiaRuntimeRead: true, MinComputeCap: "8.6"})
 	ch, reserve, env := llamacppStart(t, "gpu")
 	if ch.Ref != "ghcr.io/noomesh/llamacpp:v0.6.15" || reserve != "0" || !hasKV(env, "N_GPU_LAYERS=0") {
 		t.Fatalf("no runtime: image %q reserve %q env %v, want the CPU build as cpu", ch.Ref, reserve, env)

@@ -237,13 +237,13 @@ pub(crate) fn at_rest_check(state: &AtRest) -> Check {
             verdict: Verdict::Ok,
             detail: "every secret is in secrets/env.sops; .env holds no secret-class value".into(),
             remedy: None,
-        },
+        }.checked(),
         Some(why) => Check {
             name: "secrets at rest",
             verdict: Verdict::Fail,
             detail: why,
             remedy: Some(state.remedy().into()),
-        },
+        }.checked(),
     }
 }
 

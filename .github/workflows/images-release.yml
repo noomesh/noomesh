@@ -106,7 +106,20 @@ jobs:
       # The infra images (JSON list: scripts/infra-staged.py DAILY, as the
       # plan reads it). One the images leg BUILDS is scanned and gated there.
       infra: ${{ steps.plan.outputs.infra }}
+    env:
+      RAW_TAG: ${{ github.event.inputs.tag || github.ref_name }}   # validated by the job's first step
     steps:
+      # FIRST, before anything else touches it: the tag (the free-text
+      # dispatch input `tag`, or the pushed tag's name) is a stack release
+      # tag, or nothing in this job runs. It reaches a shell only as
+      # "$RAW_TAG" (tests/test_dispatch_inputs_never_reach_a_shell_raw.py).
+      - name: Validate dispatch inputs
+        shell: bash
+        run: |
+          export LC_ALL=C
+          re='^(stack-)?v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$'
+          [[ $RAW_TAG =~ $re ]] || {
+            printf '::error::tag %q refused: must be exactly vX.Y.Z or stack-vX.Y.Z with an optional -rc.N\n' "$RAW_TAG"; exit 1; }
       - name: Checkout (full history)   # actions/checkout@v7.0.1
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -115,7 +128,7 @@ jobs:
         id: line
         run: |
           set -eu
-          raw="${{ github.event.inputs.tag || github.ref_name }}"
+          raw="$RAW_TAG"
           tag="stack-${raw#stack-}"
           case "$tag" in
             *-rc.*) line=staging ;;
@@ -133,18 +146,19 @@ jobs:
           echo "sibling_ref=$line" >> "$GITHUB_OUTPUT"
           echo "$tag (${commit:0:8}) is on origin/$line; siblings build from their $line"
 
-      # harrier is the default embedder and ships as an OCI model artifact
-      # (<namespace>/harrier:v1), versioned independently of the stack
-      # tag, so it is in no matrix and no lock row: `noo onboard` and `noo
-      # migrate import` pull it by the fixed :v1 tag. It is published by
-      # publish-harrier.yml, once. A release that cannot be installed
-      # (rc.3: `denied`, no embedder, RAG down) must not start, so ask for
-      # it the way a fresh host does: anonymously, before any login.
-      - name: The harrier embedder artifact is published and public
+      # harrier is the default embedder and ships as an OCI model artifact,
+      # published once by publish-harrier.yml under its own tag. The release
+      # pins it BY DIGEST (scripts/harrier-artifact.json; the lock job writes
+      # the `harrier@sha256:` row), and every install pulls that digest, never
+      # the mutable :v1. A release whose pinned artifact cannot be installed
+      # (rc.3: `denied`, no embedder, RAG down) must not start, so ask for it
+      # the way a fresh host does: anonymously, before any login, by digest.
+      - name: The pinned harrier embedder artifact is published and public
         run: |
           set -eu
-          if ! docker manifest inspect "${REGISTRY}/${OWNER}/harrier:v1" >/dev/null 2>&1; then
-            echo "::error::${REGISTRY}/${OWNER}/harrier:v1 is not pullable anonymously (absent, or the package is private). Run the 'publish harrier artifact' workflow once (after uploading the models-harrier-v1 release assets), then set the package public, then re-run this release."
+          ref="$(python3 scripts/harrier-artifact-pin.py ref --registry "$REGISTRY" --owner "$OWNER")"
+          if ! docker manifest inspect "$ref" >/dev/null 2>&1; then
+            echo "::error::$ref (the digest scripts/harrier-artifact.json pins) is not pullable anonymously (absent, or the package is private). Publish it with the 'publish harrier artifact' workflow and set the package public, or fix the pinned digest; then re-run this release."
             exit 1
           fi
 
@@ -196,7 +210,7 @@ jobs:
           RELEASE_RETAG: ${{ vars.RELEASE_RETAG }}
         run: |
           set -eu
-          raw="${{ github.event.inputs.tag || github.ref_name }}"
+          raw="$RAW_TAG"
           tag="stack-${raw#stack-}"
           python3 -c 'import yaml' 2>/dev/null || python3 -m pip install --user pyyaml
           python3 scripts/release-retag-plan.py --tag "$tag" \
@@ -243,10 +257,22 @@ jobs:
     if: github.repository == 'noomesh/noomesh' && github.event.inputs.dry_run != 'true'
     runs-on: ubuntu-latest
     env:
+      RAW_TAG: ${{ github.event.inputs.tag || github.ref_name }}   # validated by the job's first step
       RETAG: ${{ fromJSON(needs.release-line.outputs.retag)['deps-core'] }}
       RC_TAG: ${{ needs.release-line.outputs.rc_image_tag }}
       RC_DIGEST: ${{ fromJSON(needs.release-line.outputs.rc_digests)['deps-core'] }}   # from the rc's stack-<rc>.bases; empty for an rc cut before it existed
     steps:
+      # FIRST, before anything else touches it: the tag (the free-text
+      # dispatch input `tag`, or the pushed tag's name) is a stack release
+      # tag, or nothing in this job runs. It reaches a shell only as
+      # "$RAW_TAG" (tests/test_dispatch_inputs_never_reach_a_shell_raw.py).
+      - name: Validate dispatch inputs
+        shell: bash
+        run: |
+          export LC_ALL=C
+          re='^(stack-)?v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$'
+          [[ $RAW_TAG =~ $re ]] || {
+            printf '::error::tag %q refused: must be exactly vX.Y.Z or stack-vX.Y.Z with an optional -rc.N\n' "$RAW_TAG"; exit 1; }
       - name: Checkout   # actions/checkout@v7.0.1
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -292,7 +318,7 @@ jobs:
           # launcher strips, so it looked for `:v0.2.25` and found nothing.
           # An input that is wrong only for the value a human would naturally
           # pass is worse than one that is always wrong.
-          raw="${{ github.event.inputs.tag || github.ref_name }}"
+          raw="$RAW_TAG"
           echo "TAG=${raw#stack-}" >> "$GITHUB_ENV"
           # A release candidate never moves `:latest` (promotion model).
           case "${raw#stack-}" in *-rc.*) ;; *) echo "PUSH_LATEST=1" >> "$GITHUB_ENV" ;; esac
@@ -364,10 +390,22 @@ jobs:
     if: github.repository == 'noomesh/noomesh'
     runs-on: ubuntu-latest
     env:
+      RAW_TAG: ${{ github.event.inputs.tag || github.ref_name }}   # validated by the job's first step
       RETAG: ${{ fromJSON(needs.release-line.outputs.retag)['deps-base'] }}
       RC_TAG: ${{ needs.release-line.outputs.rc_image_tag }}
       RC_DIGEST: ${{ fromJSON(needs.release-line.outputs.rc_digests)['deps-base'] }}   # from the rc's stack-<rc>.bases; empty for an rc cut before it existed
     steps:
+      # FIRST, before anything else touches it: the tag (the free-text
+      # dispatch input `tag`, or the pushed tag's name) is a stack release
+      # tag, or nothing in this job runs. It reaches a shell only as
+      # "$RAW_TAG" (tests/test_dispatch_inputs_never_reach_a_shell_raw.py).
+      - name: Validate dispatch inputs
+        shell: bash
+        run: |
+          export LC_ALL=C
+          re='^(stack-)?v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$'
+          [[ $RAW_TAG =~ $re ]] || {
+            printf '::error::tag %q refused: must be exactly vX.Y.Z or stack-vX.Y.Z with an optional -rc.N\n' "$RAW_TAG"; exit 1; }
       - name: Checkout   # actions/checkout@v7.0.1
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -481,7 +519,7 @@ jobs:
           # launcher strips, so it looked for `:v0.2.25` and found nothing.
           # An input that is wrong only for the value a human would naturally
           # pass is worse than one that is always wrong.
-          raw="${{ github.event.inputs.tag || github.ref_name }}"
+          raw="$RAW_TAG"
           echo "TAG=${raw#stack-}" >> "$GITHUB_ENV"
           # A release candidate never moves `:latest` (promotion model).
           case "${raw#stack-}" in *-rc.*) ;; *) echo "PUSH_LATEST=1" >> "$GITHUB_ENV" ;; esac
@@ -558,6 +596,7 @@ jobs:
     if: github.repository == 'noomesh/noomesh'
     runs-on: ubuntu-latest
     env:
+      RAW_TAG: ${{ github.event.inputs.tag || github.ref_name }}   # validated by the job's first step
       RETAG: ${{ fromJSON(needs.release-line.outputs.retag)[matrix.image] }}
       # the rc's image tag, or `@sha256:…` for a staged infra image (i567)
       RC_TAG: ${{ fromJSON(needs.release-line.outputs.source_tags)[matrix.image] }}
@@ -617,7 +656,7 @@ jobs:
             dockerfile: docker/Dockerfile.node-agent-go
             context: .
             platforms: linux/amd64,linux/arm64
-            extra_args: --build-arg NODE_AGENT_VERSION=${{ github.ref_name }} --build-arg NODE_AGENT_COMMIT=${{ github.sha }}
+            extra_args: --build-arg NODE_AGENT_VERSION=stack-$TAG --build-arg NODE_AGENT_COMMIT=${{ github.sha }}
           # ── Remaining controller-profile first-party images ──────────────
           # Published so `pai stack start --dist` is a genuine pull-only
           # install (no local build). All amd64: the controller is x86.
@@ -763,6 +802,17 @@ jobs:
             platforms: linux/amd64
             extra_args: ""
     steps:
+      # FIRST, before anything else touches it: the tag (the free-text
+      # dispatch input `tag`, or the pushed tag's name) is a stack release
+      # tag, or nothing in this job runs. It reaches a shell only as
+      # "$RAW_TAG" (tests/test_dispatch_inputs_never_reach_a_shell_raw.py).
+      - name: Validate dispatch inputs
+        shell: bash
+        run: |
+          export LC_ALL=C
+          re='^(stack-)?v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$'
+          [[ $RAW_TAG =~ $re ]] || {
+            printf '::error::tag %q refused: must be exactly vX.Y.Z or stack-vX.Y.Z with an optional -rc.N\n' "$RAW_TAG"; exit 1; }
       - name: Checkout   # actions/checkout@v7.0.1
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -814,7 +864,7 @@ jobs:
           # launcher strips, so it looked for `:v0.2.25` and found nothing.
           # An input that is wrong only for the value a human would naturally
           # pass is worse than one that is always wrong.
-          raw="${{ github.event.inputs.tag || github.ref_name }}"
+          raw="$RAW_TAG"
           echo "TAG=${raw#stack-}" >> "$GITHUB_ENV"
           # A release candidate never moves `:latest` (promotion model).
           case "${raw#stack-}" in *-rc.*) ;; *) echo "PUSH_LATEST=1" >> "$GITHUB_ENV" ;; esac
@@ -981,7 +1031,20 @@ jobs:
     permissions:
       contents: write
       packages: read
+    env:
+      RAW_TAG: ${{ github.event.inputs.tag || github.ref_name }}   # validated by the job's first step
     steps:
+      # FIRST, before anything else touches it: the tag (the free-text
+      # dispatch input `tag`, or the pushed tag's name) is a stack release
+      # tag, or nothing in this job runs. It reaches a shell only as
+      # "$RAW_TAG" (tests/test_dispatch_inputs_never_reach_a_shell_raw.py).
+      - name: Validate dispatch inputs
+        shell: bash
+        run: |
+          export LC_ALL=C
+          re='^(stack-)?v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$'
+          [[ $RAW_TAG =~ $re ]] || {
+            printf '::error::tag %q refused: must be exactly vX.Y.Z or stack-vX.Y.Z with an optional -rc.N\n' "$RAW_TAG"; exit 1; }
       - name: Resolve tag
         run: |
           set -eu
@@ -994,7 +1057,7 @@ jobs:
           # launcher strips, so it looked for `:v0.2.25` and found nothing.
           # An input that is wrong only for the value a human would naturally
           # pass is worse than one that is always wrong.
-          raw="${{ github.event.inputs.tag || github.ref_name }}"
+          raw="$RAW_TAG"
           echo "TAG=${raw#stack-}" >> "$GITHUB_ENV"
           # A release candidate never moves `:latest` (promotion model).
           case "${raw#stack-}" in *-rc.*) ;; *) echo "PUSH_LATEST=1" >> "$GITHUB_ENV" ;; esac
@@ -1077,10 +1140,28 @@ jobs:
               print(row)
           PY
 
+      # The harrier embedder artifact, by the digest the repo pins
+      # (scripts/harrier-artifact.json), NEVER a tag resolved now: the
+      # script pulls that digest anonymously, checks every file against the
+      # image's harrier.sha256 and that file against the pinned GGUF sha,
+      # and writes `harrier@sha256:...` plus `# harrier-gguf-sha256 <hex>`
+      # (the GGUF a node's harrier model layer must equal; `noo cluster
+      # verify`) into digests/. The CLI never stages or runs the row
+      # (image_stage.rs ARTIFACT_LOCK_ROWS); onboard, `noo models pull
+      # harrier`, the roll's embedder ensure and `noo cluster import-model`
+      # pull exactly it. Before any login in this job; no seed in this step.
+      - name: Pin the harrier embedder artifact by its repo digest
+        run: |
+          set -eu
+          python3 scripts/harrier-artifact-pin.py rows --registry "$REGISTRY" --owner "$OWNER" --out digests
+
       # Third-party images the stack runs straight from their upstream
       # registry by a FIXED compose tag (ollama, nats, nginx, redis, loki,
       # prometheus, alertmanager, grafana, node-exporter, TEI, vLLM; the DHI
-      # ones resolve from the ghcr.io/noomesh/dhi mirror). Their index digest is
+      # ones resolve from the ghcr.io/noomesh/dhi mirror, nats and nginx from
+      # our ghcr.io/noomesh copies of the official images, each of which must
+      # equal the digest its mirror-images.yml lane copied and be pullable
+      # anonymously). Their index digest is
       # resolved from that tag NOW and becomes an ordinary `<name>@sha256:`
       # row, so `noo upgrade --stack` pulls them by digest and skips them when
       # unchanged (2026-10-15: `ollama/ollama:latest` re-pulled 91.6 s on

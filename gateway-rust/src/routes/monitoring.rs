@@ -159,7 +159,7 @@ fn sso_key_path() -> std::path::PathBuf {
     }
     let roots: Vec<String> = crate::tls::pki_dir().map(|p| p.to_string_lossy().into_owned())
         .into_iter()
-        .chain(["/tmp/pki".to_string(), "/app/pki".to_string()])
+        .chain([crate::tls::STAGED_PKI_DIR.to_string(), crate::tls::LIVE_PKI_MOUNT.to_string()])
         .collect();
     roots
         .iter()

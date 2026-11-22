@@ -179,6 +179,7 @@ var heartbeatSections = []payloadSection{
 	secLanes,
 	secGPUContention,
 	secModelSets,
+	secImageStore,
 	secOllamaVerify,
 	secNodeLocal,
 	secBackendCaps,
@@ -213,11 +214,30 @@ var (
 		}
 	}}
 
+	secImageStore = payloadSection{name: "imageStore", add: func(r *Reporter, p map[string]any) {
+		// i1036: the least free bytes over Docker's data root, containerd's
+		// root and the agent's staging dir, so the controller's GPU llama.cpp
+		// placement check measures where the CUDA image would land. OMITTED
+		// when unknown, never 0; 0 is a full disk.
+		if free, ok := r.imageStoreFreeBytes(); ok {
+			p["image_store_free_bytes"] = free
+		}
+		// i1036: {ref: held} for the release's own backend images, so the
+		// check knows whether the CUDA image is a pull. OMITTED when Docker
+		// could not answer for any of them; a ref it could not judge is left
+		// out, never sent as false.
+		if held := r.heldImagesReport(); len(held) > 0 {
+			p["held_images"] = held
+		}
+	}}
+
 	secOllamaVerify = payloadSection{name: "ollamaVerify", add: func(r *Reporter, p map[string]any) {
 		// Each placed Ollama model checked against the controller's store
 		// (reconcile/ollama_verify.go): state, anchor and the model layer's
-		// digest, so the controller sees every node's weight digest. OMITTED
-		// until a check has run: an empty list would claim "none placed".
+		// digest, so the controller sees every node's weight digest. Every
+		// model the node holds is a row, a "pending" one until its check has
+		// run (i1067). OMITTED while nothing is listed: an empty list would
+		// claim "none placed".
 		if ov := r.ollamaVerifyReport(); ov != nil {
 			p["ollama_verify"] = ov
 		}

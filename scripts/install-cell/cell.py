@@ -34,6 +34,10 @@ from pathlib import Path
 MASK = "[REDACTED]"
 
 # Shapes, most specific first. Each is replaced, never the whole line.
+# ONE list for both sides: redact_line masks every shape here and
+# secret_hits detects exactly these, so whatever the scan can see the
+# redactor has already masked (tests: redact(x) passes the scan for every
+# shape of a corpus).
 SECRET_SHAPES = [
     # PEM blocks are handled line by line below (BEGIN ... END).
     re.compile(r"noo1\.[A-Za-z0-9_\-.=]+"),                                   # join / bootstrap blobs
@@ -101,9 +105,14 @@ def secret_hits(text: str) -> list[str]:
         for rx in SECRET_SHAPES[:3]:
             if rx.search(probe):
                 hits.append(f"{i}: {rx.pattern[:24]}")
-        m = SECRET_SHAPES[3].search(probe)
-        if m and m.group(3) != MASK:
-            hits.append(f"{i}: {m.group(1).strip()} value")
+        # key=value on the line WITH its masks, every pair: a stripped mask
+        # joined `node.key=[REDACTED] agent-env` into `node.key= agent-env`,
+        # and the next item read as the key's value (0.6.27 -> rc.1 upgrade
+        # cell, run 44709015537: the applier's `node.key=unchanged`, masked,
+        # withheld the artifact). A pair whose value is the mask is redacted.
+        for m in SECRET_SHAPES[3].finditer(line):
+            if m.group(3) != MASK:
+                hits.append(f"{i}: {m.group(1).strip()} value")
         for b in LONG_B64.findall(probe):
             if looks_random(b):
                 hits.append(f"{i}: long base64 run")
@@ -214,6 +223,11 @@ def summarize(d: Path) -> dict:
     # not the product's time, so they are reported apart (general, rc.1 run
     # 43642041751: 2,792 s on the wall, 327 s without the 2,465 s of probes).
     first_answer, probe_wait = first_answer_times(steps, meta.get("first_answer_s"))
+    # verify-ratchet's NOT JUDGED lines (ratchet.py: a default chat FAIL after
+    # a registry outage at onboard); the run summary counts the cells.
+    rlog = d / "logs" / "verify-ratchet.log"
+    not_judged = ([l.strip() for l in rlog.read_text(errors="replace").splitlines()
+                   if l.startswith("RATCHET NOT JUDGED:")] if rlog.exists() else None)
     out = {**meta, "first_answer_s": first_answer, "first_answer_wall_s": meta.get("first_answer_s"),
            "probe_wait_before_first_answer_s": probe_wait,
            "result": ("not run" if meta.get("not_run") or not steps
@@ -224,7 +238,8 @@ def summarize(d: Path) -> dict:
            "verify": None if verify is None else ("green" if verify["rc"] == 0 else verify["first_error"]),
            "probes": {s["step"]: ("pass" if s["rc"] == 0 else s["first_error"]) for s in probes},
            "warning_count": len(warnings), "warnings": warnings[:40],
-           "prompt_count": len(prompts), "prompts": prompts[:60]}
+           "prompt_count": len(prompts), "prompts": prompts[:60],
+           "ratchet_not_judged": not_judged}
     md = [f"### {meta.get('cell', '?')}: {out['result'].upper()}"
           + (f" at `{out['failed_step']}`" if failed else ""),
           f"runner `{meta.get('runner', '?')}` · installed `{meta.get('installed_version', '?')}` · "
@@ -236,10 +251,13 @@ def summarize(d: Path) -> dict:
     if failed:
         md += ["", f"**First error** ({failed['step']}): `{failed['first_error']}`"]
     if verify is not None and verify["rc"] != 0:
-        md += ["", f"**cluster verify is RED** (recorded, not fatal): `{verify['first_error']}`"]
+        md += ["", f"**cluster verify is RED** (this step is recorded, not fatal; its FAIL rows are judged by "
+               f"verify-ratchet): `{verify['first_error']}`"]
     for s in probes:
         md += ["", f"**Probe `{s['step']}`: {'PASS' if s['rc'] == 0 else 'FAIL'}**"
                + ("" if s["rc"] == 0 else f" `{s['first_error']}`")]
+    for line in not_judged or []:
+        md += ["", f"**{line}**"]
     md += ["", f"**Warnings a stranger sees: {len(warnings)}**"] + [f"- `{w}`" for w in warnings[:20]]
     md += ["", f"**Prompts: {len(prompts)}**"] + [f"- `{p}`" for p in prompts[:20]]
     if meta.get("limits"):

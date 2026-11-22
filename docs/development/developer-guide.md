@@ -502,3 +502,5 @@ change identically, or the parity tests fail.
   [reference/config.md](../reference/config.md#where-does-a-value-go).
 - **Public docs:** current behaviour a contributor can act on goes in
   `docs/`; `internal/` never ships and must not be cited from `docs/`.
+- **What a review asks of every change** (least privilege, secure by
+  default, fast, clear; cited as P1–P8): [principles.md](principles.md).

@@ -272,7 +272,7 @@ pub(crate) fn judge(check: Check, readiness_miss: bool, container: &str, state: 
                 check.detail, st.restart_count, st.exit_code, check.name),
             remedy: None,
             ..check
-        };
+        }.checked();
     }
     let warming = st.running && matches!(health, None | Some("starting"));
     if warming && up < window {
@@ -283,7 +283,7 @@ pub(crate) fn judge(check: Check, readiness_miss: bool, container: &str, state: 
             detail: format!("starting ({phase}{up}s since start{hs}; {container} gets {window}s) — re-run in a minute, or `noo cluster verify --wait`"),
             remedy: None,
             ..check
-        };
+        }.checked();
     }
     let why = if !st.running {
         format!("{container} is not running")
@@ -353,7 +353,7 @@ pub(crate) fn judge_node_doors(check: Check, warm: &[String], n: &Value, now_uni
                 starting.join(", "), check.detail),
             remedy: None,
             ..check
-        };
+        }.checked();
     }
     Check { detail: format!("{} — {}", check.detail, why.join("; ")), ..check }
 }

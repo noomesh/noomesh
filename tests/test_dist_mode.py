@@ -319,6 +319,9 @@ DIST_EXEMPT_UP_CONSUMERS = {
     "noomesh-rebuild.sh",
     # Sandbox harness drives noomesh-start.sh --dist for the actual stack.
     "noomesh-sandbox.sh",
+    # The launcher's `up` wrappers (start_inputs_full_up / _named_up): a
+    # library noomesh-start.sh sources, with the launcher's $COMPOSE_FILES.
+    "lib-start-inputs.sh",
 }
 
 

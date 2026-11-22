@@ -90,9 +90,19 @@ pub struct Failure {
     pub detail: String,
 }
 
+/// tailscale's own refusal, and nothing else: every LocalAPI 403 reaches
+/// the CLI as `AccessDeniedError`, printed as a line that STARTS with
+/// "Access denied: " (tailscale client/local/local.go; for serve the body is
+/// "serve config denied", ipn/localapi/serve.go), and on a non-root Unix run
+/// the CLI adds the fixed hint "To not require root, use 'sudo tailscale set
+/// --operator=$USER' once." (cmd/tailscale/cli/cli.go), both v1.102.3. The
+/// same hint also echoes the failed command ("Use 'sudo tailscale serve …'"),
+/// whose target can hold "root" (a /root/... path) or "operator" (a host
+/// name), and the exit status is 1 for every error, so neither a substring
+/// of the whole text nor the exit code can decide it (i1057 H3).
 fn looks_like_permission(detail: &str) -> bool {
-    let d = detail.to_ascii_lowercase();
-    d.contains("operator") || d.contains("root") || d.contains("permission") || d.contains("denied")
+    // The hint is printed only after that line, so the line alone decides.
+    detail.lines().map(str::trim).any(|l| l.starts_with("Access denied: "))
 }
 
 /// How long one `tailscale serve` write may take. A write is instant; the
@@ -1203,11 +1213,33 @@ mod tests {
         ));
     }
 
+    /// tailscale v1.102.3's exact stderr for a serve write by a non-operator
+    /// (client/local/local.go AccessDeniedError + cmd/tailscale/cli/cli.go).
+    const TS_DENIED: &str = "Access denied: serve config denied\n\nUse 'sudo tailscale serve --bg --https=8452 https://127.0.0.1:8452'.\nTo not require root, use 'sudo tailscale set --operator=$USER' once.";
+
     #[test]
     fn permission_failures_are_recognised_by_tailscale_wording() {
-        assert!(looks_like_permission("Access denied: serve config denied"));
-        assert!(looks_like_permission("tailscale serve requires root or the operator"));
+        assert!(looks_like_permission(TS_DENIED));
+        assert!(looks_like_permission("Access denied: serve config denied"), "the 403 line alone (root, or no hint)");
+        assert!(looks_like_permission("Warning: client version \"1.98.0\" != tailscaled server version \"1.102.3\"\nAccess denied: serve config denied"),
+            "the refusal after another line");
         assert!(!looks_like_permission("invalid port"));
+    }
+
+    /// i1057 H3: the words that used to decide it appear in ordinary failures
+    /// (a target under /root, a host named for its operator, "denied" inside a
+    /// message), and must not trigger `sudo tailscale set --operator`.
+    #[test]
+    fn a_failure_that_merely_mentions_root_or_operator_is_not_a_permission_refusal() {
+        for d in [
+            "error: invalid argument: /root/srv/app.sock: no such file or directory",
+            "dial tcp: lookup operator-box.tailnet.ts.net: no such host",
+            "serve: path /home/root/data is not absolute-safe; permission bits 0700",
+            "foreground listener: connection to backend denied by the target",
+            "Error: access denied: serve config denied",
+        ] {
+            assert!(!looks_like_permission(d), "{d}");
+        }
     }
 
     /// The live host8 ServeConfig (2026-10-03) once the bookmark redirect

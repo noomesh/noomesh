@@ -253,12 +253,24 @@ pub(crate) fn ensure(ctx: &mut Ctx) {
         Some(v) => {
             ctx.update_env(ENV_KEY, v);
             std::env::set_var(ENV_KEY, v);
-            ctx.info(&format!("{ENV_KEY}={v} in .env (a running sandbox takes it on its next start: noo stack restart --force sandbox)"));
+            let running = super::sh::are_services_running(&[&crate::envfile::container("sandbox")]);
+            ctx.info(&env_set_line(v, running));
         }
         None if current.trim() != PROFILE => {
             ctx.warn(&format!("{ENV_KEY}={} in .env was set by hand and is left as it is; the bundled profile is {PROFILE}", current.trim()));
         }
         None => {}
+    }
+}
+
+/// The line saying the profile is set in `.env`. The restart hint only when
+/// a sandbox is running to take it: on a fresh install none is yet, and the
+/// stack start that follows reads it. Pure.
+pub(crate) fn env_set_line(value: &str, sandbox_running: bool) -> String {
+    if sandbox_running {
+        format!("{ENV_KEY}={value} in .env (a running sandbox takes it on its next start: noo stack restart --force sandbox)")
+    } else {
+        format!("{ENV_KEY}={value} in .env")
     }
 }
 
@@ -369,5 +381,16 @@ mod tests {
         let at = body.find("super::sandbox_apparmor::ensure(ctx)").expect("services() must call sandbox_apparmor::ensure (i263b)");
         let start = body.find("run_compose").unwrap_or(usize::MAX);
         assert!(at < start, "the profile is installed before the stack starts");
+    }
+}
+
+#[cfg(test)]
+mod env_set_line_tests {
+    use super::{env_set_line, ENV_KEY, PROFILE};
+
+    #[test]
+    fn the_restart_hint_is_for_a_running_sandbox_only() {
+        assert_eq!(env_set_line(PROFILE, false), format!("{ENV_KEY}={PROFILE} in .env"));
+        assert!(env_set_line(PROFILE, true).contains("noo stack restart --force sandbox"));
     }
 }

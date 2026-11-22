@@ -115,6 +115,29 @@ fn fail_guided(g: &Globals, code: ExitCode, kind: &str, msg: &str, hint: &str, g
     std::process::exit(code as i32);
 }
 
+/// A node's applier refused its bundle with exit `rc`: one row of
+/// [`apply_refusal_for`] (the refusal the node named, else the code's row)
+/// renders both the human lines and the `--json` envelope (`{error, code,
+/// hint}` plus `rc`, `refusal`, `why`, `next`, `needs_person`). The node's
+/// own log is a secondary "for detail" step, never the remedy.
+fn fail_apply_refused(g: &Globals, node: &str, rc: i64, refusal: Option<&str>, darwin: bool) -> ! {
+    let r = apply_refusal_for(rc, refusal);
+    let msg = r.headline(node, rc);
+    if g.json {
+        let mut obj = r.json(node, rc);
+        obj["error"] = serde_json::Value::String(msg);
+        obj["hint"] = serde_json::Value::String(r.next_line(node));
+        eprintln!("{obj}");
+        ui::pager_finish();
+        std::process::exit(ExitCode::Generic as i32);
+    }
+    let next = r.next_command(node);
+    fail_guided(g, ExitCode::Generic, r.code, &msg, &r.next_line(node),
+        &[(&next, r.guide_why()),
+          (if darwin { "sudo /usr/local/bin/noo node fetch --user $(id -un)" } else { "journalctl -u noo-fetch -n 20" },
+           "on the node, for detail: the applier's own log")]);
+}
+
 
 /// Record that `node` holds the CURRENT fleet signing key, from the
 /// applier's own report of the bundle it just applied (exit 0).
@@ -1897,15 +1920,15 @@ fn await_apply(g: &Globals, a: &ProvisionArgs, m: &ProvMachine, staged: &ProvSta
     let started = std::time::Instant::now();
     let deadline = started + std::time::Duration::from_secs(600);
     let mut seen_fetch = false;
-    let mut outcome: Option<(i64, String)> = None;
+    let mut outcome: Option<(i64, String, Option<String>)> = None;
     while std::time::Instant::now() < deadline {
         poll.tick(started.elapsed().as_secs());
         if let Some(st) = crate::http::get_json_opt(
             g, &format!("/api/cluster/provision-bundle/{node}/status"), true, 10)
         {
             match judge_bundle_status(&st, &staged_sha) {
-                BundleVerdict::Applied { rc, msg } => {
-                    outcome = Some((rc, msg));
+                BundleVerdict::Applied { rc, msg, refusal } => {
+                    outcome = Some((rc, msg, refusal));
                     break;
                 }
                 BundleVerdict::Fetched if !seen_fetch => {
@@ -1923,7 +1946,7 @@ fn await_apply(g: &Globals, a: &ProvisionArgs, m: &ProvMachine, staged: &ProvSta
     drop(poll);
     let reprovision = format!("noo cluster provision {node}");
     match outcome {
-        Some((0, ref msg)) => {
+        Some((0, ref msg, _)) => {
             nstep(&format!("{node} reported: applied (exit 0)"));
             // One function for every caller (this verb and the combined
             // wait of `noo upgrade --nodes`), so the post-apply steps
@@ -1935,15 +1958,10 @@ fn await_apply(g: &Globals, a: &ProvisionArgs, m: &ProvMachine, staged: &ProvSta
                 after_remote_applied(g, &node, msg);
             }
         }
-        Some((rc, msg)) => {
+        Some((rc, msg, refusal)) => {
             let tail: String = msg.chars().rev().take(400).collect::<Vec<_>>().into_iter().rev().collect();
             ui::capture("applier output", tail.trim());
-            fail_guided(g, ExitCode::Generic, "apply_failed",
-                &format!("{node}: the applier refused the bundle (exit {rc})"),
-                "the node kept its previous state; fix the cause and re-run `noo cluster provision <node>`",
-                &[(&reprovision, "the node kept its previous state — fix the cause above, then re-stage"),
-                  (if darwin { "sudo /usr/local/bin/noo node fetch --user $(id -un)" } else { "journalctl -u noo-fetch -n 20" },
-                   "on the node — the applier's own log, if the tail above is not enough")]);
+            fail_apply_refused(g, &node, rc, refusal.as_deref(), darwin);
         }
         None if legacy && seen_fetch => {
             println!("{}", ui::sub(&ui::status_line(Glyph::Warn,
@@ -2036,13 +2054,25 @@ fn ensure_door_leaves(g: &Globals, ca: &crate::pki::ClusterCa, node: &str) {
     }
 }
 
+/// The lines for backend door leaves just issued. Under `noo onboard` a
+/// node's FIRST leaves ("no leaf yet") are the expected start of an install,
+/// not news: not said one per backend. A re-issue for any other reason
+/// (expiry, a new SAN, a new CA) is always said. Pure.
+pub(crate) fn door_leaf_lines(issued: &[(&str, String)], onboard: bool) -> Vec<String> {
+    issued
+        .iter()
+        .filter(|(_, why)| !(onboard && why == "no leaf yet"))
+        .map(|(svc, why)| format!("backend door leaf {svc}: issued ({why})"))
+        .collect()
+}
+
 /// [`ensure_door_leaves`], returning the error instead of exiting.
 fn ensure_door_leaves_try(ca: &crate::pki::ClusterCa, node: &str) -> Result<(), String> {
     match super::node_leaves::ensure_node_leaves(ca, node, crate::pki::DEFAULT_DAYS) {
         Ok(issued) if issued.is_empty() => nstep("backend door leaves: current (none re-issued)"),
         Ok(issued) => {
-            for (svc, why) in issued {
-                nstep(&format!("backend door leaf {svc}: issued ({why})"));
+            for line in door_leaf_lines(&issued, crate::onboard::onboard_is_caller()) {
+                nstep(&line);
             }
         }
         Err(e) => return Err(format!("could not issue {node}'s backend door leaves: {e}")),
@@ -4532,8 +4562,9 @@ pub(crate) fn is_live_enrollment(t: &serde_json::Value) -> bool {
 #[derive(Debug, PartialEq)]
 pub(crate) enum BundleVerdict {
     /// The node's report names the staged sha: it applied (rc 0) or refused
-    /// (rc != 0, -1 when the report carried no code).
-    Applied { rc: i64, msg: String },
+    /// (rc != 0, -1 when the report carried no code). `refusal`: the name the
+    /// node gave the refusal ([`reported_refusal`]), None on success.
+    Applied { rc: i64, msg: String, refusal: Option<String> },
     /// Fetched (`fetched_at` stamped for this staging) but no report for it yet.
     Fetched,
     /// Not fetched yet, or only an older bundle's report is on the row.
@@ -4549,10 +4580,10 @@ pub(crate) enum BundleVerdict {
 pub(crate) fn judge_bundle_status(st: &serde_json::Value, staged_sha: &str) -> BundleVerdict {
     let reported = st.get("applied_sha").and_then(|v| v.as_str()).unwrap_or("");
     if !staged_sha.is_empty() && reported == staged_sha {
-        return BundleVerdict::Applied {
-            rc: st.get("apply_rc").and_then(|v| v.as_i64()).unwrap_or(-1),
-            msg: st.get("apply_msg").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-        };
+        let rc = st.get("apply_rc").and_then(|v| v.as_i64()).unwrap_or(-1);
+        let msg = st.get("apply_msg").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let refusal = reported_refusal(st, rc, &msg);
+        return BundleVerdict::Applied { rc, msg, refusal };
     }
     if st.get("fetched_at").and_then(|v| v.as_str()).is_some() {
         BundleVerdict::Fetched
@@ -4651,10 +4682,265 @@ pub(crate) struct PendingApply {
     pub applier_first: bool,
 }
 
+/// What a person does after a node's applier refused a bundle.
+///
+/// There is no "nothing: the node retries" row: the fetcher records a
+/// refused bundle's sha (scripts/noo-fetch.sh), so the same bundle is never
+/// applied again; only a new staging is. The two decrypt failures it does
+/// NOT record (`birth_key_unreadable`, `bundle_decrypt_io`) retry on their
+/// own; their rows still name what a person checks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ApplyNext {
+    /// Run this `noo` command on the controller (`<node>` filled in).
+    Run(&'static str),
+    /// A person acts or decides first (`what`), then runs `then`
+    /// (`<node>` filled in).
+    Person { what: &'static str, then: &'static str },
+}
+
+/// One row of the applier refusal table: a stable code, the reason in
+/// plain words, and the next step. The human lines and `--json` of
+/// `cluster provision` and `upgrade --nodes` render from this one row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ApplyRefusal {
+    pub code: &'static str,
+    pub why: &'static str,
+    pub next: ApplyNext,
+    /// The refusal's name when the row came from [`REFUSALS`]; None for the
+    /// per-code row.
+    pub refusal: Option<&'static str>,
+}
+
+/// The code a refusal gets when its exit code is not in the table.
+pub(crate) const APPLY_FAILED_UNKNOWN_RC: &str = "apply_failed_unknown_rc";
+
+/// Exit code (scripts/noo-apply.sh; the Mac applier reports the same codes)
+/// to its row. Built from the script's own `exit N` refusals; a code the
+/// table does not hold keeps the generic text under
+/// [`APPLY_FAILED_UNKNOWN_RC`].
+pub(crate) fn apply_refusal(rc: i64) -> ApplyRefusal {
+    let known = match rc {
+        65 => Some(ApplyRefusal {
+            code: "apply_refused_bundle_content",
+            why: "the bundle is malformed, or holds a part this node will not install (the applier output names it)",
+            next: ApplyNext::Person { what: "fix the part the applier output names", then: "noo cluster provision <node>" },
+            refusal: None,
+        }),
+        69 => Some(ApplyRefusal {
+            code: "apply_refused_missing_tool",
+            why: "a tool the node needs is missing (gzip to unpack the bundle, or the teardown helper for a teardown)",
+            next: ApplyNext::Person { what: "install the missing tool on the node", then: "noo cluster provision <node>" },
+            refusal: None,
+        }),
+        70 => Some(ApplyRefusal {
+            code: "apply_refused_node_settings",
+            why: "the node's own settings lost its node name while the bundle was merged in",
+            next: ApplyNext::Person { what: "re-enroll the node: run the line this prints on the node", then: "noo cluster bootstrap-token create --node <node>" },
+            refusal: None,
+        }),
+        73 => Some(ApplyRefusal {
+            code: "apply_refused_cli_install",
+            why: "the node could not install the noo CLI for its user account",
+            next: ApplyNext::Person { what: "check that account on the node", then: "noo cluster provision <node>" },
+            refusal: None,
+        }),
+        74 => Some(ApplyRefusal {
+            code: "apply_refused_checksum",
+            why: "a part of the bundle does not match its signed checksum (damaged on the way)",
+            next: ApplyNext::Run("noo cluster provision <node>"),
+            refusal: None,
+        }),
+        75 => Some(ApplyRefusal {
+            code: "apply_refused_release_check",
+            why: "the bundle carries root code that no published release lists, or the node is ahead of its controller",
+            next: ApplyNext::Run("noo upgrade --all"),
+            refusal: None,
+        }),
+        76 => Some(ApplyRefusal {
+            code: "apply_refused_applier_too_old",
+            why: "the node's applier is older than the bundle (or a part of it names another node)",
+            next: ApplyNext::Run("noo cluster upgrade-applier <node>"),
+            refusal: None,
+        }),
+        77 => Some(ApplyRefusal {
+            code: "apply_refused_signature",
+            why: "the node could not trust the bundle: its signature, signing-key rollover, address or age failed the check",
+            next: ApplyNext::Person {
+                what: "if the node holds an older signing key, deliver the current one (a wrong clock on the node is the other cause)",
+                then: "noo security pki rotate-signing-key <node> --deliver-only",
+            },
+            refusal: None,
+        }),
+        78 => Some(ApplyRefusal {
+            code: "apply_refused_not_enrolled",
+            why: "the machine is not set up as a node yet (no cluster CA, node settings or service group)",
+            next: ApplyNext::Person { what: "enroll it: run the line this prints on the node", then: "noo cluster bootstrap-token create --node <node>" },
+            refusal: None,
+        }),
+        _ => None,
+    };
+    known.unwrap_or(ApplyRefusal {
+        code: APPLY_FAILED_UNKNOWN_RC,
+        why: "the applier output above says why",
+        next: ApplyNext::Person { what: "fix the cause the applier output names", then: "noo cluster provision <node>" },
+        refusal: None,
+    })
+}
+
+/// One named refusal: the applier's `refusal_table` (scripts/noo-apply.sh)
+/// names each refusal and its exit code; this row gives it words and a
+/// remedy. `code` is the exit code the name belongs to: a name is honoured
+/// only with that code ([`apply_refusal_for`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RefusalRow {
+    pub name: &'static str,
+    pub code: i64,
+    pub why: &'static str,
+    pub next: ApplyNext,
+}
+
+/// Every refusal name the node applier and fetcher can report, with the same
+/// code as the applier's `refusal_table` (tests/test_apply_refusal_table.py
+/// and `apply_refusal_tests` hold the two equal).
+pub(crate) const REFUSALS: &[RefusalRow] = &[
+    RefusalRow { name: "bundle_shape", code: 65, why: "the bundle is not a well-formed signed bundle: its tar or manifest is damaged, or it carries a member a bundle may not", next: ApplyNext::Run("noo cluster provision <node>") },
+    RefusalRow { name: "manifest_file_mismatch", code: 65, why: "the bundle's files and its signed manifest disagree (a file is missing, or one is not named)", next: ApplyNext::Run("noo cluster provision <node>") },
+    RefusalRow { name: "payload_control_bytes", code: 65, why: "a text part of the bundle carries a carriage return or NUL byte", next: ApplyNext::Run("noo cluster provision <node>") },
+    RefusalRow { name: "bundle_empty", code: 65, why: "the signed bundle held nothing this node installs", next: ApplyNext::Run("noo cluster provision <node>") },
+    RefusalRow { name: "script_payload_invalid", code: 65, why: "the applier or fetcher the bundle carries is not a valid script", next: ApplyNext::Run("noo upgrade --all") },
+    RefusalRow { name: "binary_not_elf", code: 65, why: "a binary in the bundle is not a Linux executable", next: ApplyNext::Run("noo upgrade --all") },
+    RefusalRow { name: "applier_downgrade", code: 65, why: "the bundle's applier is older than the one on the node: the node is ahead of this controller", next: ApplyNext::Run("noo upgrade --stack") },
+    RefusalRow { name: "hostd_downgrade", code: 65, why: "the bundle's host helper is older than the one on the node: the node is ahead of this controller", next: ApplyNext::Run("noo upgrade --stack") },
+    RefusalRow { name: "env_shape", code: 65, why: "the node settings in the bundle do not have the shape this node's applier accepts (the controller and the node run different releases)", next: ApplyNext::Run("noo upgrade --all") },
+    RefusalRow { name: "unit_shape", code: 65, why: "a service unit in the bundle is not the one this node's release ships (the controller and the node run different releases)", next: ApplyNext::Run("noo upgrade --all") },
+    RefusalRow { name: "vendor_cli_invalid", code: 65, why: "the vendor CLI in the bundle does not match its pin (name, version, checksum or archive)", next: ApplyNext::Person { what: "fix the vendor CLI pin on the controller (config/harness-kinds.json)", then: "noo cluster provision <node>" } },
+    RefusalRow { name: "service_leaf_invalid", code: 65, why: "a service certificate in the bundle is incomplete, misnamed, or does not match its key", next: ApplyNext::Run("noo cluster provision <node>") },
+    RefusalRow { name: "service_leaf_untrusted", code: 65, why: "a service certificate in the bundle was issued by a CA this node does not trust (a CA rotation in flight?)", next: ApplyNext::Person { what: "deliver the current cluster CA to the node", then: "noo security pki push-nodes <node>" } },
+    RefusalRow { name: "node_payload_invalid", code: 65, why: "a node credential in the bundle is malformed (a missing node name, user, password or key line)", next: ApplyNext::Run("noo cluster provision <node>") },
+    RefusalRow { name: "cli_user_invalid", code: 65, why: "the account recorded for the node's CLI is not a valid account name", next: ApplyNext::Person { what: "re-enroll the node from a valid user account: run the line this prints on the node", then: "noo cluster bootstrap-token create --node <node>" } },
+    RefusalRow { name: "secret_pointer_multiline", code: 65, why: "a secret file on the node holds more than one line", next: ApplyNext::Person { what: "fix that file on the node (the applier output names it)", then: "noo cluster provision <node>" } },
+    RefusalRow { name: "hostd_install_failed", code: 65, why: "the new host helper did not install or start on the node; the previous one was restored", next: ApplyNext::Person { what: "check the noo-hostd service on the node", then: "noo cluster provision <node>" } },
+    RefusalRow { name: "restart_backends_invalid", code: 65, why: "the bundle names a container to restart that is not a noomesh backend", next: ApplyNext::Run("noo cluster provision <node>") },
+    RefusalRow { name: "bundle_decrypt_failed", code: 65, why: "the node could not decrypt the bundle with its birth key: the bundle was encrypted to another key", next: ApplyNext::Person { what: "re-enroll the node: run the line this prints on the node", then: "noo cluster bootstrap-token create --node <node>" } },
+    RefusalRow { name: "tool_missing", code: 69, why: "a tool the node needs is missing (gzip, unzip, or the teardown helper)", next: ApplyNext::Person { what: "install the missing tool on the node (the output names it)", then: "noo cluster provision <node>" } },
+    RefusalRow { name: "bundle_gzip_failed", code: 69, why: "the node could not decompress the bundle (damaged on the way)", next: ApplyNext::Run("noo cluster provision <node>") },
+    RefusalRow { name: "merge_lost_node_id", code: 70, why: "the node's own settings lost its node name while the bundle was merged in", next: ApplyNext::Person { what: "re-enroll the node: run the line this prints on the node", then: "noo cluster bootstrap-token create --node <node>" } },
+    RefusalRow { name: "node_write_failed", code: 73, why: "the node could not write its settings or secret files", next: ApplyNext::Person { what: "check the disk and the /etc/noo permissions on the node", then: "noo cluster provision <node>" } },
+    RefusalRow { name: "cli_install_failed", code: 73, why: "the node could not install the noo CLI for its user account", next: ApplyNext::Person { what: "check that account on the node", then: "noo cluster provision <node>" } },
+    RefusalRow { name: "bundle_decrypt_io", code: 73, why: "the node could not read or write the decrypted bundle (a disk or file error); it retries on its next poll", next: ApplyNext::Person { what: "check the disk on the node", then: "noo cluster provision <node>" } },
+    RefusalRow { name: "payload_checksum", code: 74, why: "a part of the bundle does not match its signed checksum (damaged on the way)", next: ApplyNext::Run("noo cluster provision <node>") },
+    RefusalRow { name: "release_unlisted", code: 75, why: "the bundle carries root code that no published release lists", next: ApplyNext::Run("noo upgrade --all") },
+    RefusalRow { name: "release_list_invalid", code: 75, why: "the release list in the bundle is not valid (its signature, version or previous-release rows)", next: ApplyNext::Run("noo upgrade --all") },
+    RefusalRow { name: "release_verifier_missing", code: 75, why: "the node cannot verify a release signature: it needs OpenSSL 3 or python3", next: ApplyNext::Person { what: "install OpenSSL 3 or python3 on the node", then: "noo cluster provision <node>" } },
+    RefusalRow { name: "node_ahead_of_controller", code: 75, why: "the node is ahead of its controller: it applied a newer release than the one staged", next: ApplyNext::Run("noo upgrade --stack") },
+    RefusalRow { name: "applier_too_old", code: 76, why: "the node's applier is older than the bundle", next: ApplyNext::Run("noo cluster upgrade-applier <node>") },
+    RefusalRow { name: "payload_for_other_node", code: 76, why: "a part of the bundle names another node (the controller rendered it wrong)", next: ApplyNext::Run("noo cluster provision <node>") },
+    RefusalRow { name: "signature_invalid", code: 77, why: "the bundle's signature does not verify against the signing key this node holds", next: ApplyNext::Person { what: "deliver the current signing key to the node", then: "noo security pki rotate-signing-key <node> --deliver-only" } },
+    RefusalRow { name: "ca_signed_lane_retired", code: 77, why: "the bundle is signed by the cluster CA, a lane this node no longer accepts", next: ApplyNext::Person { what: "deliver the current signing key to the node", then: "noo security pki rotate-signing-key <node> --deliver-only" } },
+    RefusalRow { name: "ca_rollover_overreach", code: 77, why: "a CA-signed signing-key rollover carried more than the key", next: ApplyNext::Person { what: "deliver the key alone, then the rest signed by the signing key", then: "noo security pki rotate-signing-key <node> --deliver-only" } },
+    RefusalRow { name: "rollover_not_countersigned", code: 77, why: "a CA-signed signing-key rollover was not countersigned by the signing key this node holds", next: ApplyNext::Person { what: "rotate from a controller that still holds the previous signing key; if it is lost, re-enroll the node", then: "noo security pki rotate-signing-key <node> --deliver-only" } },
+    RefusalRow { name: "bundle_unaddressed", code: 77, why: "the bundle names no node: it was built by a controller older than addressed bundles", next: ApplyNext::Run("noo upgrade --stack") },
+    RefusalRow { name: "bundle_for_other_node", code: 77, why: "the bundle is addressed to another node", next: ApplyNext::Person { what: "if this node was renamed, re-enroll it: run the line this prints on the node", then: "noo cluster bootstrap-token create --node <node>" } },
+    RefusalRow { name: "bundle_undated", code: 77, why: "the bundle carries no valid issue date: it was built by an older controller", next: ApplyNext::Run("noo upgrade --stack") },
+    RefusalRow { name: "bundle_stale", code: 77, why: "the bundle is older than the node's freshness window (or the node's clock is ahead)", next: ApplyNext::Run("noo cluster provision <node>") },
+    RefusalRow { name: "bundle_from_future", code: 77, why: "the bundle is dated in the future: the node's clock or the controller's is wrong", next: ApplyNext::Person { what: "fix the clock on the node or the controller", then: "noo cluster provision <node>" } },
+    RefusalRow { name: "not_enrolled", code: 78, why: "the machine is not set up as a node yet (no cluster CA, node settings or service group)", next: ApplyNext::Person { what: "enroll it: run the line this prints on the node", then: "noo cluster bootstrap-token create --node <node>" } },
+    RefusalRow { name: "birth_key_unreadable", code: 78, why: "the node's birth key cannot be read, so it cannot decrypt its bundles; it retries on its next poll", next: ApplyNext::Person { what: "re-enroll the node: run the line this prints on the node", then: "noo cluster bootstrap-token create --node <node>" } },
+];
+
+/// The row for a refusal with exit `rc`, refined by the NAME the node
+/// reported when [`REFUSALS`] holds that name under the same code; any
+/// other name (unknown, or another code's) falls back to the code's row of
+/// [`apply_refusal`]. A name can only pick among the remedies of the code
+/// the node exited with: a report cannot move a signature refusal (77) onto
+/// a re-provision. `code` stays the per-exit-code one (`--json` adds the
+/// name as `refusal`).
+pub(crate) fn apply_refusal_for(rc: i64, refusal: Option<&str>) -> ApplyRefusal {
+    let base = apply_refusal(rc);
+    match refusal.and_then(|n| REFUSALS.iter().find(|r| r.name == n)) {
+        Some(row) if row.code == rc => ApplyRefusal { code: base.code, why: row.why, next: row.next, refusal: Some(row.name) },
+        _ => base,
+    }
+}
+
+/// A refusal name as a report may carry it: `[a-z][a-z0-9_]`, at most 48.
+pub(crate) fn refusal_name_ok(n: &str) -> bool {
+    (1..=48).contains(&n.len())
+        && n.starts_with(|c: char| c.is_ascii_lowercase())
+        && n.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+}
+
+/// The name on the applier's own last line in an apply message,
+/// `noo-apply: refusal=<name> (exit <rc>)`, for THIS rc only: what a new
+/// applier says when the fetcher that ran it is still the old one (the first
+/// report after a roll carries the line but no field). None when absent.
+pub(crate) fn refusal_from_msg(msg: &str, rc: i64) -> Option<String> {
+    const LINE: &str = "noo-apply: refusal=";
+    let at = msg.rfind(LINE)? + LINE.len();
+    let name: String = msg[at..].chars().take_while(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '_').collect();
+    let rest = &msg[at + name.len()..];
+    (refusal_name_ok(&name) && rest.starts_with(&format!(" (exit {rc})"))).then_some(name)
+}
+
+/// The refusal name of a status row: the `apply_refusal` field the gateway
+/// stored, else the applier's line in `apply_msg`, else None (an older node:
+/// the code's row then). None on success.
+pub(crate) fn reported_refusal(st: &serde_json::Value, rc: i64, msg: &str) -> Option<String> {
+    if rc == 0 {
+        return None;
+    }
+    st.get("apply_refusal").and_then(|v| v.as_str()).filter(|n| refusal_name_ok(n)).map(str::to_string)
+        .or_else(|| refusal_from_msg(msg, rc))
+}
+
+impl ApplyRefusal {
+    /// The `noo` command of this row, with the node filled in.
+    pub(crate) fn next_command(&self, node: &str) -> String {
+        let cmd = match self.next {
+            ApplyNext::Run(c) => c,
+            ApplyNext::Person { then, .. } => then,
+        };
+        cmd.replace("<node>", node)
+    }
+
+    /// What the person does next, in one line.
+    pub(crate) fn next_line(&self, node: &str) -> String {
+        match self.next {
+            ApplyNext::Run(_) => format!("run `{}`", self.next_command(node)),
+            ApplyNext::Person { what, .. } => format!("needs a person: {what}, then `{}`", self.next_command(node)),
+        }
+    }
+
+    /// The headline: `<node>: the applier refused the bundle (exit N): why`.
+    pub(crate) fn headline(&self, node: &str, rc: i64) -> String {
+        format!("{node}: the applier refused the bundle (exit {rc}): {}", self.why)
+    }
+
+    /// The guide row the human output prints: the command and its why.
+    pub(crate) fn guide_why(&self) -> &'static str {
+        match self.next {
+            ApplyNext::Run(_) => "the next step; the node kept its previous state",
+            ApplyNext::Person { what, .. } => what,
+        }
+    }
+
+    /// The `--json` fields: the same row the human line renders.
+    pub(crate) fn json(&self, node: &str, rc: i64) -> serde_json::Value {
+        serde_json::json!({
+            "rc": rc,
+            "code": self.code,
+            "refusal": self.refusal,
+            "why": self.why,
+            "next": self.next_command(node),
+            "needs_person": matches!(self.next, ApplyNext::Person { .. }),
+        })
+    }
+}
+
 /// How one pending node ended.
 #[derive(Debug, PartialEq)]
 pub(crate) enum ApplyEnd {
-    Applied { rc: i64, msg: String },
+    Applied { rc: i64, msg: String, refusal: Option<String> },
     /// Legacy fetcher: fetched, cannot report, agent online. Not a failure,
     /// and not confirmed either.
     LegacyUnconfirmed,
@@ -4731,13 +5017,13 @@ fn wait_applied_timed_via(
             let st = crate::http::get_json_opt(g, &status_path(&p.node), true, 10);
             if let Some(st) = &st {
                 match judge_bundle_status(st, &p.sha) {
-                    BundleVerdict::Applied { rc, msg } => {
+                    BundleVerdict::Applied { rc, msg, refusal } => {
                         say(if rc == 0 {
                             ui::status_line(Glyph::Ok, &format!("{}: applied (exit 0)", p.node))
                         } else {
                             ui::status_line(Glyph::Err, &format!("{}: the applier refused the bundle (exit {rc})", p.node))
                         });
-                        ends[i] = Some(ApplyEnd::Applied { rc, msg });
+                        ends[i] = Some(ApplyEnd::Applied { rc, msg, refusal });
                         took[i] = started.elapsed().as_secs();
                         continue;
                     }
@@ -6896,19 +7182,39 @@ mod bundle_status_judgement_tests {
     #[test]
     fn applied_ok_is_rc_zero_with_the_appliers_message() {
         let st = json!({"fetched_at":"t","applied_at":"t","applied_sha":SHA,"apply_rc":0,"apply_msg":"applied: agent-env"});
-        assert_eq!(judge_bundle_status(&st, SHA), BundleVerdict::Applied { rc: 0, msg: "applied: agent-env".into() });
+        assert_eq!(judge_bundle_status(&st, SHA), BundleVerdict::Applied { rc: 0, msg: "applied: agent-env".into(), refusal: None });
     }
 
     #[test]
     fn applied_refused_carries_the_nonzero_rc() {
         let st = json!({"fetched_at":"t","applied_sha":SHA,"apply_rc":76,"apply_msg":"unknown kind"});
-        assert_eq!(judge_bundle_status(&st, SHA), BundleVerdict::Applied { rc: 76, msg: "unknown kind".into() });
+        assert_eq!(judge_bundle_status(&st, SHA), BundleVerdict::Applied { rc: 76, msg: "unknown kind".into(), refusal: None });
     }
 
     #[test]
     fn a_report_without_a_code_is_minus_one_not_success() {
         let st = json!({"applied_sha":SHA});
-        assert_eq!(judge_bundle_status(&st, SHA), BundleVerdict::Applied { rc: -1, msg: String::new() });
+        assert_eq!(judge_bundle_status(&st, SHA), BundleVerdict::Applied { rc: -1, msg: String::new(), refusal: None });
+    }
+
+    /// The name: the gateway's field first, then the applier's own last line
+    /// in the message (a new applier run by an old fetcher), then none.
+    #[test]
+    fn the_refusal_name_comes_from_the_field_then_the_line() {
+        let line = "noo-apply: REFUSED — the bundle is not a readable tar noo-apply: refusal=bundle_shape (exit 65) ";
+        let st = json!({"applied_sha":SHA,"apply_rc":65,"apply_msg":line,"apply_refusal":"manifest_file_mismatch"});
+        assert_eq!(judge_bundle_status(&st, SHA), BundleVerdict::Applied { rc: 65, msg: line.into(), refusal: Some("manifest_file_mismatch".into()) });
+        let st = json!({"applied_sha":SHA,"apply_rc":65,"apply_msg":line});
+        assert_eq!(judge_bundle_status(&st, SHA), BundleVerdict::Applied { rc: 65, msg: line.into(), refusal: Some("bundle_shape".into()) },
+            "an old fetcher: the name comes from the applier's line");
+        let st = json!({"applied_sha":SHA,"apply_rc":65,"apply_msg":line,"apply_refusal":null});
+        assert!(matches!(judge_bundle_status(&st, SHA), BundleVerdict::Applied { refusal: Some(ref n), .. } if n == "bundle_shape"));
+        let st = json!({"applied_sha":SHA,"apply_rc":65,"apply_msg":"noo-apply: REFUSED — old applier"});
+        assert_eq!(judge_bundle_status(&st, SHA), BundleVerdict::Applied { rc: 65, msg: "noo-apply: REFUSED — old applier".into(), refusal: None });
+        let st = json!({"applied_sha":SHA,"apply_rc":0,"apply_msg":line,"apply_refusal":"bundle_shape"});
+        assert!(matches!(judge_bundle_status(&st, SHA), BundleVerdict::Applied { refusal: None, .. }), "a success has no name");
+        let st = json!({"applied_sha":SHA,"apply_rc":65,"apply_msg":"","apply_refusal":"Not A Name"});
+        assert!(matches!(judge_bundle_status(&st, SHA), BundleVerdict::Applied { refusal: None, .. }));
     }
 
     #[test]
@@ -7333,5 +7639,226 @@ mod applier_only_list_tests {
         let (files, why) = applier_only_files(&apply, |f| proof_rows(f, String::new(), "sig".to_string()));
         assert_eq!(files.iter().map(|(k, _)| *k).collect::<Vec<_>>(), ["applier"]);
         assert!(why.is_some_and(|e| e.contains("applier")));
+    }
+}
+
+/// The door-leaf lines a first install does not need one by one.
+#[cfg(test)]
+mod onboard_door_leaf_line_tests {
+    use super::door_leaf_lines;
+    use crate::commands::node_leaves::{reissue_reason, LeafState};
+
+    #[test]
+    fn first_issue_lines_are_quiet_under_onboard_only() {
+        let first = reissue_reason(&LeafState::Missing, "ollama", None, 0).expect("a missing leaf is issued");
+        let issued = vec![("vllm", first.clone()), ("ollama", first), ("tei", "it expires in 3 days".to_string())];
+        assert_eq!(door_leaf_lines(&issued, true), vec!["backend door leaf tei: issued (it expires in 3 days)".to_string()]);
+        let all = door_leaf_lines(&issued, false);
+        assert_eq!(all.len(), 3, "a person running provision reads every leaf");
+        assert_eq!(all[0], "backend door leaf vllm: issued (no leaf yet)");
+    }
+}
+
+#[cfg(test)]
+mod apply_refusal_tests {
+    use super::{apply_refusal, apply_refusal_for, refusal_from_msg, ApplyNext, APPLY_FAILED_UNKNOWN_RC, REFUSALS};
+
+    /// The refusal codes scripts/noo-apply.sh exits with (`exit N` outside
+    /// comments; 0 is success, 1 is `set -e`'s generic failure, not a
+    /// refusal), plus noo-fetch.sh's own refusal (`return 69`, gzip).
+    fn script_refusal_codes() -> Option<std::collections::BTreeSet<i64>> {
+        let mut set = std::collections::BTreeSet::new();
+        for (rel, word) in [("scripts/noo-apply.sh", "exit "), ("scripts/noo-fetch.sh", "return ")] {
+            let p = crate::test_support::repo_file_or_skip(rel)?;
+            let src = std::fs::read_to_string(p).expect(rel);
+            for line in src.lines().filter(|l| !l.trim_start().starts_with('#')) {
+                for (i, _) in line.match_indices(word) {
+                    let n: String = line[i + word.len()..].chars().take_while(|c| c.is_ascii_digit()).collect();
+                    // noo-fetch.sh: only its applier-style refusal (gzip, 69).
+                    let keep = word == "exit " || n == "69";
+                    if let (true, Ok(n)) = (keep, n.parse::<i64>()) {
+                        if n > 1 { set.insert(n); }
+                    }
+                }
+            }
+        }
+        Some(set)
+    }
+
+    /// The `noo …` command a row names, checked against the usage table:
+    /// its words are a real command and every flag it passes is in that
+    /// command's syntax line.
+    fn assert_real_command(cmd: &str) {
+        let words: Vec<&str> = cmd.split_whitespace().collect();
+        assert_eq!(words.first(), Some(&"noo"), "{cmd}");
+        let rest = &words[1..];
+        let n = (1..=rest.len()).rev()
+            .find(|&n| crate::usage::lookup(&rest[..n]).is_some())
+            .unwrap_or_else(|| panic!("`{cmd}` is not a noo command"));
+        let (syntax, _) = crate::usage::lookup(&rest[..n]).unwrap();
+        for flag in rest[n..].iter().filter(|w| w.starts_with('-')) {
+            assert!(syntax.contains(flag), "`{cmd}`: {flag} is not in its syntax `{syntax}`");
+        }
+    }
+
+    #[test]
+    fn every_script_refusal_has_a_distinct_row_with_a_real_command() {
+        let Some(codes) = script_refusal_codes() else { return };
+        assert!(codes.len() >= 9, "the scripts' refusal codes were not read: {codes:?}");
+        let mut seen = std::collections::BTreeSet::new();
+        for rc in &codes {
+            let r = apply_refusal(*rc);
+            assert_ne!(r.code, APPLY_FAILED_UNKNOWN_RC, "exit {rc} has no row in apply_refusal");
+            assert!(seen.insert(r.code), "exit {rc}: code {} is not distinct", r.code);
+            assert!(!r.why.trim().is_empty(), "exit {rc}: empty why");
+            assert!(!r.why.contains("kind"), "exit {rc}: `kind` is an internal word: {}", r.why);
+            let cmd = r.next_command("node_a");
+            assert!(!cmd.contains('<'), "exit {rc}: a placeholder is left in `{cmd}`");
+            if matches!(r.next, ApplyNext::Person { .. }) {
+                assert!(r.next_line("node_a").starts_with("needs a person: "), "exit {rc}");
+            }
+            assert_real_command(&cmd);
+        }
+    }
+
+    #[test]
+    fn release_applier_and_signature_refusals_do_not_send_a_reprovision() {
+        for rc in [75, 76, 77] {
+            let r = apply_refusal(rc);
+            let cmd = r.next_command("node_a");
+            assert!(!cmd.starts_with("noo cluster provision"), "exit {rc} would loop on a re-provision: {cmd}");
+            assert!(!r.next_line("node_a").contains("cluster provision"), "exit {rc}: {}", r.next_line("node_a"));
+        }
+        assert_eq!(apply_refusal(76).next_command("node_a"), "noo cluster upgrade-applier node_a");
+        assert_eq!(apply_refusal(75).next_command("node_a"), "noo upgrade --all");
+    }
+
+    #[test]
+    fn an_unknown_rc_keeps_the_generic_text_and_the_human_and_json_agree() {
+        let r = apply_refusal(2);
+        assert_eq!(r.code, APPLY_FAILED_UNKNOWN_RC);
+        assert_eq!(r.next_command("node_a"), "noo cluster provision node_a");
+        assert!(r.headline("node_a", 2).starts_with("node_a: the applier refused the bundle (exit 2)"));
+        for rc in [2, 65, 76, 77] {
+            let r = apply_refusal(rc);
+            let j = r.json("node_a", rc);
+            assert_eq!(j["code"], r.code);
+            assert_eq!(j["rc"], rc);
+            assert_eq!(j["next"], r.next_command("node_a"));
+            assert!(r.next_line("node_a").contains(&r.next_command("node_a")), "the human line names the same command");
+            assert!(!r.next_line("node_a").contains("journalctl"), "the node log is never the remedy");
+        }
+    }
+
+    /// Both callers render from the table; neither keeps its own remedy.
+    #[test]
+    fn provision_and_upgrade_render_refusals_from_the_table() {
+        let prov = crate::test_src::own_code(include_str!("provision.rs"));
+        let arm = crate::test_src::fn_body(&prov, "fn fail_apply_refused(");
+        assert!(arm.contains("apply_refusal_for(rc, refusal)") && arm.contains("r.json(node, rc)"), "{arm}");
+        let wait = crate::test_src::fn_body(&prov, "fn await_apply(");
+        assert!(wait.contains("fail_apply_refused(g, &node, rc, refusal.as_deref(), darwin)"), "await_apply keeps its own remedy");
+        assert!(!wait.contains("\"apply_failed\""), "the one-remedy code is back");
+        let up = crate::test_src::own_code(include_str!("upgrade.rs"));
+        let settle = crate::test_src::fn_body(&up, "fn settle_end(");
+        assert!(settle.contains("super::provision::apply_refusal_for(rc, refusal.as_deref())") && settle.contains("r.json(n, rc)"), "{settle}");
+        let outcome = crate::test_src::fn_body(&up, "fn outcome_of(");
+        assert!(outcome.contains("super::provision::apply_refusal_for(*rc, refusal.as_deref())"), "{outcome}");
+    }
+
+    /// The applier's `refusal_table` (name -> code), read from the script.
+    fn script_refusal_table() -> Option<std::collections::BTreeMap<String, i64>> {
+        let p = crate::test_support::repo_file_or_skip("scripts/noo-apply.sh")?;
+        let src = std::fs::read_to_string(p).expect("noo-apply.sh");
+        let block = &src[src.find("# BEGIN refusal_table").expect("block")..src.find("# END refusal_table").expect("end")];
+        let mut out = std::collections::BTreeMap::new();
+        for line in block.lines().map(str::trim) {
+            if let Some((name, rest)) = line.split_once(") echo ") {
+                let code: i64 = rest.trim_end_matches(" ;;").parse().expect(line);
+                assert!(out.insert(name.to_string(), code).is_none(), "{name} twice");
+            }
+        }
+        Some(out)
+    }
+
+    #[test]
+    fn the_names_and_codes_are_the_appliers_table() {
+        let Some(sh) = script_refusal_table() else { return };
+        assert!(sh.len() >= 40, "the applier's table was not read: {sh:?}");
+        let rs: std::collections::BTreeMap<String, i64> = REFUSALS.iter().map(|r| (r.name.to_string(), r.code)).collect();
+        assert_eq!(rs.len(), REFUSALS.len(), "a name is listed twice in REFUSALS");
+        assert_eq!(rs, sh, "REFUSALS and noo-apply.sh's refusal_table disagree");
+    }
+
+    #[test]
+    fn every_named_row_has_words_and_a_real_command() {
+        for r in REFUSALS {
+            assert!(super::refusal_name_ok(r.name), "{}", r.name);
+            assert!(!r.why.trim().is_empty() && !r.why.contains("kind"), "{}: {}", r.name, r.why);
+            let row = apply_refusal_for(r.code, Some(r.name));
+            assert_eq!(row.refusal, Some(r.name));
+            assert_eq!(row.code, apply_refusal(r.code).code, "{}: `code` stays the exit code's", r.name);
+            assert_ne!(row.code, APPLY_FAILED_UNKNOWN_RC, "{}: {} is not a code the applier exits with", r.name, r.code);
+            let cmd = row.next_command("node_a");
+            assert!(!cmd.contains('<'), "{}: a placeholder is left in `{cmd}`", r.name);
+            if matches!(r.next, ApplyNext::Person { .. }) {
+                assert!(row.next_line("node_a").starts_with("needs a person: "), "{}", r.name);
+            }
+            assert!(!row.next_line("node_a").contains("journalctl"), "{}: the node log is never the remedy", r.name);
+            assert_real_command(&cmd);
+        }
+    }
+
+    /// A re-provision re-stages the same bytes from the same controller: it
+    /// cannot fix these, so none of them RUNS one as its remedy.
+    #[test]
+    fn what_a_reprovision_cannot_fix_never_runs_one() {
+        let cannot = ["release_unlisted", "release_list_invalid", "release_verifier_missing", "node_ahead_of_controller",
+            "applier_too_old", "applier_downgrade", "hostd_downgrade", "env_shape", "unit_shape", "script_payload_invalid",
+            "binary_not_elf", "signature_invalid", "ca_signed_lane_retired", "ca_rollover_overreach",
+            "rollover_not_countersigned", "bundle_unaddressed", "bundle_undated", "bundle_from_future", "not_enrolled",
+            "bundle_decrypt_failed", "birth_key_unreadable", "bundle_for_other_node", "cli_user_invalid"];
+        for name in cannot {
+            let r = REFUSALS.iter().find(|r| r.name == name).unwrap_or_else(|| panic!("{name} is not in REFUSALS"));
+            assert!(!matches!(r.next, ApplyNext::Run(c) if c.starts_with("noo cluster provision")), "{name} would loop on a re-provision");
+        }
+        // 76's other cause is exactly what a re-provision fixes; upgrading the applier does not.
+        assert_eq!(apply_refusal_for(76, Some("payload_for_other_node")).next_command("node_a"), "noo cluster provision node_a");
+        assert_eq!(apply_refusal_for(76, Some("applier_too_old")).next_command("node_a"), "noo cluster upgrade-applier node_a");
+        assert_eq!(apply_refusal_for(75, Some("node_ahead_of_controller")).next_command("node_a"), "noo upgrade --stack");
+    }
+
+    /// A name counts only with its own code: a report cannot move a
+    /// signature refusal onto a re-provision, and an unknown name is the
+    /// code's row.
+    #[test]
+    fn a_name_is_honoured_only_with_its_own_code() {
+        assert_eq!(apply_refusal_for(77, Some("bundle_shape")), apply_refusal(77));
+        assert_eq!(apply_refusal_for(65, Some("signature_invalid")), apply_refusal(65));
+        assert_eq!(apply_refusal_for(65, Some("no_such_refusal")), apply_refusal(65));
+        assert_eq!(apply_refusal_for(65, None), apply_refusal(65));
+        assert_eq!(apply_refusal_for(2, Some("bundle_shape")).code, APPLY_FAILED_UNKNOWN_RC);
+        let r = apply_refusal_for(65, Some("bundle_shape"));
+        assert_eq!(r.refusal, Some("bundle_shape"));
+        assert!(r.headline("node_a", 65).starts_with("node_a: the applier refused the bundle (exit 65): "), "the headline prefix stays");
+        let j = r.json("node_a", 65);
+        assert_eq!(j["code"], "apply_refused_bundle_content", "`code` stays per exit code");
+        assert_eq!(j["refusal"], "bundle_shape");
+        assert_eq!(apply_refusal(65).json("node_a", 65)["refusal"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn the_name_is_read_from_the_appliers_last_line_for_its_rc() {
+        let m = "noo-apply: REFUSED — x noo-apply: refusal=env_shape (exit 65) ";
+        assert_eq!(refusal_from_msg(m, 65).as_deref(), Some("env_shape"));
+        assert_eq!(refusal_from_msg(m, 77), None, "another rc's line is no name");
+        let two = "noo-apply: refusal=env_shape (exit 65) noo-apply: refusal=unit_shape (exit 65)";
+        assert_eq!(refusal_from_msg(two, 65).as_deref(), Some("unit_shape"), "the last line wins");
+        assert_eq!(refusal_from_msg("noo-apply: refusal=env_shape(exit 65)", 65), None);
+        assert_eq!(refusal_from_msg("noo-apply: refusal= (exit 65)", 65), None);
+        assert_eq!(refusal_from_msg("noo-apply: refusal=Env (exit 65)", 65), None);
+        assert_eq!(refusal_from_msg("noo-apply: refusal=env_shape (exit 650)", 65), None);
+        assert_eq!(refusal_from_msg("no line at all", 65), None);
+        assert_eq!(refusal_from_msg(&format!("noo-apply: refusal={} (exit 65)", "a".repeat(49)), 65), None);
     }
 }

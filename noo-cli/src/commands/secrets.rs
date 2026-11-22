@@ -2421,7 +2421,7 @@ fn is_standalone_install(root: &std::path::Path) -> bool {
 }
 
 pub fn secrets_audit(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
-    audit_run(g, args, &[])
+    audit_run(g, args, &[], false)
 }
 
 /// The audit `noo onboard` runs in its summary when the stack NEVER STARTED
@@ -2429,8 +2429,19 @@ pub fn secrets_audit(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
 /// running gateway (the per-consumer service keys). Their absence is then a
 /// consequence of the services failure, not a second thing to fix, so it is
 /// said that way ([`defer_stack_minted`]) and does not count as an ERROR.
+///
+/// Onboard's audit prints its table only with `--verbose` or when it has an
+/// ERROR to show: a clean install's summary is the one "no errors" line,
+/// not 115 rows a stranger cannot act on.
 pub fn secrets_audit_stack_down(g: &Globals, stack_minted: &[String]) -> Result<i32, Unhandled> {
-    audit_run(g, &[], stack_minted)
+    audit_run(g, &[], stack_minted, true)
+}
+
+/// Whether the audit prints its table: always for `noo security secrets
+/// audit`; for a caller that asked for quiet-when-clean, only with
+/// `--verbose` or an ERROR finding. Pure.
+pub(crate) fn audit_table_shown(quiet_when_clean: bool, verbose: bool, errors: usize) -> bool {
+    !quiet_when_clean || verbose || errors > 0
 }
 
 /// Rewrite a `required-key-absent` ERROR for a key in `stack_minted` as an
@@ -2457,7 +2468,7 @@ pub fn defer_stack_minted(findings: Vec<Finding>, stack_minted: &[String]) -> Ve
         .collect()
 }
 
-fn audit_run(g: &Globals, args: &[String], stack_minted: &[String]) -> Result<i32, Unhandled> {
+fn audit_run(g: &Globals, args: &[String], stack_minted: &[String], quiet_when_clean: bool) -> Result<i32, Unhandled> {
     let mut sops_path: Option<PathBuf> = None;
     let mut env_path: Option<PathBuf> = None;
     let mut iter = args.iter();
@@ -2522,14 +2533,6 @@ fn audit_run(g: &Globals, args: &[String], stack_minted: &[String]) -> Result<i3
         findings.extend(orphaned_node_password_findings(&sops, &conf));
     }
     let findings = defer_stack_minted(findings, stack_minted);
-
-    if g.json {
-        println!("{}", audit_json(&rows, &findings, &sops, &env, backend));
-    } else if rows.is_empty() {
-        println!("{}", ui::muted(&format!("no keys found in {} or {}", sops_path.display(), env_path.display())));
-    } else {
-        print!("{}", render_audit(&rows, &findings, &sops, &env, backend));
-    }
     // Exit 1 on any ERROR finding. This used to be "exit 0 regardless, parity
     // with `security scan`" — and the 2026-09-02 install carried 22 plaintext
     // duplicates of encrypted secrets for five days while this command
@@ -2537,6 +2540,14 @@ fn audit_run(g: &Globals, args: &[String], stack_minted: &[String]) -> Result<i3
     // zero exit means no script can notice. A detector with no trigger and no
     // exit code is documentation.
     let errors = findings.iter().filter(|f| f.severity == Severity::Error).count();
+
+    if g.json {
+        println!("{}", audit_json(&rows, &findings, &sops, &env, backend));
+    } else if rows.is_empty() {
+        println!("{}", ui::muted(&format!("no keys found in {} or {}", sops_path.display(), env_path.display())));
+    } else if audit_table_shown(quiet_when_clean, g.verbose, errors) {
+        print!("{}", render_audit(&rows, &findings, &sops, &env, backend));
+    }
     Ok(if errors > 0 { 1 } else { 0 })
 }
 
@@ -8775,6 +8786,24 @@ mod stack_minted_tests {
         let count = run.find("f.severity == Severity::Error").expect("the exit count");
         assert!(defer < print && defer < count, "deferred after printing or counting");
         let plain = crate::test_src::fn_body(&own, "pub fn secrets_audit(");
-        assert!(plain.contains("audit_run(g, args, &[])"), "the operator's own audit defers something");
+        assert!(plain.contains("audit_run(g, args, &[], false)"), "the operator's own audit defers something, or hides its table");
+    }
+}
+
+/// Onboard's summary audit is one line on a clean install (a stranger's
+/// 0.6.28 run printed a 115-line table there).
+#[cfg(test)]
+mod onboard_audit_table_tests {
+    use super::audit_table_shown;
+
+    #[test]
+    fn the_table_shows_for_the_verb_for_verbose_and_for_an_error() {
+        assert!(audit_table_shown(false, false, 0), "`noo security secrets audit` always prints its table");
+        assert!(!audit_table_shown(true, false, 0), "a clean onboard audit is one line");
+        assert!(audit_table_shown(true, true, 0), "--verbose shows it");
+        assert!(audit_table_shown(true, false, 1), "an ERROR is shown with its row");
+        let own = crate::test_src::own_code(include_str!("secrets.rs"));
+        let down = crate::test_src::fn_body(&own, "pub fn secrets_audit_stack_down(");
+        assert!(down.contains("audit_run(g, &[], stack_minted, true)"));
     }
 }

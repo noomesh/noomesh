@@ -22,7 +22,7 @@ import (
 // ModelStat is one model the ollama holds. Wire shape (heartbeat
 // `model_stats` is a JSON list of these):
 //
-//	{"name","size_bytes","resident_bytes","vram_bytes","loaded","context_length"}
+//	{"name","size_bytes","resident_bytes","vram_bytes","loaded","context_length","arch"}
 //
 // size_bytes is the weights (/api/tags size); resident_bytes and vram_bytes
 // are /api/ps size and size_vram, and are 0 unless loaded. context_length is
@@ -41,6 +41,10 @@ type ModelStat struct {
 	// RunningContext is /api/ps `context_length`: what the loaded model runs
 	// at, as distinct from its ceiling. 0 = not loaded, or not reported.
 	RunningContext int64 `json:"running_context,omitempty"`
+	// Arch is the attention shape /api/show reports, which the controller's
+	// memory fit prices a model's cache from (layers x kv_heads x head_dim x
+	// K+V x f16) when its table has no row for the model. nil = not known.
+	Arch *Arch `json:"arch,omitempty"`
 	// LoadedUnknown: /api/ps could not be read, so whether this model is
 	// loaded, and its resident and vram bytes, are NOT known. Loaded,
 	// ResidentBytes and VRAMBytes are then left out of the wire shape (see
@@ -63,8 +67,9 @@ func (m ModelStat) MarshalJSON() ([]byte, error) {
 		Loaded        *bool  `json:"loaded,omitempty"`
 		ContextLength int64  `json:"context_length,omitempty"`
 		RunningContext int64 `json:"running_context,omitempty"`
+		Arch           *Arch `json:"arch,omitempty"`
 	}
-	w := wire{Name: m.Name, SizeBytes: m.SizeBytes, ContextLength: m.ContextLength}
+	w := wire{Name: m.Name, SizeBytes: m.SizeBytes, ContextLength: m.ContextLength, Arch: m.Arch}
 	if !m.LoadedUnknown {
 		w.RunningContext = m.RunningContext
 		w.ResidentBytes, w.VRAMBytes, w.Loaded = &m.ResidentBytes, &m.VRAMBytes, &m.Loaded
@@ -161,20 +166,95 @@ func ShowContextLength(body []byte) int64 {
 	return int64(n)
 }
 
+// Arch is the attention shape the controller prices a model's KV cache from
+// (gateway placement_fit `kv_per_token`: layers x kv_heads x head_dim x 2 x
+// 2 bytes). Where a model's layers differ (Gemma's sliding and global
+// layers) each field is the LARGEST over the layers, so the figure is never
+// below the truth.
+type Arch struct {
+	Layers  int64 `json:"layers"`
+	KVHeads int64 `json:"kv_heads"`
+	HeadDim int64 `json:"head_dim"`
+}
+
+// ShowArch is the model's attention shape from an /api/show body's
+// model_info, under `<general.architecture>.`: `block_count`,
+// `attention.head_count_kv` (one number, or one per layer: the largest),
+// and the head size, `attention.key_length` / `value_length` (the larger)
+// else `embedding_length` / `attention.head_count`. nil when any of them is
+// missing or not above 0, or when the model declares a sliding window shorter
+// than its context.
+func ShowArch(body []byte) *Arch {
+	var v struct {
+		ModelInfo map[string]any `json:"model_info"`
+	}
+	if len(body) == 0 || json.Unmarshal(body, &v) != nil {
+		return nil
+	}
+	arch, _ := v.ModelInfo["general.architecture"].(string)
+	if arch == "" {
+		return nil
+	}
+	num := func(key string) float64 {
+		switch x := v.ModelInfo[arch+"."+key].(type) {
+		case float64:
+			return x
+		case []any:
+			m := 0.0
+			for _, e := range x {
+				if f, ok := e.(float64); ok && f > m {
+					m = f
+				}
+			}
+			return m
+		}
+		return 0
+	}
+	// A model that declares a sliding window shorter than its context caches
+	// only the window on most layers. Reported as layers x kv_heads x head_dim
+	// the gateway would price it at FULL attention, which over-states it
+	// 2.4-12.9x (gemma4 at 4096-32768 tokens), and a per-token figure cannot
+	// model a window. So no arch is reported: such a model keeps the weights
+	// estimate until a context-aware figure exists (0.6.30 followup). A window
+	// as long as the context (phi3's 131072 of 16384) limits nothing.
+	if sw := num("attention.sliding_window"); sw > 0 {
+		if ctx := num("context_length"); ctx <= 0 || sw < ctx {
+			return nil
+		}
+	}
+	layers, kvHeads := num("block_count"), num("attention.head_count_kv")
+	dim := max(num("attention.key_length"), num("attention.value_length"))
+	if dim <= 0 {
+		if heads := num("attention.head_count"); heads > 0 {
+			dim = num("embedding_length") / heads
+		}
+	}
+	if layers <= 0 || kvHeads <= 0 || dim < 1 {
+		return nil
+	}
+	return &Arch{Layers: int64(layers), KVHeads: int64(kvHeads), HeadDim: int64(dim)}
+}
+
 // showBudget bounds the /api/show calls one heartbeat makes: a node that
 // holds many models learns their ceilings over a few beats instead of
 // stalling one.
 const showBudget = 2
 
-// Ceilings remembers each model's context ceiling by name and digest, so
-// /api/show runs once per model, not once per heartbeat. The zero value is
-// ready to use.
-type Ceilings struct {
-	mu    sync.Mutex
-	known map[string]int64
+// shown is what one /api/show taught about a model.
+type shown struct {
+	ctx  int64
+	arch *Arch
 }
 
-// Fill sets ContextLength on stats from what is remembered, asking `show`
+// Ceilings remembers each model's context ceiling and attention shape by
+// name and digest, so /api/show runs once per model, not once per
+// heartbeat. The zero value is ready to use.
+type Ceilings struct {
+	mu    sync.Mutex
+	known map[string]shown
+}
+
+// Fill sets ContextLength and Arch on stats from what is remembered, asking `show`
 // (an /api/show for one model name) for at most [showBudget] models it does
 // not know yet. A failed call is not remembered: the next beat asks again.
 func (c *Ceilings) Fill(stats []ModelStat, show func(name string) ([]byte, error)) {
@@ -184,12 +264,12 @@ func (c *Ceilings) Fill(stats []ModelStat, show func(name string) ([]byte, error
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.known == nil {
-		c.known = map[string]int64{}
+		c.known = map[string]shown{}
 	}
 	asked := 0
 	for i := range stats {
 		key := stats[i].Name + "@" + stats[i].digest
-		n, ok := c.known[key]
+		sh, ok := c.known[key]
 		if !ok {
 			if asked >= showBudget {
 				continue
@@ -199,10 +279,10 @@ func (c *Ceilings) Fill(stats []ModelStat, show func(name string) ([]byte, error
 			if err != nil {
 				continue
 			}
-			n = ShowContextLength(body)
-			c.known[key] = n
+			sh = shown{ctx: ShowContextLength(body), arch: ShowArch(body)}
+			c.known[key] = sh
 		}
-		stats[i].ContextLength = n
+		stats[i].ContextLength, stats[i].Arch = sh.ctx, sh.arch
 	}
 }
 

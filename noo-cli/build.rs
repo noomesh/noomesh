@@ -76,11 +76,19 @@ const STANDALONE_FILES: &[&str] = &[
     "scripts/lib-created-guard.sh",
     // `docker compose up` isolates one unkillable container (exit 75).
     "scripts/lib-stuck-container.sh",
+    // A plain start recreates only the services whose secret or config file
+    // contents changed (the `noo.inputs` label); the lib calls the helper.
+    "scripts/lib-start-inputs.sh",
+    "scripts/noo-start-inputs.py",
     // Every launcher `compose up` is preceded by its bind-source check
     // (2026-09-29, grafana.pub made a directory by Docker).
     "scripts/lib-bind-sources.sh",
     // The launcher re-owns redis/grafana data to 65532 right before `up`.
     "scripts/lib-reown.sh",
+    // The throwaway helper container every launcher chown/wipe runs (the
+    // stack's own nginx by digest, never Docker Hub); sourced by lib-reown,
+    // lib-secrets, lib-instance and the launchers.
+    "scripts/lib-helper-image.sh",
     "scripts/lib-compose-lock.sh",
     "scripts/lib-addons.sh",
     // The retired-.env-key list: read by lib-addons.sh (the WARN) and by
