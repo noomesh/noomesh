@@ -96,15 +96,18 @@ noo cluster verify <node>
   2. Only then, on the controller:
 
      ```sh
-     noo security pki push-nodes <node>
+     noo security pki push-nodes <node> --prove
      ```
 
+     It proves the node holds its key at that address before it issues
+     anything. A plain `push-nodes <node>` refuses a new address: it mints only
+     the node's enrollment, tailnet or current certificate address.
   3. If the row names an address you do not recognise, or one another machine
      uses, stop and do not run it. If the row gives no command, the address
      belongs to another node: stop.
 
-  Planned for 0.6.30: a changed address is proved with
-  `noo security pki push-nodes <node> --prove`.
+  On 0.6.29, which has no `--prove`, the command is the plain
+  `noo security pki push-nodes <node>`.
 - **The controller's address changed.** Every node lost the controller, and
   nothing sent from the controller reaches them. Give the controller its old
   address back (reserve it in your router, then restart the machine).

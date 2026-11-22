@@ -68,11 +68,14 @@ The tailnet is the default path: every machine keeps a name that does not change
   edit a node's `/etc/noo/controller-url` yourself.
 - **Without a tailnet,** behind a proxy or Docker Desktop, the node's
   certificate can miss the address the controller dials (`agent certificate`
-  FAIL). Fix it with `noo security pki push-nodes <node>` when the row offers
-  it. When it gives no remedy, the address is another node's: stop and report.
-  Up to 0.6.29, a roll (`noo upgrade --nodes` or `--all`) re-issues such a
-  node's certificate for its enrollment address alone and the
-  `agent certificate` row FAILs again, with `tls: bad certificate` in the
-  agent log: run
-  `noo security pki push-nodes <node>` after each roll. (i1074: from 0.6.30
-  a roll keeps the address.)
+  FAIL). Fix it with `noo security pki push-nodes <node> --prove` when the row
+  offers it: the controller first proves the node holds its key at that
+  address, then issues the certificate. A plain `push-nodes <node>` mints only
+  an address the node already had (its enrollment, tailnet or current
+  certificate address), so it refuses a new one. When the row gives no remedy,
+  the address is another node's: stop and report.
+  On 0.6.29 (no `--prove`), the fix is the plain `push-nodes <node>`, and a roll
+  (`noo upgrade --nodes` or `--all`) re-issues such a node's certificate for
+  its enrollment address alone, so the `agent certificate` row FAILs again,
+  with `tls: bad certificate` in the agent log: run it again after each roll.
+  From 0.6.30 a roll keeps the address (i1074).
