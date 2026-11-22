@@ -85,6 +85,10 @@ check "the old unit does" grep -q '^After=.*plymouth-quit-wait' "$work/kiosk.old
 # The incident's plymouth: the wait returns only when plymouthd is gone
 # (here: the flag), and plymouth-quit never runs.
 rm -f "$FLAG"
+# A runner image may MASK the plymouth units (a symlink to /dev/null): a
+# write through that link lands in /dev/null and no fake unit exists.
+systemctl unmask plymouth-quit-wait.service plymouth-quit.service >/dev/null 2>&1 || true
+rm -f "$UNITS/plymouth-quit-wait.service" "$UNITS/plymouth-quit.service"
 cat > "$UNITS/plymouth-quit-wait.service" <<EOF
 [Unit]
 Description=fake: hold until something quits plymouth (never, here)
@@ -108,6 +112,8 @@ systemctl start --no-block plymouth-quit-wait.service
 sleep 2
 check "plymouth-quit-wait is running and never returns" \
     test "$(systemctl show -p ActiveState --value plymouth-quit-wait.service)" = activating
+[ "$(systemctl show -p ActiveState --value plymouth-quit-wait.service)" = activating ] || {
+    ls -l "$UNITS/plymouth-quit-wait.service"; systemctl status --no-pager plymouth-quit-wait.service 2>&1 | head -12; }
 
 # 1. This release's unit.
 systemctl start --no-block kiosk.service
