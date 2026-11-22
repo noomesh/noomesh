@@ -103,7 +103,7 @@ fn the_mismatch_is_found_inside_a_wrapped_rustls_error() {
     let tls = rustls::Error::InvalidCertificate(rustls::CertificateError::Other(rustls::OtherError(Arc::new(m.clone()))));
     let io = std::io::Error::new(std::io::ErrorKind::InvalidData, tls);
     assert_eq!(identity_mismatch(&io), Some(m));
-    let other = std::io::Error::new(std::io::ErrorKind::Other, "refused");
+    let other = std::io::Error::other("refused");
     assert_eq!(identity_mismatch(&other), None);
 }
 
