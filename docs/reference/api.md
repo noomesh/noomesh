@@ -248,6 +248,19 @@ add-on service key with the `metrics` scope; at most 256 series per source,
 | POST | `/api/external/embeddings/jobs` | consumer key (scope `embeddings`): a bulk embedding batch as a job. `{input: [..], space?, model?}` (`space` wins; both mean what `model` means on `/api/external/embeddings`, so `<space>@next` works) answers `202 {job_id, path, model}`. `path: pull`: a node that serves the model claims the batch from the `WORK_EMBED` work queue when it has a free embed slot (one slot per node stays free for query-time embeds); `path: push`: no node is pulling, so the gateway embeds it itself, two batches at a time. At most 64 texts per job and the encoded result must fit 600 KiB (`413`, the message names the cap); `429` + `Retry-After` when the model's queue holds over 5000 batches; `503` when no node serves the model. A pull job nobody claims within 2 minutes, or whose worker goes quiet, is run by the gateway once, then failed. Opt-in: the synchronous route never queues. Vectors are kept 15 minutes |
 | GET | `/api/external/embeddings/jobs/{job_id}` | consumer key (scope `embeddings`): the caller's own embedding job (`404` for anyone else's); `?vectors=1` on a completed job adds `vectors` (one float32 row per input, in order). `410` once the 15 minutes are up: resubmit. The same job is readable at `GET /api/jobs/{job_id}?vectors=1` by a caller that reaches the scheduler routes |
 
+### What a rerank answer says
+
+`POST /api/external/rerank` answers `{results: [{index, score}], noo}`. A
+placed reranker (a GGUF cross-encoder on llama.cpp) serves it; with none
+placed, the cluster's chat model does (`noo.served_by: "llm"`,
+`noo.fallback: true`), and `GET /api/external/capabilities` says
+`rerank.available: false`. When the chat model ranks nothing (it scores
+every document 0, or cannot be asked), the answer is the input order with
+every `score` **null**, and `noo` carries `degraded: "identity"` and
+`degraded_reason`. A caller that needs a ranking checks `degraded`, or
+`rerank.available` first. `noo cluster verify` warns in its `reranker` row
+when no reranker is placed.
+
 ### Model classes, failover and what the answer says
 
 The `model` a consumer sends is a **class**, an **alias** or a concrete

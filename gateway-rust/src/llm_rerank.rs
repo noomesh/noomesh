@@ -26,9 +26,12 @@
 //!    keeps only the last duplicate key, collapsing every score into one. The
 //!    model was ranking correctly the whole time; the shape mismatch discarded
 //!    the answer. The prompt therefore asks for `{"results":[...]}`.
-//! 2. **Empty scores are a WARNING, not a silent identity fallback.** Identity
-//!    order is indistinguishable from a real ranking at the API boundary, so
-//!    this log is the only signal that reranking stopped happening.
+//! 2. **Empty scores are a WARNING, not a silent identity fallback.** When the
+//!    model scores nothing (every score 0) or cannot be asked, the answer is
+//!    the input order with `score: null` and the reason, and the route marks
+//!    it `noo.degraded: "identity"` (i1182a). It used to invent descending
+//!    scores 1.0, 0.9, … for that order, which a caller could not tell from
+//!    a real ranking.
 
 use std::sync::Arc;
 
@@ -103,14 +106,18 @@ fn value_as_f64(v: &Value) -> Option<f64> {
         .or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
 }
 
-/// Fallback ranking: original order, descending positional scores.
+/// No ranking: the input order, each `score` null. Never invented scores:
+/// a number here would read as the model's judgement (i1182a).
 pub fn identity(n: usize) -> Vec<Value> {
-    (0..n)
-        .map(|i| {
-            let score = 1.0 - (i as f64) / (n.max(1) as f64);
-            json!({"index": i, "score": round4(score)})
-        })
-        .collect()
+    (0..n).map(|i| json!({"index": i, "score": null})).collect()
+}
+
+/// What the LLM reranker answered: the rows, and when they are the input
+/// order unranked, why.
+pub struct LlmRerank {
+    pub results: Vec<Value>,
+    /// `Some(reason)` when `results` is [`identity`]: the model ranked nothing.
+    pub degraded: Option<String>,
 }
 
 fn round4(v: f64) -> f64 {
@@ -146,50 +153,61 @@ pub fn extract_json(content: &str) -> Option<Value> {
     }
 }
 
-/// Rank `documents` against `query`. Never returns an error — degrades to
-/// identity order, matching the Python contract ("never returns empty").
+/// Rank `documents` against `query`. Never returns an error: when the model
+/// ranks nothing it answers the input order unranked, with the reason.
 pub async fn rerank(
     state: &Arc<AppState>,
     query: &str,
     documents: &[String],
     top_n: Option<usize>,
-) -> Vec<Value> {
+) -> LlmRerank {
     let n = documents.len();
     if n == 0 {
-        return Vec::new();
+        return LlmRerank { results: Vec::new(), degraded: None };
     }
-
-    let mut results = match call_model(state, query, documents, n).await {
-        Some(raw) => {
-            let scores = parse_scores(&raw, n);
-            if scores.iter().all(|s| *s == 0.0) {
-                // WARN, not debug: identity order is indistinguishable from a
-                // real ranking at the API boundary, so this is the only signal
-                // that reranking silently stopped happening. Carry the raw
-                // shape — the duplicate-key bug was invisible without it.
-                let shape = raw.to_string().chars().take(200).collect::<String>();
-                tracing::warn!(n, raw = %shape, "llm_rerank.empty_scores");
-                identity(n)
-            } else {
-                scores
-                    .iter()
-                    .enumerate()
-                    .map(|(i, s)| json!({"index": i, "score": round4(*s)}))
-                    .collect()
-            }
+    let answer = call_model(state, query, documents, n).await;
+    if let Ok(raw) = &answer {
+        if parse_scores(raw, n).iter().all(|s| *s == 0.0) {
+            // Carry the raw shape: the duplicate-key bug was invisible without it.
+            let shape = raw.to_string().chars().take(200).collect::<String>();
+            tracing::warn!(n, raw = %shape, "llm_rerank.empty_scores");
         }
-        None => identity(n),
+    }
+    ranked(answer, n, top_n)
+}
+
+/// The model's answer (or why there is none) as the rows to return. Pure, so
+/// the identity case is tested without a backend.
+pub(crate) fn ranked(answer: Result<Value, String>, n: usize, top_n: Option<usize>) -> LlmRerank {
+    let raw = match answer {
+        Ok(raw) => raw,
+        Err(why) => {
+            return LlmRerank { results: identity(n), degraded: Some(format!("the chat model could not rank them: {why}")) };
+        }
     };
+    let scores = parse_scores(&raw, n);
+    if scores.iter().all(|s| *s == 0.0) {
+        return LlmRerank {
+            results: identity(n),
+            degraded: Some("the chat model scored every document 0, so there is no ranking".to_string()),
+        };
+    }
+    let mut results: Vec<Value> = scores
+        .iter()
+        .enumerate()
+        .map(|(i, s)| json!({"index": i, "score": round4(*s)}))
+        .collect();
 
     results.sort_by(|a, b| {
         let sa = a.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
         let sb = b.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
         sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
     });
-    match top_n {
+    let results = match top_n {
         Some(k) => results.into_iter().take(k).collect(),
         None => results,
-    }
+    };
+    LlmRerank { results, degraded: None }
 }
 
 /// One narrow completion against the resolved backend.
@@ -201,12 +219,12 @@ async fn call_model(
     query: &str,
     docs: &[String],
     n: usize,
-) -> Option<Value> {
+) -> Result<Value, String> {
     let backend = match crate::coordinator::resolve_backend(state).await {
         Ok(b) => b,
         Err(e) => {
             tracing::warn!(error = %e, n, "llm_rerank.no_backend");
-            return None;
+            return Err(format!("no chat backend ({e})"));
         }
     };
 
@@ -241,15 +259,15 @@ async fn call_model(
         Ok(r) if r.status().is_success() => r,
         Ok(r) => {
             tracing::warn!(status = %r.status(), n, "llm_rerank.non_2xx");
-            return None;
+            return Err(format!("the chat backend answered {}", r.status()));
         }
         Err(e) => {
             tracing::warn!(error = %e, n, "llm_rerank.request_failed");
-            return None;
+            return Err(format!("the chat backend could not be reached ({e})"));
         }
     };
 
-    let data: Value = resp.json().await.ok()?;
+    let data: Value = resp.json().await.map_err(|e| format!("the chat backend's answer was not JSON ({e})"))?;
     let content = data
         .get("choices")
         .and_then(|c| c.as_array())
@@ -258,7 +276,7 @@ async fn call_model(
         .and_then(|m| m.get("content"))
         .and_then(|c| c.as_str())
         .unwrap_or("");
-    extract_json(content)
+    extract_json(content).ok_or_else(|| "the chat model's reply held no JSON".to_string())
 }
 
 #[cfg(test)]
@@ -304,13 +322,39 @@ mod tests {
         assert_eq!(parse_scores(&json!("nonsense"), 2), vec![0.0, 0.0]);
     }
 
+    /// i1182a: the input order with NO score. It used to be 1.0, 0.9, …, a
+    /// ranking nobody made.
     #[test]
-    fn identity_is_descending_and_bounded() {
+    fn identity_is_the_input_order_with_null_scores() {
         let ids = identity(3);
-        let scores: Vec<f64> = ids.iter().map(|r| r["score"].as_f64().unwrap()).collect();
-        assert!(scores[0] > scores[1] && scores[1] > scores[2]);
-        assert!(scores.iter().all(|s| (0.0..=1.0).contains(s)));
-        assert_eq!(ids[0]["index"], 0);
+        assert_eq!(ids.iter().map(|r| r["index"].as_u64().unwrap()).collect::<Vec<_>>(), [0, 1, 2]);
+        assert!(ids.iter().all(|r| r["score"].is_null()), "{ids:?}");
+    }
+
+    /// The model scored everything 0 (seen 2026-11-20 on a 2-document request):
+    /// unranked, and said so.
+    #[test]
+    fn all_zero_scores_are_unranked_with_the_reason() {
+        let r = ranked(Ok(json!({"results": [{"index": 0, "score": 0.0}, {"index": 1, "score": 0.0}]})), 2, None);
+        assert!(r.results.iter().all(|x| x["score"].is_null()), "{:?}", r.results);
+        assert_eq!(r.degraded.as_deref(), Some("the chat model scored every document 0, so there is no ranking"));
+    }
+
+    /// No answer at all (no backend, a refusal, no JSON): unranked, with why.
+    #[test]
+    fn no_answer_is_unranked_with_why() {
+        let r = ranked(Err("no chat backend (none placed)".into()), 3, None);
+        assert_eq!(r.results.len(), 3);
+        assert!(r.results.iter().all(|x| x["score"].is_null()));
+        assert_eq!(r.degraded.as_deref(), Some("the chat model could not rank them: no chat backend (none placed)"));
+    }
+
+    /// A real ranking keeps its numbers, sorted, and is not degraded.
+    #[test]
+    fn a_real_ranking_is_sorted_and_not_degraded() {
+        let r = ranked(Ok(json!({"results": [{"index": 0, "score": 0.1}, {"index": 1, "score": 0.9}]})), 2, Some(1));
+        assert!(r.degraded.is_none());
+        assert_eq!(r.results, vec![json!({"index": 1, "score": 0.9})]);
     }
 
     #[test]

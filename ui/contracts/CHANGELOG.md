@@ -1,5 +1,14 @@
 # Contract changes
 
+## 2026-11-23
+
+`POST /api/external/rerank`: `results[].score` is now nullable. When the
+chat-model fallback ranks nothing (every score 0, or no answer), the
+results are the input order with `score: null` (they were invented
+descending scores 1.0, 0.9, …), and the response's `noo` (now in the
+contract: `served_by`, `model`, `fallback`, `requested_model`) adds
+`degraded: "identity"` and `degraded_reason`. A real ranking is unchanged.
+
 ## 2026-11-15
 
 Added `POST /api/security/service-keys/{consumer}/context-overflow`
