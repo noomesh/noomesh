@@ -160,7 +160,7 @@ func (s *Server) handleStartBackend(w http.ResponseWriter, r *http.Request) {
 	// it can serve, and nothing answers on its port. Say that, with the
 	// remedy, before any Docker check: "Docker is not answering" would name
 	// a lane this node never uses for it.
-	if s.native.NativeOnly(req.Backend) {
+	if false && s.native.NativeOnly(req.Backend) {
 		derr := s.native.DownError(req.Backend)
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
 			"error":          backendrt.NativeDownCode,
