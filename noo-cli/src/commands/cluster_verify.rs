@@ -1923,7 +1923,7 @@ pub(crate) fn removed_engine_space_check(body: Option<&Value>) -> Option<Check> 
     let detail = stale
         .iter()
         // PR 5 of the TEI removal changes "no longer supported" to "removed" once the code is gone (i1182a).
-        .map(|(sp, m)| format!("space {sp} model {m}: was served by an engine that is no longer supported (TEI) and no node serves it; embed writes are refused until it is migrated: `noo cluster embedding-space migrate {sp} <model>`"))
+        .map(|(sp, m)| format!("space {sp} model {m}: no node serves this model, and it is a Hugging Face id (the kind only the TEI engine, no longer supported, served); embed writes are refused until a node serves it or the space is migrated: `noo cluster embedding-space migrate {sp} <model>`"))
         .collect::<Vec<_>>()
         .join("; ");
     let remedy = stale
