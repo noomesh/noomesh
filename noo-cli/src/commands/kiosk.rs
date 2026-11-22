@@ -386,7 +386,7 @@ pub(crate) fn render_kiosk_service_in(user: &str, mode: Mode, vt: u8, bin: &str)
     // when THIS unit starts. Shared stays graphical: there a desktop is the
     // point, and the display is something you switch to.
     let wanted_by = match mode {
-        Mode::Dedicated => "graphical.target multi-user.target",
+        Mode::Dedicated => "graphical.target",
         Mode::Shared => "graphical.target",
     };
     let (after_plymouth, plymouth, quit_splash) = match mode {
