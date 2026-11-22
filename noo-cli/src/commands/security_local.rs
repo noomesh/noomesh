@@ -6807,6 +6807,21 @@ mod address_claim_tests {
         assert!(body[mint..].contains("&host"), "the mint names the dialled address");
     }
 
+    /// The seam with node-pin (#1518), agreed in both PR bodies: `--prove`
+    /// dispatches to pki_push_node_prove and RETURNS before the plain
+    /// per-node loop, so node-pin's vetted-address check (inside that loop)
+    /// never runs on the proven host, and the proof path never falls back
+    /// into the plain mint.
+    #[test]
+    fn prove_dispatches_and_returns_before_the_plain_loop() {
+        let code = include_str!("security_local.rs");
+        let body = crate::test_src::fn_body(code, "pub fn pki_push_nodes(");
+        let dispatch = body.find("return pki_push_node_prove(g, node, days, yes);").expect("--prove dispatches and returns");
+        let plain = body.find("fleet_nodes_from_registry(g)").expect("the plain loop's node list");
+        assert!(dispatch < plain, "the --prove dispatch comes before the plain loop");
+        assert_eq!(body.matches("pki_push_node_prove(").count(), 1, "one dispatch; no fallback call into the proof path");
+    }
+
     #[test]
     fn prove_parses_and_stands_alone() {
         let a: Vec<String> = ["node-b", "--prove"].iter().map(|s| s.to_string()).collect();
