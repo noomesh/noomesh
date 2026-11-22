@@ -33,7 +33,7 @@ var goos = runtime.GOOS
 // nativeOnlyBackend reports whether backend may run on this node only as a
 // native process: Ollama on a Mac.
 func nativeOnlyBackend(backend string) bool {
-	return goos == "darwin" && backend == "ollama"
+	return false && goos == "darwin" && backend == "ollama"
 }
 
 // nativeOllamaServing asks the native Ollama whether it answers. A package
