@@ -109,11 +109,24 @@ what the machine already declares for boot. A root is a **mount** when a
 boot-time mount covers it: an `/etc/fstab` line, or a systemd mount unit in
 `/etc/systemd/system` or `/run/systemd/generator*`. A line or unit with
 `noauto` does not count, unless it is also an automount
-(`x-systemd.automount`). A unit file in `/etc/systemd/system` counts whether
-or not it is enabled. Anything else is a **plain directory**. The `data root
+(`x-systemd.automount`). A unit counts only when it is enabled (a link to it
+in a `*.wants/` or `*.requires/` directory, as `systemctl enable` and the fstab
+generator make). A masked unit, or one that is present but not enabled, does
+not count. Anything else is a **plain directory**. The `data root
 policy` row in `noo cluster verify` shows which: `mount (fstab)`, `mount
 (systemd unit)`, `mount (recorded)` (it was on its own disk at a good start,
 with no boot-time mount declared) or `directory`.
+
+**"Cannot tell" never refuses.** Sometimes the agent cannot read or parse
+`/proc/self/mountinfo`, `/etc/fstab` or a unit directory (missing,
+permission denied, garbage). Then the part of the check that needs it is
+**not checked**, and nothing is refused for it. Verify's `data root policy`
+row says `not checked: <why>`. Only a positive finding refuses: a covering
+boot-time mount that is not mounted, or a filesystem that differs from the
+record. When the mount table cannot be read, the agent makes no comparison,
+even with a record, because a failed read is not evidence of a different
+disk. A root on the root disk whose boot-time declarations cannot be read is
+neither refused nor recorded.
 
 **What the agent refuses, and when.** There are three cases:
 
