@@ -233,10 +233,21 @@ jobs:
   # release check, i907 1b's netns unit, the agent's hold, the verify rows,
   # the journal, a chat answer after). Dispatch only: it judges a release.
   upgrade:
-    name: upgrade-24.04
+    name: ${{ matrix.cell }}
     if: github.event_name == 'workflow_dispatch' && inputs.cells != 'fresh' && inputs.cells != 'reboot'
-    runs-on: ubuntu-24.04
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 150
+    # Two docker legs, one cell and one judge. ce: the runner image's docker-ce
+    # (the leg the job always had). distro: Ubuntu's `apt install docker.io` +
+    # docker-compose-v2, installed by scripts/install-cell/distro-docker.sh, the
+    # same script the fresh matrix's docker.io cell runs. Each leg prints its
+    # docker and compose versions (`UPGRADE LEG <leg> NOTE: docker <v>, compose <v>`).
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {leg: ce, runner: ubuntu-24.04, cell: upgrade-24.04, artifact: install-cell-upgrade-24.04}
+          - {leg: distro, runner: ubuntu-22.04, cell: upgrade-22.04-distro, artifact: install-cell-upgrade-22.04-distro}
     steps:
       # FIRST, before anything else touches them: the free-text dispatch
       # inputs cli_tag and prev_tag, whole-string, as
@@ -273,8 +284,9 @@ jobs:
       - name: Run the upgrade cell
         env:
           OUT: ${{ runner.temp }}/cell
-          CELL: upgrade-24.04
-          RUNNER: ubuntu-24.04
+          CELL: ${{ matrix.cell }}
+          RUNNER: ${{ matrix.runner }}
+          LEG: ${{ matrix.leg }}
           CLI_TAG: ${{ inputs.cli_tag || 'latest' }}
           # the chosen start, through env only (never interpolated into run:);
           # upgrade_judge.py resolve holds it to the strict rules
@@ -286,7 +298,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
-          name: install-cell-upgrade-24.04
+          name: ${{ matrix.artifact }}
           path: ${{ runner.temp }}/cell/
           retention-days: 14
           if-no-files-found: warn

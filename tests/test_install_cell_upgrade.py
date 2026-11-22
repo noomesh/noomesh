@@ -796,3 +796,89 @@ def test_snapshot_image_column_reads_and_old_rows_still_parse(tmp_path):
     assert rc_mod.read_images(str(f)) == {"noo-a": "sha256:abc"}
     assert rc_mod.read_labelled(str(f)) == {"noo-a": True, "noo-b": False}
     assert "{{.Image}}" in rc_mod.FMT
+
+
+# ── K3: a third-party digest the RELEASE moved recreates that service only ──
+# The cell never moves a digest: a signed-lock install refuses an override.
+def _k3(tmp, ids, bimg, aimg, rec, kept):
+    got = _k(tmp, _snap({}, True, imgs=bimg), _snap(ids, True, imgs=aimg), roll_line=_line(rec, kept),
+             stack_line=_line([], sorted(_FIRST + _THIRD)))
+    return got["K3"]
+
+
+def test_k3_skips_when_no_redis_digest_moved_and_says_why(tmp_path):
+    k = _k3(tmp_path, _NEW, {}, {}, _FIRST, _THIRD)
+    assert k.startswith("UPGRADE K3 SKIP:"), k
+    assert "case 5 waits for a real third-party digest bump in an rc" in k and "refuses a digest override" in k
+    assert "noomesh-start.sh:504" in k, k
+
+
+def test_k3_passes_when_only_redis_moved_and_only_redis_was_recreated(tmp_path):
+    k = _k3(tmp_path, dict(_NEW, redis="redis-2"), {}, {"redis": "redisimg2" + "0" * 20},
+            sorted(_FIRST + ["redis"]), [t for t in _THIRD if t != "redis"])
+    assert k.startswith("UPGRADE K3 PASS:") and "redisimg1000>redisimg2000" in k, k
+
+
+def test_k3_fails_when_another_third_party_is_recreated_with_its_image_unchanged(tmp_path):
+    k = _k3(tmp_path, dict(_NEW, redis="redis-2", nats="nats-2"), {}, {"redis": "redisimg2" + "0" * 20},
+            sorted(_FIRST + ["redis", "nats"]), [t for t in _THIRD if t not in ("redis", "nats")])
+    assert k.startswith("UPGRADE K3 FAIL:") and "recreated though their image is unchanged: nats" in k, k
+
+
+def test_k3_fails_when_redis_moved_but_was_kept(tmp_path):
+    k = _k3(tmp_path, _NEW, {}, {"redis": "redisimg2" + "0" * 20}, _FIRST, _THIRD)
+    assert k.startswith("UPGRADE K3 FAIL:") and "redis: its image moved" in k and "kept" in k, k
+
+
+def test_k3_is_not_reached_without_image_ids(tmp_path):
+    got = _k(tmp_path, _snap({}, True), _snap(_NEW, True), roll_line=_line(_FIRST, _THIRD), stack_line=_line([], sorted(_FIRST + _THIRD)))
+    assert got["K3"].startswith("UPGRADE K3 NOT REACHED:"), got["K3"]
+
+
+# ── the two docker legs of the upgrade job ─────────────────────────────────
+def _upgrade_job():
+    import yaml
+    wf = (ROOT / ".github" / "workflows" / "install-matrix.yml").read_text()
+    return yaml.safe_load(wf)["jobs"]["upgrade"]
+
+
+def test_the_upgrade_job_runs_a_ce_leg_and_a_distro_leg_with_distinct_artifacts():
+    job = _upgrade_job()
+    inc = job["strategy"]["matrix"]["include"]
+    assert {(i["leg"], i["runner"], i["artifact"]) for i in inc} == {
+        ("ce", "ubuntu-24.04", "install-cell-upgrade-24.04"),
+        ("distro", "ubuntu-22.04", "install-cell-upgrade-22.04-distro")}, inc
+    assert job["strategy"]["fail-fast"] is False and job["runs-on"] == "${{ matrix.runner }}"
+    # selection and bounds exactly as before
+    assert job["timeout-minutes"] == 150
+    assert job["if"] == "github.event_name == 'workflow_dispatch' && inputs.cells != 'fresh' && inputs.cells != 'reboot'"
+    run = next(s for s in job["steps"] if s.get("name") == "Run the upgrade cell")
+    assert run["env"]["LEG"] == "${{ matrix.leg }}" and run["env"]["CELL"] == "${{ matrix.cell }}"
+    up = next(s for s in job["steps"] if s.get("uses", "").startswith("actions/upload-artifact@"))
+    assert up["with"]["name"] == "${{ matrix.artifact }}"
+    assert all(len(s["uses"].split("@")[1].split()[0]) == 40 for s in job["steps"] if "uses" in s), "pinned by sha"
+
+
+def test_both_users_of_the_distro_engine_run_the_one_script():
+    d = JUDGE.parent / "distro-docker.sh"
+    assert d.exists() and "docker.io docker-compose-v2" in d.read_text()
+    for f in ("run.sh", "upgrade.sh"):
+        t = (JUDGE.parent / f).read_text()
+        assert 'sudo bash "$HERE/distro-docker.sh"' in t, f
+        assert "apt-get install" not in t, f
+    up = (JUDGE.parent / "upgrade.sh").read_text()
+    assert up.index("step distro-docker") < up.index("step install-previous")
+    assert 'case "$LEG" in ce|distro)' in up
+
+
+def test_the_judge_prints_the_leg_with_the_versions_the_cell_recorded(tmp_path):
+    out = tmp_path / "out"
+    rc, got = cell(tmp_path)
+    (out / "judge" / "leg").write_text("distro\n")
+    (out / "judge" / "docker-version").write_text("29.1.3\n")
+    (out / "judge" / "compose-version").write_text("2.40.3\n")
+    env = dict(os.environ, OUT=str(out), J=str(out / "judge"), SELF=SELF, NETNS_UNIT_ENABLED="enabled",
+               ROLL_T0=ROLL_T0, STACK_T0=STACK_T0, STACK_T1=STACK_T1, NETNS_UNIT=str(tmp_path / "x.service"),
+               NETNS_UNIT_OWNER="%d:%d" % (os.getuid(), os.getgid()))
+    r = subprocess.run([sys.executable, str(JUDGE), "judge"], env=env, capture_output=True, text=True)
+    assert "UPGRADE LEG distro NOTE: docker 29.1.3, compose 2.40.3" in r.stdout.splitlines(), r.stdout

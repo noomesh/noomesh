@@ -12,7 +12,13 @@
 # nothing).
 #
 #   OUT=<dir> CELL=upgrade-24.04 RUNNER=<label> CLI_TAG=noo-cli-vX.Y.Z[-rc.N] \
-#   [PREV_TAG=noo-cli-vX.Y.Z] scripts/install-cell/upgrade.sh
+#   [PREV_TAG=noo-cli-vX.Y.Z] [LEG=ce|distro] scripts/install-cell/upgrade.sh
+#
+# LEG (the workflow's matrix): `ce` (default) runs on the runner image's own
+# docker-ce; `distro` first installs Ubuntu's `apt install docker.io` +
+# docker-compose-v2 exactly as the fresh matrix's DOCKER=distro cell does
+# (distro-docker.sh, one home for both). Either leg records `docker version` and
+# `docker compose version` and prints `UPGRADE LEG <leg> NOTE: docker <v>, compose <v>`.
 #
 # PREV_TAG (the dispatch input `prev_tag`) chooses the final the box starts
 # on; empty, it is the newest final below the release under test. A chosen
@@ -30,7 +36,7 @@
 # the roll's own "N recreated (...), M kept (...)" line against the cell's
 # container-id snapshots (before/after --all, after the same-tag --stack).
 set -uo pipefail
-: "${OUT:?}" "${CELL:=upgrade-24.04}" "${RUNNER:=?}" "${CLI_TAG:=latest}" "${PREV_TAG:=}"
+: "${OUT:?}" "${CELL:=upgrade-24.04}" "${RUNNER:=?}" "${CLI_TAG:=latest}" "${PREV_TAG:=}" "${LEG:=ce}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 # CLI_TAG and PREV_TAG are free-text dispatch inputs: hold both to the rule
 # before ANY use, on their own (the workflow refuses them first, resolve
@@ -39,6 +45,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 . "$HERE/validate_tag.sh"
 require_cli_tag "$CLI_TAG" || exit 2
 require_prev_tag "$PREV_TAG" || exit 2
+case "$LEG" in ce|distro) ;; *) echo "upgrade-cell: LEG must be ce or distro, not '$LEG'" >&2; exit 2 ;; esac
 # ── end of the dispatch-input check ──
 if [ -n "$PREV_TAG" ]; then START_KIND="chosen"; else START_KIND="previous final"; fi
 mkdir -p "$OUT" "$OUT/stranger-cwd"
@@ -48,6 +55,7 @@ export PATH="$HOME/.local/bin:$PATH"
 J="$OUT/judge"; mkdir -p "$J"
 
 meta cell "$CELL"
+meta leg "$LEG"
 meta runner "$RUNNER"
 meta modes "upgrade: ${PREV_TAG:-previous final} ($START_KIND) -> $CLI_TAG (noo upgrade --all, then a same-tag --stack); model=default"
 meta limits "the operator is the runner user with passwordless sudo: sudo password prompts are never seen"
@@ -71,6 +79,24 @@ sys.exit(0 if s["result"] in ("pass", "not run") else 1)
 PY
     exit $?
 }
+
+# ── 0. the docker engine under test (the leg), and its versions SEEN ───────
+# distro: Ubuntu's own docker.io + docker-compose-v2 (the same script the fresh
+# matrix's distro cell runs). ce: the runner image's engine, untouched. Both
+# legs then record `docker version` and `docker compose version`; the judge
+# prints them, so the compose version is read, never assumed.
+if [ "$LEG" = distro ]; then
+    step distro-docker 900 -- sudo bash "$HERE/distro-docker.sh" || finish
+fi
+step docker-versions 120 -- sh -c 'd=docker; docker info >/dev/null 2>&1 || d="sudo -n docker"
+  echo "== docker version"; $d version 2>&1 | head -40
+  echo "== docker compose version"; $d compose version 2>&1 | head -3
+  $d version --format "{{.Server.Version}}" 2>/dev/null | head -1 > "$1/docker-version"
+  $d compose version --short 2>/dev/null | head -1 > "$1/compose-version"
+  echo "docker $(cat "$1/docker-version"), compose $(cat "$1/compose-version")"' _ "$J" || true
+meta docker_version "$(cat "$J/docker-version" 2>/dev/null)"
+meta compose_version "$(cat "$J/compose-version" 2>/dev/null)"
+echo "$LEG" > "$J/leg"
 
 # ── 1. the previous final, from the releases API ────────────────────────────
 # The newest noo-cli-vX.Y.Z FINAL (no prerelease) strictly below the release
