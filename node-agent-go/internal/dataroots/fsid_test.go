@@ -28,16 +28,21 @@ func TestMain(m *testing.M) {
 }
 
 var (
-	dataFS = FSID{Target: "/data", Source: "/dev/sdb1", FSType: "ext4", UUID: "u-data", Dev: "8:17"}
-	rootFS = FSID{Target: "/", Source: "/dev/sda1", FSType: "ext4", UUID: "u-root", Dev: "8:1"}
+	dataFS  = FSID{Target: "/data", Source: "/dev/sdb1", FSType: "ext4", UUID: "u-data", Dev: "8:17"}
+	rootFS  = FSID{Target: "/", Source: "/dev/sda1", FSType: "ext4", UUID: "u-root", Dev: "8:1"}
+	otherFS = FSID{Target: "/data", Source: "/dev/sdc1", FSType: "ext4", UUID: "u-other", Dev: "8:33"}
 )
 
 // fakeDisk is a data disk mounted at /data, or not (its mount point then an
 // empty directory on the root filesystem).
-type fakeDisk struct{ mounted bool }
+// other: a different disk is mounted there instead.
+type fakeDisk struct{ mounted, other bool }
 
 func (d *fakeDisk) identity(p string) (FSID, string, error) {
 	if d.mounted && (p == "/data" || strings.HasPrefix(p, "/data/")) {
+		if d.other {
+			return otherFS, rootFS.Dev, nil
+		}
 		return dataFS, rootFS.Dev, nil
 	}
 	return rootFS, rootFS.Dev, nil
@@ -53,7 +58,7 @@ func fakeFSCheck(t *testing.T) (*fakeDisk, *int) {
 	calls := 0
 	prevID, prevOS, prevEval, prevStat, prevRec, prevFstab, prevMk :=
 		fsIdentity, fsCheckOS, fsEvalPath, fsStatDir, recordPath, fstabPath, mkdirAll
-	prevUnits, prevMI, prevTrig := mountUnitGlobs, mountinfoPath, automountTrigger
+	prevUnits, prevMI, prevTrig, prevCount := mountUnitGlobs, mountinfoPath, automountTrigger, countEntries
 	fsIdentity, fsCheckOS = disk.identity, "linux"
 	fsEvalPath = func(p string) (string, error) { return p, nil }
 	fsStatDir = func(string) bool { return true }
@@ -66,12 +71,13 @@ func fakeFSCheck(t *testing.T) (*fakeDisk, *int) {
 	mountUnitGlobs = []string{filepath.Join(unitDir, "*.mount"), filepath.Join(unitDir, "*.automount")}
 	mountinfoPath = filepath.Join(dir, "no-mountinfo")
 	automountTrigger = func(string) {}
+	countEntries = func(string) (int, bool) { return 0, false }
 	mkdirAll = func(string, os.FileMode) error { calls++; return nil }
 	resetRecordCache()
 	t.Cleanup(func() {
 		fsIdentity, fsCheckOS, fsEvalPath, fsStatDir, recordPath, fstabPath, mkdirAll =
 			prevID, prevOS, prevEval, prevStat, prevRec, prevFstab, prevMk
-		mountUnitGlobs, mountinfoPath, automountTrigger = prevUnits, prevMI, prevTrig
+		mountUnitGlobs, mountinfoPath, automountTrigger, countEntries = prevUnits, prevMI, prevTrig, prevCount
 		resetRecordCache()
 	})
 	t.Setenv("NOO_DATA_ROOT", "/data/noo")
@@ -353,6 +359,99 @@ func TestALateNetworkMountClearsByItself(t *testing.T) {
 	}
 	if !strings.Contains(clearedLine("/data/noo"), "data root /data/noo is mounted now; the refusal is cleared") {
 		t.Fatal(clearedLine("/data/noo"))
+	}
+}
+
+// captureLog sends slog to a buffer for the test.
+func captureLog(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	return &buf
+}
+
+// A root recorded on the root filesystem (empty at the first look) whose disk
+// then arrives: accepted, re-recorded, one plain line.
+func TestADiskArrivingOverAnEmptyDirectoryIsAccepted(t *testing.T) {
+	disk, _ := fakeFSCheck(t)
+	r := Resolve(os.Getenv)
+	_ = checkFilesystems(r) // recorded on the root filesystem
+	buf := captureLog(t)
+	disk.mounted = true
+	for i := 0; i < 3; i++ {
+		if c := fsCodes(r); len(c) != 0 {
+			t.Fatalf("the disk arrived over a root-fs record: accept, got %v", c)
+		}
+	}
+	b, _ := os.ReadFile(recordPath())
+	if !strings.Contains(string(b), `"uuid": "u-data"`) {
+		t.Fatalf("not re-recorded: %s", b)
+	}
+	want := "data root /data/noo is now on its own filesystem (/dev/sdb1, was on the root filesystem); recorded"
+	if n := strings.Count(buf.String(), want); n != 1 || strings.Contains(buf.String(), "hidden") {
+		t.Fatalf("want the plain line once, got %d:\n%s", n, buf.String())
+	}
+	if got := FilesystemReport(r); got["meant"] != "mount" || got["hidden_entries"] != nil {
+		t.Fatalf("%v", got)
+	}
+}
+
+// The same with 3 entries under the root at the first look: they are hidden
+// under the mount now, and the line and the report say so.
+func TestADiskArrivingOverFilesSaysTheyAreHidden(t *testing.T) {
+	disk, _ := fakeFSCheck(t)
+	countEntries = func(string) (int, bool) { return 3, false }
+	r := Resolve(os.Getenv)
+	_ = checkFilesystems(r)
+	buf := captureLog(t)
+	disk.mounted = true
+	for i := 0; i < 2; i++ {
+		if c := fsCodes(r); len(c) != 0 {
+			t.Fatalf("accept, got %v", c)
+		}
+	}
+	note := "the disk is now mounted at /data/noo; 3 files written before it was mounted are hidden under the mount point on the root filesystem: unmount to recover or remove them"
+	if n := strings.Count(buf.String(), note); n != 1 {
+		t.Fatalf("want the hidden-files line once, got %d:\n%s", n, buf.String())
+	}
+	if got := FilesystemReport(r); got["hidden_entries"] != 3 || got["hidden_capped"] != false {
+		t.Fatalf("%v", got)
+	}
+	if got := HiddenNote("/x", 10000, true); !strings.Contains(got, "at least 10000 files") {
+		t.Fatal(got)
+	}
+}
+
+// Recorded on its own disk, now on the root filesystem: refused.
+func TestARecordedDiskNowOnTheRootFilesystemIsRefused(t *testing.T) {
+	disk, _ := fakeFSCheck(t)
+	disk.mounted = true
+	r := Resolve(os.Getenv)
+	_ = checkFilesystems(r)
+	disk.mounted = false
+	f := checkFilesystems(r)
+	if len(f) != 1 || f[0].Code != "not_on_recorded_fs" || !strings.Contains(f[0].Detail, "the ROOT filesystem") {
+		t.Fatalf("%+v", f)
+	}
+}
+
+// Recorded on disk A, now on disk B: refused, and the detail says another
+// disk is mounted there.
+func TestADifferentDiskIsRefused(t *testing.T) {
+	disk, _ := fakeFSCheck(t)
+	disk.mounted = true
+	r := Resolve(os.Getenv)
+	_ = checkFilesystems(r)
+	disk.other = true
+	f := checkFilesystems(r)
+	if len(f) != 1 || f[0].Code != "not_on_recorded_fs" || !strings.Contains(f[0].Detail, "on a different filesystem") {
+		t.Fatalf("%+v", f)
+	}
+	b, _ := os.ReadFile(recordPath())
+	if !strings.Contains(string(b), `"uuid": "u-data"`) {
+		t.Fatalf("a different disk was recorded: %s", b)
 	}
 }
 

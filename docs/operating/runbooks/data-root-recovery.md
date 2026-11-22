@@ -155,12 +155,25 @@ look:
 - Any other root is recorded where it is, as a plain directory, even when it
   is on the root disk.
 
-That last case has one edge. Say a disk mounted by hand, by a script or by
-the desktop (udisks), with no fstab line or mount unit, is absent at that
-first start. Its empty mount point is recorded as a directory. When the disk
-is mounted later, the agent refuses it (`not_on_recorded_fs`). It fails
-closed: verify shows the row as FAIL and names the record file. To make such
-a disk safe across reboots, give it an fstab line or a mount unit.
+**Which way the filesystem changed matters.**
+
+- **Recorded on the root disk, now on its own disk:** the disk arrived, for
+  example a disk mounted by hand or by the desktop that was absent at the
+  first look. The agent accepts it and records the new disk, with one log
+  line. No command is needed.
+- **Recorded on its own disk, now on the root disk:** the mount is missing.
+  The agent refuses (`not_on_recorded_fs`).
+- **Recorded on one disk, now on a different one:** another disk is mounted
+  there. The agent refuses (`not_on_recorded_fs`).
+
+Files can end up hidden under the mount. At the first look the agent records
+how many entries the root holds when it is on the root disk (one directory
+listing, counted up to 10 000). If that count was not zero when the disk
+arrives, whatever the node wrote there is now hidden beneath the mount. The
+log line and the `data root policy` row in verify then say: "the disk is now
+mounted at `<root>`; `<N>` files written before it was mounted are hidden
+under the mount point on the root filesystem: unmount to recover or remove
+them" ("at least `<N>`" past the cap).
 
 **What noomesh creates or changes in a data root.**
 
@@ -195,6 +208,8 @@ a disk safe across reboots, give it an fstab line or a mount unit.
 unit). Never create the directory: the mount would hide it, along with
 anything written there. After a deliberate disk change, remove the record
 file on the node, and the agent records the new disk at its next check.
+This applies only when a different disk replaced the recorded one. A disk
+that arrives over a root recorded on the root disk is recorded by itself.
 
 ## For agents
 

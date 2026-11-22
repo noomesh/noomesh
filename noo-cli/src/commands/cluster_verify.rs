@@ -2525,9 +2525,12 @@ pub(crate) fn data_root_policy_row(n: &Value) -> Option<Check> {
     // systemd mount unit), a disk recorded at a known-good start, or a plain
     // directory. Older agents do not say; then nothing is shown.
     let kind = data_root_kind(&pol["filesystem"]);
+    // A disk that arrived over a root the node had already written to: those
+    // entries are under the mount now (the agent's count at its first look).
+    let hidden = data_root_hidden_note(root, &pol["filesystem"]);
     if pol["ok"].as_bool() == Some(true) {
         let k = kind.as_deref().map(|k| format!("; {k}")).unwrap_or_default();
-        return Some(ok(NAME, format!("{root}: dedicated, conventional and owned by the agent{k}")));
+        return Some(ok(NAME, format!("{root}: dedicated, conventional and owned by the agent{k}{hidden}")));
     }
     let probs: Vec<&Value> = pol["problems"].as_array().map(|a| a.iter().collect()).unwrap_or_default();
     let codes: Vec<&str> = probs.iter().filter_map(|p| p["code"].as_str()).collect();
@@ -2562,8 +2565,8 @@ pub(crate) fn data_root_policy_row(n: &Value) -> Option<Check> {
         format!("noo cluster set-config {id} --data-root {target} && noo cluster provision {id} --move-data --wait")
     };
     let msg = match &kind {
-        Some(k) => format!("{root} [{k}]: {detail}"),
-        None => format!("{root}: {detail}"),
+        Some(k) => format!("{root} [{k}]: {detail}{hidden}"),
+        None => format!("{root}: {detail}{hidden}"),
     };
     // Refused in warn mode too (the agent's safety problems, i1160): a root
     // that does not answer, or whose mount is not there.
@@ -2575,7 +2578,9 @@ pub(crate) fn data_root_policy_row(n: &Value) -> Option<Check> {
     }
     if codes.iter().any(|c| matches!(*c, "not_on_recorded_fs" | "mount_missing")) {
         let mut r = data_root_mount_remedy(id, root);
-        if codes.contains(&"not_on_recorded_fs") {
+        // Only a DIFFERENT disk can have been replaced on purpose; a root back
+        // on the root filesystem is a missing mount, never re-recorded.
+        if codes.contains(&"not_on_recorded_fs") && detail.contains("on a different filesystem") {
             r.push_str(&format!("; only if the disk was replaced or the root moved ON PURPOSE: on {id}: sudo rm {DATA_ROOT_FS_RECORD} (the agent records the new filesystem at its next check)"));
         }
         return Some(fail(NAME, msg, r));
@@ -2593,6 +2598,18 @@ fn data_root_kind(fs: &Value) -> Option<String> {
         ("directory", _) => Some("directory".to_string()),
         _ => None,
     }
+}
+
+/// `data_roots.policy.filesystem.hidden_entries` in words, or "" when there
+/// are none (the agent's text, node-agent-go dataroots.HiddenNote).
+fn data_root_hidden_note(root: &str, fs: &Value) -> String {
+    let n = fs["hidden_entries"].as_u64().unwrap_or(0);
+    if n == 0 {
+        return String::new();
+    }
+    let count = if fs["hidden_capped"].as_bool() == Some(true) { format!("at least {n}") } else { n.to_string() };
+    format!("; the disk is now mounted at {root}; {count} files written before it was mounted are hidden under the mount point \
+             on the root filesystem: unmount to recover or remove them")
 }
 
 /// The agent's record of each data root's filesystem
@@ -16066,12 +16083,15 @@ mod config_mount_tests {
         let dir = super::data_root_policy_row(&missing(Some("directory"))).unwrap().remedy.unwrap();
         assert_eq!(dir, "on node_a: sudo install -d -o noo-agent -g noo-agent /data/noo && sudo chmod go-w /data/noo");
         // Not on its recorded filesystem: FAIL in warn mode, mount it, never create.
-        let moved = json!({"id": "node_a", "data_roots": {"noo_data_root": "/data/noo",
-            "policy": {"mode": "warn", "ok": false, "problems": [{"code": "not_on_recorded_fs", "detail": "on / (ext4)"}]}}});
-        let c = super::data_root_policy_row(&moved).unwrap();
+        let moved = |detail: &str| json!({"id": "node_a", "data_roots": {"noo_data_root": "/data/noo",
+            "policy": {"mode": "warn", "ok": false, "problems": [{"code": "not_on_recorded_fs", "detail": detail}]}}});
+        let c = super::data_root_policy_row(&moved("/data/noo is on /dev/sda1 at / (ext4): the ROOT filesystem")).unwrap();
         assert_eq!(c.verdict, super::Verdict::Fail);
         let r = c.remedy.unwrap();
         assert!(r.starts_with("on node_a: the mount for /data/noo is not there") && !r.contains("install -d"), "{r}");
+        assert!(!r.contains("data-root-fs.json"), "back on the root fs: never re-record: {r}");
+        // A different disk: the record may be replaced, on purpose only.
+        let r = super::data_root_policy_row(&moved("/data/noo is on a different filesystem, /dev/sdc1")).unwrap().remedy.unwrap();
         assert!(r.contains("data-root-fs.json"), "{r}");
     }
 
@@ -16092,6 +16112,12 @@ mod config_mount_tests {
             "/data/noo: dedicated, conventional and owned by the agent; directory");
         assert_eq!(row(json!({"meant": "mount", "by": "systemd unit"}), false), "/data/noo [mount (systemd unit)]: not mounted");
         assert_eq!(row(json!({"meant": "unknown", "by": ""}), true), "/data/noo: dedicated, conventional and owned by the agent");
+        // A disk that arrived over 3 entries: the row says they are hidden.
+        assert_eq!(row(json!({"meant": "mount", "by": "fstab", "hidden_entries": 3, "hidden_capped": false}), true),
+            "/data/noo: dedicated, conventional and owned by the agent; mount (fstab); the disk is now mounted at /data/noo; \
+             3 files written before it was mounted are hidden under the mount point on the root filesystem: unmount to recover or remove them");
+        assert!(row(json!({"meant": "mount", "by": "fstab", "hidden_entries": 10000, "hidden_capped": true}), true)
+            .contains("; at least 10000 files written before"));
     }
 
     #[test]
