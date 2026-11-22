@@ -32,6 +32,9 @@ type fakeRunner struct {
 	// stderr maps a substring of the joined argv to the stderr a SUCCESSFUL
 	// Run returns (what a script prints to fd 2 on its way to exit 0).
 	stderr map[string]string
+	// rcMsg is the stderr a FAILING Run returns for an rc entry with the same
+	// key (Docker's own words); without one it is "boom: <key>".
+	rcMsg map[string]string
 }
 
 func (f *fakeRunner) Run(_ context.Context, dir string, env []string, name string, args ...string) (int, string) {
@@ -42,6 +45,9 @@ func (f *fakeRunner) Run(_ context.Context, dir string, env []string, name strin
 	joined := strings.Join(argv, " ")
 	for frag, code := range f.rc {
 		if strings.Contains(joined, frag) {
+			if m, ok := f.rcMsg[frag]; ok {
+				return code, m
+			}
 			return code, "boom: " + frag
 		}
 	}
