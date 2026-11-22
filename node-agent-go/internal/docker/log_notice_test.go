@@ -63,6 +63,11 @@ func TestAQuietContainerIsNotAccused(t *testing.T) {
 	if n := unreadableLogNotice("noo-vllm", before, before, started, "", now); n != "" {
 		t.Fatalf("no line since the start, so nothing to name:\n%s", n)
 	}
+	// An empty answer, and the probe's newest line is from before the
+	// start: nothing written since, so nothing was missed.
+	if n := unreadableLogNotice("noo-vllm", nil, before, started, "", now); n != "" {
+		t.Fatalf("the probe holds nothing since the start:\n%s", n)
+	}
 	// Lines since the start, but all older than the window asked for.
 	if n := unreadableLogNotice("noo-vllm", nil, after, started, "10s", now); n != "" {
 		t.Fatalf("the probe's lines are outside the since window:\n%s", n)
