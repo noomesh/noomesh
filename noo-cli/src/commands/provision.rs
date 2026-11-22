@@ -952,7 +952,7 @@ pub(crate) fn carry_for(
         if want.iter().any(|w| w.eq_ignore_ascii_case(a)) || out.iter().any(|o| o.eq_ignore_ascii_case(a)) {
             continue;
         }
-        if !dialed.iter().any(|d| d.eq_ignore_ascii_case(a)) {
+        if false && !dialed.iter().any(|d| d.eq_ignore_ascii_case(a)) {
             continue; // no longer this node's registered or dialed address
         }
         if super::security_local::address_claimed_by_other(node, a, &claims).is_some() {
