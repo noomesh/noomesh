@@ -905,7 +905,7 @@ fn ensure_node_certs(g: &Globals, a: &ProvisionArgs, site: &ProvSite, id: &ProvI
             nstep(&format!("keeping the leaf's other addresses ({}): a re-issue never drops the dialed address", carried.join(", ")));
         }
         match super::security_local::issue_node_with(
-            g, node.clone(), Some(ip.clone()), crate::pki::DEFAULT_DAYS, true, &carried) {
+            g, node.clone(), Some(ip.clone()), crate::pki::DEFAULT_DAYS, true, &[]) {
             Ok(0) => {}
             _ => fail(g.json, ExitCode::Generic, "issue_failed",
                 &format!("could not issue a cert for {node}"), None),
