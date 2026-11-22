@@ -101,6 +101,7 @@ impl ServerCertVerifier for PinnedLeaf {
             ));
         }
         self.leaf_ok.store(true, Ordering::SeqCst);
+        self.proven.store(true, Ordering::SeqCst);
         Ok(ServerCertVerified::assertion())
     }
 
