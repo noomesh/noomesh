@@ -584,11 +584,12 @@ _THIRD = ["nats", "redis", "model-cache", "loki", "tempo", "prometheus", "alertm
 _FIRST = ["gateway", "worker", "postgres", "sandbox"]
 
 
-def _snap(ids, labelled, services=None):
-    """A recreated.py snapshot: name id service depends_on L|-."""
+def _snap(ids, labelled, services=None, imgs=None):
+    """A recreated.py snapshot: name id service depends_on L|- [image id]."""
     rows = []
     for svc in services or _FIRST + _THIRD:
-        rows.append("noo-%s %s %s - %s\n" % (svc, ids.get(svc, svc + "-1"), svc, "L" if labelled else "-"))
+        img = " sha256:" + (imgs or {}).get(svc, svc + "img1" + "0" * 20) if imgs is not None else ""
+        rows.append("noo-%s %s %s - %s%s\n" % (svc, ids.get(svc, svc + "-1"), svc, "L" if labelled else "-", img))
     return "".join(rows)
 
 
@@ -758,3 +759,40 @@ def test_upgrade_sh_snapshots_around_the_roll_and_after_the_stack():
                                       text.index('STACK_T0="$(date +%s)"'), text.index("step upgrade-stack-same-tag"),
                                       text.index('STACK_T1="$(date +%s)"'), text.index('snap "$J/stack.after"'))
     assert b < t0 < roll < a < s0 < st < t1 < sa
+
+
+def test_k1_a_moved_third_party_image_must_be_recreated_and_only_that_one(tmp_path):
+    ids = dict(_NEW, redis="redis-2")
+    first = sorted(_FIRST + ["redis"])
+    keep = [t for t in _THIRD if t != "redis"]
+    bimg, aimg = {}, {"redis": "redisimg2" + "0" * 20}
+    got = _k(tmp_path / "ok", _snap({}, True, imgs=bimg), _snap(ids, True, imgs=aimg), roll_line=_line(first, keep))
+    assert got["K1"].startswith("UPGRADE K1 PASS:"), got["K1"]
+    assert "recreated: redis: its image moved redisimg1000>redisimg2000" in got["K1"], got["K1"]
+    assert "NOTE: image ids not visible" not in got["K1"], got["K1"]
+    # moved but kept: FAIL
+    got = _k(tmp_path / "kept", _snap({}, True, imgs=bimg), _snap(_NEW, True, imgs=aimg), roll_line=_line(_FIRST, _THIRD))
+    assert got["K1"].startswith("UPGRADE K1 FAIL:") and "redis: its image moved (" in got["K1"] and "but the container was kept" in got["K1"], got["K1"]
+    # unchanged nats recreated: FAIL
+    got = _k(tmp_path / "nats", _snap({}, True, imgs={}), _snap(dict(_NEW, nats="nats-2"), True, imgs={}),
+             roll_line=_line(_FIRST + ["nats"], [t for t in _THIRD if t != "nats"]))
+    assert got["K1"].startswith("UPGRADE K1 FAIL:") and "recreated but must keep its id: nats (its image is unchanged)" in got["K1"], got["K1"]
+
+
+def test_k1_without_image_ids_falls_back_to_the_plain_rule_and_says_so(tmp_path):
+    got = _k(tmp_path, _snap({}, True), _snap(_NEW, True), roll_line=_line(_FIRST, _THIRD))
+    assert got["K1"].startswith("UPGRADE K1 PASS:") and "NOTE: image ids not visible in the snapshot for" in got["K1"], got["K1"]
+
+
+def test_k1_compares_only_names_both_sides_see(tmp_path):
+    # the line names a project container the snapshot (noo-* only) never saw: a NOTE, not a FAIL
+    got = _k(tmp_path, _snap({}, True), _snap(_NEW, True), roll_line=_line(_FIRST, _THIRD + ["init-once"]))
+    assert got["K1"].startswith("UPGRADE K1 PASS:") and "NOTE: not in the snapshot (not compared): init-once" in got["K1"], got["K1"]
+
+
+def test_snapshot_image_column_reads_and_old_rows_still_parse(tmp_path):
+    f = tmp_path / "s"
+    f.write_text("noo-a a1 a - L sha256:abc\nnoo-b b1 b - -\n")
+    assert rc_mod.read_images(str(f)) == {"noo-a": "sha256:abc"}
+    assert rc_mod.read_labelled(str(f)) == {"noo-a": True, "noo-b": False}
+    assert "{{.Image}}" in rc_mod.FMT

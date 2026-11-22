@@ -48,10 +48,12 @@ import sys
 # The 4th field is whether the container carries the start-inputs label
 # (`noo.inputs`, 0.6.29 and later): L or -. It sits before depends_on, whose
 # value may be empty, so a split on spaces stays unambiguous; snap() writes the
-# row as `name id service depends_on L|-`.
+# row as `name id service depends_on L|-`. The 5th field is the container's image
+# ID (`{{.Image}}`, the sha256 id, not the tag), so a moved digest is visible;
+# the row then ends `... L|- sha256:<id>`. Rows without it still parse.
 FMT = ('{{.Name}} {{.Id}} {{index .Config.Labels "com.docker.compose.service"}} '
        '{{if index .Config.Labels "noo.inputs"}}L{{else}}-{{end}} '
-       '{{index .Config.Labels "com.docker.compose.depends_on"}}')
+       '{{.Image}} {{index .Config.Labels "com.docker.compose.depends_on"}}')
 
 
 def _docker(args: list[str]) -> str:
@@ -70,10 +72,10 @@ def snap(path: str) -> int:
     rows = []
     if ids:
         for line in _docker(["inspect", "-f", FMT, *ids]).splitlines():
-            parts = line.replace("<no value>", "-").split(" ", 4)
+            parts = line.replace("<no value>", "-").split(" ", 5)
             if len(parts) >= 3 and parts[2] not in ("", "-"):
-                name, cid, svc, lab, dep = [p.strip() or "-" for p in (parts + ["-", "-"])[:5]]
-                rows.append(" ".join((name, cid, svc, dep, lab if lab in ("L", "-") else "-")))
+                name, cid, svc, lab, img, dep = [p.strip() or "-" for p in (parts + ["-"] * 3)[:6]]
+                rows.append(" ".join((name, cid, svc, dep, lab if lab in ("L", "-") else "-", img)))
     with open(path, "w") as f:
         f.write("".join(r + "\n" for r in sorted(rows)))
     print(f"{len(rows)} compose containers recorded")
@@ -100,6 +102,17 @@ def read_labelled(path: str) -> dict[str, bool]:
             p = line.split()
             if len(p) >= 5:
                 out[p[0].lstrip("/")] = p[4] == "L"
+    return out
+
+
+def read_images(path: str) -> dict[str, str]:
+    """name -> image ID when it was recorded; a row without the column is left out."""
+    out = {}
+    with open(path) as f:
+        for line in f:
+            p = line.split()
+            if len(p) >= 6 and p[5] != "-":
+                out[p[0].lstrip("/")] = p[5]
     return out
 
 
