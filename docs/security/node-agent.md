@@ -534,9 +534,27 @@ reason: the agent is older than the controller, or it has not been told yet.
 The agent starts tolerant: its listener is up before its first desired-config
 read, and a header-less call in that window is what an older controller
 sends anyway; a call naming another node is refused from the first second.
-The agent reports its latest refusal for ten minutes as `wrong_node_refused`
-(`target`, `path`, `at`); the same row then FAILs naming the call and the
-node it was meant for.
+Every caller that names another node is refused with `421`, whoever it is.
+An agent records a misaddressed call only when the controller sent it (the
+controller's leaf): it reports that latest refusal for ten minutes as
+`wrong_node_refused` (`target`, `path`, `at`), and the same row then FAILs
+naming the call and the node it was meant for. A misaddressed controller call
+is a controller or routing problem, so it belongs on that row.
+
+A peer's misaddressed call (a node or service leaf) is refused and logged,
+never recorded on the refusing node's row:
+
+- the agent logs `misaddressed_call_refused` with the caller's leaf name (its
+  common name, nothing else from the certificate), the node named and the
+  path, at most once per caller per ten minutes (`earlier_calls` counts the
+  calls since the previous line). It tracks at most 64 callers; the one seen
+  longest ago is dropped first;
+- its heartbeat lists those callers for ten minutes as `misaddressed_from`
+  (`caller`, `count`, `last_at`);
+- the gateway raises the `node.misaddressed_calls` operator alert on the
+  CALLER, phrased as the refusing node's report ("node B reports that A sent
+  calls addressed to another node"), at most once per caller per hour. It
+  marks no node failed: it is one node's account of another.
 
 ## A heartbeat cannot claim another node's address
 

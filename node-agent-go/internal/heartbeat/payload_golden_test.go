@@ -146,3 +146,26 @@ func TestPayloadCarriesTheLatestWrongNodeRefusal(t *testing.T) {
 		t.Fatalf("no refusal: the field must be absent, got %#v", beat[auth.WrongNodeRefusedField])
 	}
 }
+
+// i1174: the peers whose misaddressed calls this agent refused ride the beat
+// as misaddressed_from while reported, and the field is absent otherwise.
+func TestPayloadCarriesMisaddressedCallers(t *testing.T) {
+	prev := misaddressedReport
+	t.Cleanup(func() { misaddressedReport = prev })
+	misaddressedReport = func() []map[string]any {
+		return []map[string]any{{"caller": "node_c", "count": 3, "last_at": int64(9)}}
+	}
+	beat, _ := capturePayloads(t)
+	list, ok := beat[auth.MisaddressedFromField].([]any)
+	if !ok || len(list) != 1 {
+		t.Fatalf("misaddressed_from = %#v, want one caller", beat[auth.MisaddressedFromField])
+	}
+	if e, _ := list[0].(map[string]any); e["caller"] != "node_c" || e["count"] != float64(3) {
+		t.Fatalf("misaddressed_from[0] = %#v", list[0])
+	}
+	misaddressedReport = func() []map[string]any { return nil }
+	beat, _ = capturePayloads(t)
+	if _, present := beat[auth.MisaddressedFromField]; present {
+		t.Fatalf("no caller: the field must be absent, got %#v", beat[auth.MisaddressedFromField])
+	}
+}

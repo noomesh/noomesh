@@ -7,7 +7,9 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/http"
+	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -19,7 +21,12 @@ import (
 // The gateway names the node every call is meant for in TargetNodeHeader.
 // This agent answers only calls that name ITSELF: a call naming another node
 // is refused with 421 Misdirected Request and {"code":"wrong_node"}, whoever
-// sent it.
+// sent it. The refusal is recorded for the heartbeat (verify's
+// `target-node check` row on this node) only when the controller sent it: a
+// misaddressed controller call is a controller or routing problem. A peer's
+// misaddressed call (a node or service leaf) is refused and logged, once per
+// caller per misaddressedWindow, and reported against the CALLER
+// (MisaddressedFromField), never as this node's failure.
 //
 // A call that names no node is accepted while the controller has not said
 // otherwise. The controller turns strictness on PER NODE through the
@@ -108,6 +115,102 @@ func LastWrongNode() map[string]any {
 	return map[string]any{"target": w.target, "path": w.path, "detail": w.detail, "at": w.at.Unix()}
 }
 
+// MisaddressedFromField is the heartbeat field listing the peers (not the
+// controller) whose calls this agent refused as addressed to another node in
+// the last misaddressedWindow: [{caller, count, last_at}]. It is this node's
+// report on the caller, for an operator alert on the caller.
+const MisaddressedFromField = "misaddressed_from"
+
+// misaddressedWindow is both the log rate limit (one line per caller per
+// window) and how long a caller stays in MisaddressedFromField.
+const misaddressedWindow = 10 * time.Minute
+
+// misaddressedCallersMax bounds the callers tracked; the one seen longest ago
+// is evicted first.
+const misaddressedCallersMax = 64
+
+type misaddressedCaller struct {
+	count        int // calls since the last log line
+	logged, last time.Time
+}
+
+var (
+	misaddressedMu sync.Mutex
+	misaddressed   = map[string]*misaddressedCaller{}
+	// Seams for the tests: the clock and the log line.
+	misaddressedNow = time.Now
+	misaddressedLog = func(caller, target, path string, earlier int) {
+		slog.Warn("misaddressed_call_refused", "caller", caller, "target", target, "path", path,
+			"earlier_calls", earlier, "note", "a peer's call naming another node; logged once per caller per 10m")
+	}
+)
+
+// callerName is the verified leaf's common name (a node id or a service
+// name), never more of the certificate.
+func callerName(r *http.Request) string {
+	if r.TLS == nil || len(r.TLS.PeerCertificates) == 0 {
+		return "unknown"
+	}
+	cn := strings.TrimSpace(r.TLS.PeerCertificates[0].Subject.CommonName)
+	if cn == "" {
+		return "unknown"
+	}
+	if len(cn) > 64 {
+		cn = cn[:64]
+	}
+	return cn
+}
+
+// noteMisaddressed counts a peer's misaddressed call and logs it at most
+// once per caller per misaddressedWindow.
+func noteMisaddressed(caller string, r *http.Request) {
+	now := misaddressedNow()
+	misaddressedMu.Lock()
+	e := misaddressed[caller]
+	if e == nil {
+		if len(misaddressed) >= misaddressedCallersMax {
+			oldest := ""
+			for k, v := range misaddressed {
+				if oldest == "" || v.last.Before(misaddressed[oldest].last) {
+					oldest = k
+				}
+			}
+			delete(misaddressed, oldest)
+		}
+		e = &misaddressedCaller{}
+		misaddressed[caller] = e
+	}
+	e.last = now
+	logIt := e.logged.IsZero() || now.Sub(e.logged) >= misaddressedWindow
+	earlier := e.count
+	if logIt {
+		e.logged, e.count = now, 1
+	} else {
+		e.count++
+	}
+	misaddressedMu.Unlock()
+	if logIt {
+		misaddressedLog(caller, strings.TrimSpace(r.Header.Get(TargetNodeHeader)), r.URL.Path, earlier)
+	}
+}
+
+// MisaddressedFrom is the heartbeat's MisaddressedFromField: the callers
+// refused within misaddressedWindow, the latest first, or nil when there
+// were none.
+func MisaddressedFrom() []map[string]any {
+	now := misaddressedNow()
+	misaddressedMu.Lock()
+	defer misaddressedMu.Unlock()
+	var out []map[string]any
+	for caller, e := range misaddressed {
+		if now.Sub(e.last) <= misaddressedWindow {
+			out = append(out, map[string]any{"caller": caller, "count": e.count, "last_at": e.last.Unix()})
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i]["last_at"].(int64) > out[j]["last_at"].(int64) })
+	return out
+}
+
 // SetRequireTargetNode applies desired-config's `require_target_node`
 // (absent = false).
 func SetRequireTargetNode(v bool) {
@@ -125,8 +228,12 @@ func TargetNode(cfg *config.Config) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if why := TargetNodeRefusal(cfg, r); why != "" {
-				slog.Warn("wrong_node", "path", r.URL.Path, "target", r.Header.Get(TargetNodeHeader), "detail", why)
-				noteWrongNode(r, why)
+				if r.TLS != nil && isController(r.TLS.PeerCertificates) {
+					slog.Warn("wrong_node", "path", r.URL.Path, "target", r.Header.Get(TargetNodeHeader), "detail", why)
+					noteWrongNode(r, why)
+				} else {
+					noteMisaddressed(callerName(r), r)
+				}
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusMisdirectedRequest)
 				_ = json.NewEncoder(w).Encode(map[string]string{"code": WrongNodeCode, "detail": why})

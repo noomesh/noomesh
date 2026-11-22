@@ -987,6 +987,12 @@ async fn node_heartbeat(
     // second on per node once the first is reported; verify's `target-node
     // check` row reads both.
     carry_target_node(&mut data, &body);
+    // The peers this agent refused calls from as addressed to another node:
+    // its report on each CALLER, alerted on the caller (i1174).
+    for alert in crate::node_pin::misaddressed_alerts(&node_id, &body) {
+        crate::operator_alert::send_operator_alert_with(&state, alert, crate::node_pin::MISADDRESSED_ALERT_COOLDOWN_SECS)
+            .await;
+    }
     // Which image the node's backend-door sidecars run on
     // B: "published", or "fallback-alpine" — stunnel installed from the
     // alpine mirror at every sidecar start. `noo cluster verify <node>`
