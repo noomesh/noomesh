@@ -842,12 +842,14 @@ def _upgrade_job():
     return yaml.safe_load(wf)["jobs"]["upgrade"]
 
 
-def test_the_upgrade_job_runs_a_ce_leg_and_a_distro_leg_with_distinct_artifacts():
+def test_the_upgrade_job_runs_three_legs_with_distinct_artifacts():
     job = _upgrade_job()
     inc = job["strategy"]["matrix"]["include"]
     assert {(i["leg"], i["runner"], i["artifact"]) for i in inc} == {
         ("ce", "ubuntu-24.04", "install-cell-upgrade-24.04"),
-        ("distro", "ubuntu-22.04", "install-cell-upgrade-22.04-distro")}, inc
+        ("distro", "ubuntu-22.04", "install-cell-upgrade-22.04-distro"),
+        ("compose-floor", "ubuntu-24.04", "install-cell-upgrade-24.04-compose-floor")}, inc
+    assert len({i["artifact"] for i in inc}) == 3 and len({i["cell"] for i in inc}) == 3
     assert job["strategy"]["fail-fast"] is False and job["runs-on"] == "${{ matrix.runner }}"
     # selection and bounds exactly as before
     assert job["timeout-minutes"] == 150
@@ -868,7 +870,7 @@ def test_both_users_of_the_distro_engine_run_the_one_script():
         assert "apt-get install" not in t, f
     up = (JUDGE.parent / "upgrade.sh").read_text()
     assert up.index("step distro-docker") < up.index("step install-previous")
-    assert 'case "$LEG" in ce|distro)' in up
+    assert 'case "$LEG" in ce|distro|compose-floor)' in up
 
 
 def test_the_judge_prints_the_leg_with_the_versions_the_cell_recorded(tmp_path):
@@ -882,3 +884,60 @@ def test_the_judge_prints_the_leg_with_the_versions_the_cell_recorded(tmp_path):
                NETNS_UNIT_OWNER="%d:%d" % (os.getuid(), os.getgid()))
     r = subprocess.run([sys.executable, str(JUDGE), "judge"], env=env, capture_output=True, text=True)
     assert "UPGRADE LEG distro NOTE: docker 29.1.3, compose 2.40.3" in r.stdout.splitlines(), r.stdout
+
+
+# ── the compose-floor leg: the lowest supported Compose (2.33.x) ───────────
+import hashlib
+
+
+def _floor_script():
+    return (JUDGE.parent / "compose-floor.sh").read_text()
+
+
+def test_compose_floor_pins_url_and_sha256_and_the_judge_pin_agrees():
+    s = _floor_script()
+    assert 'COMPOSE_URL="https://github.com/docker/compose/releases/download/v2.33.1/docker-compose-linux-x86_64"' in s
+    assert 'COMPOSE_SHA256="3efda1ad6caed49dedd5644cadbf7e0c9cc3d74d8844ca5237b6a43ac1ef1a46"' in s
+    assert 'COMPOSE_VERSION="2.33.1"' in s
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("uj_floor", JUDGE)
+    m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+    assert m.COMPOSE_FLOOR_PIN == "2.33.1"
+    # verified before ANY install, and the user's and the system plugin dirs
+    assert s.index('"$COMPOSE_SHA256"') < s.index("install -D")
+    assert "/.docker/cli-plugins/docker-compose" in s and "/usr/local/lib/docker/cli-plugins" in s
+    up = (JUDGE.parent / "upgrade.sh").read_text()
+    assert 'sudo bash "$HERE/compose-floor.sh"' in up and 'ce|distro|compose-floor)' in up
+    assert up.index("step compose-floor") < up.index("step install-previous")
+
+
+def test_compose_floor_refuses_a_sha256_mismatch_and_installs_nothing(tmp_path):
+    bad = tmp_path / "bin"; bad.write_bytes(b"not compose")
+    assert hashlib.sha256(b"not compose").hexdigest() not in _floor_script()
+    env = dict(os.environ, COMPOSE_URL_OVERRIDE="file://" + str(bad), SUDO_USER=os.environ.get("USER") or "root")
+    r = subprocess.run(["bash", str(JUDGE.parent / "compose-floor.sh")], env=env, capture_output=True, text=True)
+    assert r.returncode != 0 and "sha256 mismatch" in r.stdout and "nothing installed" in r.stdout, r.stdout + r.stderr
+    assert "verified" not in r.stdout
+
+
+def _leg_lines(tmp_path, cv):
+    out = tmp_path / "out"
+    rc, got = cell(tmp_path)
+    (out / "judge" / "leg").write_text("compose-floor\n")
+    (out / "judge" / "docker-version").write_text("28.5.1\n")
+    (out / "judge" / "compose-version").write_text(cv + "\n")
+    env = dict(os.environ, OUT=str(out), J=str(out / "judge"), SELF=SELF, NETNS_UNIT_ENABLED="enabled",
+               ROLL_T0=ROLL_T0, STACK_T0=STACK_T0, STACK_T1=STACK_T1, NETNS_UNIT=str(tmp_path / "x.service"),
+               NETNS_UNIT_OWNER="%d:%d" % (os.getuid(), os.getgid()))
+    r = subprocess.run([sys.executable, str(JUDGE), "judge"], env=env, capture_output=True, text=True)
+    return r.stdout.splitlines()
+
+
+def test_compose_floor_judge_passes_2_33_1_and_fails_a_newer_plugin(tmp_path):
+    ok = _leg_lines(tmp_path / "a", "2.33.1") if (tmp_path / "a").mkdir() is None else []
+    assert "UPGRADE LEG compose-floor NOTE: docker 28.5.1, compose 2.33.1" in ok
+    assert not [l for l in ok if l.startswith("UPGRADE LEG compose-floor PIN")]
+    (tmp_path / "b").mkdir()
+    bad = _leg_lines(tmp_path / "b", "2.38.2")
+    assert "UPGRADE LEG compose-floor NOTE: docker 28.5.1, compose 2.38.2" in bad
+    assert any(l.startswith("UPGRADE LEG compose-floor PIN FAIL") and "2.38.2" in l and "2.33.1" in l for l in bad), bad

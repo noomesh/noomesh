@@ -237,10 +237,13 @@ jobs:
     if: github.event_name == 'workflow_dispatch' && inputs.cells != 'fresh' && inputs.cells != 'reboot'
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 150
-    # Two docker legs, one cell and one judge. ce: the runner image's docker-ce
+    # Three docker legs, one cell and one judge. ce: the runner image's docker-ce
     # (the leg the job always had). distro: Ubuntu's `apt install docker.io` +
     # docker-compose-v2, installed by scripts/install-cell/distro-docker.sh, the
-    # same script the fresh matrix's docker.io cell runs. Each leg prints its
+    # same script the fresh matrix's docker.io cell runs. compose-floor: the
+    # runner's docker-ce (Engine 28+) with the pinned lowest supported Compose
+    # (2.33.x) installed by scripts/install-cell/compose-floor.sh, sha256-verified
+    # first; the judge FAILs if the leg did not run it. Each leg prints its
     # docker and compose versions (`UPGRADE LEG <leg> NOTE: docker <v>, compose <v>`).
     strategy:
       fail-fast: false
@@ -248,6 +251,7 @@ jobs:
         include:
           - {leg: ce, runner: ubuntu-24.04, cell: upgrade-24.04, artifact: install-cell-upgrade-24.04}
           - {leg: distro, runner: ubuntu-22.04, cell: upgrade-22.04-distro, artifact: install-cell-upgrade-22.04-distro}
+          - {leg: compose-floor, runner: ubuntu-24.04, cell: upgrade-24.04-compose-floor, artifact: install-cell-upgrade-24.04-compose-floor}
     steps:
       # FIRST, before anything else touches them: the free-text dispatch
       # inputs cli_tag and prev_tag, whole-string, as
