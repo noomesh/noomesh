@@ -391,7 +391,7 @@ pub(crate) fn render_kiosk_service_in(user: &str, mode: Mode, vt: u8, bin: &str)
     };
     let (after_plymouth, plymouth, quit_splash) = match mode {
         Mode::Dedicated => (
-            "",
+            " plymouth-quit-wait.service",
             "# The display manager pattern (gdm's unit): this unit replaces\n\
              # plymouth-quit and quits the splash itself, so it never waits for\n\
              # plymouth-quit-wait, which returns only once someone quits it.\n\
