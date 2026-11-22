@@ -50,7 +50,9 @@ Each one has a followup that removes the need for the step.
     `loginctl show-user <user> -p Linger` says `Linger=yes`.
 
   Turn it on with `sudo loginctl enable-linger <user>`, then `noo stack restart`
-  for this boot (`noo stack start` if that does not bring it back). (i1160.)
+  for this boot (`noo stack start` if that does not bring it back).
+  From 0.6.30, `noo onboard` turns linger on, and `noo cluster verify` warns
+  in a `hostd at boot` row, with this command, when it is off. (i1160.)
 - **A dedicated kiosk seat on a machine that also has a desktop installed
   stays black** (0.6.29 and earlier). Its display waits behind the boot
   splash, which nothing tells to quit. At the seat: `sudo plymouth quit`; the
