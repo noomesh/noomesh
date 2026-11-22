@@ -2687,7 +2687,7 @@ pub(crate) fn seat_checks(seat: &Value, controller_cli: &str, controller_tag: &s
     // unit waits on the splash by design, and the seat says `shared`.
     let unit_word = hb["kiosk_unit"].as_str();
     let dedicated = hb["kiosk"]["mode"].as_str() == Some("dedicated");
-    if unit_word == Some("needs_migrate") {
+    if unit_word == Some("needs_migrate.x") {
         out.push(check("kiosk unit", Verdict::Warn, KIOSK_UNIT_WAITS_ON_SPLASH.into(), repair()));
     } else if hb_unit_stale(hb) {
         let why = if hb["kiosk_unit_runtime_dir"].as_bool() == Some(false) {
