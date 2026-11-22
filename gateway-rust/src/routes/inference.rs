@@ -2284,7 +2284,7 @@ mod pinned_sampling_tests {
     #[test]
     fn the_raw_branch_turns_thinking_off_and_judges_the_answer() {
         let code = crate::test_src::own_code(include_str!("inference.rs"));
-        let f = crate::test_src::fn_body(&code, "async fn native_inference(");
+        let f = crate::test_src::fn_body(&code, "async fn native_inference_inner(");
         assert!(f.contains("raw_chat::chat_completions_with(") && f.contains("think_off"), "the raw branch adjusts per candidate");
         assert!(f.contains("disable_on_wire(b, \"openai\", &cand.backend, cand.backend.starts_with(\"cloud-\"))"), "every engine's switch, never a cloud's");
         assert!(f.contains("match chat_answer(&data)") && f.contains("ChatAnswer::Empty"), "empty is judged");
@@ -2423,7 +2423,7 @@ mod num_ctx_tests {
     #[test]
     fn the_pinned_and_streaming_paths_resolve_and_stamp_before_sending() {
         let code = crate::test_src::own_code(include_str!("inference.rs"));
-        let f = crate::test_src::fn_body(&code, "async fn native_inference(");
+        let f = crate::test_src::fn_body(&code, "async fn native_inference_inner(");
         let ask = f.find("crate::chat_context::num_ctx_for_node(&state, node_id, &backend_type, &model).await").expect("resolves");
         let call = f.find("chat_completion_on_node(&backend_type, &model, &base_url, &req.prompt, sampling)").expect("calls");
         assert!(ask < call, "{f}");
