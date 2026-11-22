@@ -362,7 +362,12 @@ mod tests {
     #[test]
     fn nothing_listening_is_no_proof() {
         let ca = cluster("a", "node_a");
-        let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port(); // dropped: closed
+        // Port 1 on loopback: binding it needs root, so no other test in a
+        // parallel `cargo test` can take it, and nothing listens there. A
+        // freed ephemeral port (bound, then dropped) could be reused by a
+        // sibling test's server before the dial (fa, 2026-11-22: the dial
+        // connected and the handshake failed instead of "no answer").
+        let port = 1;
         let e = prove_node_at(&read(ca.ca_cert_path()), &read(ca.dir.join("nodes/node_a/node.crt")), "127.0.0.1", port, T)
             .unwrap_err();
         assert!(e.contains("no answer"), "{e}");
