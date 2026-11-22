@@ -44,6 +44,20 @@ not a reboot). Check `lsblk -f` shows it, then `sudo mount <target>` (or let
 fstab do it) and `findmnt -T <data root>` shows the recorded UUID. Then
 `noo stack start`. Do not create the directory by hand to "make it pass".
 
+### Enrollment refused: the mount is not there
+
+Enrolling a node never creates a data root that a boot-time mount would hide.
+When the data root is under a mount the machine declares for boot (an
+`/etc/fstab` entry without `noauto`, or an enabled systemd mount unit) and that
+mount is not mounted, enroll stops with `<data root> is under the mount
+<mount> declared in <fstab or unit>, which is not mounted` and creates
+nothing: at its preflight (a `FAIL` line, before the token is spent), and again
+in host prep (`FATAL`, exit 1). An automount is touched once first. Mount it
+(`sudo mount <mount>`, check `findmnt <mount>`), then run the enroll line
+again (after a `FATAL` the token is spent: mint a fresh one). If prep cannot
+read the fstab, the unit directories or the mount table, it says so once and
+goes on as before.
+
 ### No findmnt (Linux)
 
 `REFUSED: not starting — findmnt is not installed` means the host has no
@@ -115,5 +129,8 @@ database on the wrong disk. Never work around it.
 - **Never** create the data root directory by hand, and never set
   `NOO_DATA_ROOT_RERECORD=1` to get past a refusal: it records whatever
   disk is mounted now as the right one.
+- **Enrollment refused** (`... which is not mounted`): mounting it is
+  the person's; never create the directory or comment out the fstab entry
+  to get past it. Once `findmnt <mount>` shows it, re-run the enroll line.
 - **Once the disk is back** (the recorded UUID shows in `findmnt`),
   `noo stack start` is safe to run.
