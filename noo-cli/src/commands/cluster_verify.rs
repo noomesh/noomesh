@@ -1684,7 +1684,7 @@ pub(crate) fn docker_engine_upgrade_remedy(id: &str, kind: &str) -> String {
 /// minimum: the controller's `docker compose` verify row and `noo onboard`'s
 /// Docker probe read it, and docs/getting-started/install.md names it. Below
 /// it is a WARN, never a refusal. Raise it here and nowhere else.
-pub(crate) const MIN_COMPOSE: (u32, u32, u32) = (2, 33, 0);
+pub(crate) const MIN_COMPOSE: (u32, u32, u32) = (2, 24, 6);
 
 /// What `docker compose version --short` said on this machine. Compose runs
 /// only on the controller (the stack launcher); workers use the node agent's
