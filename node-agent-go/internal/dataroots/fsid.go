@@ -777,7 +777,7 @@ func checkFilesystems(r Roots) []fsFinding {
 		}
 		first := fsRecord{FSID: now, OnRootFS: onRootFS}
 		if onRootFS {
-			first.Entries, first.Capped = countEntries(p)
+			first.Entries, first.Capped = 0, false
 		}
 		if putRecord(p, first, true) {
 			slog.Info("data_root.filesystem_recorded", "path", p, "filesystem", now.String(), "entries", first.Entries, "file", recordPath())
