@@ -12,7 +12,7 @@
     upgrade_judge.py before VERIFY_JSON SELF
         The self node's rows that say what the box was before the roll.
     upgrade_judge.py judge
-        One line per assert, `UPGRADE <id> PASS|FAIL|NOTE|NOT REACHED: <why>`,
+        One line per assert, `UPGRADE <id> PASS|FAIL|NOTE|SKIP|NOT REACHED: <why>`,
         quoting the product's own line on a FAIL (K1/K2: the roll's "N recreated (…),
         M kept (…)" line against the cell's container-id snapshots). Exit 1 on any FAIL. Reads
         $OUT/logs/<step>.log and $J/* written by upgrade.sh.
@@ -515,6 +515,45 @@ def judge_apply_line(log, before, after, labels, target, same_tag, images=None):
         rule, len(rec), len(kept), len(created), tail, got["line"])
 
 
+K3_SKIP_WHY = ("case 5 waits for a real third-party digest bump in an rc: a signed-lock install refuses a digest "
+               "override (scripts/lib-dist.sh dist_reassert_pins, called at scripts/noomesh-start.sh:504, drops every "
+               "NOO_IMAGE_DIGEST_* and re-exports only the signed stack.lock's)")
+
+
+def judge_third_party_move(log, before, after, labels, images):
+    """K3 (noomesh #1470 case 5): a third-party digest the RELEASE moved recreates
+    that service and nothing else third-party. The cell never moves a digest itself
+    (a signed-lock install refuses an override, so none is faked): it judges for real
+    only when redis's BEFORE and AFTER image ids differ across the --all roll, and
+    otherwise says SKIP with why. -> (verdict, why)."""
+    if not before or not after:
+        return "NOT REACHED", "no container-id snapshot %s the --all roll" % ("before" if not before else "after")
+    bi, ai = (img_by_service(before, images[0]), img_by_service(after, images[1])) if images else ({}, {})
+    if "redis" not in bi or "redis" not in ai:
+        return "NOT REACHED", "redis's image id was not recorded in both snapshots, so a moved digest cannot be seen"
+    if bi["redis"] == ai["redis"]:
+        return "SKIP", "no redis image id moved in this release (%s); %s" % (_short(bi["redis"]), K3_SKIP_WHY)
+    b, a = by_service(before), by_service(after)
+    rec = {s for s in a if s in b and a[s] != b[s]}
+    both = [s for s in b if s in a]
+    lab = {s: all(labels.get(n) for n, (_i, sv, _d) in before.items() if sv == s) for s in both}
+    problems = []
+    if "redis" not in rec:
+        problems.append("redis: its image moved (%s>%s) but the container was kept" % (_short(bi["redis"]), _short(ai["redis"])))
+    others = sorted(s for s in both if s != "redis" and s in THIRD_PARTY_KEEP and lab[s] and s in bi and s in ai)
+    wrong = [s for s in others if bi[s] == ai[s] and s in rec]
+    if wrong:
+        problems.append("recreated though their image is unchanged: " + ", ".join(wrong))
+    got = parse_apply_line(log)
+    if got is not None and "redis" not in [n[4:] if n.startswith("noo-") else n for n in got["recreated"]]:
+        problems.append("the apply line does not list redis as recreated: " + got["line"])
+    if problems:
+        return "FAIL", "; ".join(problems)
+    kept = [s for s in others if s not in rec]
+    return "PASS", "redis recreated, its image id moved %s>%s; other third-party kept: %s" % (
+        _short(bi["redis"]), _short(ai["redis"]), ", ".join(kept) or "-")
+
+
 def judge():
     out, j, me = os.environ["OUT"], os.environ["J"], os.environ["SELF"]
     lines, failed = [], False
@@ -523,6 +562,16 @@ def judge():
         nonlocal failed
         failed |= verdict == "FAIL"
         lines.append("UPGRADE %s %s%s: %s" % (aid, verdict, waited, one(why, n)))
+
+    # the docker engine this leg ran on: its versions are SEEN (recorded by upgrade.sh)
+    leg = (text(os.path.join(j, "leg")) or "").strip() or "ce"
+    dv = (text(os.path.join(j, "docker-version")) or "").strip()
+    cv = (text(os.path.join(j, "compose-version")) or "").strip()
+    if dv and cv:
+        say("LEG %s" % leg, "NOTE", "docker %s, compose %s" % (dv, cv))
+    else:
+        say("LEG %s" % leg, "NOTE", "docker %s, compose %s (a version was not recorded: see logs/docker-versions.log)"
+            % (dv or "unknown", cv or "unknown"))
 
     roll = text(os.path.join(out, "logs", "upgrade-all.log"))
     stack = text(os.path.join(out, "logs", "upgrade-stack-same-tag.log"))
@@ -633,6 +682,13 @@ def judge():
             _labels(os.path.join(j, "roll.before")), text(os.path.join(j, "target")), False,
             (_images(os.path.join(j, "roll.before")), _images(os.path.join(j, "roll.after"))))
         say("K1", v_, why, 4000)
+        # K3: only judged for real when the release itself moved redis's digest.
+        v_, why = judge_third_party_move(
+            roll, recreated._read_or_empty(os.path.join(j, "roll.before")),
+            recreated._read_or_empty(os.path.join(j, "roll.after")),
+            _labels(os.path.join(j, "roll.before")),
+            (_images(os.path.join(j, "roll.before")), _images(os.path.join(j, "roll.after"))))
+        say("K3", v_, why, 4000)
 
     # ── after the same-tag --stack ──
     if stack is None:
