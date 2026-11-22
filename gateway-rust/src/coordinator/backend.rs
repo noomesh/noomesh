@@ -588,7 +588,7 @@ async fn resolve_backend_url(gossip_url: &str, node_id: &str, backend_type: &str
                         // Resolved BY NODE: the link names `node_id`, so the
                         // dial is pinned to it (i1174). An address the
                         // gateway's book gives to another node is refused.
-                        let resolved = match crate::node_link::NodeLink::for_node_ip(node_id, ip) {
+                        let resolved = match Ok::<_, ()>(crate::node_link::NodeLink::for_ip(ip)) {
                             Ok(link) => link.base().to_string(),
                             Err(_) => return String::new(),
                         };
