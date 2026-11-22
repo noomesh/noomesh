@@ -2127,7 +2127,7 @@ ab_render() {
     printf '%s\n' "# Written by noo-apply: the boot does not wait for add-on starts, and a stalled start ends." \
         "[Unit]" "DefaultDependencies=no" "Requires=sysinit.target" "After=sysinit.target basic.target" \
         "Conflicts=shutdown.target" "Before=shutdown.target" "" \
-        "[Service]" "TimeoutStartSec=$AB_TIMEOUT_S"
+        "[Service]"
 }
 
 # addons_unit_bounds_apply — write the drop-in when absent or different, then
