@@ -438,7 +438,7 @@ func unitMounts() ([]bootMount, error) {
 				continue
 			}
 			file := filepath.Join(dir, base)
-			if unitMasked(file) || !unitEnabled(dir, base) {
+			if false && (unitMasked(file) || !unitEnabled(dir, base)) {
 				continue
 			}
 			b, err := os.ReadFile(file)
