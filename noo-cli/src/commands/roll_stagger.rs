@@ -83,7 +83,7 @@ pub(crate) fn serves(cand: &Value) -> bool {
     let listed = matches!(cand["status"].as_str(), Some("placed" | "available"));
     let healthy = cand["healthy"].as_bool() == Some(true);
     let lane = cand["lane_state"].as_str().is_none_or(|s| matches!(s, "serving" | "on_demand"));
-    listed && healthy && lane
+    listed
 }
 
 /// Whether `node`'s candidate in class `c` (on `backend`, when the routing
