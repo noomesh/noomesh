@@ -32,7 +32,6 @@ func TestRealLoopMountEmptyMountPoint(t *testing.T) {
 	t.Setenv("NOO_AGENT_STATE", t.TempDir())
 	t.Setenv("NOO_DATA_ROOT", at)
 	t.Setenv(PolicyEnv, "")
-	t.Setenv(FSEnv, "")
 	for _, k := range []string{"HF_CACHE_DIR", "MODELS_DIR", "OLLAMA_DATA_DIR"} {
 		t.Setenv(k, "")
 	}

@@ -4,7 +4,9 @@
 package dataroots
 
 import (
+	"bytes"
 	"errors"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -41,7 +43,8 @@ func (d *fakeDisk) identity(p string) (FSID, string, error) {
 	return rootFS, rootFS.Dev, nil
 }
 
-// fakeFSCheck installs the fake disk, a temp record, no fstab, and a
+// fakeFSCheck installs the fake disk, a temp record, no fstab, no mount
+// units, an empty mount table for autofs, a trigger that only counts, and a
 // MkdirAll that only counts. Returns the disk and the MkdirAll counter.
 func fakeFSCheck(t *testing.T) (*fakeDisk, *int) {
 	t.Helper()
@@ -50,31 +53,58 @@ func fakeFSCheck(t *testing.T) (*fakeDisk, *int) {
 	calls := 0
 	prevID, prevOS, prevEval, prevStat, prevRec, prevFstab, prevMk :=
 		fsIdentity, fsCheckOS, fsEvalPath, fsStatDir, recordPath, fstabPath, mkdirAll
+	prevUnits, prevMI, prevTrig := mountUnitGlobs, mountinfoPath, automountTrigger
 	fsIdentity, fsCheckOS = disk.identity, "linux"
 	fsEvalPath = func(p string) (string, error) { return p, nil }
 	fsStatDir = func(string) bool { return true }
 	recordPath = func() string { return filepath.Join(dir, RecordFileName) }
 	fstabPath = filepath.Join(dir, "no-fstab")
+	unitDir := filepath.Join(dir, "units")
+	if err := os.Mkdir(unitDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mountUnitGlobs = []string{filepath.Join(unitDir, "*.mount"), filepath.Join(unitDir, "*.automount")}
+	mountinfoPath = filepath.Join(dir, "no-mountinfo")
+	automountTrigger = func(string) {}
 	mkdirAll = func(string, os.FileMode) error { calls++; return nil }
 	resetRecordCache()
 	t.Cleanup(func() {
 		fsIdentity, fsCheckOS, fsEvalPath, fsStatDir, recordPath, fstabPath, mkdirAll =
 			prevID, prevOS, prevEval, prevStat, prevRec, prevFstab, prevMk
+		mountUnitGlobs, mountinfoPath, automountTrigger = prevUnits, prevMI, prevTrig
 		resetRecordCache()
 	})
 	t.Setenv("NOO_DATA_ROOT", "/data/noo")
 	t.Setenv(PolicyEnv, "")
-	t.Setenv(FSEnv, "")
 	for _, k := range []string{"HF_CACHE_DIR", "MODELS_DIR", "OLLAMA_DATA_DIR"} {
 		t.Setenv(k, "")
 	}
 	return disk, &calls
 }
 
+// writeUnit writes a systemd unit into the fake unit directory.
+func writeUnit(t *testing.T, name, body string) {
+	t.Helper()
+	dir := filepath.Dir(mountUnitGlobs[0])
+	if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func writeFstab(t *testing.T, body string) {
+	t.Helper()
+	if err := os.WriteFile(fstabPath, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func resetRecordCache() {
 	recordMu.Lock()
 	recordCache, recordStamp, recordWarn = fsRecordFile{}, "", ""
 	recordMu.Unlock()
+	refusedMu.Lock()
+	refused = map[string]bool{}
+	refusedMu.Unlock()
 }
 
 func fsCodes(r Roots) []string {
@@ -85,30 +115,37 @@ func fsCodes(r Roots) []string {
 	return out
 }
 
-// First run: a root on the root filesystem's device is NOT recorded (it may
-// be an empty mount point whose disk is late); on its own disk it is.
-func TestFirstRunRecordsOnlyOffTheRootFilesystem(t *testing.T) {
-	disk, _ := fakeFSCheck(t)
+// First run, no boot-time mount covers the root: it is a plain directory,
+// recorded where it is (root filesystem included).
+func TestFirstRunRecordsAPlainDirectoryWhereItIs(t *testing.T) {
+	_, _ = fakeFSCheck(t)
 	r := Resolve(os.Getenv)
 	if c := fsCodes(r); len(c) != 0 {
-		t.Fatalf("nothing recorded, nothing declared: no problem, got %v", c)
-	}
-	if recorded("/data/noo") {
-		t.Fatal("a root on the root filesystem was recorded on a first look")
-	}
-	disk.mounted = true
-	if c := fsCodes(r); len(c) != 0 {
-		t.Fatalf("mounted: %v", c)
+		t.Fatalf("no boot mount: no problem, got %v", c)
 	}
 	if !recorded("/data/noo") {
-		t.Fatal("a root on its own disk was not recorded")
+		t.Fatal("a plain directory on the root filesystem was not recorded")
+	}
+	if got := FilesystemReport(r); got["meant"] != "directory" || got["by"] != "" {
+		t.Fatalf("a plain directory: %v", got)
+	}
+}
+
+// First run on its own disk with no boot mount declared (a hand mount):
+// recorded, and reported as a mount by its record.
+func TestFirstRunRecordsADisk(t *testing.T) {
+	disk, _ := fakeFSCheck(t)
+	disk.mounted = true
+	r := Resolve(os.Getenv)
+	if c := fsCodes(r); len(c) != 0 {
+		t.Fatalf("mounted: %v", c)
 	}
 	b, err := os.ReadFile(recordPath())
 	if err != nil || !strings.Contains(string(b), `"uuid": "u-data"`) || !strings.Contains(string(b), `"/data/noo"`) {
 		t.Fatalf("record file: %v %s", err, b)
 	}
-	if got := FilesystemReport(r)["meant"]; got != "mount" {
-		t.Fatalf("a root recorded on its own disk is meant to be a mount, got %v", got)
+	if got := FilesystemReport(r); got["meant"] != "mount" || got["by"] != "recorded" {
+		t.Fatalf("a root recorded on its own disk: %v", got)
 	}
 }
 
@@ -156,35 +193,59 @@ func TestAnEmptyMountPointIsRefusedAndNothingIsCreated(t *testing.T) {
 	}
 }
 
-// A root declared a plain directory is recorded where it is, root fs or not.
-func TestADeclaredDirectoryIsRecordedOnTheRootFilesystem(t *testing.T) {
+// An /etc/fstab mount above the root that is not mounted: refused on a
+// first run, nothing recorded, cleared when it mounts.
+func TestAnFstabMountThatIsNotThereIsRefused(t *testing.T) {
+	disk, calls := fakeFSCheck(t)
+	writeFstab(t, "# x\nUUID=u-root / ext4 defaults 0 1\nUUID=u-data /data ext4 defaults,nofail 0 2\n/swapfile none swap sw 0 0\n")
+	r := Resolve(os.Getenv)
+	if c := fsCodes(r); len(c) != 1 || c[0] != "mount_missing" {
+		t.Fatalf("got %v", c)
+	}
+	if err := MkdirAll("/data/noo/models", 0o755); err == nil || *calls != 0 {
+		t.Fatalf("fstab mount absent: %v, %d calls", err, *calls)
+	}
+	if recorded("/data/noo") {
+		t.Fatal("recorded the root filesystem under an fstab mount")
+	}
+	if got := FilesystemReport(r); got["meant"] != "mount" || got["by"] != "fstab" {
+		t.Fatalf("%v", got)
+	}
+	disk.mounted = true
+	if c := fsCodes(r); len(c) != 0 {
+		t.Fatalf("mounted: %v", c)
+	}
+}
+
+// `noauto` in fstab is not a boot-time mount: the root is a plain directory.
+func TestAnFstabNoautoEntryIsNotABootMount(t *testing.T) {
 	_, _ = fakeFSCheck(t)
-	t.Setenv(FSEnv, "directory")
+	writeFstab(t, "UUID=u-data /data ext4 nofail,noauto 0 2\n")
 	r := Resolve(os.Getenv)
 	if c := fsCodes(r); len(c) != 0 {
-		t.Fatalf("%v", c)
+		t.Fatalf("noauto: not a boot mount, got %v", c)
 	}
 	if !recorded("/data/noo") {
-		t.Fatal("a declared plain directory was not recorded")
+		t.Fatal("a root under a noauto entry was not recorded as a plain directory")
 	}
 	if got := FilesystemReport(r)["meant"]; got != "directory" {
 		t.Fatalf("meant = %v", got)
 	}
 }
 
-// NOO_DATA_ROOT_FS=mount with nothing recorded: the root fs is refused.
-func TestADeclaredMountOnTheRootFilesystemIsRefused(t *testing.T) {
-	disk, calls := fakeFSCheck(t)
-	t.Setenv(FSEnv, "mount")
+// A systemd mount unit (read by Where=) that is not mounted: mount_missing.
+func TestAMountUnitThatIsNotThereIsRefused(t *testing.T) {
+	disk, _ := fakeFSCheck(t)
+	writeUnit(t, "data.mount", "[Unit]\nDescription=data\n\n[Mount]\nWhat=/dev/disk/by-uuid/u-data\nWhere=/data\nType=ext4\nOptions=defaults\n")
 	r := Resolve(os.Getenv)
 	if c := fsCodes(r); len(c) != 1 || c[0] != "mount_missing" {
 		t.Fatalf("got %v", c)
 	}
-	if err := MkdirAll("/data/noo/models", 0o755); err == nil || *calls != 0 {
-		t.Fatalf("declared mount absent: %v, %d calls", err, *calls)
-	}
 	if recorded("/data/noo") {
-		t.Fatal("recorded the root filesystem for a declared mount")
+		t.Fatal("recorded the root filesystem under a mount unit")
+	}
+	if got := FilesystemReport(r); got["meant"] != "mount" || got["by"] != "systemd unit" {
+		t.Fatalf("%v", got)
 	}
 	disk.mounted = true
 	if c := fsCodes(r); len(c) != 0 {
@@ -192,23 +253,119 @@ func TestADeclaredMountOnTheRootFilesystemIsRefused(t *testing.T) {
 	}
 }
 
-// An /etc/fstab mount above the root that is not mounted: refused on a
-// first run too, without any declaration.
-func TestAnFstabMountThatIsNotThereIsRefused(t *testing.T) {
+// A mount unit with no Where= is named by its escaped path; a noauto unit
+// does not count.
+func TestAMountUnitIsReadByItsName(t *testing.T) {
+	if got := unescapeUnitPath(`srv-my\x2ddisk`); got != "/srv/my-disk" {
+		t.Fatalf("unescape: %q", got)
+	}
+	_, _ = fakeFSCheck(t)
+	writeUnit(t, "data.mount", "[Mount]\nWhat=/dev/sdb1\nType=ext4\n")
+	writeUnit(t, "srv.mount", "[Mount]\nWhat=/dev/sdc1\nWhere=/srv\nOptions=noauto\n")
+	if m := bootMountFor("/data/noo"); m.where != "/data" || m.by != "systemd unit" {
+		t.Fatalf("by name: %+v", m)
+	}
+	if m := bootMountFor("/srv/noo"); m.where != "" {
+		t.Fatalf("a noauto unit counted: %+v", m)
+	}
+}
+
+// An automount (x-systemd.automount) is touched once, bounded, before it is
+// called missing: not mounted, touched, mounted, fine.
+func TestAnAutomountIsTouchedBeforeItIsMissing(t *testing.T) {
 	disk, _ := fakeFSCheck(t)
-	if err := os.WriteFile(fstabPath, []byte("# x\nUUID=u-root / ext4 defaults 0 1\nUUID=u-data /data ext4 defaults,nofail 0 2\n/swapfile none swap sw 0 0\n"), 0o644); err != nil {
+	writeFstab(t, "srv:/x /data nfs4 noauto,x-systemd.automount,_netdev 0 0\n")
+	touched := 0
+	automountTrigger = func(p string) { touched++; disk.mounted = true }
+	r := Resolve(os.Getenv)
+	if c := fsCodes(r); len(c) != 0 {
+		t.Fatalf("an automount that mounts when touched: %v", c)
+	}
+	if touched != 1 || !recorded("/data/noo") {
+		t.Fatalf("touched %d, recorded %v", touched, recorded("/data/noo"))
+	}
+}
+
+// An autofs trap in the mount table (no fstab line) is touched the same way.
+func TestAnAutofsTrapIsTouched(t *testing.T) {
+	disk, _ := fakeFSCheck(t)
+	if err := os.WriteFile(mountinfoPath, []byte("22 1 8:1 / / rw - ext4 /dev/sda1 rw\n42 22 0:51 / /data rw - autofs systemd-1 rw\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	r := Resolve(os.Getenv)
-	if c := fsCodes(r); len(c) != 1 || c[0] != "mount_missing" {
-		t.Fatalf("got %v", c)
+	touched := 0
+	automountTrigger = func(string) { touched++; disk.mounted = true }
+	if c := fsCodes(Resolve(os.Getenv)); len(c) != 0 || touched != 1 {
+		t.Fatalf("autofs trap: %v, touched %d", c, touched)
 	}
-	if got := FilesystemReport(r)["meant"]; got != "mount" {
-		t.Fatalf("meant = %v", got)
+}
+
+// An automount whose touch hangs (a dead NFS server) is not_answering
+// within the bound; the agent is never held.
+func TestAHungAutomountIsNotAnswering(t *testing.T) {
+	_, _ = fakeFSCheck(t)
+	writeFstab(t, "srv:/x /data nfs4 x-systemd.automount 0 0\n")
+	prev := ProbeTimeout
+	ProbeTimeout = 100 * time.Millisecond
+	release := make(chan struct{})
+	automountTrigger = func(string) { <-release }
+	t.Cleanup(func() {
+		close(release)
+		WaitProbeForTest("/data", 3*time.Second)
+		ProbeTimeout = prev
+	})
+	got := make(chan []string, 1)
+	go func() { got <- fsCodes(Resolve(os.Getenv)) }()
+	select {
+	case c := <-got:
+		if len(c) != 1 || c[0] != "not_answering" {
+			t.Fatalf("a hung automount: %v", c)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("a hung automount held the check past the bound")
+	}
+}
+
+// A late network mount (nofail, _netdev): refused at start, re-checked on
+// every use, cleared by itself when it arrives, with ONE log line.
+func TestALateNetworkMountClearsByItself(t *testing.T) {
+	disk, calls := fakeFSCheck(t)
+	writeFstab(t, "srv:/export /data nfs4 nofail,_netdev 0 0\n")
+	var buf bytes.Buffer
+	prevLog := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+	t.Cleanup(func() { slog.SetDefault(prevLog) })
+	r := Resolve(os.Getenv)
+	f := checkFilesystems(r)
+	if len(f) != 1 || f[0].Code != "mount_missing" || !strings.Contains(f[0].Detail, "network mount") {
+		t.Fatalf("at start: %+v", f)
+	}
+	if err := MkdirAll("/data/noo/models", 0o755); err == nil || *calls != 0 {
+		t.Fatalf("refused: %v, %d calls", err, *calls)
 	}
 	disk.mounted = true
-	if c := fsCodes(r); len(c) != 0 {
-		t.Fatalf("mounted: %v", c)
+	for i := 0; i < 3; i++ {
+		if c := fsCodes(r); len(c) != 0 {
+			t.Fatalf("the mount arrived: %v", c)
+		}
+	}
+	if n := strings.Count(buf.String(), clearedLine("/data/noo")); n != 1 {
+		t.Fatalf("the cleared line was logged %d times, want 1:\n%s", n, buf.String())
+	}
+	if !strings.Contains(clearedLine("/data/noo"), "data root /data/noo is mounted now; the refusal is cleared") {
+		t.Fatal(clearedLine("/data/noo"))
+	}
+}
+
+// darwin: the check is a no-op (the policy's other rules still apply).
+func TestTheFilesystemCheckIsLinuxOnly(t *testing.T) {
+	_, _ = fakeFSCheck(t)
+	fsCheckOS = "darwin"
+	r := Resolve(os.Getenv)
+	if f := checkFilesystems(r); f != nil {
+		t.Fatalf("darwin: %v", f)
+	}
+	if got := FilesystemReport(r)["meant"]; got != "unknown" {
+		t.Fatalf("darwin meant = %v", got)
 	}
 }
 

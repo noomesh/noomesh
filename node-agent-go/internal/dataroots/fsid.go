@@ -39,30 +39,30 @@ import (
 // /var/lib/noo-node-agent, which is on the root filesystem by design, so it
 // is there when the data disk is not). One entry per root path.
 //
-// First run (no entry for a path): the current filesystem is recorded only
-// when it is NOT the root filesystem's device, or when the node declares its
-// data root a plain directory (NOO_DATA_ROOT_FS=directory). A path that sits
-// on the root filesystem with nothing recorded may be an empty mount point
-// whose disk is late, and recording that would refuse the real disk later.
+// What a root is MEANT to be comes from what the machine already declares,
+// never from a switch set by hand: a root is a MOUNT when a boot-time mount
+// covers it (the longest mount point above it) — an /etc/fstab entry without
+// `noauto` (or with `x-systemd.automount`), or a systemd mount unit
+// (/etc/systemd/system/*.mount, /run/systemd/generator*/*.mount, read by its
+// Where=; a unit whose Options= has `noauto` does not count unless an
+// .automount unit names the same Where=). Otherwise it is a plain directory.
+// A unit file in /etc/systemd/system counts whether or not it is enabled.
 //
-// What the node is MEANT to have, without a record:
-//   - NOO_DATA_ROOT_FS=mount (node-local declaration): the data root must be
-//     on its own filesystem; on the root filesystem's device it is refused.
-//   - an /etc/fstab entry whose mount point contains the path: the path must
-//     be on that mount; a containing mount ABOVE it (the fstab mount is not
-//     there) is refused.
-//   - NOO_DATA_ROOT_FS=directory: a plain directory; recorded where it is.
+// First run (no entry for a path): a root covered by a boot-time mount that
+// is not mounted is refused (mount_missing), and nothing is recorded; any
+// other root is recorded where it is (a plain directory on the root
+// filesystem included: a hand-made, non-boot mount does not come back after a
+// reboot either, so there is nothing to protect).
 //
-// A path whose filesystem differs from the record, or a declared mount that
-// is not there, is a SAFETY problem: refused in warn mode too (Refusal), for
-// backend starts and for the fetch paths' directory creation (MkdirAll). It
-// is re-checked on every use, so the refusal clears itself when the mount
-// returns. Linux only: macOS has another mount model (the controller's check
-// skips it the same way). A deliberate move (a new disk) is re-recorded by
-// removing the record file: the agent records again at its next check.
-
-// FSEnv is the node-local declaration of what the data root is.
-const FSEnv = "NOO_DATA_ROOT_FS"
+// An automount (`x-systemd.automount`, a .automount unit, or an autofs trap in
+// mountinfo) is not mounted until first access: before it is called missing,
+// the check touches the path ONCE through Bounded (ProbeTimeout) and reads
+// the mount table again. A touch that hangs is `not_answering`; it never
+// blocks the agent.
+//
+// A late network mount (_netdev, nfs, cifs) is refused the same way and
+// clears by itself: every use re-checks, and the first check that finds it
+// mounted logs "data root <p> is mounted now; the refusal is cleared" once.
 
 // RecordFileName is the record's name inside the agent's state directory.
 const RecordFileName = "data-root-fs.json"
@@ -100,11 +100,24 @@ type fsRecordFile struct {
 var (
 	mountinfoPath = "/proc/self/mountinfo"
 	fstabPath     = "/etc/fstab"
-	byUUIDDir     = "/dev/disk/by-uuid"
-	fsCheckOS     = runtime.GOOS
-	fsEvalPath    = filepath.EvalSymlinks
-	fsStatDir     = func(p string) bool { fi, err := os.Stat(p); return err == nil && fi.IsDir() }
-	recordPath    = func() string {
+	// mountUnitGlobs are where systemd mount and automount units live
+	// (generator* holds the fstab-generated ones too).
+	mountUnitGlobs = []string{
+		"/etc/systemd/system/*.mount", "/etc/systemd/system/*.automount",
+		"/run/systemd/generator*/*.mount", "/run/systemd/generator*/*.automount",
+	}
+	// automountTrigger touches p once so an automount mounts (an open
+	// follows the path; a stat would not trigger it).
+	automountTrigger = func(p string) {
+		if f, err := os.Open(p); err == nil {
+			f.Close()
+		}
+	}
+	byUUIDDir  = "/dev/disk/by-uuid"
+	fsCheckOS  = runtime.GOOS
+	fsEvalPath = filepath.EvalSymlinks
+	fsStatDir  = func(p string) bool { fi, err := os.Stat(p); return err == nil && fi.IsDir() }
+	recordPath = func() string {
 		dir := os.Getenv("NOO_AGENT_STATE")
 		if dir == "" {
 			dir = "/var/lib/noo-node-agent"
@@ -227,14 +240,39 @@ func readFSIdentity(p string) (FSID, string, error) {
 	return FSID{Target: m.target, Source: m.source, FSType: m.fstype, Dev: m.dev, UUID: uuidOf(m.source)}, rootDev, nil
 }
 
-// fstabMountFor is the longest /etc/fstab mount point (never "/", never
-// swap) that contains p, or "".
-func fstabMountFor(p string) string {
+// bootMount is a boot-time mount the machine declares.
+type bootMount struct {
+	where     string
+	by        string // "fstab" or "systemd unit"
+	automount bool   // mounted on first access
+	network   bool   // _netdev or a network filesystem: may be late at boot
+}
+
+func hasOpt(opts []string, o string) bool {
+	for _, x := range opts {
+		if x == o {
+			return true
+		}
+	}
+	return false
+}
+
+func isNetworkFS(fstype string) bool {
+	switch fstype {
+	case "nfs", "nfs4", "cifs", "smb3", "smbfs", "sshfs", "fuse.sshfs", "glusterfs", "ceph":
+		return true
+	}
+	return false
+}
+
+// fstabMounts are the /etc/fstab boot-time mounts (never "/", never swap,
+// never `noauto` unless it is also an automount).
+func fstabMounts() []bootMount {
 	b, err := os.ReadFile(fstabPath)
 	if err != nil {
-		return ""
+		return nil
 	}
-	best := ""
+	var out []bootMount
 	sc := bufio.NewScanner(strings.NewReader(string(b)))
 	for sc.Scan() {
 		line := strings.TrimSpace(sc.Text())
@@ -246,14 +284,142 @@ func fstabMountFor(p string) string {
 			continue
 		}
 		mp := filepath.Clean(unescapeMount(f[1]))
-		if mp == "/" || !strings.HasPrefix(mp, "/") || !under(p, mp) {
+		if mp == "/" || !strings.HasPrefix(mp, "/") {
 			continue
 		}
-		if len(mp) > len(best) {
-			best = mp
+		var opts []string
+		if len(f) > 3 {
+			opts = strings.Split(f[3], ",")
+		}
+		auto := hasOpt(opts, "x-systemd.automount")
+		if hasOpt(opts, "noauto") && !auto {
+			continue
+		}
+		out = append(out, bootMount{where: mp, by: "fstab", automount: auto,
+			network: hasOpt(opts, "_netdev") || isNetworkFS(f[2])})
+	}
+	return out
+}
+
+// unescapeUnitPath decodes a mount unit's name into its path, as
+// `systemd-escape --path --unescape` does: "-" is "/", "\xNN" a byte.
+func unescapeUnitPath(name string) string {
+	var b strings.Builder
+	b.WriteByte('/')
+	for i := 0; i < len(name); i++ {
+		switch {
+		case name[i] == '-':
+			b.WriteByte('/')
+		case name[i] == '\\' && i+3 < len(name) && name[i+1] == 'x':
+			if n, err := strconv.ParseUint(name[i+2:i+4], 16, 8); err == nil {
+				b.WriteByte(byte(n))
+				i += 3
+				continue
+			}
+			b.WriteByte(name[i])
+		default:
+			b.WriteByte(name[i])
+		}
+	}
+	return filepath.Clean(b.String())
+}
+
+// unitMounts are the systemd mount units' boot-time mounts. A .mount whose
+// Options= has noauto does not count; an .automount names an automount.
+func unitMounts() []bootMount {
+	var out []bootMount
+	for _, g := range mountUnitGlobs {
+		files, _ := filepath.Glob(g)
+		for _, file := range files {
+			b, err := os.ReadFile(file)
+			if err != nil {
+				continue
+			}
+			base := filepath.Base(file)
+			ext := filepath.Ext(base)
+			where, fstype, opts := "", "", ""
+			for _, line := range strings.Split(string(b), "\n") {
+				k, v, ok := strings.Cut(strings.TrimSpace(line), "=")
+				if !ok {
+					continue
+				}
+				switch strings.TrimSpace(k) {
+				case "Where":
+					where = strings.TrimSpace(v)
+				case "Type":
+					fstype = strings.TrimSpace(v)
+				case "Options":
+					opts = strings.TrimSpace(v)
+				}
+			}
+			if where == "" {
+				where = unescapeUnitPath(strings.TrimSuffix(base, ext))
+			}
+			where = filepath.Clean(where)
+			if where == "/" || !strings.HasPrefix(where, "/") {
+				continue
+			}
+			o := strings.Split(opts, ",")
+			if ext == ".automount" {
+				out = append(out, bootMount{where: where, by: "systemd unit", automount: true})
+				continue
+			}
+			if hasOpt(o, "noauto") {
+				continue
+			}
+			out = append(out, bootMount{where: where, by: "systemd unit",
+				network: hasOpt(o, "_netdev") || isNetworkFS(fstype)})
+		}
+	}
+	return out
+}
+
+// bootMountFor is the longest boot-time mount covering p (zero when none).
+// fstab names it when both declare the same mount point (systemd generates
+// units from fstab); the flags are merged.
+func bootMountFor(p string) bootMount {
+	var best bootMount
+	for _, m := range append(fstabMounts(), unitMounts()...) {
+		if !under(p, m.where) {
+			continue
+		}
+		switch {
+		case len(m.where) > len(best.where):
+			best = m
+		case m.where == best.where:
+			best.automount = best.automount || m.automount
+			best.network = best.network || m.network
 		}
 	}
 	return best
+}
+
+// autofsCovering is the longest autofs trap in mountinfo above p, or "".
+func autofsCovering(p string) string {
+	b, err := os.ReadFile(mountinfoPath)
+	if err != nil {
+		return ""
+	}
+	best := ""
+	for _, m := range parseMountinfo(string(b)) {
+		if m.fstype == "autofs" && m.target != "/" && under(p, m.target) && len(m.target) > len(best) {
+			best = m.target
+		}
+	}
+	return best
+}
+
+// automountFor is the automount point above p that a touch would mount: the
+// boot mount's when it is an automount, or an autofs trap; the longer wins.
+func automountFor(p string, bm bootMount) string {
+	want := ""
+	if bm.automount {
+		want = bm.where
+	}
+	if t := autofsCovering(p); len(t) > len(want) {
+		want = t
+	}
+	return want
 }
 
 // sameFS is the controller's comparison: UUIDs when both sides have one,
@@ -313,7 +479,7 @@ func writeRecordLocked(rf fsRecordFile) {
 	if err != nil {
 		if recordWarn != err.Error() {
 			recordWarn = err.Error()
-			slog.Warn("data root filesystem not recorded; the check stays on fstab and NOO_DATA_ROOT_FS only", "file", p, "error", err)
+			slog.Warn("data root filesystem not recorded; the check stays on fstab and the mount units only", "file", p, "error", err)
 		}
 		recordCache = rf // keep it for this process
 		return
@@ -358,30 +524,61 @@ func fsPaths(r Roots) []string {
 	return out
 }
 
-// declaredFS is NOO_DATA_ROOT_FS: "mount", "directory" or "" (not declared).
-func declaredFS() string {
-	switch v := strings.ToLower(strings.TrimSpace(os.Getenv(FSEnv))); v {
-	case "mount", "directory":
-		return v
+var (
+	refusedMu sync.Mutex
+	refused   = map[string]bool{} // root paths refused at the last check
+)
+
+// clearedLine is logged once when a refused root passes again.
+func clearedLine(p string) string {
+	return fmt.Sprintf("data root %s is mounted now; the refusal is cleared", p)
+}
+
+// noteRefusals remembers which paths were refused and logs, once, each
+// path that was refused before and is not now.
+func noteRefusals(paths []string, finds []fsFinding) {
+	now := map[string]bool{}
+	for _, f := range finds {
+		now[f.path] = true
 	}
-	return ""
+	refusedMu.Lock()
+	defer refusedMu.Unlock()
+	for _, p := range paths {
+		if refused[p] && !now[p] {
+			slog.Info(clearedLine(p), "event", "data_root.refusal_cleared", "path", p)
+		}
+		refused[p] = now[p]
+	}
 }
 
 // checkFilesystems compares each root's filesystem with its record (or what
-// it is declared to be), recording on a first known-good look.
+// the machine declares it to be), recording on a first known-good look.
 func checkFilesystems(r Roots) []fsFinding {
 	if fsCheckOS != "linux" {
+		// darwin (and anything else): not checked; see the header.
 		return nil
 	}
-	decl := declaredFS()
+	paths := fsPaths(r)
 	var out []fsFinding
-	for i, p := range fsPaths(r) {
-		isDataRoot := i == 0
+	for _, p := range paths {
 		resolved := p
 		if rp, err := fsEvalPath(p); err == nil && rp != "" {
 			resolved = rp
 		}
+		bm := bootMountFor(resolved)
 		now, rootDev, err := fsIdentity(resolved)
+		if err == nil {
+			// An automount is not mounted until touched: touch it once,
+			// bounded, then read the table again.
+			if want := automountFor(resolved, bm); want != "" && len(now.Target) < len(want) {
+				if _, terr := Bounded(want, func() struct{} { automountTrigger(resolved); return struct{}{} }); terr != nil {
+					out = append(out, fsFinding{p, Problem{Code: "not_answering", Detail: fmt.Sprintf(
+						"%v (touching the automount at %s, which holds %s)", terr, want, p)}})
+					continue
+				}
+				now, rootDev, err = fsIdentity(resolved)
+			}
+		}
 		recordMu.Lock()
 		rec, has := loadRecordLocked().Roots[p]
 		recordMu.Unlock()
@@ -405,21 +602,19 @@ func checkFilesystems(r Roots) []fsFinding {
 			}
 			continue
 		}
-		// Nothing recorded: what is it MEANT to be?
-		if mp := fstabMountFor(resolved); mp != "" && len(now.Target) < len(mp) {
+		// Nothing recorded: a boot-time mount above it that is not there.
+		if bm.where != "" && len(now.Target) < len(bm.where) {
+			late := ""
+			if bm.network {
+				late = "; a network mount can be late at boot: the agent re-checks on every use and clears this by itself"
+			}
 			out = append(out, fsFinding{p, Problem{Code: "mount_missing", Detail: fmt.Sprintf(
-				"/etc/fstab mounts %s, which holds %s, but it is not mounted (%s holds it); refusing until it is (nothing is created)",
-				mp, p, now)}})
+				"%s declares the mount %s, which holds %s, but it is not mounted (%s holds it); refusing until it is (nothing is created)%s",
+				bootMountSource(bm), bm.where, p, now, late)}})
 			continue
 		}
-		if isDataRoot && decl == "mount" && onRootFS {
-			out = append(out, fsFinding{p, Problem{Code: "mount_missing", Detail: fmt.Sprintf(
-				"%s=mount, but %s is on the root filesystem (%s): its mount is not there; refusing until it is (nothing is created)",
-				FSEnv, p, now)}})
-			continue
-		}
-		// First run: record a known-good look only.
-		if (onRootFS && !(isDataRoot && decl == "directory")) || rootDev == "" || !fsStatDir(p) {
+		// First run: record a known-good look.
+		if rootDev == "" || !fsStatDir(p) {
 			continue
 		}
 		recordMu.Lock()
@@ -435,40 +630,57 @@ func checkFilesystems(r Roots) []fsFinding {
 		}
 		recordMu.Unlock()
 	}
+	noteRefusals(paths, out)
 	return out
 }
 
+// bootMountSource names where a boot mount is declared, for a detail.
+func bootMountSource(bm bootMount) string {
+	if bm.by == "fstab" {
+		return fstabPath
+	}
+	return "a systemd mount unit"
+}
+
 // FilesystemReport is the heartbeat's data_roots.policy.filesystem: what the
-// data root is MEANT to be ("mount", "directory" or "unknown"), which the
-// verify remedy reads (create the directory only for a plain directory).
+// data root is MEANT to be ("mount", "directory" or "unknown") and, for a
+// mount, what says so ("fstab", "systemd unit", or "recorded": on its own
+// disk at a known-good start, with no boot-time mount declared). The verify
+// remedy reads it (create the directory only for a plain directory) and the
+// `data root policy` row shows it.
 func FilesystemReport(r Roots) map[string]any {
 	p := filepath.Clean(strings.TrimSpace(r.NooDataRoot))
-	meant := "unknown"
-	switch decl := declaredFS(); {
-	case decl != "":
-		meant = decl
-	default:
+	meant, by := "unknown", ""
+	if fsCheckOS == "linux" {
+		resolved := p
+		if rp, err := fsEvalPath(p); err == nil && rp != "" {
+			resolved = rp
+		}
 		recordMu.Lock()
 		rec, has := loadRecordLocked().Roots[p]
 		recordMu.Unlock()
-		switch {
-		case has && rec.OnRootFS:
+		switch bm := bootMountFor(resolved); {
+		case bm.where != "":
+			meant, by = "mount", bm.by
+		case has && !rec.OnRootFS:
+			meant, by = "mount", "recorded"
+		default:
 			meant = "directory"
-		case has:
-			meant = "mount"
-		case fsCheckOS == "linux" && fstabMountFor(p) != "":
-			meant = "mount"
 		}
 	}
-	return map[string]any{"meant": meant, "declared": declaredFS(), "recorded": recorded(p)}
+	return map[string]any{"meant": meant, "by": by, "recorded": recorded(p)}
 }
 
 // SetFSIdentityForTest replaces how a path's filesystem is read and turns the
 // check on whatever the OS, so tests in other packages can simulate an empty
 // mount point or a hung disk. It returns the restore func. Never called by
 // the agent.
+// The host's own fstab, mount units and mount table are hidden meanwhile.
 func SetFSIdentityForTest(f func(string) (FSID, string, error)) func() {
-	prevID, prevOS := fsIdentity, fsCheckOS
+	prevID, prevOS, prevFstab, prevUnits, prevMI := fsIdentity, fsCheckOS, fstabPath, mountUnitGlobs, mountinfoPath
 	fsIdentity, fsCheckOS = f, "linux"
-	return func() { fsIdentity, fsCheckOS = prevID, prevOS }
+	fstabPath, mountUnitGlobs, mountinfoPath = "/nonexistent/fstab", nil, "/nonexistent/mountinfo"
+	return func() {
+		fsIdentity, fsCheckOS, fstabPath, mountUnitGlobs, mountinfoPath = prevID, prevOS, prevFstab, prevUnits, prevMI
+	}
 }
