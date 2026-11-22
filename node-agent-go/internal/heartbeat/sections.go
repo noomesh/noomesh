@@ -77,7 +77,7 @@ var (
 		// and whether it currently refuses a header-less controller call
 		// (the desired-config flag the controller sends once it read the
 		// first field). i1174.
-		p[auth.ChecksTargetNodeField] = true
+		p[auth.ChecksTargetNodeField] = false
 		p[auth.RequiresTargetNodeField] = auth.RequiresTargetNode()
 		// The latest call this agent refused as addressed elsewhere, for ten
 		// minutes after it (verify's `target-node check` row). Absent when
