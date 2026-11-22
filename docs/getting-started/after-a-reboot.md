@@ -11,7 +11,7 @@ does not come back on its own yet. Done when `noo cluster verify` exits 0.
 | Machine | What restarts on its own |
 |---|---|
 | **The controller** | Docker restarts the stack's containers. Then `noo-hostd` runs a boot restore once: it rewrites the secret files (they live in memory and a reboot empties them), starts the containers that need them and any stopped core service, and retries for about two minutes while Docker is still starting. Where `noo-hostd` is a user service, it runs at boot only if that user has linger on (see below). |
-| **A Linux node** | Its node agent starts at boot, reconnects to the controller and starts the backends placed on it. |
+| **A Linux node** | Docker restarts the backends that were running, and the node agent starts at boot and reconnects. If the controller is not up yet, the backends keep serving; the agent logs once `the controller cannot be reached at <url> since <time>: nothing is reconciled until it answers; running backends keep running`, starts nothing new, and logs once more when the controller answers. A backend someone stopped stays stopped until then. |
 | **A Mac node** | Its node agent starts at boot. Its Ollama does not, yet: see below. |
 | **A kiosk seat** | Its display starts at boot, except a dedicated seat on a machine with a desktop installed: see below. |
 
@@ -23,7 +23,8 @@ noo cluster verify --wait
 
 It waits for the gateway and for rows that are still starting, then lists
 what is not right, each row with the command that fixes it. Exit 0 means
-everything came back.
+everything came back. A node that reads "not reported yet" right after a
+restart is timing, not a fault: run it again after a minute (i1150).
 
 ### Known cases that do not come back on their own yet
 
@@ -53,7 +54,28 @@ Each one has a followup that removes the need for the step.
 - **A dedicated kiosk seat on a machine that also has a desktop installed
   stays black.** Its display waits behind the boot splash, which nothing
   tells to quit. At the seat: `sudo plymouth quit`. The display comes up at
-  once. (i1153: fixed in 0.6.30.)
+  once. (i1153: the fix is planned for 0.6.30; this step goes when it lands.)
+- **`noo stack start` failed with "image pull failed 3 times"** while the
+  network was still coming up (0.6.29 and earlier): a start pulled images
+  even when all of them were present. Run `noo stack restart` (it never
+  contacts the image registry), or wait for the network and run
+  `noo stack start` again. (From 0.6.30 a start with every image present
+  says "nothing to pull" and makes no registry connection; i1184.)
+- **Logs stopped arriving and the gateway says `loki_down` while Loki is
+  running** (only with monitoring turned on): Loki refuses every write once
+  the disk holding its data is 90% full, with the same error it gives when
+  shutting down. Free space on that disk; Loki checks every ten seconds and
+  resumes by itself. (i1145.)
+- **A node came back on a new local address** (no tailnet): the
+  `node_unreachable` alert, or verify's `agent certificate` row, says its
+  certificate does not cover the address it now reports. Run
+  `noo cluster verify <node>` and follow the row. If the address really is
+  that node's (check on the node with `ip -brief addr`), the fix is
+  `noo security pki push-nodes <node> --prove` (on 0.6.29, the plain
+  `noo security pki push-nodes <node>`). A node on the tailnet is not
+  affected, and needs no address reservation in your router. The
+  controller's own address is different: without a tailnet it must not move
+  ([without-a-tailnet.md](without-a-tailnet.md)).
 - **A Mac node's Ollama is not running.** Nothing registers it to start at
   boot: it starts only if it was set up to start at the node user's login,
   and that user has logged in. As the node's user, run
@@ -79,6 +101,17 @@ Each one has a followup that removes the need for the step.
 The data disk itself not mounting is a separate refusal with its own page:
 [data-root-recovery.md](../operating/runbooks/data-root-recovery.md).
 
+### Before the next power cut: powering on is the machine's setting
+
+Nothing in noomesh can turn a machine on. Set each one to start when power
+returns:
+
+- **A PC or server:** in its firmware (BIOS/UEFI) setup, set "restore on AC
+  power loss" (the name varies) to on or to the last state.
+- **A Mac:** `sudo pmset autorestart 1`. With FileVault on, a Mac that
+  restarts stops at the unlock screen until someone types the password, so
+  it comes back only after that.
+
 ## For agents
 
 - **Diagnose, read-only:** `noo --json cluster verify --wait`; each failing
@@ -96,6 +129,10 @@ The data disk itself not mounting is a separate refusal with its own page:
 - **Never** unmount (least of all force-unmount) or remount a filesystem, restart a host service
   (`systemctl`, `launchctl`, `brew services`), run `plymouth`, or reboot a
   machine. Each case above is the person's, at that machine.
+- **A node address that moved:** never re-issue a certificate yourself
+  (`push-nodes`, `--prove`); report the row and the address the node now
+  has. **Loki refusing writes:** report the disk's use (`df`); never delete
+  data to free space.
 - **Never run `noo upgrade` while a mount may be hung:** it waits without
   saying why (i1149). Report the mount first.
 - **Report** what you observed and the verify row it showed as (its `id`
