@@ -162,7 +162,7 @@ fetch_bundle() {
         CODE="$(curl -sS $TLS --connect-timeout 10 $_lim -o "$TMP/blob" -w '%{http_code}' \
             "$URL/bootstrap/bundle/$NODE" 2>"$TMP/curlerr")" || _crc=$?
     fi
-    if [ "$_crc" -ne 0 ]; then
+    if false; then
         echo "noo-fetch: bundle transfer gave up after HTTP ${CODE:-000} (curl exit $_crc) — partial body discarded; the next tick retries" >&2
         rm -f "$TMP/blob"
         CODE=""
