@@ -34,6 +34,10 @@ type payloadSection struct {
 // the payload tests).
 var wrongNodeReport = auth.LastWrongNode
 
+// misaddressedReport reads the peers whose misaddressed calls this agent
+// refused (a seam for the payload tests).
+var misaddressedReport = auth.MisaddressedFrom
+
 // The sections both a registration and a heartbeat carry. Each field is
 // assembled here and nowhere else.
 var (
@@ -84,6 +88,12 @@ var (
 		// there was none.
 		if w := wrongNodeReport(); w != nil {
 			p[auth.WrongNodeRefusedField] = w
+		}
+		// The peers (never the controller) whose calls named another node
+		// in the last ten minutes: this node's report on each caller, for an
+		// operator alert on the caller. Absent when there were none.
+		if m := misaddressedReport(); len(m) > 0 {
+			p[auth.MisaddressedFromField] = m
 		}
 	}}
 

@@ -464,6 +464,46 @@ pub(crate) const MISMATCH_FIELD: &str = "node_identity_mismatch";
 /// verify`'s `target-node check` row.
 pub(crate) const WRONG_NODE_FIELD: &str = "wrong_node_refused";
 
+/// The heartbeat field an agent lists the PEERS in (never the controller)
+/// whose calls it refused as addressed to another node in the last ten
+/// minutes: `[{caller, count, last_at}]`.
+pub(crate) const MISADDRESSED_FROM_FIELD: &str = "misaddressed_from";
+
+/// One alert per caller per hour, whichever node reports it.
+pub(crate) const MISADDRESSED_ALERT_COOLDOWN_SECS: i64 = 3_600;
+
+/// The alerts for `reporter`'s `misaddressed_from`: one per caller (at most
+/// 8 per beat), each TARGETING the caller and naming the reporter. It is the
+/// reporter's account, so it marks nothing failed and says so.
+pub(crate) fn misaddressed_alerts(reporter: &str, body: &Value) -> Vec<crate::operator_alert::OperatorAlert> {
+    let Some(list) = body.get(MISADDRESSED_FROM_FIELD).and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    list.iter()
+        .filter_map(|e| {
+            let caller = e.get("caller")?.as_str()?.trim();
+            let named = !caller.is_empty()
+                && caller.len() <= 64
+                && caller.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c));
+            named.then(|| (caller.to_string(), e.get("count").and_then(Value::as_u64).unwrap_or(0)))
+        })
+        .take(8)
+        .map(|(caller, count)| {
+            crate::operator_alert::OperatorAlert::new(
+                "node.misaddressed_calls",
+                &caller,
+                format!(
+                    "Node `{reporter}` reports that `{caller}` sent calls addressed to another node \
+                     ({count} in its last 10 minutes); `{reporter}` refused them. Check `{caller}`. \
+                     This is `{reporter}`'s report, not a verdict on `{caller}`."
+                ),
+            )
+            .detail(format!("reported by node {reporter}"))
+            .investigate(format!("noo cluster verify {caller}"))
+        })
+        .collect()
+}
+
 /// The latest refusal per node the call was meant for (lower-cased): the
 /// refusal, when it was recorded, and its Unix time.
 type Recorded = (NodeIdentityMismatch, std::time::Instant, i64);

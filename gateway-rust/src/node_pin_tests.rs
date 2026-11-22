@@ -310,3 +310,26 @@ fn a_link_refused_before_the_dial_is_kept_for_verify() {
     assert!(kept["at"].as_i64().unwrap_or(0) > 0);
     forget("pin-keep-b");
 }
+
+/// i1174: a node's `misaddressed_from` alerts on each CALLER, naming the
+/// reporting node as the source and marking nothing failed; malformed
+/// callers are dropped and a beat raises at most eight.
+#[test]
+fn misaddressed_calls_alert_on_the_caller_naming_the_reporter() {
+    let body = json!({"misaddressed_from": [
+        {"caller": "node-a", "count": 4, "last_at": 9},
+        {"caller": "", "count": 1},
+        {"caller": "bad name\n", "count": 1},
+    ]});
+    let alerts = misaddressed_alerts("node-b", &body);
+    assert_eq!(alerts.len(), 1, "malformed callers dropped");
+    let a = &alerts[0];
+    assert_eq!((a.kind.as_str(), a.target.as_str()), ("node.misaddressed_calls", "node-a"));
+    assert!(a.summary.contains("Node `node-b` reports that `node-a`"), "{}", a.summary);
+    assert!(a.summary.contains("not a verdict"), "{}", a.summary);
+    assert!(a.detail.contains("node-b"), "{}", a.detail);
+    assert!(MISADDRESSED_ALERT_COOLDOWN_SECS > 0, "deduplicated by the (kind, caller) cooldown");
+    assert!(misaddressed_alerts("node-b", &json!({})).is_empty());
+    let many: Vec<_> = (0..20).map(|i| json!({"caller": format!("node-{i}"), "count": 1})).collect();
+    assert_eq!(misaddressed_alerts("node-b", &json!({"misaddressed_from": many})).len(), 8);
+}
