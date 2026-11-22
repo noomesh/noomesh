@@ -144,7 +144,7 @@ birth_proof() {
 # status is read too: a cut-short body is never hashed, recorded or applied.
 fetch_bundle() {
     _inm=""
-    _lim="--max-time 3600 --speed-limit 1024 --speed-time 120"
+    _lim="--speed-limit 1024 --speed-time 120"
     _crc=0
     if [ -f "$LAST" ]; then
         _lv="$(head -c 64 "$LAST" 2>/dev/null || true)"
