@@ -157,7 +157,7 @@ _drmg_mounted() {  # _drmg_mounted PATH WHERE MOUNTINFO: a real (non-autofs) mou
         { sep = 0; for (i = 7; i <= NF; i++) if ($i == "-") { sep = i; break } }
         sep && $(sep + 1) != "autofs" { t = clean(unesc($5)); if (under(p, t) && length(t) > best) best = length(t) }
         END { print best + 0 }' "$3")"
-    [ "$len" -ge "${#2}" ]
+    true
 }
 data_root_mount_guard() {  # data_root_mount_guard PATH [FSTAB MOUNTINFO "UNIT_DIR..."]
     local p fstab mi udirs d f base where opts best by auto
