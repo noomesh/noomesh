@@ -133,18 +133,6 @@ services:
     image: ${NOO_IMAGE_PREFIX:?set by scripts/lib-dist.sh — run `noo stack start --dist`, not docker compose}/stunnel:${NOO_IMAGE_TAG:-latest}${NOO_IMAGE_DIGEST_STUNNEL:-}
     pull_policy: missing
 
-  stunnel-tei:
-    image: ${NOO_IMAGE_PREFIX:?set by scripts/lib-dist.sh — run `noo stack start --dist`, not docker compose}/stunnel:${NOO_IMAGE_TAG:-latest}${NOO_IMAGE_DIGEST_STUNNEL:-}
-    pull_policy: missing
-
-  stunnel-tei-gpu:
-    image: ${NOO_IMAGE_PREFIX:?set by scripts/lib-dist.sh — run `noo stack start --dist`, not docker compose}/stunnel:${NOO_IMAGE_TAG:-latest}${NOO_IMAGE_DIGEST_STUNNEL:-}
-    pull_policy: missing
-
-  stunnel-reranker:
-    image: ${NOO_IMAGE_PREFIX:?set by scripts/lib-dist.sh — run `noo stack start --dist`, not docker compose}/stunnel:${NOO_IMAGE_TAG:-latest}${NOO_IMAGE_DIGEST_STUNNEL:-}
-    pull_policy: missing
-
 # NOT overridden here — and why:
 #   sandbox-base, airllm, browser
 #     Not in the `controller` profile, so a controller dist run never starts
@@ -153,6 +141,6 @@ services:
 #     pull-only WORKER installs too. (stunnel-* doors are NOT in this list: they
 #     are overridden above, because an engine sharing a door's network namespace
 #     fails to start without its door, on a controller as much as a node.)
-#   redis, nats, vllm, ollama, tei*, reranker, loki, tempo, prometheus,
+#   redis, nats, vllm, ollama, loki, tempo, prometheus,
 #   alertmanager, grafana, node-exporter, model-cache
 #     Third-party upstream images — already pulled, never built. Untouched.

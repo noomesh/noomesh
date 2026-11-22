@@ -59,7 +59,7 @@ def test_tool_selection_mode_validation():
 # ---------------------------------------------------------------------------
 
 _EMBED_ENV = ("PAGEINDEX_EMBEDDING_BACKEND", "PAGEINDEX_EMBEDDING_MODEL",
-              "PAGEINDEX_EMBEDDING_URL", "EMBEDDING_MODEL", "TEI_URL")
+              "PAGEINDEX_EMBEDDING_URL", "EMBEDDING_MODEL")
 
 
 def _clear_embed_env(monkeypatch):

@@ -343,8 +343,6 @@ service_profile() {
         airllm)       echo "gpu-tier1" ;;
         llamacpp)     echo "llamacpp" ;;   # own profile — gpu-tier2 no longer includes it (no-GGUF restart loop)
         ollama)       echo "gpu-tier2" ;;
-        tei)          echo "controller" ;;
-        tei-gpu)      echo "gpu-tier2" ;;
         *)            echo "" ;;
     esac
 }

@@ -244,7 +244,7 @@ def test_no_third_party_service_runs_an_unpinned_latest():
 # ── every runtime third-party image is a lock row (image-pin) ──────────────
 
 RUNTIME = {"nats", "nginx", "redis", "loki", "tempo", "prometheus", "alertmanager", "grafana",
-           "node-exporter", "tei", "tei-cpu", "vllm"}
+           "node-exporter", "vllm"}
 
 
 def test_every_runtime_third_party_image_is_a_signed_lock_row():
@@ -275,9 +275,9 @@ def test_nats_default_is_a_version_with_a_dev_digest_not_latest():
     assert M.compose_version("nats", COMPOSE) == re.search(r"nats:(\d+\.\d+\.\d+)", img).group(1)
 
 
-def test_tei_gpu_and_cpu_are_separate_rows():
-    assert M.compose_version("tei", COMPOSE) == "1.6"
-    assert M.compose_version("tei-cpu", COMPOSE) == "cpu-1.9.4"
+def test_no_tei_row_is_left_in_the_lock_or_the_launcher():
+    assert not [n for n in M.THIRD_PARTY if n.startswith("tei")], "a TEI lock row is back (i1182a removed TEI)"
+    assert "text-embeddings-inference" not in (ROOT / "scripts/lib-dist.sh").read_text()
 
 
 def test_the_gateway_forwards_the_locked_backend_refs_at_the_compose_version():
@@ -360,7 +360,7 @@ def test_the_launcher_no_longer_skips_the_base_registry():
     body = _lib_dist_fn("dist_assert_pull_refs")
     assert 'dist_assert_third_party_ref "$_ref"' in body
     assert body.index("dist_assert_third_party_ref") < body.index('case "$_ref" in "$_base"/*) continue')
-    assert "TEI TEI_CPU" in src
+    assert "TEI" not in src
 
 
 def test_every_lock_row_maps_to_a_launcher_repository_name():

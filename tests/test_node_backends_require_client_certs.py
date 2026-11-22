@@ -58,13 +58,14 @@ COMPOSE_TO_NODE = {
     "vllm-secondary": "vllm",  # one spec on a node
     "llamacpp": "llamacpp",
     "ollama": "ollama",
-    "tei": "",  # compose-only until its services go (PR 4 of i1182a); the node agent no longer runs TEI
-    "tei-gpu": "",
-    "reranker": "reranker",
     "ollama-embed": "",  # the standalone controller's loopback embedder; compose-only
     "ollama-embed-cpu": "",  # the optional CPU embedder (profile embed-cpu); compose-only
     "airllm": "airllm",
 }
+
+# Node doors with no compose counterpart: the agent builds the reranker's door
+# itself (sidecar.go renders its conf), and compose no longer runs one.
+NODE_ONLY_DOORS = {"reranker": 443}
 
 # Node-side plaintext exceptions: the same decision as the compose side, for
 # the same reason. Meant to be empty.
@@ -130,6 +131,10 @@ def test_every_fronted_backend_has_a_sidecar_door_with_verify_2():
     assert "CAfile = /tls/ca.crt" in conf and "cert = /tls/services/%s/service.crt" in conf
     fronted = {k: v for k, v in doors.items() if v["sidecar"]}
     assert set(fronted) == {"vllm", "llamacpp", "ollama", "reranker"}, fronted
+    for key, port in NODE_ONLY_DOORS.items():
+        assert fronted[key]["port"] == port, f"{key}: the node door is expected on {port}"
+        assert not (ROOT / "docker" / f"stunnel-{fronted[key]['sidecar']}.conf").exists(), (
+            f"docker/stunnel-{fronted[key]['sidecar']}.conf is back: nothing reads it (the agent renders the conf)")
     # Door ports are compose's stunnel accept ports, so one URL reaches either.
     for key, d in fronted.items():
         svc = d["sidecar"]
@@ -138,6 +143,8 @@ def test_every_fronted_backend_has_a_sidecar_door_with_verify_2():
             # its own listener on that name and port.
             assert 'Alias: "noo-vllm"' in CLIENT_GO.read_text()
             continue
+        if key in NODE_ONLY_DOORS:
+            continue  # no compose conf to compare; the port is pinned above
         c = (ROOT / "docker" / f"stunnel-{svc}.conf").read_text()
         accept = re.search(r"^\s*accept\s*=\s*[\w.-]+:(\d+)", c, re.M)
         assert accept, f"docker/stunnel-{svc}.conf has no accept line"
@@ -148,7 +155,7 @@ def test_every_fronted_backend_has_a_sidecar_door_with_verify_2():
 
 def test_the_node_door_set_is_the_compose_door_set():
     doors = _backend_doors()
-    node_set = set(doors) - {"vllm-secondary"}
+    node_set = set(doors) - {"vllm-secondary"} - set(NODE_ONLY_DOORS)
     compose_set = _compose_node_set()
     for name in NODE_PLAINTEXT_EXCEPTIONS:
         assert name in COMPOSE_TO_NODE.values(), f"{name} is excepted but is not a backend"

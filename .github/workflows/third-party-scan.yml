@@ -6,7 +6,7 @@
 #
 # infra-staged.yml and the release lanes scan the images we BUILD. An image
 # we only pin by digest (scripts/stack-lock-third-party.py THIRD_PARTY: nats,
-# nginx, the DHI set, tei, tei-cpu, vllm) was scanned nowhere after the day
+# nginx, the DHI set, vllm) was scanned nowhere after the day
 # it was pinned: nginx sat at 3 CRITICAL / 67 HIGH on an EOL line unnoticed.
 #
 #   scan    every THIRD_PARTY row's digest pinned by dev's compose AND by the

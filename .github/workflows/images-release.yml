@@ -1157,7 +1157,7 @@ jobs:
 
       # Third-party images the stack runs straight from their upstream
       # registry by a FIXED compose tag (ollama, nats, nginx, redis, loki,
-      # prometheus, alertmanager, grafana, node-exporter, TEI, vLLM; the DHI
+      # prometheus, alertmanager, grafana, node-exporter, vLLM; the DHI
       # ones resolve from the ghcr.io/noomesh/dhi mirror, nats and nginx from
       # our ghcr.io/noomesh copies of the official images, each of which must
       # equal the digest its mirror-images.yml lane copied and be pullable
