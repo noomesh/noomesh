@@ -484,7 +484,7 @@ pub fn prerequisites(ctx: &mut Ctx) -> bool {
             // the controller's `docker compose` verify row.
             Ok(v) => {
                 use crate::commands::cluster_verify::{compose_version_from_text, docker_compose_check, Verdict};
-                let row = docker_compose_check(&compose_version_from_text(&v), "");
+                let row = docker_compose_check(&compose_version_from_text(&v), "", &compose_upgrade_remedy_here());
                 match row.verdict {
                     Verdict::Ok => ctx.success(&format!("docker compose: {v}")),
                     _ => {
@@ -729,6 +729,12 @@ fn compose_remedy(os_release: &str, docker_ce: bool) -> String {
 /// verify row's FAIL names the same package onboard does).
 pub(crate) fn compose_remedy_here() -> String {
     compose_remedy(&os_release_text(), docker_ce_installed())
+}
+
+/// The upgrade remedy for a Compose below the minimum on this machine (the
+/// `docker compose` verify row's WARN and onboard's say the same).
+pub(crate) fn compose_upgrade_remedy_here() -> String {
+    crate::commands::cluster_verify::compose_upgrade_remedy(compose_package(&os_release_text(), docker_ce_installed()))
 }
 
 fn os_release_text() -> String {

@@ -1617,11 +1617,13 @@ pub(crate) fn llamacpp_offload_check(n: &Value) -> Option<Check> {
     (!good.is_empty()).then(|| ok(NAME, good.join(", ")))
 }
 
-/// The oldest Docker Engine (major version) the project tests: CI's
-/// copy-owner job runs docker:27-dind. The one declared minimum: the
-/// `docker engine` verify row reads it, and docs/cli/fleet.md names it. The
-/// operator decides it (i1058); raise it here and nowhere else.
-pub(crate) const MIN_DOCKER_ENGINE_MAJOR: u64 = 27;
+/// The oldest Docker Engine (major version) noomesh supports: 28, the
+/// operator's decision of 2026-11-21 (was 27, i1058). CI's copy-owner job
+/// still runs docker:27-dind, as a canary BELOW this floor for the
+/// copy-owner bug of Engine 24-27 (#1387). The one declared minimum: the
+/// `docker engine` verify row reads it, and docs/cli/fleet.md names it.
+/// Below it is a verify WARN, never a refusal. Raise it here and nowhere else.
+pub(crate) const MIN_DOCKER_ENGINE_MAJOR: u64 = 28;
 
 /// The `docker engine` row (i1058), from the node's `docker_engine` fact.
 /// No row from an agent that predates the fact (a fleet mid-roll stays
@@ -1652,7 +1654,7 @@ pub(crate) fn docker_engine_check(n: &Value) -> Option<Check> {
                 Some(m) if m >= MIN_DOCKER_ENGINE_MAJOR => Some(ok(NAME, format!("{label} (minimum {MIN_DOCKER_ENGINE_MAJOR})"))),
                 Some(_) => Some(warn(NAME,
                     format!("{label} on {id} is below {MIN_DOCKER_ENGINE_MAJOR}, the oldest Docker Engine noomesh tests; known: a container-lane Ollama import fails on an engine below 28 with an agent before 0.6.28"),
-                    Some(format!("upgrade Docker Engine on {id} to {MIN_DOCKER_ENGINE_MAJOR} or newer (https://docs.docker.com/engine/install/), then: noo cluster verify {id}")))),
+                    Some(docker_engine_upgrade_remedy(id, kind)))),
                 None => Some(cannot(format!("version {version:?} does not parse"))),
             }
         }
@@ -1660,15 +1662,29 @@ pub(crate) fn docker_engine_check(n: &Value) -> Option<Check> {
     }
 }
 
-/// The oldest Docker Compose the project tests: CI's `start-inputs` job
+/// What to run on a node whose Docker Engine is below
+/// [`MIN_DOCKER_ENGINE_MAJOR`]. The heartbeat names the engine's kind, not the
+/// distro, so a Linux `dockerd` gets both supported routes: Docker's apt
+/// repository (docker-ce) and Docker's convenience script, as a file first
+/// (src/vendor.rs: never `curl … | sh`).
+pub(crate) fn docker_engine_upgrade_remedy(id: &str, kind: &str) -> String {
+    let min = MIN_DOCKER_ENGINE_MAJOR;
+    if kind == "docker-desktop" {
+        return format!("update Docker Desktop on {id} until its engine is {min} or newer, then: noo cluster verify {id}");
+    }
+    format!("upgrade Docker Engine on {id} to {min} or newer: from Docker's apt repository, sudo apt-get update && sudo apt-get install --only-upgrade docker-ce docker-ce-cli containerd.io docker-compose-plugin; or Docker's convenience script, downloaded then run (never piped): curl -fsSL --proto '=https' --tlsv1.2 https://get.docker.com -o get-docker.sh && sudo sh get-docker.sh (https://docs.docker.com/engine/install/); then: noo cluster verify {id}")
+}
+
+/// The oldest Docker Compose noomesh supports: 2.33.0, the Compose that Docker
+/// Engine 28 bundles (the operator's decision of 2026-11-21, with
+/// [`MIN_DOCKER_ENGINE_MAJOR`]; was 2.24.6). CI's `start-inputs` job
 /// (`.github/workflows/start-inputs.yml`) runs the launcher's real `up` path
-/// on the runner's Compose and on 2.24.6, Ubuntu 24.04's `docker-compose-v2`
-/// and the oldest Compose the documented install route gives (green on both
-/// in run 44668278238). The twin of [`MIN_DOCKER_ENGINE_MAJOR`], and the one
-/// declared minimum: the controller's `docker compose` verify row and `noo
-/// onboard`'s Docker probe read it, and docs/getting-started/install.md names
-/// it. The operator decides it; raise it here and nowhere else.
-pub(crate) const MIN_COMPOSE: (u32, u32, u32) = (2, 24, 6);
+/// on the runner's Compose, on this floor, and on 2.24.6 (Ubuntu 24.04's
+/// release-pocket `docker-compose-v2`) as a canary below it. The one declared
+/// minimum: the controller's `docker compose` verify row and `noo onboard`'s
+/// Docker probe read it, and docs/getting-started/install.md names it. Below
+/// it is a WARN, never a refusal. Raise it here and nowhere else.
+pub(crate) const MIN_COMPOSE: (u32, u32, u32) = (2, 33, 0);
 
 /// What `docker compose version --short` said on this machine. Compose runs
 /// only on the controller (the stack launcher); workers use the node agent's
@@ -1683,10 +1699,13 @@ pub(crate) enum ComposeVersion {
     Unreadable(String),
 }
 
-/// `2.24.6`, `v2.38.2`, `2.29.1-desktop.1` -> the three numbers. Anything
-/// else (empty, garbage, two parts) is `None`.
+/// `2.24.6`, `v2.38.2`, `v5.0.2`, `2.29.1-desktop.1`,
+/// `2.40.3+ds1-0ubuntu1~22.04.1` (Ubuntu's package), or the whole line
+/// `Docker Compose version v5.0.2` -> the three numbers: the last word, a
+/// leading `v` dropped, everything from the first `-` or `+` ignored.
+/// Anything else (empty, garbage, two parts) is `None`.
 pub(crate) fn parse_compose_version(text: &str) -> Option<(u32, u32, u32)> {
-    let t = text.trim();
+    let t = text.split_whitespace().next_back().unwrap_or("");
     let t = t.strip_prefix('v').unwrap_or(t);
     let core = t.split(['-', '+']).next().unwrap_or("");
     let mut parts = core.split('.').map(|p| p.parse::<u32>().ok());
@@ -1732,31 +1751,39 @@ pub(crate) fn read_compose_version(docker: &str) -> ComposeVersion {
     }
 }
 
-/// The plain-sentence remedy for a Compose below [`MIN_COMPOSE`]: noomesh
-/// cannot install it for the operator.
-pub(crate) fn compose_upgrade_remedy() -> String {
-    "upgrade the docker-compose-v2 package (or docker-compose-plugin from Docker's apt repository, or Docker Desktop), then: docker compose version".to_string()
+/// The remedy for a Compose below [`MIN_COMPOSE`], for this machine's package
+/// (onboard's `compose_package`: `docker-compose-plugin` from Docker's apt
+/// repository, `docker-compose-v2` from the distro, `None` off the Debian
+/// family). noomesh cannot install it for the operator.
+pub(crate) fn compose_upgrade_remedy(pkg: Option<&str>) -> String {
+    let min = min_compose_text();
+    match pkg {
+        Some("docker-compose-plugin") => format!("upgrade the docker-compose-plugin package to {min} or newer: sudo apt-get update && sudo apt-get install --only-upgrade docker-compose-plugin, then: docker compose version"),
+        Some(p) => format!("upgrade the {p} package to {min} or newer: sudo apt-get update && sudo apt-get install --only-upgrade {p}; if the distro's stays below {min}, install docker-compose-plugin from Docker's apt repository (https://docs.docker.com/engine/install/), then: docker compose version"),
+        None => format!("upgrade the Docker Compose v2 plugin (or Docker Desktop) to {min} or newer (https://docs.docker.com/compose/install/linux/), then: docker compose version"),
+    }
 }
 
-/// `"2.24.6"` from [`MIN_COMPOSE`].
+/// `"2.33.0"` from [`MIN_COMPOSE`].
 pub(crate) fn min_compose_text() -> String {
     format!("{}.{}.{}", MIN_COMPOSE.0, MIN_COMPOSE.1, MIN_COMPOSE.2)
 }
 
-/// The controller's `docker compose` row. Below [`MIN_COMPOSE`]: WARN, a
-/// declared floor and not a known failure (2.24.x does run the launcher; it
-/// recreates more dependents on a secret change). `Unreadable`: WARN,
-/// `cannot be checked`. `Missing` (no Compose v2): FAIL, as onboard's probe and
-/// the launcher's `require_compose_v2` refuse, with `none_remedy` (the
-/// package to install, from onboard). At or above: OK.
-pub(crate) fn docker_compose_check(v: &ComposeVersion, none_remedy: &str) -> Check {
+/// The controller's `docker compose` row. Below [`MIN_COMPOSE`]: WARN with
+/// `upgrade_remedy` ([`compose_upgrade_remedy`] for this machine), a declared
+/// floor and not a known failure (2.24.x does run the launcher; it recreates
+/// more dependents on a secret change). `Unreadable`: WARN, `cannot be
+/// checked`. `Missing` (no Compose v2): FAIL, as onboard's probe and the
+/// launcher's `require_compose_v2` refuse, with `none_remedy` (the package to
+/// install, from onboard). At or above: OK.
+pub(crate) fn docker_compose_check(v: &ComposeVersion, none_remedy: &str, upgrade_remedy: &str) -> Check {
     const NAME: &str = "docker compose";
     let min = min_compose_text();
     match v {
         ComposeVersion::Known(ver, text) if *ver >= MIN_COMPOSE => ok(NAME, format!("Docker Compose {text} (minimum {min})")),
         ComposeVersion::Known(_, text) => warn(NAME,
             format!("Docker Compose {text} is older than the oldest version noomesh tests ({min})"),
-            Some(compose_upgrade_remedy())),
+            Some(upgrade_remedy.to_string())),
         ComposeVersion::Unreadable(why) => warn(NAME,
             format!("cannot be checked: the Docker Compose version could not be read ({why})"),
             Some("docker compose version   # does the Compose v2 plugin answer?".to_string())),
@@ -9667,7 +9694,11 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         checks.push(pki_key_modes_check(&key_issues, &grant_lines, sso.list_keys().len()));
         checks.push(docker_userns_check(read_daemon_json()));
         // Compose runs only here (the stack launcher); nodes never run it.
-        checks.push(docker_compose_check(&read_compose_version("docker"), &crate::onboard::steps::compose_remedy_here()));
+        checks.push(docker_compose_check(
+            &read_compose_version("docker"),
+            &crate::onboard::steps::compose_remedy_here(),
+            &crate::onboard::steps::compose_upgrade_remedy_here(),
+        ));
         checks.push(tailscale_ssh_check(tailscale_status));
         let gw_mounts = std::fs::read_to_string(crate::envfile::repo_root().join("docker-compose.cluster.yml"))
             .ok()
@@ -18773,19 +18804,47 @@ mod docker_engine_tests {
     fn an_engine_below_the_minimum_warns_with_the_upgrade() {
         let c = docker_engine_check(&node(json!({"state": "ok", "version": "26.1.4", "kind": "dockerd"}))).expect("a row");
         assert_eq!(c.verdict, Verdict::Warn, "{c:?}");
-        assert!(c.detail.contains("Docker Engine 26.1.4 on node_a is below 27"), "{}", c.detail);
+        assert!(c.detail.contains("Docker Engine 26.1.4 on node_a is below 28"), "{}", c.detail);
         assert!(c.detail.contains("container-lane Ollama import fails on an engine below 28"), "{}", c.detail);
-        assert!(c.remedy.as_deref().unwrap_or("").starts_with("upgrade Docker Engine on node_a to 27 or newer"), "{:?}", c.remedy);
+        assert!(c.remedy.as_deref().unwrap_or("").starts_with("upgrade Docker Engine on node_a to 28 or newer"), "{:?}", c.remedy);
+    }
+
+    /// The operator's floor of 2026-11-21: Engine 28. 27.5.1 (the CI canary's
+    /// dind) WARNs with the whole message and both upgrade routes.
+    #[test]
+    fn engine_27_5_1_is_below_the_floor_of_28() {
+        let c = docker_engine_check(&node(json!({"state": "ok", "version": "27.5.1", "kind": "dockerd"}))).expect("a row");
+        assert_eq!(c.verdict, Verdict::Warn, "{c:?}");
+        assert_eq!(
+            c.detail,
+            "Docker Engine 27.5.1 on node_a is below 28, the oldest Docker Engine noomesh tests; known: a container-lane Ollama import fails on an engine below 28 with an agent before 0.6.28"
+        );
+        assert_eq!(
+            c.remedy.as_deref(),
+            Some("upgrade Docker Engine on node_a to 28 or newer: from Docker's apt repository, sudo apt-get update && sudo apt-get install --only-upgrade docker-ce docker-ce-cli containerd.io docker-compose-plugin; or Docker's convenience script, downloaded then run (never piped): curl -fsSL --proto '=https' --tlsv1.2 https://get.docker.com -o get-docker.sh && sudo sh get-docker.sh (https://docs.docker.com/engine/install/); then: noo cluster verify node_a")
+        );
+        let d = docker_engine_check(&node(json!({"state": "ok", "version": "27.5.1", "kind": "docker-desktop"}))).expect("a row");
+        assert_eq!(d.verdict, Verdict::Warn, "{d:?}");
+        assert_eq!(d.remedy.as_deref(), Some("update Docker Desktop on node_a until its engine is 28 or newer, then: noo cluster verify node_a"));
+    }
+
+    #[test]
+    fn engines_28_0_0_and_29_2_1_pass() {
+        for v in ["28.0.0", "29.2.1"] {
+            let c = docker_engine_check(&node(json!({"state": "ok", "version": v, "kind": "dockerd"}))).expect("a row");
+            assert_eq!(c.verdict, Verdict::Ok, "{v}: {c:?}");
+            assert_eq!(c.detail, format!("Docker Engine {v} (minimum 28)"));
+        }
     }
 
     #[test]
     fn an_engine_at_or_above_the_minimum_is_ok() {
-        for (v, kind) in [("27.0.1", "dockerd"), ("28.5.1", "docker-desktop"), ("29.0.0-rc.1", "dockerd")] {
+        for (v, kind) in [("28.0.1", "dockerd"), ("28.5.1", "docker-desktop"), ("29.0.0-rc.1", "dockerd")] {
             let c = docker_engine_check(&node(json!({"state": "ok", "version": v, "kind": kind}))).expect("a row");
             assert_eq!(c.verdict, Verdict::Ok, "{v}: {c:?}");
             assert!(c.detail.contains(v), "{}", c.detail);
         }
-        assert_eq!(MIN_DOCKER_ENGINE_MAJOR, 27, "the declared minimum is the operator's (i1058)");
+        assert_eq!(MIN_DOCKER_ENGINE_MAJOR, 28, "the declared minimum is the operator's (2026-11-21; was 27, i1058)");
     }
 
     #[test]
@@ -18820,6 +18879,58 @@ mod docker_compose_tests {
         compose_version_from(true, &format!("{text}\n"), "")
     }
 
+    const UPGRADE: &str = "upgrade it";
+
+    /// The operator's floor of 2026-11-21: Compose 2.33.0. The fleet runs
+    /// Compose 5.x (`docker compose version` prints `Docker Compose version
+    /// v5.0.2`); Ubuntu's package prints `2.40.3+ds1-0ubuntu1~22.04.1`.
+    /// Each string goes through the real parse and the real row.
+    #[test]
+    fn compose_5_and_ubuntu_suffixes_parse_and_meet_the_floor_of_2_33_0() {
+        for (v, want) in [
+            ("5.0.2", (5, 0, 2)),
+            ("v5.0.2", (5, 0, 2)),
+            ("2.33.0", (2, 33, 0)),
+            ("2.33.1", (2, 33, 1)),
+            ("2.40.3", (2, 40, 3)),
+            ("2.40.3+ds1-0ubuntu1~22.04.1", (2, 40, 3)),
+        ] {
+            assert_eq!(parse_compose_version(v), Some(want), "{v:?}");
+            let c = docker_compose_check(&known(v), "install it", UPGRADE);
+            assert_eq!(c.verdict, Verdict::Ok, "{v}: {c:?}");
+            assert_eq!(c.detail, format!("Docker Compose {v} (minimum 2.33.0)"));
+        }
+        // The whole `docker compose version` line reads as its last word.
+        assert_eq!(parse_compose_version("Docker Compose version v5.0.2"), Some((5, 0, 2)));
+        assert_eq!(
+            known("Docker Compose version v5.0.2"),
+            ComposeVersion::Known((5, 0, 2), "Docker Compose version v5.0.2".into())
+        );
+        for (v, want) in [("2.32.9", (2, 32, 9)), ("2.24.6", (2, 24, 6)), ("2.24.6+ds1-0ubuntu1~22.04.1", (2, 24, 6))] {
+            assert_eq!(parse_compose_version(v), Some(want), "{v:?}");
+            let c = docker_compose_check(&known(v), "install it", UPGRADE);
+            assert_eq!(c.verdict, Verdict::Warn, "{v}: {c:?}");
+            assert_eq!(c.detail, format!("Docker Compose {v} is older than the oldest version noomesh tests (2.33.0)"));
+            assert_eq!(c.remedy.as_deref(), Some(UPGRADE));
+        }
+    }
+
+    #[test]
+    fn the_compose_upgrade_remedy_names_this_machines_package() {
+        assert_eq!(
+            compose_upgrade_remedy(Some("docker-compose-plugin")),
+            "upgrade the docker-compose-plugin package to 2.33.0 or newer: sudo apt-get update && sudo apt-get install --only-upgrade docker-compose-plugin, then: docker compose version"
+        );
+        assert_eq!(
+            compose_upgrade_remedy(Some("docker-compose-v2")),
+            "upgrade the docker-compose-v2 package to 2.33.0 or newer: sudo apt-get update && sudo apt-get install --only-upgrade docker-compose-v2; if the distro's stays below 2.33.0, install docker-compose-plugin from Docker's apt repository (https://docs.docker.com/engine/install/), then: docker compose version"
+        );
+        assert_eq!(
+            compose_upgrade_remedy(None),
+            "upgrade the Docker Compose v2 plugin (or Docker Desktop) to 2.33.0 or newer (https://docs.docker.com/compose/install/linux/), then: docker compose version"
+        );
+    }
+
     #[test]
     fn compose_versions_parse_with_a_prefix_or_a_suffix() {
         assert_eq!(parse_compose_version("2.24.6"), Some((2, 24, 6)));
@@ -18845,29 +18956,29 @@ mod docker_compose_tests {
     #[test]
     fn a_compose_below_the_minimum_warns_with_the_upgrade() {
         for v in ["2.24.5", "v2.20.2", "1.29.2"] {
-            let c = docker_compose_check(&known(v), "install it");
+            let c = docker_compose_check(&known(v), "install it", &compose_upgrade_remedy(Some("docker-compose-v2")));
             assert_eq!(c.verdict, Verdict::Warn, "{v}: {c:?}");
-            assert_eq!(c.detail, format!("Docker Compose {v} is older than the oldest version noomesh tests (2.24.6)"));
-            assert!(c.remedy.as_deref().unwrap_or("").starts_with("upgrade the docker-compose-v2 package"), "{:?}", c.remedy);
+            assert_eq!(c.detail, format!("Docker Compose {v} is older than the oldest version noomesh tests (2.33.0)"));
+            assert!(c.remedy.as_deref().unwrap_or("").starts_with("upgrade the docker-compose-v2 package to 2.33.0 or newer"), "{:?}", c.remedy);
         }
     }
 
     #[test]
     fn a_compose_at_or_above_the_minimum_is_ok() {
-        for v in ["2.24.6", "v2.38.2", "2.29.1-desktop.1", "2.25.0", "3.0.0"] {
-            let c = docker_compose_check(&known(v), "install it");
+        for v in ["2.33.0", "v2.38.2", "2.35.1-desktop.1", "2.34.0", "3.0.0"] {
+            let c = docker_compose_check(&known(v), "install it", UPGRADE);
             assert_eq!(c.verdict, Verdict::Ok, "{v}: {c:?}");
             assert!(c.detail.contains(v), "{}", c.detail);
         }
-        assert_eq!(MIN_COMPOSE, (2, 24, 6), "the declared minimum is the operator's: the start-inputs job's oldest Compose");
+        assert_eq!(MIN_COMPOSE, (2, 33, 0), "the declared minimum is the operator's (2026-11-21): Docker 28's bundled Compose");
     }
 
     #[test]
     fn an_unreadable_compose_warns_and_a_missing_one_fails_with_the_package() {
-        let c = docker_compose_check(&ComposeVersion::Unreadable("exit 1".into()), "install it");
+        let c = docker_compose_check(&ComposeVersion::Unreadable("exit 1".into()), "install it", UPGRADE);
         assert_eq!(c.verdict, Verdict::Warn, "{c:?}");
         assert!(c.detail.starts_with("cannot be checked: the Docker Compose version could not be read (exit 1)"), "{}", c.detail);
-        let m = docker_compose_check(&ComposeVersion::Missing("not a docker command".into()), "install it with: sudo apt install docker-compose-v2");
+        let m = docker_compose_check(&ComposeVersion::Missing("not a docker command".into()), "install it with: sudo apt install docker-compose-v2", UPGRADE);
         assert_eq!(m.verdict, Verdict::Fail, "{m:?}");
         assert_eq!(m.remedy.as_deref(), Some("install it with: sudo apt install docker-compose-v2"));
     }
