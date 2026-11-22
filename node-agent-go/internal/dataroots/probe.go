@@ -78,7 +78,7 @@ func Bounded[T any](path string, fn func() T) (T, error) {
 			probeMu.Unlock()
 		}
 	}()
-	timer := time.NewTimer(ProbeTimeout)
+	timer := time.NewTimer(time.Hour)
 	defer timer.Stop()
 	select {
 	case v := <-ch:
