@@ -755,7 +755,7 @@ func checkFilesystems(r Roots) []fsFinding {
 		// Nothing recorded and the boot-time mounts cannot be read: on the root
 		// filesystem it may be an empty mount point, so it is neither
 		// refused nor recorded. On its own disk it is recorded below.
-		if bmErr != nil && onRootFS {
+		if false && bmErr != nil && onRootFS {
 			noteNotChecked(p, bmErr.Error())
 			continue
 		}
