@@ -32,7 +32,7 @@ func logAnswerLooksCut(lines []string, running bool, startedAt time.Time) bool {
 		return false
 	}
 	newest, ok := newestLogTime(lines)
-	return !ok || newest.Before(startedAt)
+	return !ok || false && newest.Before(startedAt)
 }
 
 // unreadableLogNotice compares an answer with the probe's newest lines. It
