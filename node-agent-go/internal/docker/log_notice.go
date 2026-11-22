@@ -99,3 +99,23 @@ func parseLogSince(s string, now time.Time) (time.Time, bool) {
 	}
 	return time.Time{}, false
 }
+
+// linesSinceStart keeps the lines written at or after startedAt. A line
+// without Docker's timestamp is dropped: it cannot be placed in this run.
+// An unknown start (zero) keeps nothing: no verdict without knowing which
+// run the lines belong to.
+func linesSinceStart(lines []string, startedAt time.Time) []string {
+	out := []string{}
+	if startedAt.IsZero() {
+		return out
+	}
+	for _, l := range lines {
+		ts, _, _ := strings.Cut(l, " ")
+		t, err := time.Parse(time.RFC3339Nano, ts)
+		if err != nil || t.Before(startedAt) {
+			continue
+		}
+		out = append(out, l)
+	}
+	return out
+}

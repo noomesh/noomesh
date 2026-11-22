@@ -1034,6 +1034,23 @@ func (c *Client) ContainerLogs(ctx context.Context, containerName string, tail i
 // ContainerLogsWithNotice is ContainerLogs plus a notice when the answer is
 // missing lines Docker could not read (log_notice.go, i1225): "" otherwise.
 func (c *Client) ContainerLogsWithNotice(ctx context.Context, containerName string, tail int, since string) ([]string, string, error) {
+	lines, notice, _, err := c.containerLogs(ctx, containerName, tail, since)
+	return lines, notice, err
+}
+
+// ContainerLogsSinceStart is for a caller that JUDGES from the log rather
+// than shows it: only lines written since the container last started, so a
+// verdict never comes from an earlier run's lines (i1225). unreadable: Docker
+// holds lines from this start that it could not return (the notice above).
+func (c *Client) ContainerLogsSinceStart(ctx context.Context, containerName string, tail int) ([]string, bool, error) {
+	lines, notice, startedAt, err := c.containerLogs(ctx, containerName, tail, "")
+	if err != nil {
+		return nil, false, err
+	}
+	return linesSinceStart(lines, startedAt), notice != "", nil
+}
+
+func (c *Client) containerLogs(ctx context.Context, containerName string, tail int, since string) ([]string, string, time.Time, error) {
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
@@ -1081,10 +1098,10 @@ func (c *Client) ContainerLogsWithNotice(ctx context.Context, containerName stri
 
 	lines, err := read(opts, tail)
 	if err != nil {
-		return nil, "", err
+		return nil, "", startedAt, err
 	}
 	if !logAnswerLooksCut(lines, running, startedAt) {
-		return lines, "", nil
+		return lines, "", startedAt, nil
 	}
 	// One more read of only the newest lines, from the end: it starts after
 	// damage that stopped the first read. A failure here leaves the answer
@@ -1094,9 +1111,9 @@ func (c *Client) ContainerLogsWithNotice(ctx context.Context, containerName stri
 	probeOpts.Since = ""
 	probe, err := read(probeOpts, logProbeTail)
 	if err != nil {
-		return lines, "", nil
+		return lines, "", startedAt, nil
 	}
-	return lines, unreadableLogNotice(containerName, lines, probe, startedAt, since, time.Now()), nil
+	return lines, unreadableLogNotice(containerName, lines, probe, startedAt, since, time.Now()), startedAt, nil
 }
 
 // logLinesFromStream turns one container log stream into its last `tail`
