@@ -12,12 +12,14 @@
 # nothing).
 #
 #   OUT=<dir> CELL=upgrade-24.04 RUNNER=<label> CLI_TAG=noo-cli-vX.Y.Z[-rc.N] \
-#   [PREV_TAG=noo-cli-vX.Y.Z] [LEG=ce|distro] scripts/install-cell/upgrade.sh
+#   [PREV_TAG=noo-cli-vX.Y.Z] [LEG=ce|distro|compose-floor] scripts/install-cell/upgrade.sh
 #
 # LEG (the workflow's matrix): `ce` (default) runs on the runner image's own
 # docker-ce; `distro` first installs Ubuntu's `apt install docker.io` +
 # docker-compose-v2 exactly as the fresh matrix's DOCKER=distro cell does
-# (distro-docker.sh, one home for both). Either leg records `docker version` and
+# (distro-docker.sh, one home for both); `compose-floor` keeps the runner's
+# docker-ce and installs the pinned lowest supported Compose (2.33.x,
+# compose-floor.sh: sha256-verified before install). Every leg records `docker version` and
 # `docker compose version` and prints `UPGRADE LEG <leg> NOTE: docker <v>, compose <v>`.
 #
 # PREV_TAG (the dispatch input `prev_tag`) chooses the final the box starts
@@ -45,7 +47,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 . "$HERE/validate_tag.sh"
 require_cli_tag "$CLI_TAG" || exit 2
 require_prev_tag "$PREV_TAG" || exit 2
-case "$LEG" in ce|distro) ;; *) echo "upgrade-cell: LEG must be ce or distro, not '$LEG'" >&2; exit 2 ;; esac
+case "$LEG" in ce|distro|compose-floor) ;; *) echo "upgrade-cell: LEG must be ce, distro or compose-floor, not '$LEG'" >&2; exit 2 ;; esac
 # ── end of the dispatch-input check ──
 if [ -n "$PREV_TAG" ]; then START_KIND="chosen"; else START_KIND="previous final"; fi
 mkdir -p "$OUT" "$OUT/stranger-cwd"
@@ -87,6 +89,9 @@ PY
 # prints them, so the compose version is read, never assumed.
 if [ "$LEG" = distro ]; then
     step distro-docker 900 -- sudo bash "$HERE/distro-docker.sh" || finish
+fi
+if [ "$LEG" = compose-floor ]; then
+    step compose-floor 300 -- sudo bash "$HERE/compose-floor.sh" || finish
 fi
 step docker-versions 120 -- sh -c 'd=docker; docker info >/dev/null 2>&1 || d="sudo -n docker"
   echo "== docker version"; $d version 2>&1 | head -40

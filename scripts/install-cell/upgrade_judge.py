@@ -233,6 +233,8 @@ def is_own_sudo(line, own):
 # --all`, the same-tag `--stack`, the plain `noo stack start` after them
 # (and the cell's own remove-netns-unit step between): the NEW version's
 # roll and start, never the previous final's onboard/start.
+# the Compose the compose-floor leg installs (compose-floor.sh pins the same; a test holds them equal)
+COMPOSE_FLOOR_PIN = "2.33.1"
 HUB_HOSTS = ("docker.io", "index.docker.io", "registry-1.docker.io")
 # Images a container can name without a registry that are Docker Hub's, and
 # that no noomesh build is called: the leak the 0.6.28 `docker run alpine
@@ -572,6 +574,13 @@ def judge():
     else:
         say("LEG %s" % leg, "NOTE", "docker %s, compose %s (a version was not recorded: see logs/docker-versions.log)"
             % (dv or "unknown", cv or "unknown"))
+
+    if leg == "compose-floor":
+        # the leg exists to run the lowest supported Compose: it must not
+        # silently run the runner's newer plugin (compose-floor.sh's pin)
+        if cv.lstrip("v") != COMPOSE_FLOOR_PIN:
+            say("LEG compose-floor PIN", "FAIL", "compose %s is not the pinned %s (the leg ran the wrong plugin)"
+                % (cv or "unknown", COMPOSE_FLOOR_PIN))
 
     roll = text(os.path.join(out, "logs", "upgrade-all.log"))
     stack = text(os.path.join(out, "logs", "upgrade-stack-same-tag.log"))
