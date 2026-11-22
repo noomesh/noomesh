@@ -258,7 +258,7 @@ any bundle staged for the old one.
   (`current`, `needs_migrate`, `shared`, `absent` or `unreadable`); verify's
   `kiosk unit` row warns on `needs_migrate` and its remedy is the person's
   one `sudo <seat user's home>/.local/libexec/noo-seat/noo kiosk seat-sync --migrate`.
-  A seat whose `noo` predates 0.6.30 shows the row as OK, "not reported".
+  A seat whose `noo` does not report its kiosk unit yet shows the row as OK, "not reported".
 - **Updates reach the displays:** `noo upgrade --seats` (and `--all`,
   `--nodes` unless `--no-seats`) stages a bundle every seat applies on its
   next sync tick (the timer runs once a minute), which may restart the
