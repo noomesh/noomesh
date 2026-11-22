@@ -669,6 +669,13 @@ pub enum KeyIssueKind {
     WrongOwner,
 }
 
+/// `services/tei/` and `services/tei-gpu/`: the leaves of the removed TEI
+/// compose services. The controller no longer issues them; an upgraded
+/// install may still hold the files, which are safe to delete by hand.
+fn is_retired_tei_leaf(rel: &str) -> bool {
+    rel.starts_with("services/tei/") || rel.starts_with("services/tei-gpu/")
+}
+
 impl ClusterCa {
     /// The reader — and so the mode — of a private key at `path`
     /// (absolute or PKI-relative).
@@ -803,6 +810,13 @@ impl ClusterCa {
         let mut out = Vec::new();
         for key in self.list_keys() {
             let rel = key.strip_prefix(&self.dir).unwrap_or(&key).to_string_lossy().into_owned();
+            // A retired TEI leaf (i1182a) an install that once ran the opt-in
+            // compose profile may still hold: no reader row any more, nothing
+            // reads it, and it is safe to delete. Never a finding, and never
+            // deleted here.
+            if is_retired_tei_leaf(&rel) {
+                continue;
+            }
             let reader = self.key_reader(&key);
             let Some(acc) = access_of(&key) else { continue };
             let mode = acc.mode;
@@ -3289,6 +3303,24 @@ mod key_mode_tests {
         let (again, dirs_again) = ca.fix_key_modes();
         assert!(again.iter().all(|f| !f.changed() || matches!(f.reader, KeyReader::ContainerUid(_))), "second pass is a no-op: {again:?}");
         assert!(dirs_again.is_empty(), "{dirs_again:?}");
+    }
+
+    /// i1182a: a leftover `services/tei/service.key` (an install that once ran
+    /// the opt-in compose profile) has no reader row now. The scan must not
+    /// report it forever; a stray key beside it is still found.
+    #[test]
+    fn a_leftover_retired_tei_leaf_is_not_an_audit_finding() {
+        let ca = ClusterCa::new(scratch());
+        ca.generate_ca("t", 3650).unwrap();
+        let (_, tei) = ca.issue_service_cert("tei", &[], &[], 90).unwrap();
+        let (_, other) = ca.issue_service_cert("rhaddon", &[], &[], 90).unwrap();
+        for k in [&tei, &other] {
+            std::fs::set_permissions(k, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        let issues = ca.audit_key_modes();
+        assert!(issues.iter().all(|i| !i.rel.starts_with("services/tei/")), "{issues:?}");
+        assert!(issues.iter().any(|i| i.rel == "services/rhaddon/service.key"), "{issues:?}");
+        assert!(tei.exists(), "the scan never deletes it");
     }
 
     /// i277a, the ctrl shape: a third-party add-on's leaf

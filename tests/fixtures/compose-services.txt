@@ -20,7 +20,6 @@ piper
 postgres
 prometheus
 redis
-reranker
 sandbox
 sandbox-base
 sandbox-extra
@@ -28,13 +27,8 @@ stunnel-llamacpp
 stunnel-ollama
 stunnel-ollama-embed
 stunnel-ollama-embed-cpu
-stunnel-reranker
-stunnel-tei
-stunnel-tei-gpu
 stunnel-vllm
 stunnel-vllm-secondary
-tei
-tei-gpu
 tempo
 trellion
 vllm

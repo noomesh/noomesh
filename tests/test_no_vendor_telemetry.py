@@ -14,7 +14,7 @@ must carry and fails when one goes missing:
   decides what its software phones home with — and carries its class's
   switches with the exact value;
 * the node agent's backendSpecs (node-agent-go/internal/docker/backends.go),
-  which launch the same vLLM / TEI / Ollama images on every node, carry the
+  which launch the same vLLM / Ollama images on every node, carry the
   same switches in their Env literals, and telemetry.go's table agrees with
   this one (the parity check);
 * our Python images bake the HF switches in, the headless and kiosk Chromium
@@ -74,7 +74,7 @@ TELEMETRY_SWITCHES: dict[str, dict[str, str]] = {
         "DO_NOT_TRACK": "1",
         "HF_HUB_DISABLE_TELEMETRY": "1",
     },
-    # huggingface_hub / transformers / faster-whisper / TEI's hf-hub fetch
+    # huggingface_hub / transformers / faster-whisper / hf-hub fetch
     "hf": {
         "HF_HUB_DISABLE_TELEMETRY": "1",
         "DO_NOT_TRACK": "1",
@@ -108,9 +108,6 @@ SERVICE_CLASS: dict[str, str] = {
     # inference backends
     "vllm": "vllm",
     "vllm-secondary": "vllm",
-    "tei": "hf",
-    "tei-gpu": "hf",
-    "reranker": "hf",  # the compose reranker is the TEI image
     "airllm": "hf",
     "ollama": "ollama",
     "ollama-embed": "ollama",
@@ -152,9 +149,6 @@ SERVICE_CLASS: dict[str, str] = {
     "stunnel-ollama": "none",
     "stunnel-ollama-embed": "none",
     "stunnel-ollama-embed-cpu": "none",
-    "stunnel-tei": "none",
-    "stunnel-tei-gpu": "none",
-    "stunnel-reranker": "none",
     # build-only image targets — never run
     "deps-core": "none",
     "deps-base": "none",

@@ -8,7 +8,7 @@ Until 2026-09-28 the controller's vLLM served TLS only when `NOO_VLLM_TLS`
 was set, and even then asked for no client certificate (`--ssl-ca-certs`
 without `--ssl-cert-reqs`), and llama.cpp served plaintext on the compose
 network: any process on `noo-cluster` could read every prompt and reply.
-Ollama, TEI and the reranker were already behind stunnel sidecars with
+Ollama was already behind stunnel sidecars with
 `verify = 2`.
 
 What this pins, from the shipped files (the compose projection with every
@@ -51,7 +51,7 @@ COMPOSE = ROOT / "docker-compose.cluster.yml"
 
 # Every compose service that serves inference (chat, embeddings, rerank).
 # Pinned against the file below: a service that looks like a backend (a
-# vllm/llama/ollama/tei image, or a `noo-<x>` name in BACKEND_HINTS) and is
+# vllm/llama/ollama image, or a `noo-<x>` name in BACKEND_HINTS) and is
 # not listed here fails test 4.
 BACKEND_SERVICES = {
     "vllm": "stunnel-vllm",
@@ -60,9 +60,6 @@ BACKEND_SERVICES = {
     "ollama": "stunnel-ollama",
     "ollama-embed": "stunnel-ollama-embed",
     "ollama-embed-cpu": "stunnel-ollama-embed-cpu",
-    "tei": "stunnel-tei",
-    "tei-gpu": "stunnel-tei-gpu",
-    "reranker": "stunnel-reranker",
     "airllm": "native",
 }
 
@@ -164,7 +161,7 @@ def test_every_backend_door_requires_a_client_certificate(services):
             f"docker/{front}.conf must accept on the sidecar's hostname ({hostname!r}, its bridge address), "
             "never 0.0.0.0, which would also take the backend's loopback port"
         )
-        # The bind is an env var (llama.cpp, Ollama, TEI) or, for vLLM, the
+        # The bind is an env var (llama.cpp, Ollama) or, for vLLM, the
         # command line it builds.
         bind = f"{svc.get('environment')} {_command_text(svc)}"
         assert "0.0.0.0" not in bind, f"{name} binds 0.0.0.0"

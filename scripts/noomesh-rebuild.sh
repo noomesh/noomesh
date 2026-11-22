@@ -249,8 +249,6 @@ service_profile() {
         airllm)       echo "gpu-tier1" ;;
         llamacpp)     echo "gpu-tier2" ;;
         ollama)       echo "gpu-tier2" ;;
-        tei)          echo "controller" ;;
-        tei-gpu)      echo "gpu-tier2" ;;
         *)            echo "" ;;
     esac
 }
@@ -404,13 +402,13 @@ if [ "$PROFILE" = "controller" ]; then
     if [ -n "$GPU_TIER" ]; then
         PROFILE_ARGS="$PROFILE_ARGS --profile $GPU_TIER"
         if [ "$GPU_TIER" = "gpu-tier1" ]; then
-            ui_kv "GPU" "${GPU_TIER} — tier 1 (>=10GB VRAM) → GPU monitoring + TEI (CPU)"
+            ui_kv "GPU" "${GPU_TIER} — tier 1 (>=10GB VRAM) → GPU monitoring"
         else
-            ui_kv "GPU" "${GPU_TIER} — tier 2 (4-10GB VRAM) → Ollama + TEI (CPU)"
+            ui_kv "GPU" "${GPU_TIER} — tier 2 (4-10GB VRAM) → Ollama"
         fi
         echo "  LLM backends are placement-managed: noo cluster place <node> vllm <model>"
     else
-        ui_kv "GPU" "none detected → TEI (CPU) only, inference via cloud fallback"
+        ui_kv "GPU" "none detected → inference via cloud fallback"
     fi
 fi
 

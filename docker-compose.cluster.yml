@@ -636,7 +636,7 @@ services:
       # Empty fallbacks on purpose: env_or_yaml treats empty as unset, so
       # endpoint resolution defers to noomesh.yaml and then the code
       # defaults in embedding_client.rs (ollama-first). The old fallbacks
-      # restated a stunnel-tei/tei endpoint that no longer deploys here.
+      # restated a TEI endpoint that is no longer part of the stack.
       - PAGEINDEX_EMBEDDING_URL=${PAGEINDEX_EMBEDDING_URL:-}
       # Extra static embed endpoints (comma-separated), spread over beside
       # the mesh nodes and the primary. Empty = none. See the optional
@@ -933,9 +933,6 @@ services:
     restart: unless-stopped
     depends_on:
       postgres:
-        condition: service_started
-        required: false
-      tei:
         condition: service_started
         required: false
       sandbox:
@@ -2061,95 +2058,6 @@ services:
       - noo-cluster
     restart: unless-stopped
 
-  # Text Embeddings Inference — CPU (controller)
-  # Runs on controller so embeddings work out of the box without a GPU.
-  # Optional engine; nothing defaults to it anymore — point
-  # PAGEINDEX_EMBEDDING_URL at it explicitly to use it.
-  # The TEI pins (CPU here and in the agent; GPU in tei-gpu, reranker and
-  # the agent) move per flavour, after a review of the new release's flags,
-  # env and request fields: tests/test_tei_image_contract.py holds the
-  # reviewed release of each.
-  tei:
-    logging: *default-logging
-    image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.9.4${NOO_IMAGE_DIGEST_TEI_CPU:-@sha256:2538ea1c9640d3763b15af668039d24172d063b42337b0c27796fc2be180c78d}
-    container_name: ${NOO_CONTAINER_PREFIX:-noo}-tei
-    # The agent's backend floor (node-agent-go StartBackendSDK; i301): no kernel
-    # capability beyond the start-as-root, chown, drop-to-a-user entrypoint
-    # these images share; the GPU needs none (device requests, not caps).
-    security_opt: [no-new-privileges:true]
-    cap_drop: [ALL]
-    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID]
-    profiles: ["tei-compose"]  # opt-in only (default: rerank=LLM fallback, embed=Ollama/node-agent)
-    # No external port — gateway reaches TEI via Docker network
-    environment:
-      # Vendor telemetry off (docs/security/telemetry.md): huggingface_hub and
-      # the libraries built on it honour these.
-      - HF_HUB_DISABLE_TELEMETRY=1
-      - DO_NOT_TRACK=1
-      - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN:-}
-      - MODEL_ID=${TEI_MODEL:-BAAI/bge-base-en-v1.5}
-      - HOSTNAME=127.0.0.1
-    volumes:
-      - hf-cache:/data
-    # In its door's network namespace (door generation 3): no network of
-    # its own, listening on 127.0.0.1, reachable only through stunnel-tei.
-    network_mode: "service:stunnel-tei"
-    restart: unless-stopped
-    depends_on:
-      # restart: rejoin the door's namespace when compose restarts it (i317 e1)
-      stunnel-tei:
-        condition: service_started
-        restart: true
-    command: ["--model-id", "${TEI_MODEL:-BAAI/bge-base-en-v1.5}"]
-
-  # Text Embeddings Inference — GPU (worker nodes)
-  # Use this on nodes with a GPU for faster embedding throughput.
-  tei-gpu:
-    logging: *default-logging
-    # held at 1.6: TEI 1.9.4's CUDA image requires cuda>=12.9 with no GeForce
-    # exemption (driver >= ~575, inferred from the image config); move after a
-    # GPU node proves it (#1444)
-    image: ghcr.io/huggingface/text-embeddings-inference:1.6${NOO_IMAGE_DIGEST_TEI:-@sha256:25e35b0b266241a543c5ee305083eced4b6ac0772eb969c3fdaae2d4c2ef7266}
-    container_name: ${NOO_CONTAINER_PREFIX:-noo}-tei-gpu
-    # The agent's backend floor (node-agent-go StartBackendSDK; i301): no kernel
-    # capability beyond the start-as-root, chown, drop-to-a-user entrypoint
-    # these images share; the GPU needs none (device requests, not caps).
-    security_opt: [no-new-privileges:true]
-    cap_drop: [ALL]
-    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID]
-    # SUPERSEDED on GPU nodes by the node-agent `embedding` backend
-    # (`noo cluster place <node> embedding <model>`). Gated to an
-    # opt-in profile so normal embedding/gpu-tier2 startup can't duplicate
-    # the GPU embedder. Use `--profile tei-compose` to run the compose path.
-    profiles: ["tei-compose"]
-    # No external port — gateway reaches TEI via Docker network
-    environment:
-      # Vendor telemetry off (docs/security/telemetry.md): huggingface_hub and
-      # the libraries built on it honour these.
-      - HF_HUB_DISABLE_TELEMETRY=1
-      - DO_NOT_TRACK=1
-      - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN:-}
-      - MODEL_ID=${TEI_MODEL:-BAAI/bge-base-en-v1.5}
-      - HOSTNAME=127.0.0.1
-    volumes:
-      - hf-cache:/data
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
-    # In its door's network namespace (door generation 3): no network of
-    # its own, listening on 127.0.0.1, reachable only through stunnel-tei-gpu.
-    network_mode: "service:stunnel-tei-gpu"
-    restart: unless-stopped
-    depends_on:
-      # restart: rejoin the door's namespace when compose restarts it (i317 e1)
-      stunnel-tei-gpu:
-        condition: service_started
-        restart: true
-    command: ["--model-id", "${TEI_MODEL:-BAAI/bge-base-en-v1.5}", "--dtype", "float16"]
   stunnel-ollama:
     logging: *default-logging
     build:
@@ -2176,146 +2084,6 @@ services:
       - ./docker/stunnel-ollama.conf:/etc/stunnel/stunnel.conf:ro
       - ${NOO_PKI_DIR:-./.pki-placeholder}/ca.crt:/tls/ca.crt:ro
       - ${NOO_PKI_DIR:-./.pki-placeholder}/services/ollama:/tls/services/ollama:ro
-    networks:
-      - noo-cluster
-    restart: unless-stopped
-
-  # stunnel mTLS sidecar for TEI CPU (controller)
-  stunnel-tei:
-    logging: *default-logging
-    build:
-      context: ./docker
-      dockerfile: Dockerfile.stunnel
-    image: noomesh/stunnel:latest
-    pull_policy: build
-    container_name: ${NOO_CONTAINER_PREFIX:-noo}-stunnel-tei
-    # Door floor (i301): non-root, no capability, read-only root; the
-    # self-pin entrypoint writes its conf to the /tmp tmpfs only.
-    security_opt: [no-new-privileges:true]
-    cap_drop: [ALL]
-    read_only: true
-    tmpfs: ["/tmp:rw,noexec,nosuid,nodev,size=16m"]
-    # The name its stunnel.conf accepts on (its bridge address, not
-    # 0.0.0.0): tei listens on 127.0.0.1 in this namespace.
-    hostname: noo-stunnel-tei
-    user: nonroot
-    profiles: ["tei-compose"]  # opt-in only (paired with noo-tei)
-    volumes:
-      - ./docker/stunnel-tei.conf:/etc/stunnel/stunnel.conf:ro
-      - ${NOO_PKI_DIR:-./.pki-placeholder}/ca.crt:/tls/ca.crt:ro
-      - ${NOO_PKI_DIR:-./.pki-placeholder}/services/tei:/tls/services/tei:ro
-    networks:
-      - noo-cluster
-    restart: unless-stopped
-
-  # stunnel mTLS sidecar for TEI GPU (worker nodes)
-  stunnel-tei-gpu:
-    logging: *default-logging
-    build:
-      context: ./docker
-      dockerfile: Dockerfile.stunnel
-    image: noomesh/stunnel:latest
-    pull_policy: build
-    container_name: ${NOO_CONTAINER_PREFIX:-noo}-stunnel-tei-gpu
-    # Door floor (i301): non-root, no capability, read-only root; the
-    # self-pin entrypoint writes its conf to the /tmp tmpfs only.
-    security_opt: [no-new-privileges:true]
-    cap_drop: [ALL]
-    read_only: true
-    tmpfs: ["/tmp:rw,noexec,nosuid,nodev,size=16m"]
-    # The name its stunnel.conf accepts on (its bridge address, not
-    # 0.0.0.0): tei-gpu listens on 127.0.0.1 in this namespace.
-    hostname: noo-stunnel-tei-gpu
-    user: nonroot
-    # Gated with tei-gpu — see above. Only needed for the compose path.
-    profiles: ["tei-compose"]
-    volumes:
-      - ./docker/stunnel-tei-gpu.conf:/etc/stunnel/stunnel.conf:ro
-      - ${NOO_PKI_DIR:-./.pki-placeholder}/ca.crt:/tls/ca.crt:ro
-      - ${NOO_PKI_DIR:-./.pki-placeholder}/services/tei:/tls/services/tei:ro
-    networks:
-      - noo-cluster
-    restart: unless-stopped
-
-  # Reranker — TEI serving a cross-encoder reranker model (GPU).
-  # Same image family as `tei`; a reranker MODEL_ID makes TEI expose POST
-  # /rerank. NOT REACHABLE FROM THE GATEWAY: no URL points at
-  # stunnel-reranker (a bypass would skip mesh routing and send no auth).
-  # Rerank is mesh-only — gateway -> node-agent /rerank.
-  # This service and its stunnel front are TEI-teardown leftovers behind the
-  # opt-in `tei-compose` profile; removing them is separate cleanup.
-  reranker:
-    logging: *default-logging
-    # held at 1.6: TEI 1.9.4's CUDA image requires cuda>=12.9 with no GeForce
-    # exemption (driver >= ~575, inferred from the image config); move after a
-    # GPU node proves it (#1444)
-    image: ghcr.io/huggingface/text-embeddings-inference:1.6${NOO_IMAGE_DIGEST_TEI:-@sha256:25e35b0b266241a543c5ee305083eced4b6ac0772eb969c3fdaae2d4c2ef7266}
-    container_name: ${NOO_CONTAINER_PREFIX:-noo}-reranker
-    # The agent's backend floor (node-agent-go StartBackendSDK; i301): no kernel
-    # capability beyond the start-as-root, chown, drop-to-a-user entrypoint
-    # these images share; the GPU needs none (device requests, not caps).
-    security_opt: [no-new-privileges:true]
-    cap_drop: [ALL]
-    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID]
-    # SUPERSEDED on GPU nodes by the node-agent `reranker` backend
-    # (`noo cluster place <node> reranker <model>`). Gated to opt-in
-    # so normal startup can't duplicate the GPU reranker. The mesh path
-    # (gateway -> node-agent /rerank) does not use this service.
-    profiles: ["tei-compose"]
-    # No external port — reached via stunnel-reranker on the Docker network
-    environment:
-      # Vendor telemetry off (docs/security/telemetry.md): huggingface_hub and
-      # the libraries built on it honour these.
-      - HF_HUB_DISABLE_TELEMETRY=1
-      - DO_NOT_TRACK=1
-      - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN:-}
-      - MODEL_ID=${RERANK_MODEL:-BAAI/bge-reranker-base}
-      - HOSTNAME=127.0.0.1
-    volumes:
-      - hf-cache:/data
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
-    # In its door's network namespace (door generation 3): no network of
-    # its own, listening on 127.0.0.1, reachable only through stunnel-reranker.
-    network_mode: "service:stunnel-reranker"
-    restart: unless-stopped
-    depends_on:
-      # restart: rejoin the door's namespace when compose restarts it (i317 e1)
-      stunnel-reranker:
-        condition: service_started
-        restart: true
-    command: ["--model-id", "${RERANK_MODEL:-BAAI/bge-reranker-base}", "--dtype", "float16"]
-
-  # stunnel mTLS sidecar for the reranker (mirrors stunnel-tei-gpu)
-  stunnel-reranker:
-    logging: *default-logging
-    build:
-      context: ./docker
-      dockerfile: Dockerfile.stunnel
-    image: noomesh/stunnel:latest
-    pull_policy: build
-    container_name: ${NOO_CONTAINER_PREFIX:-noo}-stunnel-reranker
-    # Door floor (i301): non-root, no capability, read-only root; the
-    # self-pin entrypoint writes its conf to the /tmp tmpfs only.
-    security_opt: [no-new-privileges:true]
-    cap_drop: [ALL]
-    read_only: true
-    tmpfs: ["/tmp:rw,noexec,nosuid,nodev,size=16m"]
-    # The name its stunnel.conf accepts on (its bridge address, not
-    # 0.0.0.0): reranker listens on 127.0.0.1 in this namespace.
-    hostname: noo-stunnel-reranker
-    user: nonroot
-    # Gated with reranker — see above. Only needed for the compose path.
-    profiles: ["tei-compose"]
-    volumes:
-      - ./docker/stunnel-reranker.conf:/etc/stunnel/stunnel.conf:ro
-      - ${NOO_PKI_DIR:-./.pki-placeholder}/ca.crt:/tls/ca.crt:ro
-      - ${NOO_PKI_DIR:-./.pki-placeholder}/services/reranker:/tls/services/reranker:ro
     networks:
       - noo-cluster
     restart: unless-stopped
@@ -3363,7 +3131,7 @@ services:
       # tailnet name exactly as they dial NATS.
       - ${NOO_PKI_DIR:-./.pki-placeholder}/ca.crt:/tls/ca.crt:ro
       - ${NOO_PKI_DIR:-./.pki-placeholder}/services/model-cache:/tls/services/model-cache:ro
-      # The controller's HF cache — served read-only (its vLLM/TEI fill this)
+      # The controller's HF cache — served read-only (its vLLM fills this)
       - ${HF_CACHE_DIR:-${NOO_DATA_ROOT:?NOO_DATA_ROOT is not set - run noo onboard --only storage or set it in .env}/hf-cache}:/hf-store:ro
       # GGUF weights served for llama.cpp nodes
       - ${MODELS_DIR:-${NOO_DATA_ROOT:?NOO_DATA_ROOT is not set - run noo onboard --only storage or set it in .env}/models}:/models:ro
@@ -3461,7 +3229,7 @@ volumes:
   # Override with NOO_DATA_ROOT env var if your D: mount path differs.
   # The sensitive STATE set (noo-data, redis, nats, prometheus, grafana, loki,
   # postgres) binds under NOO_STATE_ROOT, which defaults to NOO_DATA_ROOT (so
-  # nothing moves while it is unset). models / hf-cache / ollama / images
+  # nothing moves while it is unset). models / ollama / images
   # always stay under NOO_DATA_ROOT. See i10a.
   noo-data:
     driver: local
@@ -3500,12 +3268,6 @@ volumes:
   # engine; the agent's noo-vllm uses its own noo-vllm-compile-cache.
   vllm-compile-cache:
   vllm-secondary-compile-cache:
-  hf-cache:
-    driver: local
-    driver_opts:
-      type: none
-      o: bind
-      device: ${NOO_DATA_ROOT:?NOO_DATA_ROOT is not set - run noo onboard --only storage or set it in .env}/hf-cache
   prometheus-data:
     driver: local
     driver_opts:

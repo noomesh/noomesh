@@ -49,7 +49,7 @@ class BackendProfile:
     """
 
     name: str
-    api_format: str = "openai"          # "openai" | "ollama" | "tei"
+    api_format: str = "openai"          # "openai" | "ollama" | "tei" (the legacy /embed wire word)
     default_port: Optional[int] = None  # port Python dials directly, or None
     health_path: str = "/health"        # readiness probe path on default_port
     needs_gpu_headroom: bool = False    # require free-VRAM check before placement
@@ -134,13 +134,11 @@ backend(
     description="AirLLM layered offload (node-agent dials it at 8000; "
                 "Python never builds its URL from a port)",
 )
-backend(
-    "embedding", api_format="tei", provisionable=True,
-    description="HuggingFace TEI embedder (mesh-routed; TLS via stunnel)",
-)
+# Embedding is not a node-agent backend: an Ollama embedder serves it
+# (`noo cluster place <node> ollama <model> --role embed`).
 backend(
     "reranker", api_format="tei", provisionable=True,
-    description="HuggingFace TEI reranker (mesh-routed via node-agent /rerank)",
+    description="llama.cpp reranker (mesh-routed via node-agent /rerank)",
 )
 # Referenced by backend_manager's GPU-headroom check and placement override
 # warnings; the node-agent has no container spec for these (operator-run /

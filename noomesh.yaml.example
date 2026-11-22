@@ -138,17 +138,17 @@ services:
   # coordinator query-embed, and the Python trellion ingest/embedding
   # worker — goes through ONE backend-agnostic client and speaks the
   # wire format selected by embedding_backend:
-  #   tei    → POST {url}/embed          {"inputs": [...], "truncate": true}  (legacy default)
-  #   openai → POST {url}/v1/embeddings  {"model": m, "input": [...]}
-  #            (TEI, llama.cpp, vLLM and Ollama ALL serve this — the
-  #             portable choice for any non-TEI embedder)
   #   ollama → POST {url}/api/embed      {"model": m, "input": [...]}
-  # There is NO mesh routing for embeddings (unlike rerank). With the
-  # tei backend the model is pinned server-side in the TEI container
-  # (env TEI_MODEL, deploy-time); openai/ollama backends send
-  # embedding_model in the request body.
-  # Production TLS deploys point this at the stunnel sidecar:
-  #   embedding_url: https://stunnel-tei:443
+  #   openai → POST {url}/v1/embeddings  {"model": m, "input": [...]}
+  #            (llama.cpp, vLLM and Ollama ALL serve this — the portable
+  #             choice for any non-Ollama embedder)
+  #   tei    → POST {url}/embed          {"inputs": [...], "truncate": true}
+  #            (the legacy wire format, for an external embedder that
+  #             speaks it; nothing in the stack runs one)
+  # There is NO mesh routing for embeddings (unlike rerank). The ollama
+  # and openai backends send embedding_model in the request body.
+  # Production TLS deploys point this at the Ollama embedder's stunnel door:
+  #   embedding_url: https://noo-stunnel-ollama-embed:11434
   # To move embeddings to llama.cpp / vLLM / Ollama: point embedding_url
   # at the server, set embedding_backend: openai (+ embedding_model),
   # and keep embedding_dim matching the model — preflight probes the
@@ -156,12 +156,12 @@ services:
   # the store's vector(N) columns (reads keep working).
   # Empty = the code's ollama-first resolution (onboard writes the values
   # matching the deployed profile: standalone → http://ollama-embed:11434 /
-  # ollama / harrier). TEI is OPT-IN (tei-compose profile) — point
-  # embedding_url at it explicitly (TLS deploys: https://stunnel-tei:443,
-  # backend tei) only when that profile actually runs.
+  # ollama / harrier). To use a different embedder, place an Ollama one
+  # (noo cluster place <node> ollama <model> --role embed) or point
+  # embedding_url at an external server.
   embedding_url: ""                      # env PAGEINDEX_EMBEDDING_URL
-  embedding_backend: ""                  # env PAGEINDEX_EMBEDDING_BACKEND (ollama | openai | tei)
-  embedding_model: ""                    # env PAGEINDEX_EMBEDDING_MODEL (openai/ollama backends; ignored by tei — TEI pins TEI_MODEL server-side)
+  embedding_backend: ""                  # env PAGEINDEX_EMBEDDING_BACKEND (ollama | openai | tei: the legacy /embed wire format)
+  embedding_model: ""                    # env PAGEINDEX_EMBEDDING_MODEL (openai/ollama backends; ignored by tei)
   embedding_extra_urls: ""              # env PAGEINDEX_EMBEDDING_EXTRA_URLS (comma-separated extra static embed endpoints, e.g. the optional CPU embedder https://noo-stunnel-ollama-embed-cpu:11434)
   embedding_dim: 1024                    # env EMBEDDING_DIM (must match the served model AND the store's vector(N) columns — trellion's DDL is vector(1024); the default embedder harrier is 1024-dim)
 
@@ -371,7 +371,7 @@ kb:
 #    NOO_SELF_MODIFY_AUDIT_PATH NOO_SESSION_CACHE_MAX_COUNT
 #    NOO_TOKEN_EXPIRE_MINUTES NOO_TOOL_TIMEOUT_SECS NOO_TRUSTED_PROXIES
 #    PGVECTOR_URL PIPELINE_GATEWAY_URL RESEARCH_MAP_MODEL
-#    RESEARCH_REDUCE_MODEL RETRIEVAL_TRACKER_PATH TEI_MODEL TEI_URL
+#    RESEARCH_REDUCE_MODEL RETRIEVAL_TRACKER_PATH
 #    VLLM_IMAGE WHATSAPP_PHONE_ID
 #
 #    Deliberately env-only FOREVER (not phase 3): the

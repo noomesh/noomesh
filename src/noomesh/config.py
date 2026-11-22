@@ -428,7 +428,7 @@ class RecallMemoryConfig(BaseModel):
     )
     embedding_dim: int = Field(
         default_factory=lambda: int(os.environ.get("EMBEDDING_DIM", "1024")),
-        description="Embedding dimension (must match the embedder/PageIndex; default is ollama/harrier, not TEI)",
+        description="Embedding dimension (must match the embedder/PageIndex; default is ollama/harrier)",
     )
     archive_interval_minutes: int = Field(
         default=10,
@@ -1020,16 +1020,16 @@ class ServicesConfig(BaseModel):
     # the embedding_backend wire format — see noomesh.yaml.example.
     embedding_backend: Optional[str] = Field(
         default=None,
-        description="Embedder wire format: tei | openai | ollama "
-                    "(env PAGEINDEX_EMBEDDING_BACKEND, default ollama — TEI "
-                    "is not deployed on the controller, it is the opt-in "
-                    "`tei-compose` profile). openai (/v1/embeddings) is "
-                    "served by TEI, llama.cpp, vLLM and Ollama alike.",
+        description="Embedder wire format: ollama | openai | tei "
+                    "(env PAGEINDEX_EMBEDDING_BACKEND, default ollama; tei "
+                    "is the legacy /embed wire format, kept for an external "
+                    "embedder). openai (/v1/embeddings) is served by "
+                    "llama.cpp, vLLM and Ollama alike.",
     )
     embedding_model: Optional[str] = Field(
         default=None,
         description="Model name sent to openai/ollama-backend embedders; the "
-                    "tei backend is model-pinned server-side via TEI_MODEL "
+                    "legacy tei backend ignores it "
                     "(env PAGEINDEX_EMBEDDING_MODEL)",
     )
     gateway_url: Optional[str] = Field(
@@ -1340,7 +1340,6 @@ class AppConfig(BaseModel):
             has_url = bool(
                 self.memory.embedding_base_url
                 or os.environ.get("PAGEINDEX_EMBEDDING_URL")
-                or os.environ.get("TEI_URL")
                 or self.services.embedding_url
             )
             if backend != "gateway" and not has_url:
@@ -1348,7 +1347,7 @@ class AppConfig(BaseModel):
                     f"memory.enabled=true with the {backend} embedding backend "
                     "but no embedding endpoint URL is configured. Set "
                     "memory.embedding_base_url, services.embedding_url, or "
-                    "the PAGEINDEX_EMBEDDING_URL / TEI_URL env var."
+                    "the PAGEINDEX_EMBEDDING_URL env var."
                 )
 
         # recall_memory depends on the memory pipeline + ingestion infra

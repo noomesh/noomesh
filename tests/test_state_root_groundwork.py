@@ -47,8 +47,8 @@ STATE_VOLUMES = {
     "postgres-data": "postgres",
 }
 # Volumes outside the state set; compose renders only those a selected service
-# uses, so each is checked when present (hf-cache must be).
-CLEAR_VOLUMES = {"ollama-data": "ollama", "ollama-embed-data": "ollama", "hf-cache": "hf-cache"}
+# uses, so each is checked when present.
+CLEAR_VOLUMES = {"ollama-data": "ollama", "ollama-embed-data": "ollama"}
 
 
 def _volumes(**extra: str) -> dict:
@@ -77,7 +77,6 @@ def test_unset_state_root_binds_every_volume_exactly_where_it_always_did():
     vols = _volumes()
     for vol, sub in STATE_VOLUMES.items():
         assert _device(vols, vol) == f"{DATA}/{sub}", (vol, _device(vols, vol))
-    assert _device(vols, "hf-cache") == f"{DATA}/hf-cache"
     for vol, sub in CLEAR_VOLUMES.items():
         if vol in vols:
             assert _device(vols, vol) == f"{DATA}/{sub}", (vol, _device(vols, vol))
@@ -89,7 +88,6 @@ def test_state_root_moves_exactly_the_state_set():
     vols = _volumes(NOO_STATE_ROOT=STATE)
     for vol, sub in STATE_VOLUMES.items():
         assert _device(vols, vol) == f"{STATE}/{sub}", (vol, _device(vols, vol))
-    assert _device(vols, "hf-cache") == f"{DATA}/hf-cache", "hf-cache must stay in the clear"
     for vol, sub in CLEAR_VOLUMES.items():
         if vol in vols:
             assert _device(vols, vol) == f"{DATA}/{sub}", f"{vol} must stay in the clear"

@@ -255,7 +255,7 @@ func sidecarConnectPort(backend string, spec BackendSpec, envOverrides map[strin
 // (no-new-privileges, CapDrop ALL) plus what stunnel-as-root actually
 // needs: DAC_OVERRIDE to read the 0600 leaf key on the bind mount, and
 // NET_BIND_SERVICE only for a door below 1024 (the reranker door on
-// 443, the port compose's stunnel-reranker.conf accepts on).
+// 443).
 func (c *Client) startSidecar(ctx context.Context, backend, image, networkName string, connectPort int) error {
 	door := backendDoors[backend]
 	name := SidecarContainerFor(backend)

@@ -28,7 +28,7 @@ _GW = f"https://127.0.0.1:{_gw_port}"
 
 # Pause scheduling new embed jobs once the unembedded backlog crosses this
 # threshold. The embedding worker keeps draining what's already there; we
-# just stop piling on. Override via env when TEI capacity differs.
+# just stop piling on. Override via env when embed capacity differs.
 _EMBED_BACKPRESSURE = int(os.getenv("NOO_EMBEDDING_BACKPRESSURE_THRESHOLD", "5000"))
 
 DEFAULT_LOCATIONS: list[MonitorLocation] = [

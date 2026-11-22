@@ -97,10 +97,7 @@ IN_REPO_TREES: dict[str, tuple[str, ...]] = {
     "grafana": (),
     "vllm": (),
     "vllm-secondary": (),
-    "tei": (),
-    "tei-gpu": (),
     "whisper": (),
-    "reranker": (),
 }
 
 # Sibling checkouts (name beside this repo → sub-path) per service. Searched
@@ -127,10 +124,7 @@ NATIVE: dict[str, dict[str, str]] = {
         "HF_TOKEN": "huggingface_hub: gated model pulls",
         "HUGGING_FACE_HUB_TOKEN": "huggingface_hub: legacy spelling of HF_TOKEN",
     },
-    "tei": {"HUGGING_FACE_HUB_TOKEN": "text-embeddings-inference: gated model pulls"},
-    "tei-gpu": {"HUGGING_FACE_HUB_TOKEN": "text-embeddings-inference: gated model pulls"},
     "whisper": {"HUGGING_FACE_HUB_TOKEN": "faster-whisper image: gated model pulls"},
-    "reranker": {"HUGGING_FACE_HUB_TOKEN": "text-embeddings-inference: gated model pulls"},
 }
 
 # A word-bounded match: NOO_MCP_TOKEN must not be satisfied by

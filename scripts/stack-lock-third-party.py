@@ -97,10 +97,6 @@ THIRD_PARTY: dict[str, dict[str, str]] = {
     "alertmanager": {"compose": _BASE + "/alertmanager", "repo": DHI + "/alertmanager", "ver": _VER},
     "grafana": {"compose": _BASE + "/grafana", "repo": DHI + "/grafana", "ver": _VER},
     "node-exporter": {"compose": _BASE + "/node-exporter", "repo": DHI + "/node-exporter", "ver": _VER},
-    "tei": {"compose": "ghcr.io/huggingface/text-embeddings-inference",
-            "repo": "ghcr.io/huggingface/text-embeddings-inference", "ver": "(?!cpu-)" + _VER},
-    "tei-cpu": {"compose": "ghcr.io/huggingface/text-embeddings-inference",
-                "repo": "ghcr.io/huggingface/text-embeddings-inference", "ver": "cpu-" + _VER},
     "vllm": {"compose": "vllm/vllm-openai", "repo": "docker.io/vllm/vllm-openai", "ver": "v[A-Za-z0-9._-]*"},
 }
 
