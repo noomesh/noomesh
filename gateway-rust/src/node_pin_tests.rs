@@ -328,7 +328,7 @@ fn misaddressed_calls_alert_on_the_caller_naming_the_reporter() {
     assert!(a.summary.contains("Node `node-b` reports that `node-a`"), "{}", a.summary);
     assert!(a.summary.contains("not a verdict"), "{}", a.summary);
     assert!(a.detail.contains("node-b"), "{}", a.detail);
-    assert!(MISADDRESSED_ALERT_COOLDOWN_SECS > 0, "deduplicated by the (kind, caller) cooldown");
+    const { assert!(MISADDRESSED_ALERT_COOLDOWN_SECS > 0, "deduplicated by the (kind, caller) cooldown") };
     assert!(misaddressed_alerts("node-b", &json!({})).is_empty());
     let many: Vec<_> = (0..20).map(|i| json!({"caller": format!("node-{i}"), "count": 1})).collect();
     assert_eq!(misaddressed_alerts("node-b", &json!({"misaddressed_from": many})).len(), 8);
