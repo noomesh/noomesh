@@ -8347,7 +8347,7 @@ mod warm_digests_tests {
         let f = crate::test_src::fn_body(&src, "fn run_fleet_stages(");
         let wait = f.find("let budget = if stack { 180 } else { 60 };").expect("the gateway wait");
         let warm = wait + f[wait..].find("warm_release_digests(g);").expect("the nodes path warms");
-        let nodes = f.find("rc = upgrade_nodes(g)?;").expect("the node phase");
+        let nodes = f.find("rc = upgrade_nodes(g, allow_unserved)?;").expect("the node phase");
         assert!(wait < warm && warm < nodes, "warm after the gateway wait, before upgrade_nodes");
         // The stack-only path warms too: nodes reconcile on their own.
         assert_eq!(f.matches("warm_release_digests(g);").count(), 2, "stack-only and nodes paths");
