@@ -1027,6 +1027,13 @@ func (c *Client) ListContainers(ctx context.Context) ([]ContainerInfo, error) {
 const logReadBudget = 8 << 20 // 8 MiB
 
 func (c *Client) ContainerLogs(ctx context.Context, containerName string, tail int, since string) ([]string, error) {
+	lines, _, err := c.ContainerLogsWithNotice(ctx, containerName, tail, since)
+	return lines, err
+}
+
+// ContainerLogsWithNotice is ContainerLogs plus a notice when the answer is
+// missing lines Docker could not read (log_notice.go, i1225): "" otherwise.
+func (c *Client) ContainerLogsWithNotice(ctx context.Context, containerName string, tail int, since string) ([]string, string, error) {
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
@@ -1047,23 +1054,49 @@ func (c *Client) ContainerLogs(ctx context.Context, containerName string, tail i
 	// Whether the stream is framed depends on the container's TTY, and
 	// guessing is what broke this before. Ask.
 	tty := false
+	running := false
+	var startedAt time.Time
 	if ins, err := c.docker.ContainerInspect(ctx, containerName, client.ContainerInspectOptions{}); err == nil {
 		if cfg := ins.Container.Config; cfg != nil {
 			tty = cfg.Tty
 		}
+		if st := ins.Container.State; st != nil {
+			running = st.Running
+			startedAt, _ = time.Parse(time.RFC3339Nano, st.StartedAt)
+		}
 	}
 
-	reader, err := c.docker.ContainerLogs(ctx, containerName, opts)
-	if err != nil {
-		return nil, err
+	read := func(opts client.ContainerLogsOptions, tail int) ([]string, error) {
+		reader, err := c.docker.ContainerLogs(ctx, containerName, opts)
+		if err != nil {
+			return nil, err
+		}
+		defer reader.Close()
+		lines, err := logLinesFromStream(reader, tty, tail)
+		if err != nil {
+			return nil, fmt.Errorf("read logs for %s: %w", containerName, err)
+		}
+		return lines, nil
 	}
-	defer reader.Close()
 
-	lines, err := logLinesFromStream(reader, tty, tail)
+	lines, err := read(opts, tail)
 	if err != nil {
-		return nil, fmt.Errorf("read logs for %s: %w", containerName, err)
+		return nil, "", err
 	}
-	return lines, nil
+	if !logAnswerLooksCut(lines, running, startedAt) {
+		return lines, "", nil
+	}
+	// One more read of only the newest lines, from the end: it starts after
+	// damage that stopped the first read. A failure here leaves the answer
+	// as it was, with nothing claimed.
+	probeOpts := opts
+	probeOpts.Tail = fmt.Sprintf("%d", logProbeTail)
+	probeOpts.Since = ""
+	probe, err := read(probeOpts, logProbeTail)
+	if err != nil {
+		return lines, "", nil
+	}
+	return lines, unreadableLogNotice(containerName, lines, probe, startedAt, since, time.Now()), nil
 }
 
 // logLinesFromStream turns one container log stream into its last `tail`

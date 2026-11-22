@@ -2257,6 +2257,9 @@ fn print_node_logs(g: &Globals, node_id: &str, container: &str, tail: u64) -> i3
                     println!("{t}");
                 }
             }
+            if let Some(n) = logs_notice(node_id, &body) {
+                eprintln!("{}", ui::warn(&n));
+            }
             0
         }
         // Absence is not emptiness: a body with no `logs` key is a
@@ -2269,6 +2272,13 @@ fn print_node_logs(g: &Globals, node_id: &str, container: &str, tail: u64) -> i3
             1
         }
     }
+}
+
+/// The agent's `notice` (i1225): Docker could not read lines it holds, so
+/// an empty or old answer is not a quiet backend. To stderr, so a pipe of
+/// the lines stays pure.
+fn logs_notice(node_id: &str, body: &serde_json::Value) -> Option<String> {
+    body["notice"].as_str().filter(|n| !n.is_empty()).map(|n| format!("{node_id}: {n}"))
 }
 
 /// `noo cluster restart-agent NODE` —
@@ -4269,5 +4279,26 @@ mod ollama_tag_refusal_tests {
         assert!(check < stop && stop < retry, "the refusal stops before the retry PUT");
         let stops = crate::test_src::fn_body(&own, "fn place_refused_with_next(");
         assert!(stops.contains("std::process::exit(ExitCode::RemoteError as i32);"), "it exits as a refusal does");
+    }
+}
+
+#[cfg(test)]
+mod logs_notice_tests {
+    use super::logs_notice;
+    use serde_json::json;
+
+    #[test]
+    fn the_agents_notice_is_printed_with_the_node() {
+        let body = json!({"container": "noo-vllm", "logs": [], "notice": "Docker could not read noo-vllm's log past its start"});
+        assert_eq!(
+            logs_notice("node_a", &body).as_deref(),
+            Some("node_a: Docker could not read noo-vllm's log past its start")
+        );
+    }
+
+    #[test]
+    fn no_notice_says_nothing() {
+        assert_eq!(logs_notice("node_a", &json!({"logs": ["a"]})), None);
+        assert_eq!(logs_notice("node_a", &json!({"logs": [], "notice": ""})), None);
     }
 }

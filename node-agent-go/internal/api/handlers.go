@@ -484,16 +484,22 @@ func (s *Server) handleContainerLogs(w http.ResponseWriter, r *http.Request) {
 	}
 	since := r.URL.Query().Get("since")
 
-	lines, err := s.docker.ContainerLogs(r.Context(), containerName, tail, since)
+	lines, notice, err := s.docker.ContainerLogsWithNotice(r.Context(), containerName, tail, since)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"detail": err.Error()})
 		return
 	}
 
-	writeJSON(w, http.StatusOK, map[string]any{
+	body := map[string]any{
 		"container": containerName,
 		"logs":      lines,
-	})
+	}
+	// Docker could not read lines it holds (i1225): say so, so an empty or
+	// old answer is not read as a quiet backend.
+	if notice != "" {
+		body["notice"] = notice
+	}
+	writeJSON(w, http.StatusOK, body)
 }
 
 func (s *Server) handleContainerStats(w http.ResponseWriter, r *http.Request) {
