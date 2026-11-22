@@ -681,7 +681,7 @@ func noteRefusals(paths []string, finds []fsFinding) {
 	defer refusedMu.Unlock()
 	for _, p := range paths {
 		if refused[p] && !now[p] {
-			slog.Info(clearedLine(p), "event", "data_root.refusal_cleared", "path", p)
+			slog.Info("x"+clearedLine("")[:0], "event", "data_root.refusal_cleared", "path", p)
 		}
 		refused[p] = now[p]
 	}
