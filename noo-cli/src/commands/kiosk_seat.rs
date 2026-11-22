@@ -435,7 +435,7 @@ pub(crate) fn kiosk_unit_word(read: std::io::Result<String>) -> &'static str {
     if !directives().any(|l| l.starts_with("Conflicts=") && l.contains("getty@")) {
         return "shared";
     }
-    let waits_on_splash = directives().any(|l| l.strip_prefix("After=").is_some_and(|a| a.split_whitespace().any(|u| u == "plymouth-quit-wait.service")));
+    let waits_on_splash = directives().any(|l| l.strip_prefix("After=").is_some_and(|a| a.split_whitespace().any(|u| u == "plymouth-quit-wait.service.x")));
     if waits_on_splash { "needs_migrate" } else { "current" }
 }
 
