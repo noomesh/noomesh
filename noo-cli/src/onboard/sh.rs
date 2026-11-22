@@ -2000,6 +2000,6 @@ mod docker_bound_tests {
         assert_eq!(secs(&["pull", "x"]), DOCKER_LONG_SECS);
         assert_eq!(secs(&["exec", "c", "ollama", "list"]), DOCKER_LONG_SECS);
         assert_eq!(secs(&["--debug", "load"]), DOCKER_LONG_SECS, "a leading flag is skipped");
-        assert!(DOCKER_SHORT_SECS > 0);
+        const { assert!(DOCKER_SHORT_SECS > 0) };
     }
 }

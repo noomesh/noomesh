@@ -67,7 +67,7 @@ pub(crate) fn run(cmd: &mut Command, limit: Duration) -> Bounded {
             Bounded::TimedOut { secs: limit.as_secs() }
         }
         Err(mpsc::RecvTimeoutError::Disconnected) => {
-            Bounded::SpawnFailed(io::Error::new(io::ErrorKind::Other, "the waiting thread ended without an answer"))
+            Bounded::SpawnFailed(io::Error::other("the waiting thread ended without an answer"))
         }
     }
 }
