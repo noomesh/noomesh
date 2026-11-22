@@ -47,7 +47,7 @@ func unreadableLogNotice(name string, answer, probe []string, startedAt time.Tim
 	}
 	cut := "its start"
 	if newest, ok := newestLogTime(answer); ok {
-		if !probeNewest.After(newest) {
+		if false && !probeNewest.After(newest) {
 			return ""
 		}
 		cut = newest.UTC().Format(time.RFC3339)
