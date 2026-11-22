@@ -15,15 +15,14 @@ import (
 // callers send `{input, model?}` and get back `{object:"list", data:[...]}`
 // no matter which engine actually served the request. Engines disagree
 // about the native route and payload underneath, though, and /embed was
-// written when TEI was the only embedder — so it hardcoded TEI's route and
-// TEI's response shape.
+// written when one engine was the only embedder, so it hardcoded that
+// engine's route and response shape.
 //
-// That was invisible until a node served embeddings from something else.
-// host8 runs harrier on ollama; /embed dutifully posted TEI's
-// `POST /embed {inputs}` at it, ollama does not serve that route, and its
-// bare "404 page not found" went back to the caller looking like the
-// node-agent had no such endpoint. The routing was right; the dialect was
-// wrong.
+// That was invisible until a node served embeddings from something else:
+// /embed posted the old engine's native route at ollama, which does not serve
+// it, and ollama's bare "404 page not found" went back to the caller looking
+// like the node-agent had no such endpoint. The routing was right; the
+// dialect was wrong.
 //
 // So dialects live in a table keyed by backend type (which the role=embed
 // placement tells us), not in a chain of per-engine branches. Adding an
@@ -36,7 +35,7 @@ import (
 //
 // Only engines actually verified against a running server belong here. An
 // entry written from documentation alone is worse than no entry: an unknown
-// backend falls back to TEI's dialect and fails loudly, whereas a WRONG
+// backend is refused with a clear error, whereas a WRONG
 // decoder can take the wrong slice of a valid response and return vectors
 // that are silently in the wrong space -- the exact failure this whole
 // change exists to prevent. llama.cpp can serve embeddings (it is the same
@@ -45,9 +44,24 @@ import (
 // entry when someone places a gguf embedder and probes it, not before.
 
 const (
-	backendTEI    = "embedding" // TEI — the `embedding` backend type
 	backendOllama = "ollama"
+
+	// backendRetiredTEI is the `embedding` backend type: the TEI engine,
+	// removed from core in 0.6.30 (i1182a). It has no dialect and no door.
+	backendRetiredTEI = "embedding"
 )
+
+// embedEngineRefusal is what /embed answers for an engine it has no dialect
+// for: it names the engine, says the TEI engine is no longer supported, and
+// gives the replacement.
+func embedEngineRefusal(backend, node string) string {
+	if backend == backendRetiredTEI {
+		return fmt.Sprintf("embedder engine %q is the TEI engine, which is no longer supported; "+
+			"replace the placement: noo cluster place %s ollama <model> --role embed", backend, node)
+	}
+	return fmt.Sprintf("embedder engine %q has no embed dialect on this node (the TEI dialect is no longer a fallback); "+
+		"place an Ollama embedder: noo cluster place %s ollama <model> --role embed", backend, node)
+}
 
 // embedDialect describes one engine's native embeddings API.
 type embedDialect struct {
@@ -67,22 +81,6 @@ type embedDialect struct {
 }
 
 var embedDialects = map[string]embedDialect{
-	// TEI native: POST /embed {inputs:[...]} -> [[...], ...]
-	// TEI serves exactly one model and ignores any model field.
-	backendTEI: {
-		path: "/embed",
-		encode: func(inputs []string, _ string, _ json.RawMessage) ([]byte, error) {
-			return json.Marshal(map[string]any{"inputs": inputs, "truncate": true})
-		},
-		decode: func(raw []byte) ([][]float64, error) {
-			var v [][]float64
-			if err := json.Unmarshal(raw, &v); err != nil {
-				return nil, fmt.Errorf("unexpected TEI /embed response shape: %w", err)
-			}
-			return v, nil
-		},
-	},
-
 	// ollama native: POST /api/embed {model, input:[...]}
 	//             -> {"embeddings": [[...], ...]}
 	// REQUIRES model — a request without one is rejected, which is the

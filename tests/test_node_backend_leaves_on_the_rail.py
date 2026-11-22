@@ -94,6 +94,10 @@ def test_the_agent_door_table_agrees_when_it_is_present() -> None:
         go[backend] = m.group(1) if m else "vllm"
     assert go, "parsed no rows from backendDoors"
     rust = {b: r["service"] for r in _rust_rows() for b in r["backends"]}
+    # The controller still issues the `tei` leaf for one release (a 0.6.29 node
+    # verifying a 0.6.30 bundle must not fail: i1182a, expand then contract);
+    # the node agent has no `embedding` door any more.
+    rust.pop("embedding", None)
     assert go == rust, f"agent doors {go} vs controller leaves {rust}"
 
 

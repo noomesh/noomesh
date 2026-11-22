@@ -23,7 +23,7 @@ func TestPlacementEnvAllowList(t *testing.T) {
 		"GPU_MEMORY_UTILIZATION", "TENSOR_PARALLEL_SIZE",
 		"OLLAMA_MODEL", "OLLAMA_KEEP_ALIVE",
 		"VLLM_TOOL_PARSER", "VLLM_MAX_MODEL_LEN", "VLLM_USE_V2_MODEL_RUNNER",
-		"LLAMA_ARG_JINJA", "TEI_MODEL", "RERANK_N_CTX", "LOG_LEVEL",
+		"LLAMA_ARG_JINJA", "RERANK_N_CTX", "LOG_LEVEL",
 	}
 	refused := []string{
 		"LD_PRELOAD", "LD_LIBRARY_PATH", "PATH", "HOME",
@@ -33,6 +33,7 @@ func TestPlacementEnvAllowList(t *testing.T) {
 		"NOO_CLUSTER_SECRET", "NOO_NODE_AGENT_TOKEN", "NOO_TLS_KEY",
 		"NATS_PASSWORD", "DOCKER_HOST",
 		"MODELS_DIR", "NOO_DATA_ROOT",
+		"TEI_MODEL", // the TEI engine is gone: its tuning keys are no longer on the list
 	}
 
 	for _, k := range allowed {

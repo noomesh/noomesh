@@ -649,31 +649,22 @@ func nativeDialScheme(base string) string {
 
 // ─────────────────────────── rerank proxy ───────────────────────────
 //
-// The GATEWAY-facing rerank contract is fixed to the TEI shape:
+// The GATEWAY-facing rerank contract is fixed to the shape the gateway's
+// parser reads (historically named for the TEI engine this node no longer
+// runs):
 //
 //	POST /rerank {query, texts, ...}  →  [{index, score}, ...]  (score desc)
 //
-// but the LOCAL reranker container may speak one of two engines:
-//
-//   - TEI cross-encoder:  POST :80/rerank  {query, texts}      → [{index, score}]
-//   - llama.cpp llama-server --reranking (hardened image, RERANK_ENGINE
-//     default): POST :8085/v1/rerank {query, documents, model} →
-//     {results: [{index, relevance_score}]}
+// The LOCAL reranker container is always llama.cpp (llama-server
+// --reranking on a GGUF cross-encoder): POST :8085/v1/rerank
+// {query, documents, model} → {results: [{index, relevance_score}]}.
 //
 // The proxy translates request+response so gateway/UI/CLI callers never see
-// the difference. Engine detection keys on the PORT the candidate answers on
-// (the backend specs pin TEI to :80 and llama.cpp to :8085 inside the
-// container network), tried in order with a short-lived cache — NOT on a
-// static env var, because the node-agent restarts/deploys independently of
-// the reranker container: during the TEI→llamacpp flip the container can be
-// either engine, and request-time detection keeps the contract stable with
-// zero coordination. NOO_LOCAL_RERANK_URL still overrides the base URL
-// (engine then via NOO_LOCAL_RERANK_ENGINE, or both shapes are attempted).
+// the engine's own shape. NOO_LOCAL_RERANK_URL still overrides the base URL.
 
 // rerankTarget is one candidate local reranker endpoint.
 type rerankTarget struct {
-	base   string // e.g. "http://noo-reranker:8085"
-	engine string // "llamacpp" or "tei"
+	base string // e.g. "http://noo-reranker:8085"
 }
 
 var (
@@ -779,40 +770,27 @@ func resolveBackendFirstByteTimeout(raw string) time.Duration {
 //
 // `door` is the reranker's dial URL from the running containers'
 // declaration (dockerpkg.BackendDialURL(r.Context(), "reranker")): the noo-stunnel-
-// reranker sidecar (agent-run or compose) on :443 whatever the engine, or
-// — for a pre-door container — the plain noo-reranker. A sidecar hides the
-// engine, so both wire shapes are attempted at it, exactly as for a custom
-// URL whose engine is unknown.
+// reranker sidecar (agent-run or compose) on :443, or — for a pre-door
+// container — the plain noo-reranker.
 func localRerankTargets(door string) []rerankTarget {
 	var cands []rerankTarget
 	if u := strings.TrimSpace(os.Getenv("NOO_LOCAL_RERANK_URL")); u != "" {
 		base := strings.TrimRight(u, "/")
-		switch strings.ToLower(strings.TrimSpace(os.Getenv("NOO_LOCAL_RERANK_ENGINE"))) {
-		case "llamacpp":
-			cands = []rerankTarget{{base, "llamacpp"}}
-		case "tei":
-			cands = []rerankTarget{{base, "tei"}}
-		default:
-			// Engine unknown for a custom URL — attempt both shapes.
-			cands = []rerankTarget{{base, "llamacpp"}, {base, "tei"}}
-		}
+		cands = []rerankTarget{{base}}
 	} else if strings.HasPrefix(door, "http://") {
 		// Pre-door plain container (recorded as a backend_door refusal by
 		// the docker package until the reconciler recreates it). noo-reranker
 		// is the container name whether the reranker was started by the
 		// node-agent or docker-compose; llama-server listens on :8085 (spec
-		// PORT default), TEI plaintext on :80.
+		// PORT default).
 		host := strings.TrimPrefix(door, "http://")
 		if i := strings.LastIndex(host, ":"); i > 0 {
 			host = host[:i]
 		}
-		cands = []rerankTarget{
-			{"http://" + host + ":8085", "llamacpp"},
-			{"http://" + host + ":80", "tei"},
-		}
+		cands = []rerankTarget{{"http://" + host + ":8085"}}
 	} else {
 		base := strings.TrimRight(door, "/")
-		cands = []rerankTarget{{base, "llamacpp"}, {base, "tei"}}
+		cands = []rerankTarget{{base}}
 	}
 
 	rerankTargetMu.Lock()
@@ -836,12 +814,9 @@ func cacheRerankTarget(t rerankTarget) {
 	rerankTargetMu.Unlock()
 }
 
-// buildRerankRequest translates the gateway's TEI-shape body for the target
-// engine. Returns (payload, path). TEI passes through unchanged.
-func buildRerankRequest(engine string, body []byte) ([]byte, string, error) {
-	if engine == "tei" {
-		return body, "/rerank", nil
-	}
+// buildRerankRequest translates the gateway's rerank body ({query, texts})
+// into llama-server's Jina-style request. Returns (payload, path).
+func buildRerankRequest(body []byte) ([]byte, string, error) {
 	var in struct {
 		Query string   `json:"query"`
 		Texts []string `json:"texts"`
@@ -866,41 +841,34 @@ func buildRerankRequest(engine string, body []byte) ([]byte, string, error) {
 	return out, "/v1/rerank", nil
 }
 
-// normalizeRerankResponse converts an engine response into the TEI wire
-// shape `[{index, score}]` sorted by score descending (what TEI emits and
-// what the gateway's parser expects).
-func normalizeRerankResponse(engine string, raw []byte) ([]byte, error) {
+// normalizeRerankResponse converts llama-server's response into the wire
+// shape `[{index, score}]` sorted by score descending (what the gateway's
+// parser expects).
+func normalizeRerankResponse(raw []byte) ([]byte, error) {
 	type row struct {
 		Index int     `json:"index"`
 		Score float64 `json:"score"`
 	}
-	var rows []row
-	if engine == "tei" {
-		if err := json.Unmarshal(raw, &rows); err != nil {
-			return nil, fmt.Errorf("unexpected TEI rerank response: %w", err)
-		}
-	} else {
-		var out struct {
-			Results []struct {
-				Index          int     `json:"index"`
-				RelevanceScore float64 `json:"relevance_score"`
-			} `json:"results"`
-		}
-		if err := json.Unmarshal(raw, &out); err != nil || out.Results == nil {
-			return nil, fmt.Errorf("unexpected llama.cpp rerank response")
-		}
-		rows = make([]row, 0, len(out.Results))
-		for _, r := range out.Results {
-			rows = append(rows, row{Index: r.Index, Score: r.RelevanceScore})
-		}
+	var out struct {
+		Results []struct {
+			Index          int     `json:"index"`
+			RelevanceScore float64 `json:"relevance_score"`
+		} `json:"results"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil || out.Results == nil {
+		return nil, fmt.Errorf("unexpected llama.cpp rerank response")
+	}
+	rows := make([]row, 0, len(out.Results))
+	for _, r := range out.Results {
+		rows = append(rows, row{Index: r.Index, Score: r.RelevanceScore})
 	}
 	sort.SliceStable(rows, func(i, j int) bool { return rows[i].Score > rows[j].Score })
 	return json.Marshal(rows)
 }
 
 // handleRerankProxy forwards a rerank request to this node's local reranker
-// container, translating between the TEI wire contract and whatever engine
-// the container actually speaks (see block comment above). It mirrors
+// container, translating between the gateway's rerank wire contract and
+// llama-server's (see block comment above). It mirrors
 // handleInferenceProxy but targets the reranker rather than an LLM backend,
 // so the gateway can address rerank BY NODE — the gateway → node-agent hop is
 // mTLS+HMAC, and node-agent → reranker is the node's own docker network.
@@ -935,7 +903,7 @@ func (s *Server) handleRerankProxy(w http.ResponseWriter, r *http.Request) {
 
 	var lastErr string
 	for _, cand := range localRerankTargets(s.docker.BackendDialURL(r.Context(), "reranker")) {
-		payload, path, berr := buildRerankRequest(cand.engine, body)
+		payload, path, berr := buildRerankRequest(body)
 		if berr != nil {
 			// Body is malformed regardless of engine — reject once.
 			jsonError(w, http.StatusBadRequest, "bad_rerank_body", berr.Error())
@@ -953,7 +921,7 @@ func (s *Server) handleRerankProxy(w http.ResponseWriter, r *http.Request) {
 		resp, derr := s.backendClient(cand.base, 60*time.Second).Do(req)
 		if derr != nil {
 			lastErr = derr.Error()
-			continue // engine not listening on this port — try next candidate
+			continue // not listening
 		}
 		respBody, rderr := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 		_ = resp.Body.Close()
@@ -962,16 +930,15 @@ func (s *Server) handleRerankProxy(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			// Wrong engine guess (404/405) or a genuine upstream error —
-			// either way try the other candidate, remembering the failure.
+			// An upstream error: remember it for the final answer.
 			lastErr = fmt.Sprintf("%s%s returned %d: %.300s",
 				cand.base, path, resp.StatusCode, string(respBody))
 			continue
 		}
-		norm, nerr := normalizeRerankResponse(cand.engine, respBody)
+		norm, nerr := normalizeRerankResponse(respBody)
 		if nerr != nil {
 			lastErr = nerr.Error()
-			continue // response didn't match this engine's shape — try next
+			continue // not the shape llama-server answers with
 		}
 		cacheRerankTarget(cand)
 		w.Header().Set("Content-Type", "application/json")
@@ -997,7 +964,7 @@ func (s *Server) localEmbedURL(ctx context.Context, t embedtarget.Target) string
 	}
 	// Desired state is the authority on WHICH local backend serves
 	// embeddings: the reconciler publishes the role=embed placement's
-	// target here. This used to be hardcoded to noo-tei, which silently
+	// target here. This used to be hardcoded to a TEI container, which silently
 	// returned bge 768-dim vectors on a node whose declared embedder was
 	// harrier-on-ollama at 1024 dims — wrong answers, no error. Container
 	// names cannot disambiguate this (ollama serves chat on some nodes and
@@ -1009,11 +976,9 @@ func (s *Server) localEmbedURL(ctx context.Context, t embedtarget.Target) string
 		return strings.TrimRight(u, "/")
 	}
 	// No declared embedder yet (agent just started, gateway predates the
-	// role field, or no embed placement on this node). TEI is the
-	// historical default and the container the embedding backend spec
-	// pins, so this preserves prior behaviour rather than failing closed —
-	// at its door, never its plain port.
-	return strings.TrimRight(s.docker.BackendDialURL(ctx, "embedding"), "/")
+	// role field, or no embed placement on this node). There is no default
+	// embedder to guess: the caller answers 503 (embedProxyBody).
+	return ""
 }
 
 // nativeEmbedURL is the endpoint of the declared embedder when that backend
@@ -1072,14 +1037,14 @@ func oneShot(t *http.Transport) *http.Transport {
 // handleEmbedProxy forwards an OpenAI-shaped embeddings request to this
 // node's local embedding container, mirroring handleRerankProxy — it lets the
 // gateway mesh-route embeddings BY NODE (nodes advertising the `embed`
-// capability) instead of requiring a controller-co-located TEI.
+// capability) instead of requiring a controller-co-located embedder.
 //
 // Contract: POST /embed with an OpenAI `/v1/embeddings` body
-// `{input, model?, ...}` → OpenAI embeddings response. TEI ≥1.2 serves
-// `/v1/embeddings` natively, so the primary path is a passthrough; if the
-// local container is TEI-native-only (404/405 on the OpenAI route), the
-// proxy translates to TEI's native `POST /embed {inputs}` and reshapes the
-// raw `[[..]]` reply into the OpenAI shape.
+// `{input, model?, ...}` → OpenAI embeddings response. The primary path is a
+// passthrough to the engine's OpenAI route; if the engine lacks it (404/405),
+// the proxy translates to the engine's native dialect (embed_dialects.go) and
+// reshapes the reply into the OpenAI shape. An engine with no dialect is a
+// clear error, never a guess.
 //
 // Note: this is intentionally a separate route from the node-agent's
 // /v1/embeddings, which targets LLM backends (vllm/llamacpp/ollama) via
@@ -1109,21 +1074,33 @@ func (s *Server) embedProxyBody(w http.ResponseWriter, r *http.Request, body []b
 	// whose embed placement was live answered 503 no_local_embedder while
 	// ollama served the model fine.
 	tgt := embedTargetFor(body)
+	// The TEI engine (backend "embedding") is no longer supported: say so
+	// before dialing a door that no longer exists.
+	if tgt.Backend == backendRetiredTEI {
+		jsonError(w, http.StatusBadGateway, "embedder_engine_unsupported",
+			embedEngineRefusal(tgt.Backend, s.cfg.NodeID))
+		return
+	}
 	base, native := s.nativeEmbedURL(r.Context(), tgt)
 	if !native {
 		base = s.localEmbedURL(r.Context(), tgt)
 	}
+	if base == "" {
+		jsonError(w, http.StatusServiceUnavailable, "no_local_embedder",
+			"this node declares no embedder (no role=embed placement); place one: "+
+				"noo cluster place "+s.cfg.NodeID+" ollama <model> --role embed")
+		return
+	}
 
 	// Guard: precise 503 when no embedding container is here (stale gossip).
 	// Match against the container the resolved target actually names, not
-	// just "tei"/"embed" substrings — a node serving embeddings from
+	// just an "embed" substring — a node serving embeddings from
 	// harrier-on-ollama has a noo-ollama container and would otherwise be
 	// declared embedder-less despite being the declared embedder.
 	wantContainer := embedContainerFromURL(base)
 	hasEmbedder := native
 	for _, name := range s.dockerContainerNames(r.Context(), native) {
-		if name == wantContainer ||
-			strings.Contains(name, "tei") || strings.Contains(name, "embed") {
+		if name == wantContainer || strings.Contains(name, "embed") {
 			hasEmbedder = true
 			break
 		}
@@ -1145,22 +1122,22 @@ func (s *Server) embedProxyBody(w http.ResponseWriter, r *http.Request, body []b
 		return client.Do(req)
 	}
 
-	// Ensure the body names a model. TEI serves exactly one model and
-	// ignores the field, so callers on the TEI path have always omitted it.
+	// Ensure the body names a model. Callers have always omitted it (the
+	// one-model engine this contract grew up around ignored the field), but
 	// ollama serves many and rejects a request without one — that mismatch
 	// is why a correctly-routed /embed still answered "404 page not found"
 	// (ollama's own 404, copied straight through to the caller).
 	body = ensureEmbedModel(body, tgt.Model)
 	// `options` is an ollama knob (the gateway sends num_ctx on every
-	// embed). TEI and other OpenAI-compatible engines have no such field;
-	// keep it from reaching them.
+	// embed). Other OpenAI-compatible engines have no such field; keep it
+	// from reaching them.
 	if tgt.Backend != backendOllama {
 		body = stripEmbedOptions(body)
 		body = stripEmbedKeepAlive(body)
 	}
 
-	// Primary: OpenAI-compatible passthrough (TEI ≥1.2 and ollama both
-	// serve this).
+	// Primary: OpenAI-compatible passthrough (ollama and llama.cpp serve
+	// this).
 	//
 	// Skipped for ollama when the caller sent `options` (the gateway sends
 	// num_ctx on every embed): ollama's /v1/embeddings drops them, so the
@@ -1206,9 +1183,12 @@ func (s *Server) embedProxyBody(w http.ResponseWriter, r *http.Request, body []b
 	// placement, so adding an engine is a table entry, not another `if`.
 	d, ok := embedDialects[tgt.Backend]
 	if !ok {
-		// Unknown/undeclared engine: TEI's dialect is the historical
-		// default and the only one every existing deployment has spoken.
-		d = embedDialects[backendTEI]
+		// An engine with no verified dialect: say so. Speaking another
+		// engine's dialect at it (what this did with TEI's) is how a node
+		// answers with a 404 or, worse, vectors from the wrong space.
+		jsonError(w, http.StatusBadGateway, "embedder_engine_unsupported",
+			embedEngineRefusal(tgt.Backend, s.cfg.NodeID))
+		return
 	}
 
 	model := in.Model
@@ -1333,8 +1313,8 @@ func embedTargetFor(body []byte) embedtarget.Target {
 
 // ensureEmbedModel injects `model` into an embeddings body that omits it.
 //
-// The /embed contract grew up around TEI, which serves a single model and
-// ignores the field, so every existing caller sends only `input`. ollama
+// The /embed contract grew up around a single-model engine that ignored the
+// field, so every existing caller sends only `input`. ollama
 // requires `model` and answers a request without one with a bare 404 that
 // the proxy faithfully forwarded — a confusing failure that looks like a
 // missing route rather than a missing field.

@@ -20,7 +20,7 @@ func TestResolveEmbedTarget(t *testing.T) {
 		want  embedtarget.Target
 	}{
 		{
-			name: "ollama declared embed wins over a co-resident tei",
+			name: "ollama declared embed wins over a leftover embedding placement",
 			given: []placement{
 				{Backend: "llamacpp", Role: "chat", DesiredState: "running"},
 				{Backend: "ollama", Role: "embed", DesiredState: "running", Model: "harrier"},
@@ -29,9 +29,11 @@ func TestResolveEmbedTarget(t *testing.T) {
 			want: embedtarget.Target{BaseURL: "https://stunnel-ollama:11434", Backend: "ollama", Model: "harrier"},
 		},
 		{
-			name:  "tei declared embed resolves to the tei door",
+			// The TEI engine is gone: a leftover `embedding` placement is
+			// refused (convergeContainer), never an embed target.
+			name:  "a TEI embed placement is not an embed target",
 			given: []placement{{Backend: "embedding", Role: "embed", DesiredState: "running", Model: "BAAI/bge-base-en-v1.5"}},
-			want:  embedtarget.Target{BaseURL: "https://stunnel-tei:443", Backend: "embedding", Model: "BAAI/bge-base-en-v1.5"},
+			want:  embedtarget.Target{},
 		},
 		{
 			// ollama serving CHAT must never be picked as the embedder --
@@ -47,7 +49,7 @@ func TestResolveEmbedTarget(t *testing.T) {
 		},
 		{
 			// A pre-role gateway omits `role` entirely; everything reads as
-			// chat and the proxy keeps its historical noo-tei default.
+			// chat and the proxy then answers 503 until one is declared.
 			name:  "missing role field yields no target",
 			given: []placement{{Backend: "embedding", DesiredState: "running"}},
 			want:  embedtarget.Target{},

@@ -23,19 +23,9 @@ func TestEmbedDialects(t *testing.T) {
 		}
 	})
 
-	t.Run("tei encodes to inputs and decodes a bare matrix", func(t *testing.T) {
-		b, err := embedDialects[backendTEI].encode([]string{"a", "b"}, "ignored", nil)
-		if err != nil {
-			t.Fatalf("encode: %v", err)
-		}
-		var m map[string]any
-		_ = json.Unmarshal(b, &m)
-		if _, ok := m["inputs"]; !ok {
-			t.Errorf("tei body missing 'inputs': %s", b)
-		}
-		v, err := embedDialects[backendTEI].decode([]byte(`[[1.0,2.0],[3.0,4.0]]`))
-		if err != nil || len(v) != 2 || v[1][1] != 4.0 {
-			t.Errorf("tei decode = %v, err=%v", v, err)
+	t.Run("there is no TEI dialect", func(t *testing.T) {
+		if _, ok := embedDialects[backendRetiredTEI]; ok {
+			t.Error("the removed TEI engine has a dialect again")
 		}
 	})
 
@@ -91,7 +81,7 @@ func TestOllamaEmbedCarriesOptionsToTheNativeBody(t *testing.T) {
 	if got.Options["num_ctx"] != float64(1024) {
 		t.Errorf("native body options = %v, want num_ctx 1024 (body %s)", got.Options, b)
 	}
-	// No options -> no options key (TEI and old callers unchanged).
+	// No options -> no options key (old callers unchanged).
 	b, _ = embedDialects[backendOllama].encode([]string{"a"}, "harrier", nil)
 	if strings.Contains(string(b), "options") {
 		t.Errorf("no options expected, got %s", b)
@@ -107,8 +97,8 @@ func TestEmbedNativeFirstOnlyForOllamaWithOptions(t *testing.T) {
 	if embedNativeFirst(backendOllama, without) {
 		t.Error("ollama without options keeps the OpenAI route")
 	}
-	if embedNativeFirst(backendTEI, with) {
-		t.Error("TEI keeps the OpenAI route")
+	if embedNativeFirst("llamacpp", with) {
+		t.Error("every other engine keeps the OpenAI route")
 	}
 }
 

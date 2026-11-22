@@ -32,11 +32,10 @@ import (
 // BackendPorts maps backend names to their default ports.
 // Matches Python gateway.constants.BACKEND_PORTS.
 var BackendPorts = map[string]int{
-	"vllm":      8000,
-	"llamacpp":  8085,
-	"ollama":    11434,
-	"airllm":    8000,
-	"embedding": 8082,
+	"vllm":     8000,
+	"llamacpp": 8085,
+	"ollama":   11434,
+	"airllm":   8000,
 }
 
 // BackendURL returns the intra-cluster URL of a backend's DOOR as it is
@@ -56,8 +55,6 @@ func BackendURL(backend, _ string) string {
 			return u
 		}
 		return "https://stunnel-ollama:11434"
-	case "embedding", "tei":
-		return "https://stunnel-tei:443"
 	}
 	return backendDialURL(backend, nil)
 }
@@ -142,7 +139,6 @@ var backendDoors = map[string]backendDoor{
 	"vllm-secondary": {Port: 8000, PlainPort: 8000},
 	"llamacpp":       {Sidecar: "llamacpp", Port: 8085, PlainPort: 8085},
 	"ollama":         {Sidecar: "ollama", Port: 11434, PlainPort: 11434},
-	"embedding":      {Sidecar: "tei", Port: 443, PlainPort: 80},
 	"reranker":       {Sidecar: "reranker", Port: 443, PlainPort: 8085},
 }
 
@@ -179,13 +175,12 @@ func doorDialHost(backend string) string {
 }
 
 // sidecarBackend maps a running sidecar container name back to the backend
-// key it fronts ("" for a name that is not a known sidecar). The compose
-// stack runs `noo-stunnel-tei-gpu` for its GPU TEI: same backend.
+// key it fronts ("" for a name that is not a known sidecar).
 func sidecarBackend(name string) string {
 	if !strings.HasPrefix(name, StunnelContainerPrefix) {
 		return ""
 	}
-	svc := strings.TrimSuffix(strings.TrimPrefix(name, StunnelContainerPrefix), "-gpu")
+	svc := strings.TrimPrefix(name, StunnelContainerPrefix)
 	for backend, d := range backendDoors {
 		if d.Sidecar != "" && d.Sidecar == svc {
 			return backend
@@ -473,20 +468,18 @@ func backendDialURL(backend string, d *declaredTLS) string {
 
 // ProfileMap maps backend names to docker-compose profiles.
 var ProfileMap = map[string]string{
-	"vllm":      "vllm",
-	"llamacpp":  "llamacpp",
-	"ollama":    "ollama",
-	"airllm":    "airllm",
-	"embedding": "embedding",
+	"vllm":     "vllm",
+	"llamacpp": "llamacpp",
+	"ollama":   "ollama",
+	"airllm":   "airllm",
 }
 
 // EnvVarNames maps backend names to model environment variable names.
 var EnvVarNames = map[string]string{
-	"vllm":      "VLLM_MODEL",
-	"llamacpp":  "LLAMACPP_MODEL",
-	"ollama":    "OLLAMA_MODEL",
-	"airllm":    "AIRLLM_MODEL",
-	"embedding": "EMBEDDING_MODEL",
+	"vllm":     "VLLM_MODEL",
+	"llamacpp": "LLAMACPP_MODEL",
+	"ollama":   "OLLAMA_MODEL",
+	"airllm":   "AIRLLM_MODEL",
 }
 
 // Client wraps the Docker Engine API client with node-agent specific operations.
@@ -828,28 +821,11 @@ func (c *Client) RunningBackends(ctx context.Context) (map[string]string, error)
 			}
 			backends["ollama"] = model
 
-		case "embedding":
-			// TEI's --model-id beats its MODEL_ID env: the flag is the
-			// model that runs. An agent before the fix passed the node
-			// default there while MODEL_ID named the placed model; read
-			// back MODEL_ID-first, such a container looked converged and
-			// was never recreated.
-			model := teiModelOf(envMap, cmdArgs)
-			if model == "" {
-				model = "tei"
-			}
-			backends["embedding"] = model
-
 		case "reranker":
-			// Two engines share the noo-reranker name: llamacpp reads
-			// MODEL_PATH (a /models/<file>.gguf path), TEI reads MODEL_ID
-			// (a HuggingFace repo id).
+			// llama.cpp reads MODEL_PATH (a /models/<file>.gguf path).
 			model := envMap["MODEL_PATH"]
 			if idx := strings.LastIndex(model, "/"); idx >= 0 {
 				model = model[idx+1:]
-			}
-			if model == "" {
-				model = teiModelOf(envMap, cmdArgs)
 			}
 			backends["reranker"] = model
 		}
@@ -900,14 +876,12 @@ func backendKeyFromName(name string) string {
 	case strings.Contains(name, "ollama") && !strings.Contains(name, "embed"):
 		return "ollama"
 	case strings.Contains(name, "reranker"):
-		// noo-reranker matches neither "llamacpp" nor "tei" regardless of
-		// which engine is inside. Leaving it unmapped made RunningBackends()
+		// noo-reranker does not match "llamacpp" regardless of which
+		// engine is inside. Leaving it unmapped made RunningBackends()
 		// blind to a healthy reranker: the reconciler recreated it every
 		// tick (was_running=false) and the heartbeat reported it missing,
 		// firing node_placement_drift forever.
 		return "reranker"
-	case strings.Contains(name, "tei"):
-		return "embedding"
 	}
 	return ""
 }
@@ -1275,12 +1249,6 @@ func parseEnv(envList []string) map[string]string {
 		}
 	}
 	return m
-}
-
-// teiModelOf is the model a TEI container serves: its --model-id flag (which
-// TEI reads before its MODEL_ID env), else MODEL_ID.
-func teiModelOf(envMap map[string]string, cmdArgs []string) string {
-	return firstNonEmpty(findArgValue(cmdArgs, "--model-id"), envMap["MODEL_ID"])
 }
 
 func findArgValue(args []string, flag string) string {

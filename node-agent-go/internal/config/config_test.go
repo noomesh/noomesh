@@ -154,7 +154,7 @@ func TestMTLSDowngradeIsRecordedOnlyForDowngradeValues(t *testing.T) {
 // start, naming the line; every other value is inert. There is no plaintext
 // backend door to switch to.
 func TestBackendTLSDowngradeRefusesTheStart(t *testing.T) {
-	for _, env := range []string{"NOO_VLLM_TLS", "NOO_LLAMACPP_TLS", "NOO_OLLAMA_TLS", "NOO_TEI_TLS", "NOO_RERANKER_TLS"} {
+	for _, env := range []string{"NOO_VLLM_TLS", "NOO_LLAMACPP_TLS", "NOO_OLLAMA_TLS", "NOO_RERANKER_TLS"} {
 		os.Unsetenv(env)
 	}
 	defer os.Unsetenv("NOO_LLAMACPP_TLS")
@@ -183,7 +183,7 @@ func TestBackendTLSDowngradeRefusesTheStart(t *testing.T) {
 		}
 	}
 	// The flag table names every fronted backend, once.
-	want := map[string]string{"vllm": "NOO_VLLM_TLS", "llamacpp": "NOO_LLAMACPP_TLS", "ollama": "NOO_OLLAMA_TLS", "embedding": "NOO_TEI_TLS", "reranker": "NOO_RERANKER_TLS"}
+	want := map[string]string{"vllm": "NOO_VLLM_TLS", "llamacpp": "NOO_LLAMACPP_TLS", "ollama": "NOO_OLLAMA_TLS", "reranker": "NOO_RERANKER_TLS"}
 	if len(BackendTLSFlags) != len(want) {
 		t.Fatalf("BackendTLSFlags = %v", BackendTLSFlags)
 	}

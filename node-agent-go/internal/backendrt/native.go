@@ -368,7 +368,7 @@ func looksLikeEmbedder(model string) bool {
 			return true
 		}
 	}
-	return m == "bge" || m == "tei"
+	return m == "bge"
 }
 
 // Loaded reports what each backend this lane owns has in memory right now,

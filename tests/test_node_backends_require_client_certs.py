@@ -58,8 +58,8 @@ COMPOSE_TO_NODE = {
     "vllm-secondary": "vllm",  # one spec on a node
     "llamacpp": "llamacpp",
     "ollama": "ollama",
-    "tei": "embedding",
-    "tei-gpu": "embedding",
+    "tei": "",  # compose-only until its services go (PR 4 of i1182a); the node agent no longer runs TEI
+    "tei-gpu": "",
     "reranker": "reranker",
     "ollama-embed": "",  # the standalone controller's loopback embedder; compose-only
     "ollama-embed-cpu": "",  # the optional CPU embedder (profile embed-cpu); compose-only
@@ -129,7 +129,7 @@ def test_every_fronted_backend_has_a_sidecar_door_with_verify_2():
     assert re.search(r"^verify = 2$", conf, re.M), "the sidecar conf template does not set verify = 2"
     assert "CAfile = /tls/ca.crt" in conf and "cert = /tls/services/%s/service.crt" in conf
     fronted = {k: v for k, v in doors.items() if v["sidecar"]}
-    assert set(fronted) == {"vllm", "llamacpp", "ollama", "embedding", "reranker"}, fronted
+    assert set(fronted) == {"vllm", "llamacpp", "ollama", "reranker"}, fronted
     # Door ports are compose's stunnel accept ports, so one URL reaches either.
     for key, d in fronted.items():
         svc = d["sidecar"]
@@ -159,7 +159,7 @@ def test_the_node_door_set_is_the_compose_door_set():
     )
     # And every backend the agent can start is either fronted or excepted.
     specs = set(re.findall(r'^\t"([a-z]+)": ', BACKENDS_GO.read_text(), re.M))
-    assert specs >= {"vllm", "llamacpp", "ollama", "embedding", "reranker", "airllm"}, specs
+    assert specs >= {"vllm", "llamacpp", "ollama", "reranker", "airllm"}, specs
     for b in specs:
         assert b in doors or b in NODE_PLAINTEXT_EXCEPTIONS, f"backend spec {b} has no door and no named exception"
 
@@ -168,7 +168,7 @@ def test_the_tls_flags_are_retired_and_name_the_fronted_backends():
     flags = _go_map_entries("BackendTLSFlags", CONFIG_GO.read_text())
     doors = _backend_doors()
     assert set(flags) == set(doors) - {"vllm-secondary"}, (flags, doors)
-    assert flags["embedding"] == '"NOO_TEI_TLS"' and flags["reranker"] == '"NOO_RERANKER_TLS"'
+    assert "embedding" not in flags and flags["reranker"] == '"NOO_RERANKER_TLS"'
     client = CLIENT_GO.read_text()
     fn = re.search(r"func SchemeFor\(backend string\) string \{(.*?)\n\}", client, re.S).group(1)
     assert "os.Getenv" not in fn, "SchemeFor reads an env switch again — the door is TLS by default"
@@ -219,5 +219,5 @@ def test_the_door_check_runs_before_the_running_container_is_touched():
 
 def test_the_parser_finds_what_it_is_written_for():
     assert len(_backend_doors()) >= 5
-    assert len(_go_map_entries("BackendTLSFlags", CONFIG_GO.read_text())) == 5
+    assert len(_go_map_entries("BackendTLSFlags", CONFIG_GO.read_text())) == 4
     assert _go_script("vllmEntrypointScript", BACKENDS_GO.read_text()).count("\n") > 10
