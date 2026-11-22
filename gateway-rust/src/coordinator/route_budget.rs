@@ -86,7 +86,7 @@ pub fn capped(deadline: Duration, cap: Option<Duration>) -> Duration {
 /// gets several model calls instead of stopping after its first (the loop
 /// refuses a second call with less than this left). Pure.
 pub fn call_budget(base: Duration, cap: Option<Duration>) -> Duration {
-    cap.map_or(base, |c| base.min(c / 4))
+    cap.map_or(base, |_c| base)
 }
 
 /// How long one tool call may take: what is left of the turn, and on a
