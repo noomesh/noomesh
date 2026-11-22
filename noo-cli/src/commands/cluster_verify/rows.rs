@@ -1117,7 +1117,7 @@ pub(crate) const ROWS: &[Row] = &[
         scope: Scope::Node,
         verdicts: &[Verdict::Warn, Verdict::Fail],
         meaning: "On a Mac node, whether the native Ollama answers on 127.0.0.1:11434 and runs as a boot service; a Mac never runs Ollama in a container, so when it is down nothing serves Ollama there. WARN: it serves from a per-user LaunchAgent (a Mac enrolled before Ollama became a boot service), which starts only at a login.",
-        clears: "On the Mac, once, as the node's user: `noo enroll --resume` (installs Ollama if missing, registers it as a boot service run as that user with its model store kept; asks for sudo, no new token). A roll or `noo cluster provision` cannot do this: the applier never runs Homebrew as root. To only start it: `sudo HOMEBREW_NO_ANALYTICS=1 brew services start --sudo-service-user \"$USER\" ollama`.",
+        clears: "On the Mac, once, as the node's user: `noo enroll --resume` (installs Ollama if missing, registers it as a boot service run as that user with its model store kept; asks for sudo, no new token). A roll or a provision cannot do this: the applier never runs Homebrew as root. To only start it: `sudo HOMEBREW_NO_ANALYTICS=1 brew services start --sudo-service-user \"$USER\" ollama`.",
         findings: &[],
         shown_as: None,
         doc: None,
