@@ -201,7 +201,7 @@ func (c *Client) StartContainer(ctx context.Context, id string) error {
 
 // NoomeshContainer is ANY container on this host that is noomesh's — the
 // agent's own backends, the compose-managed controller stack (noo-ollama-embed,
-// noo-tei, noo-reranker, noo-whisper, noo-piper, ...), and leftovers from an
+// noo-reranker, noo-whisper, noo-piper, ...), and leftovers from an
 // older agent or image. The shared-GPU yield uses this set to tell "our
 // process" from "someone else's"; it must be a superset of GPUBackend.
 type NoomeshContainer struct {

@@ -174,7 +174,7 @@ func Load() *Config {
 // These variables no longer switch anything. Since 2026-09-29 every backend
 // the agent starts serves TLS with a REQUIRED cluster-CA client certificate
 // at the door a caller reaches — vLLM by its own listener (`--ssl-cert-reqs
-// 2`), llama.cpp, ollama, TEI and the reranker behind a stunnel sidecar
+// 2`), llama.cpp, ollama and the reranker behind a stunnel sidecar
 // (`verify = 2`) the agent runs beside them. The one thing a flag can still
 // do is refuse the start: a node whose env says NOO_LLAMACPP_TLS=false is a
 // node someone once downgraded on purpose, and silently ignoring the line
@@ -182,11 +182,10 @@ func Load() *Config {
 // empty, unset — provision renders them empty) is accepted and means
 // nothing.
 var BackendTLSFlags = map[string]string{
-	"vllm":      "NOO_VLLM_TLS",
-	"llamacpp":  "NOO_LLAMACPP_TLS",
-	"ollama":    "NOO_OLLAMA_TLS",
-	"embedding": "NOO_TEI_TLS",
-	"reranker":  "NOO_RERANKER_TLS",
+	"vllm":     "NOO_VLLM_TLS",
+	"llamacpp": "NOO_LLAMACPP_TLS",
+	"ollama":   "NOO_OLLAMA_TLS",
+	"reranker": "NOO_RERANKER_TLS",
 }
 
 // backendTLSDowngradeAsked returns the first `NAME=value` among

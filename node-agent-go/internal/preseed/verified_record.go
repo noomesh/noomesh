@@ -23,8 +23,7 @@ import (
 // WHO CAN WRITE WHAT:
 //
 //   - The HF cache (HF_CACHE_DIR) is writable by the agent's user AND by
-//     every model container that mounts it read-write (vllm, TEI, the
-//     reranker). So anything that can rewrite a weight is assumed hostile.
+//     every model container that mounts it read-write (vllm). So anything that can rewrite a weight is assumed hostile.
 //   - The record lives in the agent's own state dir (NOO_AGENT_STATE,
 //     default /var/lib/noo-node-agent → verified/hf-weights.json), which is
 //     mounted into no container. OpenVerifiedRecord REFUSES a path under any

@@ -47,8 +47,8 @@ func TestEmbedCapabilityFollowsDeclaredRole(t *testing.T) {
 		}
 	})
 
-	// The stray-TEI case: a container is present but desired state declares
-	// no embedder here, so this node must NOT draw mesh embed traffic.
+	// A container is present but desired state declares no embedder here, so
+	// this node must NOT draw mesh embed traffic (a leftover noo-tei did).
 	t.Run("undeclared tei container does not advertise embed", func(t *testing.T) {
 		embedtarget.Set(embedtarget.Target{})
 		d2 := &RuntimeCapabilityDetector{
@@ -60,12 +60,12 @@ func TestEmbedCapabilityFollowsDeclaredRole(t *testing.T) {
 		}
 	})
 
-	t.Run("declared tei embedder advertises embed", func(t *testing.T) {
+	t.Run("a declared embedder advertises embed", func(t *testing.T) {
 		embedtarget.Set(embedtarget.Target{
-			BaseURL: "http://noo-tei:80", Backend: "embedding", Model: "BAAI/bge-base-en-v1.5",
+			BaseURL: "https://noo-stunnel-llamacpp:8085", Backend: "llamacpp", Model: "embed.gguf",
 		})
 		if caps := d.Detect(); !has(caps, "embed") {
-			t.Errorf("declared TEI did not advertise embed: %v", caps)
+			t.Errorf("a declared embedder did not advertise embed: %v", caps)
 		}
 	})
 }

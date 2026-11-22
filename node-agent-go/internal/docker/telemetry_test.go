@@ -16,13 +16,11 @@ func TestBackendSpecsCarryTheirTelemetrySwitches(t *testing.T) {
 	for k, v := range backendSpecs {
 		specs[k] = v
 	}
-	specs["reranker(tei)"] = rerankerSpecTEI()
 	specs["reranker(llamacpp)"] = rerankerSpecLlamacpp()
 	checked := 0
 	for name, spec := range specs {
 		key := strings.SplitN(name, "(", 2)[0]
-		_, isTEI := spec.Env["MODEL_ID"]
-		for k, want := range TelemetrySwitchesFor(key, isTEI) {
+		for k, want := range TelemetrySwitchesFor(key) {
 			checked++
 			if got, ok := spec.Env[k]; !ok || got != want {
 				t.Errorf("backend %s: Env[%s] = %q (present=%v), want %q — vendor telemetry must stay off", name, k, got, ok, want)
@@ -38,18 +36,15 @@ func TestBackendSpecsCarryTheirTelemetrySwitches(t *testing.T) {
 
 // The backends whose software phones home must each have a non-empty set.
 func TestTelemetryTableCoversThePhoneHomeBackends(t *testing.T) {
-	for _, b := range []string{"vllm", "vllm-secondary", "embedding", "airllm", "ollama"} {
-		if len(TelemetrySwitchesFor(b, false)) == 0 {
+	for _, b := range []string{"vllm", "vllm-secondary", "airllm", "ollama"} {
+		if len(TelemetrySwitchesFor(b)) == 0 {
 			t.Errorf("%s has no telemetry switches", b)
 		}
 	}
-	if len(TelemetrySwitchesFor("reranker", true)) == 0 {
-		t.Error("a TEI reranker has no telemetry switches")
-	}
-	if TelemetrySwitchesFor("reranker", false) != nil || TelemetrySwitchesFor("llamacpp", false) != nil {
+	if TelemetrySwitchesFor("reranker") != nil || TelemetrySwitchesFor("llamacpp") != nil {
 		t.Error("llama.cpp has no phone-home; it must not be asked for switches it cannot read")
 	}
-	if _, ok := TelemetrySwitchesFor("vllm", false)["VLLM_NO_USAGE_STATS"]; !ok {
+	if _, ok := TelemetrySwitchesFor("vllm")["VLLM_NO_USAGE_STATS"]; !ok {
 		t.Error("vllm must carry VLLM_NO_USAGE_STATS")
 	}
 }
@@ -84,10 +79,7 @@ func TestTelemetryMissingNamesWhatIsAbsent(t *testing.T) {
 	if m := TelemetryMissing("llamacpp", nil); len(m) != 0 {
 		t.Errorf("llamacpp needs no switch, got %v", m)
 	}
-	// A reranker is judged by its engine.
-	if m := TelemetryMissing("reranker", []string{"MODEL_ID=x"}); len(m) != 2 {
-		t.Errorf("a TEI reranker without switches must miss two, got %v", m)
-	}
+	// The reranker is llama.cpp.
 	if m := TelemetryMissing("reranker", []string{"MODEL_PATH=/models/x.gguf"}); len(m) != 0 {
 		t.Errorf("a llama.cpp reranker needs none, got %v", m)
 	}

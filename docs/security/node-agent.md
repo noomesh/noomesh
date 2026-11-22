@@ -663,7 +663,7 @@ Every container the agent creates on a controller's instruction runs with:
   process cap.
 - a read-only root filesystem with a tmpfs `/tmp` for llama.cpp, the
   llama.cpp reranker and every door sidecar (except on the `alpine` fallback
-  image): their write set outside their mounts is empty. vLLM, Ollama and TEI
+  image): their write set outside their mounts is empty. vLLM and Ollama
   keep a writable root until theirs is moved to a cache mount
   ([networks and containers](networks-and-containers.md#container-hardening)).
 
@@ -696,8 +696,7 @@ The backend's own port is never published on the host.
 | vLLM | `https://noo-vllm:8000` | the `noo-stunnel-vllm` sidecar (`verify = 2`, the `vllm` leaf), which joins the bridge under the alias `noo-vllm`: the name every caller already dials and the vllm leaf already carries (door generation 5). The engine serves plain on `127.0.0.1:8000` inside the door's namespace and mounts no PKI; its healthcheck probes that loopback listener. Until generation 5 vLLM served TLS itself (`--ssl-cert-reqs 2`), which admitted any cluster-CA leaf |
 | llama.cpp | `https://noo-stunnel-llamacpp:8085` | a stunnel sidecar the agent runs beside it (`verify = 2`, the `llamacpp` leaf); llama-server has no TLS listener |
 | Ollama | `https://noo-stunnel-ollama:11434` | the same sidecar shape, the `ollama` leaf |
-| TEI (`embedding`) | `https://noo-stunnel-tei:443` | the same, the `tei` leaf — `:443` is what compose's `stunnel-tei.conf` accepts on, so one URL reaches either |
-| reranker | `https://noo-stunnel-reranker:443` | the same, the `reranker` leaf, whichever engine (`llama-server --reranking` on 8085 or TEI on 80) sits behind it |
+| reranker | `https://noo-stunnel-reranker:443` | the same, the `reranker` leaf, `llama-server --reranking` on 8085 sits behind it |
 | airllm | `http://noo-airllm:8000` | **plaintext, by the same named exception as compose**: opt-in, experimental; the deferred private-network step covers it |
 
 The sidecar is one shape reused per backend (`internal/docker/sidecar.go`):
@@ -791,9 +790,20 @@ spec hash, so the binary roll itself is the trigger — once the leaf is
 there).
 
 **The retired switches.** `NOO_VLLM_TLS`, `NOO_LLAMACPP_TLS`,
-`NOO_OLLAMA_TLS`, `NOO_TEI_TLS`, `NOO_RERANKER_TLS` select nothing.
+`NOO_OLLAMA_TLS`, `NOO_RERANKER_TLS` select nothing (`NOO_TEI_TLS` went with the TEI engine and is ignored).
 `provision` renders them empty; a `false`/`0`/`no`/`off` value **refuses
 the agent's start**, naming the line, like `NOO_MTLS_NODES`.
+
+**Leftover TEI containers.** The TEI engine is removed from core. On its first
+reconcile pass after an upgrade the agent stops and removes the TEI containers
+an older agent made: `noo-tei`, `noo-tei-gpu`, their `noo-stunnel-tei` and
+`noo-stunnel-tei-gpu` doors, and a `noo-reranker` running the TEI image. It
+matches those names exactly and only when the container carries the agent's own
+`noo.managed-by=node-agent-go` label, so a compose-run container or anyone
+else's is never touched. Each removal logs one line naming the replacement. A
+placement still in desired state is refused (`backend_start`, shown by `noo
+cluster show`) with `noo cluster place <node> ollama <model> --role embed` (an
+embedder) or `noo cluster place <node> reranker <file>.gguf` (a reranker).
 
 **The one plaintext hop that stays.** A host-native Ollama — the
 operator's own process outside Docker (macOS Metal, or a Linux install the
@@ -1265,7 +1275,7 @@ says "the release's harrier". With no pin in the lock it is not compared.
 
 Every backend the agent starts serves through a door that requires a
 cluster-CA client certificate: vLLM's own listener, a `noo-stunnel-<x>`
-sidecar in front of llama.cpp, ollama, TEI and the reranker. Each door
+sidecar in front of llama.cpp, ollama and the reranker. Each door
 serves with a service leaf at `$NOO_PKI_DIR/services/<x>/service.{crt,key}`
 whose SANs name the host the agent dials it by, and the agent refuses to
 start a backend whose leaf is missing or does not name its door.

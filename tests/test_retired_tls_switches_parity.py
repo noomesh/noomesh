@@ -70,11 +70,15 @@ def test_no_rust_writer_or_renderer_emits_a_retired_tls_switch() -> None:
 def test_every_switch_the_agent_refuses_is_in_the_retired_key_list() -> None:
     go = (ROOT / "node-agent-go" / "internal" / "config" / "config.go").read_text()
     refused = set(re.findall(r'"(NOO_[A-Z]+_TLS)"', go.split("var BackendTLSFlags")[1].split("}")[0]))
-    assert refused == set(SWITCHES), f"the Go refusal table and this guard disagree: {refused ^ set(SWITCHES)}"
+    # NOO_TEI_TLS left the agent's refusal table with the TEI engine (i1182a): a
+    # leftover `false` is ignored now. It stays a retired KEY (and a switch no
+    # template may ship): an upgraded .env still drops it.
+    expected = set(SWITCHES) - {"NOO_TEI_TLS"}
+    assert refused == expected, f"the Go refusal table and this guard disagree: {refused ^ expected}"
     keys = {
         line.split("|", 1)[0].strip()
         for line in (ROOT / "scripts" / "retired-env-keys").read_text().splitlines()
         if line.strip() and not line.startswith("#")
     }
-    missing = refused - keys
+    missing = set(SWITCHES) - keys
     assert not missing, f"scripts/retired-env-keys must list {sorted(missing)}: an upgraded .env keeps them otherwise"

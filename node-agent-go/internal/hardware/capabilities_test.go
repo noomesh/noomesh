@@ -59,11 +59,11 @@ func TestContainsAny(t *testing.T) {
 		needles  []string
 		want     bool
 	}{
-		{"noo-tei-gpu", []string{"tei"}, true},
-		{"noo-ollama", []string{"tei", "embed"}, false},
-		{"noo-ollama-embed", []string{"tei", "embed"}, true},
+		{"noo-ollama-embed", []string{"embed"}, true},
+		{"noo-ollama", []string{"embed"}, false},
+		{"noo-ollama-embed", []string{"embed", "other"}, true},
 		{"whisper-service", []string{"whisper", "stt"}, true},
-		{"random-container", []string{"whisper", "stt", "tei"}, false},
+		{"random-container", []string{"whisper", "stt", "embed"}, false},
 		{"", []string{"anything"}, false},
 		{"something", []string{}, false},
 	}
@@ -102,7 +102,7 @@ func TestRuntimeCapabilityDetector(t *testing.T) {
 			}
 		},
 		ListContainers: func() []string {
-			return []string{"noo-ollama", "noo-vllm", "noo-tei"}
+			return []string{"noo-ollama", "noo-vllm", "noo-ollama-embed"}
 		},
 	}
 
@@ -123,7 +123,7 @@ func TestRuntimeCapabilityDetector(t *testing.T) {
 		t.Error("expected 'inference' capability")
 	}
 	if !hasEmbedding {
-		t.Error("expected 'embedding' capability (tei container running)")
+		t.Error("expected 'embedding' capability (an embed container running)")
 	}
 }
 

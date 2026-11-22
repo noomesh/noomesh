@@ -44,7 +44,7 @@ type GPUFacts struct {
 	// NvidiaRuntimeRead: NvidiaRuntimeKnown has answered at least once in this
 	// process, so NvidiaRuntime is a fact. false is "never read" (a fresh
 	// agent whose first docker info failed or is slow), which is NOT "known
-	// absent": TEI refuses to choose an image on it (TEIRuntimeUnknownError)
+	// absent": the start is refused on it (GPURuntimeUnknownError)
 	// instead of taking the CPU one. llamacpp waits on it too (llamacppWaitsOnRuntime) but its usable rule is unchanged.
 	NvidiaRuntimeRead bool
 	// NvidiaRuntimeErr is the last failed ask's text, "" after a good one;
@@ -90,7 +90,7 @@ func llamacppOnGPU(target string, f GPUFacts) bool {
 // the target is not cpu, a GPU build exists, no GPU is known to be below the
 // compute floor (that would be cpu whatever the runtime says), and the nvidia
 // runtime was never read: unknown is not absent, so the start is refused for
-// this pass (TEIRuntimeUnknownError) instead of taking the CPU build. Once the
+// this pass (GPURuntimeUnknownError) instead of taking the CPU build. Once the
 // runtime is read, LlamacppGPUUsable decides exactly as before.
 func llamacppWaitsOnRuntime(target string, f GPUFacts) bool {
 	if target == "cpu" || !LlamacppHasGPUBuild || !f.NvidiaGPU || f.NvidiaRuntimeRead {

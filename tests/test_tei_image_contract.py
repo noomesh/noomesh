@@ -3,16 +3,17 @@
 
 """What we send a Text Embeddings Inference (TEI) container is what the pinned TEI reads.
 
-TEI is the opt-in embedder (compose `tei` / `tei-gpu`, profile `tei-compose`;
-the agent's `embedding` backend) and the opt-in reranker (compose `reranker`;
-the agent's reranker with RERANK_ENGINE=tei). Its CLI is clap with `long, env`
+TEI is the opt-in embedder (compose `tei` / `tei-gpu`, profile `tei-compose`)
+and the opt-in reranker (compose `reranker`). The node agent no longer runs it
+(the `embedding` backend and the TEI reranker were removed in 0.6.30, i1182a), so
+only the compose services and the gateway's bodies are checked here, until they
+go too. Its CLI is clap with `long, env`
 on every argument, and its HTTP request types do NOT deny unknown fields, so a
 renamed flag fails at start but a renamed env var or body field is silently
 ignored: `{"truncation": true}` would fall back to the server default.
 
 TEI ships two flavours, and each is pinned to its own reviewed release:
-CPU (compose `tei`, the agent's CPUImage) and CUDA (compose `tei-gpu` and
-`reranker`, the agent's Image). PINNED names the release of each, RELEASES
+CPU (compose `tei`) and CUDA (compose `tei-gpu` and `reranker`). PINNED names the release of each, RELEASES
 holds what each release reads (from its source). This test checks:
 
 - every TEI image is spelled for its flavour (`cpu-<v>` / `<v>`) at that
@@ -20,15 +21,12 @@ holds what each release reads (from its source). This test checks:
   an image without a RELEASES row (a review) fails here;
 - the GPU flavour is HELD (see HELD) and says so where it is pinned, so
   moving it is a deliberate edit of this file;
-- every `--flag` we pass is accepted by EVERY pinned release (the agent picks
-  the flavour per node, with the same Command), and every start passes
-  --model-id (no default since 1.9.0);
+- every `--flag` we pass is accepted by EVERY pinned release, and every start
+  passes --model-id (no default since 1.9.0);
 - the env vars that carry our behaviour are read by every pinned release:
-  MODEL_ID, HOSTNAME (the loopback-only listener behind the stunnel door) and
-  HUGGINGFACE_HUB_CACHE (the agent-verified snapshot tree);
-- the agent dials TEI's plain port on the PORT both images set;
-- the bodies the gateway and the agent send to /embed and /rerank use only
-  fields every pinned release reads.
+  MODEL_ID and HOSTNAME (the loopback-only listener behind the stunnel door);
+- the bodies the gateway sends to /embed and /rerank use only fields every
+  pinned release reads.
 
 Review of 1.6.1 -> 1.9.4 (release notes v1.7.0..v1.9.4 and the router source
 at both tags): no CLI argument or env var was removed or renamed (added:
@@ -47,10 +45,6 @@ import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 COMPOSE = ROOT / "docker-compose.cluster.yml"
-BACKENDS_GO = ROOT / "node-agent-go/internal/docker/backends.go"
-SIDECAR_GO = ROOT / "node-agent-go/internal/docker/sidecar.go"
-CLIENT_GO = ROOT / "node-agent-go/internal/docker/client.go"
-EMBED_DIALECTS_GO = ROOT / "node-agent-go/internal/api/embed_dialects.go"
 EMBEDDING_CLIENT_RS = ROOT / "gateway-rust/src/embedding_client.rs"
 EXTERNAL_RS = ROOT / "gateway-rust/src/routes/external.rs"
 
@@ -113,7 +107,7 @@ HELD_MARK = "held at 1.6: TEI 1.9.4's CUDA image requires cuda>=12.9"
 TEI_SERVICES = ("tei", "tei-gpu", "reranker")
 CPU_SERVICES = ("tei",)
 # The env vars whose meaning we rely on TEI reading.
-RELIED_ON_ENV = ("MODEL_ID", "HOSTNAME", "HUGGINGFACE_HUB_CACHE")
+RELIED_ON_ENV = ("MODEL_ID", "HOSTNAME")
 
 
 def _pinned_releases() -> list[dict]:
@@ -141,26 +135,12 @@ def _compose_services() -> dict:
     return {s: services[s] for s in TEI_SERVICES}
 
 
-def _go_tei_specs() -> dict[str, str]:
-    """The agent's two TEI spec bodies: the `embedding` table entry and rerankerSpecTEI."""
-    src = BACKENDS_GO.read_text()
-    table = src.index("var backendSpecs = map[string]BackendSpec{")
-    emb = _balanced_block(src, src.index('\t"embedding": {', table))
-    rr = _balanced_block(src, src.index("func rerankerSpecTEI() BackendSpec {") + len("func rerankerSpecTEI() BackendSpec "))
-    return {"embedding": emb, "rerankerSpecTEI": rr}
-
-
 def _image_refs() -> list[tuple[str, str, str]]:
     """(where, flavour, image text) for every TEI image the stack names."""
     refs = [
         (f"compose {n}", "cpu" if n in CPU_SERVICES else "gpu", str(svc["image"]))
         for n, svc in _compose_services().items()
     ]
-    for name, body in _go_tei_specs().items():
-        for field, flavour in (("Image", "gpu"), ("CPUImage", "cpu")):
-            m = re.search(rf'\b{field}:\s*"([^"]*)"', body)
-            assert m, f"backends.go {name}: no {field}"
-            refs.append((f"agent {name}.{field}", flavour, m.group(1)))
     return refs
 
 
@@ -205,9 +185,6 @@ def test_the_gpu_flavour_is_held_on_purpose():
         block = compose[compose.index(f"\n  {name}:\n"):]
         block = block[: block.index("\n    image:")]
         assert HELD_MARK in block, f"compose {name}: no hold comment above its image"
-    for name, body in _go_tei_specs().items():
-        head = body[: re.search(r"\bImage:", body).start()]
-        assert HELD_MARK in head.replace("\n\t\t// ", " "), f"backends.go {name}: no hold comment above Image"
 
 
 def _flags(args: list[str]) -> list[str]:
@@ -218,11 +195,7 @@ def test_every_flag_we_pass_tei_is_accepted_by_every_pinned_release():
     seen = []
     for name, svc in _compose_services().items():
         seen += [(f"compose {name}", f) for f in _flags([str(x) for x in svc.get("command") or []])]
-    for name, body in _go_tei_specs().items():
-        m = re.search(r"\bCommand:\s*\[\]string\{([^}]*)\}", body)
-        assert m, f"backends.go {name}: no Command"
-        seen += [(f"agent {name}", f) for f in _flags(re.findall(r'"([^"]*)"', m.group(1)))]
-    assert len(seen) >= 7, f"parsed only {seen}: the parser no longer matches the sources"
+    assert len(seen) >= 3, f"parsed only {seen}: the parser no longer matches the sources"
     for v in sorted(set(PINNED.values())):
         bad = [f"{w}: {f}" for w, f in seen if f not in RELEASES[v]["flags"]]
         assert not bad, f"TEI flags {v} does not accept (it would refuse to start):\n  " + "\n  ".join(bad)
@@ -240,24 +213,6 @@ def test_the_env_we_rely_on_is_read_by_every_pinned_release():
         env = {e.split("=", 1)[0] for e in svc.get("environment") or []}
         for k in ("MODEL_ID", "HOSTNAME"):
             assert k in env, f"compose {name}: no {k} (TEI reads it as --{k.lower().replace('_', '-')})"
-    for name, body in _go_tei_specs().items():
-        env_at = body.index("Env: map[string]string{")
-        env = dict(re.findall(r'^\s*"([A-Z0-9_]+)":\s*([^,\n]+),', _balanced_block(body, env_at + len("Env: map[string]string")), re.M))
-        assert "MODEL_ID" in env, f"backends.go {name}: no MODEL_ID"
-        assert env.get("HUGGINGFACE_HUB_CACHE") == "teiHubCache", (
-            f"backends.go {name}: HUGGINGFACE_HUB_CACHE must point TEI at the verified snapshot (teiHubCache)"
-        )
-    # The agent puts every fronted backend on loopback; TEI reads that as HOSTNAME.
-    sidecar = SIDECAR_GO.read_text()
-    door_env = _balanced_block(sidecar, sidecar.index("func privateDoorEnv("))
-    assert re.search(r'"HOSTNAME":\s*doorLoopback', door_env), "privateDoorEnv no longer sets HOSTNAME (TEI's --hostname)"
-
-
-def test_the_agent_dials_tei_on_the_image_port():
-    m = re.search(r'"embedding":\s*\{[^}]*\bPlainPort:\s*(\d+)', CLIENT_GO.read_text())
-    assert m, "client.go backendDoors: no embedding PlainPort"
-    for r in _pinned_releases():
-        assert int(m.group(1)) == r["port"], f"the agent dials TEI on {m.group(1)}, the image listens on PORT={r['port']}"
 
 
 def test_the_bodies_we_send_tei_use_fields_every_pinned_release_reads():
@@ -266,12 +221,7 @@ def test_the_bodies_we_send_tei_use_fields_every_pinned_release_reads():
     gw = re.search(r'format!\("\{\}/embed", self\.url\),\s*json!\(\{([^}]*)\}\)', EMBEDDING_CLIENT_RS.read_text())
     assert gw, "embedding_client.rs: no tei /embed body"
     gw_keys = set(re.findall(r'"(\w+)":', gw.group(1)))
-    dialects = EMBED_DIALECTS_GO.read_text()
-    tei = _balanced_block(dialects, dialects.index("backendTEI: {"))
-    ag = re.search(r"map\[string\]any\{([^}]*)\}", tei)
-    assert ag, "embed_dialects.go: no TEI /embed body"
-    ag_keys = set(re.findall(r'"(\w+)":', ag.group(1)))
-    for where, keys in (("gateway /embed", gw_keys), ("agent /embed", ag_keys)):
+    for where, keys in (("gateway /embed", gw_keys),):
         assert keys >= {"inputs", "truncate"}, f"{where}: {sorted(keys)}"
         assert keys <= embed_ok, f"{where}: fields a pinned TEI ignores: {sorted(keys - embed_ok)}"
     rr = re.search(r'json!\(\{("query": query, "texts"[^}]*)\}\)', EXTERNAL_RS.read_text())

@@ -11,7 +11,7 @@ import (
 // ollama rejects an embeddings request with no `model`, and the proxy
 // forwarded that bare 404 to the caller — it read as "the node-agent has no
 // /embed route" when in fact routing was correct and the body was short a
-// field TEI never needed.
+// field the old engine never needed.
 func TestEnsureEmbedModel(t *testing.T) {
 	modelOf := func(b []byte) string {
 		var m map[string]any

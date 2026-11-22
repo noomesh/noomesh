@@ -21,7 +21,7 @@ import (
 )
 
 // The stunnel sidecar: the client-certificate door for every agent-started
-// backend (llama.cpp, ollama, TEI, the reranker, and vLLM since door
+// backend (llama.cpp, ollama, the reranker, and vLLM since door
 // generation 5 — its own TLS listener could not pin callers by name). One shape, reused per backend, the same shape the compose
 // stack runs on the controller (docker/Dockerfile.stunnel +
 // docker/stunnel-<x>.conf, `verify = 2`): the sidecar presents the
@@ -57,7 +57,7 @@ import (
 //
 //	1  the pre-door shape (vLLM plain unless NOO_VLLM_TLS, no sidecars)
 //	2  2026-09-29: vLLM --ssl-cert-reqs 2 unconditional; stunnel sidecars
-//	   (verify = 2) beside llama.cpp, ollama, TEI and the reranker
+//	   (verify = 2) beside llama.cpp, ollama and the reranker
 //	3  2026-10-28: the fronted backend inside its sidecar's network
 //	   namespace on 127.0.0.1; the sidecar the only door (F-ii)
 //	4  2026-10-28: the door admits its callers by name (checkHost: this
@@ -125,9 +125,9 @@ func DoorNetworkMode(backend string) string {
 
 // privateDoorEnv pins a fronted backend's listener to loopback, in every
 // spelling the engines read: llama-server (HOST for the noo image's
-// wrapper, LLAMA_ARG_HOST/PORT for upstream), ollama (OLLAMA_HOST), TEI
-// (HOSTNAME, its --hostname; docker otherwise fills it with the namespace
-// owner's hostname, which resolves to the bridge address). Setting all of
+// wrapper, LLAMA_ARG_HOST/PORT for upstream), ollama (OLLAMA_HOST), and HOSTNAME (an engine that binds its
+// hostname; docker otherwise fills it with the namespace owner's, which
+// resolves to the bridge address). Setting all of
 // them on every fronted engine is harmless and keeps the rule one line.
 // Applied after every placement override, so no env can put a backend
 // back on the bridge.
@@ -234,8 +234,7 @@ func (c *Client) ensureSidecarImage(ctx context.Context, backend string) (string
 
 // sidecarConnectPort is the port the backend container listens on behind
 // its door: the placement's PORT if it set one, else the spec's, else the
-// door table's default. The reranker's depends on its engine (llama-server
-// 8085, TEI 80) and the spec says which.
+// door table's default. The reranker's is llama-server's 8085.
 func sidecarConnectPort(backend string, spec BackendSpec, envOverrides map[string]string) int {
 	if v, ok := envOverrides["PORT"]; ok {
 		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && n > 0 {
@@ -247,9 +246,6 @@ func sidecarConnectPort(backend string, spec BackendSpec, envOverrides map[strin
 			return n
 		}
 	}
-	if backend == "reranker" && spec.Env["MODEL_ID"] != "" {
-		return 80 // TEI engine
-	}
 	return backendDoors[backend].PlainPort
 }
 
@@ -258,8 +254,8 @@ func sidecarConnectPort(backend string, spec BackendSpec, envOverrides map[strin
 // the backend (which joins its namespace), with the same privilege floor as the backends
 // (no-new-privileges, CapDrop ALL) plus what stunnel-as-root actually
 // needs: DAC_OVERRIDE to read the 0600 leaf key on the bind mount, and
-// NET_BIND_SERVICE only for a door below 1024 (the TEI/reranker doors on
-// 443, the port compose's stunnel-tei.conf accepts on).
+// NET_BIND_SERVICE only for a door below 1024 (the reranker door on
+// 443, the port compose's stunnel-reranker.conf accepts on).
 func (c *Client) startSidecar(ctx context.Context, backend, image, networkName string, connectPort int) error {
 	door := backendDoors[backend]
 	name := SidecarContainerFor(backend)

@@ -18,7 +18,7 @@ func pinRelease(t *testing.T) {
 	t.Helper()
 	t.Setenv("NOO_IMAGE_PREFIX", "ghcr.io/noomesh")
 	t.Setenv("NOO_IMAGE_TAG", "v0.6.15")
-	for _, v := range []string{"LLAMACPP_IMAGE", "LLAMACPP_CUDA_IMAGE", "OLLAMA_IMAGE", "RERANK_IMAGE", "RERANK_ENGINE"} {
+	for _, v := range []string{"LLAMACPP_IMAGE", "LLAMACPP_CUDA_IMAGE", "OLLAMA_IMAGE", "RERANK_IMAGE"} {
 		t.Setenv(v, "")
 	}
 }
@@ -72,10 +72,10 @@ func TestExplicitImagesWin(t *testing.T) {
 			t.Fatalf("choice %+v err %v", c, err)
 		}
 	})
-	t.Run("RERANK_ENGINE=tei", func(t *testing.T) {
+	t.Run("a retired RERANK_ENGINE=tei changes nothing", func(t *testing.T) {
 		t.Setenv("RERANK_ENGINE", "tei")
-		if ours := hardenedDefault("reranker", true); ours != "" {
-			t.Fatalf("the TEI reranker has no hardened llama default, got %q", ours)
+		if ours := hardenedDefault("reranker", true); ours == "" {
+			t.Fatal("the reranker is always llama.cpp: the hardened default applies whatever RERANK_ENGINE says")
 		}
 	})
 }

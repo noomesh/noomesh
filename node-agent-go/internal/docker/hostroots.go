@@ -38,7 +38,7 @@ import (
 var hostRootEnvs = []string{
 	"MODELS_DIR",          // the model store (llamacpp/reranker /models source)
 	"NOO_DATA_ROOT",       // the node's data tree (models, caches, ollama)
-	"HF_CACHE_DIR",        // the HuggingFace cache (vllm, TEI)
+	"HF_CACHE_DIR",        // the HuggingFace cache (vllm)
 	"OLLAMA_DATA_DIR",     // ollama's blob store
 	"NOO_SKILLS_HOST_DIR", // the skills tree (shared with skillBindRoots)
 }

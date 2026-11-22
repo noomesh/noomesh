@@ -292,7 +292,7 @@ func (d *RuntimeCapabilityDetector) Detect() []string {
 	}
 
 	combined := lower(backendStr) + lower(containerNames)
-	if containsAny(combined, "tei", "embed") {
+	if containsAny(combined, "embed") {
 		caps = append(caps, "embedding")
 	}
 	if containsAny(combined, "whisper", "stt") {
@@ -301,11 +301,11 @@ func (d *RuntimeCapabilityDetector) Detect() []string {
 	if containsAny(combined, "faiss") {
 		caps = append(caps, "faiss")
 	}
-	// A reranker container (TEI cross-encoder, e.g. noo-reranker) makes this
+	// A reranker container (llama.cpp --reranking, noo-reranker) makes this
 	// node a rerank target. The gateway resolves rerank-capable nodes via
 	// this capability and proxies /api/external/rerank through the node-agent
 	// (it never connects to the reranker container directly). The container
-	// name carries "rerank" but not "tei"/"embed", so this stays distinct
+	// name carries "rerank" but not "embed", so this stays distinct
 	// from the embedding capability above.
 	if containsAny(combined, "rerank") {
 		caps = append(caps, "rerank")
@@ -316,7 +316,7 @@ func (d *RuntimeCapabilityDetector) Detect() []string {
 	// OpenAI-shaped embeddings through the node-agent's /embed proxy.
 	//
 	// This used to key on a container named "tei", because /embed could
-	// only reach TEI. It now speaks every engine in the dialect registry,
+	// only reach that engine. It now speaks every engine in the dialect registry,
 	// so the honest signal is DESIRED STATE: the reconciler publishes the
 	// role=embed placement's target, and a node advertises `embed` exactly
 	// when it has one.
