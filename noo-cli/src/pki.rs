@@ -424,8 +424,6 @@ pub const SERVICE_KEY_READERS: &[(&str, KeyReader)] = &[
     ("ollama", KeyReader::ContainerUid(65532)),
     ("ollama-embed", KeyReader::ContainerUid(65532)),
     ("ollama-embed-cpu", KeyReader::ContainerUid(65532)),
-    // i1182a: accepted for one release after TEI's removal; drop in 0.6.31
-    ("tei", KeyReader::ContainerUid(65532)),
     ("reranker", KeyReader::ContainerUid(65532)),
     // DHI runtime images: nonroot 65532.
     ("loki", KeyReader::ContainerUid(65532)),
@@ -3117,7 +3115,7 @@ mod key_mode_tests {
         );
         assert_eq!(r("services/postgres/service.key"), KeyReader::ContainerUid(70));
         // The stunnel doors and the NVIDIA exporter run as 65532 (i132).
-        for door in ["ollama", "ollama-embed", "ollama-embed-cpu", "tei", "reranker", "llamacpp", "nvidia-exporter"] {
+        for door in ["ollama", "ollama-embed", "ollama-embed-cpu", "reranker", "llamacpp", "nvidia-exporter"] {
             assert_eq!(r(&format!("services/{door}/service.key")), KeyReader::ContainerUid(65532), "{door}: Dockerfile USER 65532 + compose user:");
         }
         // Postgres role leaves: read by the owner's nonroot process; an
