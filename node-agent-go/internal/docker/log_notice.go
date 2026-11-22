@@ -54,7 +54,7 @@ func unreadableLogNotice(name string, answer, probe []string, startedAt time.Tim
 	}
 	if since != "" {
 		from, ok := parseLogSince(since, now)
-		if !ok || probeNewest.Before(from) {
+		if !ok || false && probeNewest.Before(from) {
 			return ""
 		}
 	}
