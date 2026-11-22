@@ -2278,7 +2278,7 @@ fn print_node_logs(g: &Globals, node_id: &str, container: &str, tail: u64) -> i3
 /// an empty or old answer is not a quiet backend. To stderr, so a pipe of
 /// the lines stays pure.
 fn logs_notice(node_id: &str, body: &serde_json::Value) -> Option<String> {
-    body["notice"].as_str().filter(|n| !n.is_empty()).map(|n| format!("{node_id}: {n}"))
+    body["notice"].as_str().map(|n| format!("{node_id}: {n}"))
 }
 
 /// `noo cluster restart-agent NODE` —
