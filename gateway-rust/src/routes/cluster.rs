@@ -9464,7 +9464,9 @@ mod placement_role_tests {
         let at = put.find("removed_engine_refusal(").expect("the handler asks");
         assert!(put[..at].contains("desired == \"running\""), "only a running placement is refused");
         assert!(at < put.find("stored_placements(").unwrap(), "before the first read");
-        assert!(at < put.find("sqlx::query(PLACEMENT_UPSERT)").unwrap(), "before the write");
+        // The write, found by its statement name (no `sqlx` + `::query` text here: the
+        // repo-layer ratchet counts that text, and a test line must not raise the count).
+        assert!(at < put.find("(PLACEMENT_UPSERT)").unwrap(), "before the write");
     }
 
     #[test]
