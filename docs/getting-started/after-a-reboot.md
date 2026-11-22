@@ -80,7 +80,9 @@ Each one has a followup that removes the need for the step.
   without an error, so a long tail shows only older lines and a `since`
   shows nothing. The newest lines are still there: `noo cluster logs <node>
   <backend>` with its default tail, or the logs in the console/Loki. It
-  clears when that log rotates or the container is recreated. (i1225.)
+  clears when that log rotates or the container is recreated. From 0.6.30
+  `noo cluster logs` says so when it happens, with the time Docker stopped
+  reading and the container's start. (i1225.)
 - **A node came back on a new local address** (no tailnet): the
   `node_unreachable` alert, or verify's `agent certificate` row, says its
   certificate does not cover the address it now reports. Run
