@@ -546,12 +546,14 @@ Docker; `unreadable` with the error when Docker is there but its version
 could not be read). `noo cluster show <node>` prints it, and `noo cluster
 verify` has a `docker engine` row:
 
-- below **27**, the oldest Docker Engine the project tests (CI runs
-  `docker:27-dind`): WARN, with the upgrade as the remedy. Known consequence:
+- below **28**, the oldest Docker Engine noomesh supports: WARN, with the
+  upgrade as the remedy (Docker's apt repository, or Docker's convenience
+  script; Docker Desktop: update it). Nothing refuses an older engine. CI
+  still runs `docker:27-dind` as a canary below the floor. Known consequence:
   a container-lane Ollama import fails on an engine below 28 with an agent
   before 0.6.28;
 - `unreadable`: WARN, `cannot be checked`, with the error;
-- `none` (a native-only node) and 27 or newer: ok. Podman is shown, not
+- `none` (a native-only node) and 28 or newer: ok. Podman is shown, not
   compared;
 - an agent that predates the report: no row.
 

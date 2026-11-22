@@ -27,7 +27,10 @@
 # The second job, copy-owner, runs the agent's two copies into noo-ollama
 # (writeManifestContainer, the mirror import's manifest; ollamaCreateInContainer,
 # the convert path's dirTar'd pair) against the same image on two daemons:
-# the runner's own dockerd and a docker:27-dind one. Our image sets
+# the runner's own dockerd and a docker:27-dind one, a CANARY below the
+# supported floor (MIN_DOCKER_ENGINE_MAJOR = 28 since 0.6.30: an existing
+# install on 27 is still warned, not refused, so the copy must keep working
+# there). Our image sets
 # `USER 65532:65532`; a CopyToContainer with CopyUIDGID makes Docker 27 and
 # older look the whole "65532:65532" up in passwd and refuse the copy
 # (getent unable to find entry), while Docker 28+ splits uid:gid. The test
@@ -154,7 +157,8 @@ jobs:
       fail-fast: false
       matrix:
         # runner: the hosted image's docker-ce (28/29), which splits uid:gid.
-        # docker-27: a Docker 27 daemon in dind, which does not.
+        # docker-27: a Docker 27 daemon in dind, which does not: a canary
+        # below the supported floor (Engine 28), kept for the #1387 bug.
         daemon: [ runner, docker-27 ]
     env:
       OLLAMA_IMAGE: ghcr.io/${{ github.repository_owner }}/ollama:staged
