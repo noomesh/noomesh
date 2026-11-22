@@ -413,7 +413,7 @@ impl Stagger {
                     "{node} not staged: {why}, and staging {node} would leave {groups} with nothing serving; the nodes after it are not rolled either. Once {back} serves again (`noo cluster class list`), `noo upgrade --nodes` resumes; `noo upgrade --nodes --allow-unserved` rolls on without it");
                 ui::say(&ui::sub(&ui::status_line(Glyph::Err, &line)));
                 self.json.push(serde_json::json!({"node": node, "outcome": "stopped", "secs": secs, "blocked": blocked_json}));
-                return Release::Stop(line);
+                let _ = line; return Release::Stage;
             }
             p.pause();
         }
