@@ -602,7 +602,8 @@ def _line(rec, kept, created=(), forced=False):
     return "+ " + s + (" — --recreate: every container" if forced else "; --recreate restarts everything")
 
 
-def _k(tmp, before, after, roll_line=None, stack_line=None, target="noo-cli-v0.6.30-rc.1", stack_after=None):
+def _k(tmp, before, after, roll_line=None, stack_line=None, target="noo-cli-v0.6.30-rc.1", stack_after=None,
+       k4_before=None, k4_after=None, k4_line=None):
     out = tmp / "out"
     rc, got = cell(tmp, roll=ROLL_OK + (roll_line + "\n" if roll_line else ""),
                    stack=STACK_OK + (stack_line + "\n" if stack_line else ""))
@@ -611,6 +612,12 @@ def _k(tmp, before, after, roll_line=None, stack_line=None, target="noo-cli-v0.6
     (j / "roll.after").write_text(after)
     (j / "stack.after").write_text(after if stack_after is None else stack_after)
     (j / "target").write_text(target)
+    if k4_line is not None:
+        (out / "logs" / "upgrade-recreate.log").write_text("> Applying\n" + k4_line + "\n")
+    if k4_before is not None:
+        (j / "k4.before").write_text(k4_before)
+    if k4_after is not None:
+        (j / "k4.after").write_text(k4_after)
     env = dict(os.environ, OUT=str(out), J=str(j), SELF=SELF, NETNS_UNIT_ENABLED="enabled",
                ROLL_T0=ROLL_T0, STACK_T0=STACK_T0, STACK_T1=STACK_T1, NETNS_UNIT=str(tmp / "noo-netns-restore.service"),
                NETNS_UNIT_OWNER="%d:%d" % (os.getuid(), os.getgid()))
@@ -723,6 +730,53 @@ def test_k2_the_same_tag_stack_must_recreate_nothing(tmp_path):
     got = _k(tmp_path / "b", _snap({}, True), _snap(_NEW, True), roll_line=_line(_FIRST, _THIRD),
              stack_line=_line(["gateway"], [s for s in allsvc if s != "gateway"]))
     assert got["K2"].startswith("UPGRADE K2 FAIL:") and "line recreated != ids recreated; line only: gateway" in got["K2"], got["K2"]
+
+
+_K4IDS = {s: s + "-3" for s in _FIRST + _THIRD}
+_ALLSVC = sorted(_FIRST + _THIRD)
+
+
+def test_k4_passes_when_every_service_is_recreated_and_the_line_is_the_forced_form(tmp_path):
+    got = _k(tmp_path, _snap({}, True), _snap(_NEW, True), k4_before=_snap(_NEW, True), k4_after=_snap(_K4IDS, True),
+             k4_line=_line(_ALLSVC, [], forced=True))
+    assert got["K4"].startswith("UPGRADE K4 PASS:") and "all 13 services" in got["K4"] and "every container" in got["K4"], got["K4"]
+
+
+def test_k4_fails_when_one_service_keeps_its_id(tmp_path):
+    ids = dict(_K4IDS, redis="redis-2")
+    got = _k(tmp_path, _snap({}, True), _snap(_NEW, True), k4_before=_snap(dict(_NEW, redis="redis-2"), True),
+             k4_after=_snap(ids, True), k4_line=_line(_ALLSVC, [], forced=True))
+    assert got["K4"].startswith("UPGRADE K4 FAIL:") and "kept its container id under --recreate: redis" in got["K4"], got["K4"]
+    assert "line recreated != ids recreated; line only: redis" in got["K4"], got["K4"]
+
+
+def test_k4_fails_when_the_line_is_the_unforced_form(tmp_path):
+    got = _k(tmp_path, _snap({}, True), _snap(_NEW, True), k4_before=_snap(_NEW, True), k4_after=_snap(_K4IDS, True),
+             k4_line=_line(_ALLSVC, []))
+    assert got["K4"].startswith("UPGRADE K4 FAIL:") and "not the forced form" in got["K4"], got["K4"]
+
+
+def test_k4_is_a_note_below_0630_and_not_reached_without_snapshots(tmp_path):
+    got = _k(tmp_path / "a", _snap({}, False), _snap(_ALLNEW, True), target="noo-cli-v0.6.29")
+    assert got["K4"].startswith("UPGRADE K4 NOTE:") and "predates --recreate" in got["K4"], got["K4"]
+    got = _k(tmp_path / "b", _snap({}, True), _snap(_NEW, True))
+    assert got["K4"].startswith("UPGRADE K4 NOT REACHED:"), got["K4"]
+    got = _k(tmp_path / "c", _snap({}, True), _snap(_NEW, True), k4_line=_line(_ALLSVC, [], forced=True))
+    assert got["K4"].startswith("UPGRADE K4 NOT REACHED:"), got["K4"]
+
+
+def test_k4_gate_runs_only_for_a_target_that_takes_recreate():
+    assert uj.recreate_supported("noo-cli-v0.6.30-rc.1") and uj.recreate_supported("noo-cli-v0.7.0")
+    assert not uj.recreate_supported("noo-cli-v0.6.29") and not uj.recreate_supported("latest")
+
+
+def test_upgrade_sh_runs_k4_after_the_plain_start_before_chat_and_gated():
+    text = (JUDGE.parent / "upgrade.sh").read_text()
+    st, gate, kb, step_, ka, chat = (text.index("step start-after-upgrade"), text.index("recreate-ok"),
+                                     text.index('snap "$J/k4.before"'), text.index("step upgrade-recreate"),
+                                     text.index('snap "$J/k4.after"'), text.index("step chat-after"))
+    assert st < gate < kb < step_ < ka < chat
+    assert "--stack --recreate --version" in text
 
 
 def test_the_keep_list_is_the_compose_s_non_first_party_services():

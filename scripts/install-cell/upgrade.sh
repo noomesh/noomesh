@@ -34,9 +34,10 @@
 # Every judged assert prints exactly one line, `UPGRADE <id> PASS|FAIL|NOT
 # REACHED: <why>`, quoting the product's own line on a FAIL. The asserts are
 # 97's spec (A1-A7 after `--all`, B1-B4 after the same-tag `--stack`) and
-# general's (G1-G5: the verify rows, the journal, a chat answer after), and K1/K2:
+# general's (G1-G5: the verify rows, the journal, a chat answer after), and K1/K2/K4:
 # the roll's own "N recreated (...), M kept (...)" line against the cell's
-# container-id snapshots (before/after --all, after the same-tag --stack).
+# container-id snapshots (before/after --all, after the same-tag --stack, and
+# before/after a same-tag --stack --recreate, K4).
 set -uo pipefail
 : "${OUT:?}" "${CELL:=upgrade-24.04}" "${RUNNER:=?}" "${CLI_TAG:=latest}" "${PREV_TAG:=}" "${LEG:=ce}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -236,6 +237,22 @@ step start-after-upgrade 1800 -- sh -c 'python3 "$1" snap "$2/start-after.before
 sleep 1
 if [ "$DOCKER" = "docker" ]; then kill "$EVENTS_PID" 2>/dev/null; else sudo -n kill "$EVENTS_PID" 2>/dev/null; fi
 wait "$EVENTS_PID" 2>/dev/null
+
+# ── 4c. a same-tag --stack --recreate recreates EVERYTHING (K4) ─────────────
+# #1470 case 4's second half (K2 judged the first: a same-tag re-apply recreates
+# nothing). Last of the upgrade steps, AFTER B4's plain start (which must see the
+# stack exactly as the upgrade left it: --recreate would change every id) and
+# after the docker-events window closed, but BEFORE chat-after: the stack is
+# recreated and healthy by the time `noo upgrade` returns (it waits on the
+# gateway), and G5's chat then proves it still answers. Nothing needs restoring.
+# k4.before is its own snapshot (B4's plain start ran after stack.after). Only a
+# >= 0.6.30 CLI takes --recreate; an older one is NOTEd by the judge, not run.
+if python3 "$HERE/upgrade_judge.py" recreate-ok "$TARGET"; then
+  python3 "$HERE/recreated.py" snap "$J/k4.before" > /dev/null 2>&1 || true
+  step upgrade-recreate 2400 -- noo upgrade --stack --recreate --version "$TARGET" --yes
+  echo "$?" > "$J/recreate.rc"
+  python3 "$HERE/recreated.py" snap "$J/k4.after" > /dev/null 2>&1 || true
+fi
 
 # ── 5. a chat answer after both ────────────────────────────────────────────
 step chat-after 900 -- noo chat --message "Reply with the single word ok."
