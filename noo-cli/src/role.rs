@@ -16,7 +16,16 @@ use std::path::{Path, PathBuf};
 
 const NODE_NAME: &str = "/etc/noo/node-name";
 const NODE_PREPPED: &str = "/etc/noo/host-prepped";
-const NODE_CONTROLLER_URL: &str = "/etc/noo/controller-url";
+pub(crate) const NODE_CONTROLLER_URL: &str = "/etc/noo/controller-url";
+
+/// Whether `cmd` (`noo stack status`, or `stack status`) starts with a
+/// verb that acts on a LOCAL stack, meaningless on a node-only box (the
+/// same table `gate` refuses by). A remedy shown on a node must never be
+/// one of these.
+pub(crate) fn is_controller_only(cmd: &str) -> bool {
+    let words: Vec<&str> = cmd.split_whitespace().skip_while(|w| *w == "noo").collect();
+    CONTROLLER_ONLY.iter().any(|p| words.len() >= p.len() && &words[..p.len()] == *p)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Controller {

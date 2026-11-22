@@ -8858,6 +8858,23 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             // verified" (0.6.16-rc.3: an older gateway's node list waited on
             // NATS KV past this 10 s bound).
             let bus = unanswered_nodes_rows(health_body(g).as_ref());
+            // On a NODE (role from what this box has, not a switch): say what
+            // the agent says while the controller is away, and the node-side
+            // checks; never a controller's command (`noo stack status`).
+            if let Some(node) = crate::role::detect().node_only().cloned() {
+                let has_ts = std::path::Path::new("/usr/bin/tailscale").is_file() || std::path::Path::new("/usr/local/bin/tailscale").is_file();
+                let (line, guide) = unreachable_from_node(&node.name, node.controller_url.as_deref(), has_ts);
+                if g.json {
+                    println!("{}", serde_json::json!({ "ok": false, "error": "controller unreachable from this node", "node": node.name,
+                        "controller_url": node.controller_url, "detail": line,
+                        "next": guide.iter().map(|(c, _)| next_cmd(c, &[])).collect::<Vec<_>>() }));
+                } else {
+                    println!("{}", ui::status_line(Glyph::Err, &line));
+                    let g2: Vec<(&str, &str)> = guide.iter().map(|(c, w)| (c.as_str(), w.as_str())).collect();
+                    ui::guide(&g2);
+                }
+                return Ok(1);
+            }
             if g.json {
                 println!("{}", serde_json::json!({ "ok": false, "error": "gateway unreachable", "controller": { "ok": false, "checks": checks_json(&bus) },
                     "next": GATEWAY_UNREACHABLE_NEXT.iter().map(|(c, _)| next_cmd(c, &[])).collect::<Vec<_>>() }));
@@ -10215,6 +10232,43 @@ fn tier_json(t: Option<Tier>) -> Option<&'static str> {
 
 /// What a verify that could not read the node list suggests, in the text
 /// guide and as `next` under --json.
+/// What verify says on a NODE that cannot reach the controller: the agent's
+/// own story while it is away (nothing is reconciled; what runs keeps
+/// running) and the checks that live on this node: the URL it uses and where
+/// that is set, whether this machine has a route to it, the tailnet when it
+/// has one, then the controller itself. Never a controller-only command
+/// (`role::is_controller_only`). Pure.
+pub(crate) fn unreachable_from_node(node: &str, controller_url: Option<&str>, has_tailscale: bool) -> (String, Vec<(String, String)>) {
+    let url = controller_url.map(str::trim).filter(|u| !u.is_empty());
+    let line = match url {
+        Some(u) => format!(
+            "this machine is node '{node}' and cannot reach the controller at {u}: nothing is reconciled on this node until it answers; running backends keep running"
+        ),
+        None => format!(
+            "this machine is node '{node}' and has no controller URL ({} is missing or empty), so it cannot reach the controller: nothing is reconciled until it can; running backends keep running",
+            crate::role::NODE_CONTROLLER_URL
+        ),
+    };
+    let host = url
+        .and_then(|u| u.split_once("://").map(|(_, r)| r).or(Some(u)))
+        .and_then(|r| r.split(['/', '?']).next())
+        .map(|hp| match hp.strip_prefix('[') {
+            Some(v6) => v6.split(']').next().unwrap_or("").to_string(),
+            None => hp.rsplit_once(':').map(|(h, _)| h).unwrap_or(hp).to_string(),
+        })
+        .filter(|h| !h.is_empty())
+        .unwrap_or_else(|| "<controller host>".to_string());
+    let mut guide = vec![
+        (format!("cat {}", crate::role::NODE_CONTROLLER_URL), "the controller URL this node uses (written at enroll)".to_string()),
+        (format!("ip route get {host}"), "whether this machine has a route to the controller".to_string()),
+    ];
+    if has_tailscale {
+        guide.push(("tailscale status".to_string(), "whether this node is on the tailnet and sees the controller".to_string()));
+    }
+    guide.push(("noo health".to_string(), "asks the controller at that URL directly".to_string()));
+    (line, guide)
+}
+
 const GATEWAY_UNREACHABLE_NEXT: &[(&str, &str)] = &[("noo health", "is the controller up"), ("noo stack status", "which container is not")];
 
 /// The `seats` field of --json: the seats judged, `[]` when the registry has
@@ -18291,6 +18345,46 @@ mod json_parity_tests {
     fn unreachable_next_is_the_text_guide() {
         let cmds: Vec<&str> = GATEWAY_UNREACHABLE_NEXT.iter().map(|(c, _)| *c).collect();
         assert_eq!(cmds, ["noo health", "noo stack status"]);
+    }
+
+    /// On a node the gateway-unreachable verify says the agent's own story
+    /// and node-side checks, never a controller-only command.
+    #[test]
+    fn a_node_that_cannot_reach_the_controller_gets_node_checks_only() {
+        for (url, ts) in [(Some("https://ctrl.example.ts.net:8080"), true), (Some("https://100.64.0.1:8080"), false), (Some("https://[fd00::1]:8080/"), false), (None, false)] {
+            let (line, guide) = unreachable_from_node("node_a", url, ts);
+            assert!(line.contains("nothing is reconciled") && line.contains("running backends keep running"), "{line}");
+            assert!(line.contains("node 'node_a'"), "{line}");
+            for (c, _) in &guide {
+                assert!(!crate::role::is_controller_only(c), "a node is told to run a controller-only command: {c}");
+            }
+            assert!(guide.iter().any(|(c, _)| c == "cat /etc/noo/controller-url"), "{guide:?}");
+            assert_eq!(guide.iter().any(|(c, _)| c == "tailscale status"), ts, "tailnet check only with tailscale: {guide:?}");
+            assert_eq!(guide.last().map(|(c, _)| c.as_str()), Some("noo health"));
+        }
+        let (_, g) = unreachable_from_node("node_a", Some("https://100.64.0.1:8080"), false);
+        assert!(g.iter().any(|(c, _)| c == "ip route get 100.64.0.1"), "{g:?}");
+        let (_, g) = unreachable_from_node("node_a", Some("https://[fd00::1]:8080/"), false);
+        assert!(g.iter().any(|(c, _)| c == "ip route get fd00::1"), "{g:?}");
+        let (line, _) = unreachable_from_node("node_a", None, false);
+        assert!(line.contains("/etc/noo/controller-url"), "{line}");
+    }
+
+    /// The controller's own guide names a controller-only verb (it is one),
+    /// so the predicate is not vacuous.
+    #[test]
+    fn is_controller_only_knows_stack() {
+        assert!(crate::role::is_controller_only("noo stack status"));
+        assert!(!crate::role::is_controller_only("noo health"));
+        assert!(!crate::role::is_controller_only("tailscale status"));
+    }
+
+    #[test]
+    fn verify_takes_the_node_branch_before_the_controller_guide() {
+        let src = include_str!("cluster_verify.rs");
+        let node = src.find("if let Some(node) = crate::role::detect().node_only().cloned() {").expect("the node branch");
+        let ctl = src.find("ui::guide(GATEWAY_UNREACHABLE_NEXT);").expect("the controller guide");
+        assert!(node < ctl);
     }
 
     /// `seats: []` is "none enrolled"; null is "the gateway did not say".
