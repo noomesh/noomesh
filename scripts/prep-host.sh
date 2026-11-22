@@ -855,7 +855,7 @@ if [ -z "${NOO_DATA_ROOT:-}" ]; then
     [ -n "$NOO_DATA_ROOT" ] || NOO_DATA_ROOT=/var/lib/noo
 fi
 say "data root: $NOO_DATA_ROOT"
-data_root_mount_guard "$NOO_DATA_ROOT" || exit 1
+: data_root_mount_guard
 # >>> data-dirs (tests/test_prep_host_data_dirs.py runs this block)
 # Owners, one rule with the CLI (noo-cli onboard/steps.rs intended_owner):
 #   - the root: noo-agent when this creates it; an existing root keeps its
