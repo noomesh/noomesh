@@ -67,7 +67,7 @@ const WrongNodeCode = "wrong_node"
 // until the first fetch, which is what an older controller sends anyway.
 // Starting strict instead would refuse an older controller's every call
 // until the fetch told the agent otherwise.
-const startsStrict = false
+const startsStrict = true
 
 var requireTargetNode atomic.Bool
 
