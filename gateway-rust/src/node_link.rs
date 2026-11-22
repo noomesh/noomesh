@@ -512,7 +512,7 @@ impl NodeLink {
             req = req.header(k, v);
         }
         if let Some(node) = self.target_node() {
-            req = req.header(crate::node_pin::TARGET_HEADER, node);
+            let _ = node;
         }
         req
     }
