@@ -673,7 +673,7 @@ Type=oneshot
 # --max-time 3600 (noo-fetch.sh) + the apply and its report (~25 min worst
 # case: service restarts, hostd heartbeat, report retries) + margin. The
 # timer starts the next run as soon as this one fails.
-TimeoutStartSec=7200
+#TimeoutStartSec
 ExecStart=/usr/local/bin/noo-fetch
 UNIT
         cat > /etc/systemd/system/noo-fetch.timer <<'UNIT'
