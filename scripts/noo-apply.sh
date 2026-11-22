@@ -2096,6 +2096,70 @@ fetch_unit_timeout_apply() {
 }
 # END fetch_unit_timeout
 
+# BEGIN addons_unit_bounds
+# noo-addons-after-boot.service's bounds (i1160 risk 7), for a controller whose
+# onboard wrote that unit before them. `noo onboard` writes the unit (only on a
+# controller, at /etc/systemd/system); a fresh one carries the same lines. As
+# a oneshot WantedBy=multi-user.target with the service defaults, it held
+# multi-user.target for its whole run, with no start timeout. The controller's
+# self node runs this applier, so the applier renders a FIXED drop-in itself
+# (no kind carries it, nothing in a bundle changes a byte of it):
+#   /etc/systemd/system/noo-addons-after-boot.service.d/10-bounds.conf
+# Its [Unit] lines set DefaultDependencies=no and restore a service's other
+# defaults by hand; its [Service] line bounds the run. Drop-ins merge into the
+# unit before systemd adds default dependencies, so the drop-in alone makes an
+# old unit equal to the new one. Written whenever it is absent or different,
+# whatever the unit already says (bytes, 0644, root:root), then daemon-reload.
+# Never a start, stop or restart: the unit runs once per boot. Only where
+# systemd runs and the unit is installed. AB_UNIT_DIR / AB_OWNER_ARGS /
+# AB_STAT_OWNER / AB_SYSTEMD_DIR are seams for the unprivileged test
+# (tests/test_apply_addons_unit_bounds.py).
+AB_UNIT_NAME=noo-addons-after-boot.service
+AB_UNIT_DIR="${AB_UNIT_DIR:-/etc/systemd/system}"
+AB_DROPIN_DIR="$AB_UNIT_DIR/$AB_UNIT_NAME.d"
+AB_DROPIN="$AB_DROPIN_DIR/10-bounds.conf"
+AB_TIMEOUT_S=3600
+AB_OWNER_ARGS="${AB_OWNER_ARGS--o root -g root}"   # empty in tests (not root)
+AB_STAT_OWNER="${AB_STAT_OWNER-root:root}"
+
+# ab_render — the drop-in, fixed.
+ab_render() {
+    printf '%s\n' "# Written by noo-apply: the boot does not wait for add-on starts, and a stalled start ends." \
+        "[Unit]" "DefaultDependencies=no" "Requires=sysinit.target" "After=sysinit.target basic.target" \
+        "Conflicts=shutdown.target" "Before=shutdown.target" "" \
+        "[Service]" "TimeoutStartSec=$AB_TIMEOUT_S"
+}
+
+# addons_unit_bounds_apply — write the drop-in when absent or different, then
+# daemon-reload. Never fails the apply.
+addons_unit_bounds_apply() {
+    [ -d "${AB_SYSTEMD_DIR:-/run/systemd/system}" ] || return 0
+    [ -f "$AB_UNIT_DIR/$AB_UNIT_NAME" ] || return 0
+    _ab_tmp="$(mktemp)"
+    ab_render > "$_ab_tmp"
+    if [ -n "$AB_STAT_OWNER" ]; then
+        if config_unchanged "$_ab_tmp" "$AB_DROPIN" 644 "$AB_STAT_OWNER"; then
+            rm -f -- "$_ab_tmp"
+            return 0
+        fi
+    elif [ -f "$AB_DROPIN" ] && cmp -s "$_ab_tmp" "$AB_DROPIN"; then
+        rm -f -- "$_ab_tmp"
+        return 0
+    fi
+    # shellcheck disable=SC2086
+    if ! install -d -m 755 $AB_OWNER_ARGS "$AB_DROPIN_DIR" \
+        || ! install -m 644 $AB_OWNER_ARGS "$_ab_tmp" "$AB_DROPIN"; then
+        rm -f -- "$_ab_tmp"
+        echo "noo-apply: noo-addons-after-boot unit: could not write $AB_DROPIN; its bounds are not set" >&2
+        return 0
+    fi
+    rm -f -- "$_ab_tmp"
+    systemctl daemon-reload 2>/dev/null || true
+    echo "noo-apply: noo-addons-after-boot unit: bounds set (start timeout $AB_TIMEOUT_S s; multi-user.target does not wait)"
+    logger -t noo-apply "noo-addons-after-boot unit: bounds set (start timeout $AB_TIMEOUT_S s)" 2>/dev/null || true
+}
+# END addons_unit_bounds
+
 # ── teardown — the graceful, controller-initiated node destroy ─────────────
 # A signed `teardown` kind means "return this node to never-met-the-fleet".
 # It runs the local de-enroll — but that script deletes noo-apply itself,
@@ -3363,6 +3427,9 @@ echo "ca-lane: retired"
 # it (see fetch_unit_timeout). After every install and the floor: it never
 # changes what this apply did.
 fetch_unit_timeout_apply
+# noo-addons-after-boot.service's bounds, for a controller onboarded before
+# them (see addons_unit_bounds). Same place, same reason.
+addons_unit_bounds_apply
 
 
 # ── 4. Orchestrate — the agent must LOAD what changed ─────

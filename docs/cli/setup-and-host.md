@@ -402,6 +402,14 @@ the other nodes first: [Start over](../getting-started/start-over.md).
 | `noo addons after-boot` | — | Hidden: once per boot, start each enabled add-on that is down and report it (systemd) |
 | `noo addons rotate-secret` | `<name> <resource>` | Give an add-on's declared shared secret a new value; restart the add-on to apply |
 
+`noo addons after-boot` runs from `noo-addons-after-boot.service`, the oneshot
+`noo onboard` installs on a controller. The unit gives up after an hour
+(`TimeoutStartSec=3600`) and sets `DefaultDependencies=no`, so
+`multi-user.target` does not wait for it. A controller onboarded before those
+bounds gets them from its applier as
+`noo-addons-after-boot.service.d/10-bounds.conf`, with a reload and no
+restart; nobody has to run `noo onboard --only addons` for it.
+
 ### `noo kiosk` — The unattended display's host seat: cage + Chromium showing /kiosk.html
 | Command | Arguments | What it does |
 |---|---|---|
