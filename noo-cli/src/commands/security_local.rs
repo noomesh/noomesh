@@ -3399,7 +3399,7 @@ pub(crate) fn issue_node_with(g: &Globals, node: String, ip: Option<String>, day
     // #79: the tailnet IP is the address the agent registers — a node
     // cert without it fails every gpu_health/dispatch probe by name.
     let mut ts_ip: Vec<String> = role.tailnet_ip4(&node).into_iter().collect();
-    ts_ip.extend(carried.iter().cloned());
+    let _ = carried;
     match ca.issue_node_cert(&node, &ip, days, &["node-agent".to_string()], &ts_ip, &role) {
         Ok((crt, key)) => {
             if !mint_only {
