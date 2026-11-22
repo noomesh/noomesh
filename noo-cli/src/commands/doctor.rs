@@ -2542,9 +2542,13 @@ mod docker_access_tests {
     /// command's does (docker_group::every_docker_gate_tries_the_relaunch_before_refusing).
     #[test]
     fn doctor_docker_tries_the_group_relaunch_before_refusing() {
+        // The relaunch and every refusal live in daemon_gate, which doctor
+        // docker (and doctor exposure) call before touching docker.
         let own = crate::test_src::own_code(include_str!("doctor.rs"));
-        let body = crate::test_src::fn_body(&own, "pub fn doctor_docker(");
-        let r = body.find("crate::docker_group::relaunch_if_needed(&err)").expect("doctor docker tries the relaunch");
+        let docker = crate::test_src::fn_body(&own, "pub fn doctor_docker(");
+        assert!(docker.contains("daemon_gate("), "doctor docker goes through the shared gate:\n{docker}");
+        let body = crate::test_src::fn_body(&own, "fn daemon_gate(");
+        let r = body.find("crate::docker_group::relaunch_if_needed(").expect("the gate tries the relaunch");
         let denied = body.find("\"docker_access\"").expect("the access refusal");
         let down = body.find("\"daemon_down\"").expect("the daemon-down refusal");
         assert!(r < denied && r < down, "{body}");
