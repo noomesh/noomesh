@@ -2445,7 +2445,7 @@ pub(crate) fn data_root_policy_row(n: &Value) -> Option<Check> {
     let kind = data_root_kind(&pol["filesystem"]);
     // A disk that arrived over a root the node had already written to: those
     // entries are under the mount now (the agent's count at its first look).
-    let hidden = data_root_hidden_note(root, &pol["filesystem"]);
+    let hidden = data_root_hidden_note(&pol["filesystem"]);
     if pol["ok"].as_bool() == Some(true) {
         let k = kind.as_deref().map(|k| format!("; {k}")).unwrap_or_default();
         return Some(ok(NAME, format!("{root}: dedicated, conventional and owned by the agent{k}{hidden}")));
@@ -2518,16 +2518,15 @@ fn data_root_kind(fs: &Value) -> Option<String> {
     }
 }
 
-/// `data_roots.policy.filesystem.hidden_entries` in words, or "" when there
-/// are none (the agent's text, node-agent-go dataroots.HiddenNote).
-fn data_root_hidden_note(root: &str, fs: &Value) -> String {
-    let n = fs["hidden_entries"].as_u64().unwrap_or(0);
-    if n == 0 {
-        return String::new();
+/// `data_roots.policy.filesystem.hidden_note` (the agent's own sentence,
+/// node-agent-go dataroots.HiddenNote: how many entries a disk that arrived
+/// hides, since when, and the day the note clears) as "; <note>", or "".
+/// The agent stops sending it 7 days after the disk arrived.
+fn data_root_hidden_note(fs: &Value) -> String {
+    match fs["hidden_note"].as_str() {
+        Some(note) if !note.is_empty() => format!("; {note}"),
+        _ => String::new(),
     }
-    let count = if fs["hidden_capped"].as_bool() == Some(true) { format!("at least {n}") } else { n.to_string() };
-    format!("; the disk is now mounted at {root}; {count} files written before it was mounted are hidden under the mount point \
-             on the root filesystem: unmount to recover or remove them")
 }
 
 /// The agent's record of each data root's filesystem
@@ -15940,12 +15939,13 @@ mod config_mount_tests {
             "/data/noo: dedicated, conventional and owned by the agent; directory");
         assert_eq!(row(json!({"meant": "mount", "by": "systemd unit"}), false), "/data/noo [mount (systemd unit)]: not mounted");
         assert_eq!(row(json!({"meant": "unknown", "by": ""}), true), "/data/noo: dedicated, conventional and owned by the agent");
-        // A disk that arrived over 3 entries: the row says they are hidden.
-        assert_eq!(row(json!({"meant": "mount", "by": "fstab", "hidden_entries": 3, "hidden_capped": false}), true),
-            "/data/noo: dedicated, conventional and owned by the agent; mount (fstab); the disk is now mounted at /data/noo; \
-             3 files written before it was mounted are hidden under the mount point on the root filesystem: unmount to recover or remove them");
-        assert!(row(json!({"meant": "mount", "by": "fstab", "hidden_entries": 10000, "hidden_capped": true}), true)
-            .contains("; at least 10000 files written before"));
+        // A disk that arrived over 3 entries: the row carries the agent's note.
+        let note = "the disk is now mounted at /data/noo since 2026-11-22: 3 files written before it was mounted are hidden under the mount point \
+                    on the root filesystem: unmount to recover or remove them; this note clears by itself on 2026-11-29";
+        assert_eq!(row(json!({"meant": "mount", "by": "fstab", "hidden_entries": 3, "hidden_note": note}), true),
+            format!("/data/noo: dedicated, conventional and owned by the agent; mount (fstab); {note}"));
+        assert_eq!(row(json!({"meant": "mount", "by": "fstab"}), true),
+            "/data/noo: dedicated, conventional and owned by the agent; mount (fstab)");
     }
 
     #[test]

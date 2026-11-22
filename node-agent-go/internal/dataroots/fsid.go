@@ -69,7 +69,8 @@ import (
 // that is now on a different, non-root filesystem is the disk arriving: it
 // is accepted and re-recorded, with one log line. When the root held
 // entries at that first look, they are now hidden under the mount, and the
-// line and the heartbeat (data_roots.policy.filesystem.hidden_entries) say
+// line and the heartbeat (data_roots.policy.filesystem.hidden_note) say
+// so, for HiddenNoteFor after the disk arrived; then the note clears itself
 // so. A root recorded on its own disk that is now on the root filesystem
 // (the empty mount point), or on another non-root filesystem (a different
 // disk), is refused.
@@ -107,7 +108,19 @@ type fsRecord struct {
 	// what the node wrote there before is now under the mount.
 	Hidden       int  `json:"hidden_entries,omitempty"`
 	HiddenCapped bool `json:"hidden_capped,omitempty"`
+	// HiddenSince is when the disk arrived (unix seconds): the note is
+	// reported for HiddenNoteFor after it.
+	HiddenSince int64 `json:"hidden_since,omitempty"`
 }
+
+// HiddenNoteFor is how long the hidden-files note is reported after the disk
+// arrived: long enough for a person to see it in verify and act (unmount,
+// recover, remount), short enough that it never needs a command on the node
+// to clear. 7 days.
+const HiddenNoteFor = 7 * 24 * time.Hour
+
+// fsNow is the clock for the note; tests replace it.
+var fsNow = time.Now
 
 // entryCap bounds the one readdir at the first look.
 const entryCap = 10000
@@ -631,6 +644,9 @@ func checkFilesystems(r Roots) []fsFinding {
 				// on its own disk. The disk arrived: accept and record it.
 				if rec.OnRootFS && !onRootFS && rootDev != "" && fsStatDir(p) {
 					next := fsRecord{FSID: now, Hidden: rec.Entries, HiddenCapped: rec.Capped}
+					if next.Hidden > 0 {
+						next.HiddenSince = fsNow().Unix()
+					}
 					if putRecord(p, next, false) {
 						logArrived(p, now, next)
 					}
@@ -694,25 +710,39 @@ func putRecord(p string, rec fsRecord, onlyIfAbsent bool) bool {
 	return true
 }
 
-// HiddenNote is what a person is told when a disk arrived over a root that
-// held n entries (capped: at least n): they are under the mount now.
-func HiddenNote(p string, n int, capped bool) string {
+// HiddenNote is what a person is told when a disk arrived (at since) over a
+// root that held n entries (capped: at least n): they are under the mount
+// now. It names the day the note clears by itself.
+func HiddenNote(p string, n int, capped bool, since time.Time) string {
 	count := strconv.Itoa(n)
 	if capped {
 		count = "at least " + count
 	}
-	return fmt.Sprintf("the disk is now mounted at %s; %s files written before it was mounted are hidden under the mount point "+
-		"on the root filesystem: unmount to recover or remove them", p, count)
+	return fmt.Sprintf("the disk is now mounted at %s since %s: %s files written before it was mounted are hidden under the mount point "+
+		"on the root filesystem: unmount to recover or remove them; this note clears by itself on %s",
+		p, since.UTC().Format("2006-01-02"), count, since.Add(HiddenNoteFor).UTC().Format("2006-01-02"))
+}
+
+// hiddenNoteOf is rec's note, or "" when there is none or it has expired.
+func hiddenNoteOf(p string, rec fsRecord) string {
+	if rec.Hidden <= 0 {
+		return ""
+	}
+	since := time.Unix(rec.HiddenSince, 0)
+	if !fsNow().Before(since.Add(HiddenNoteFor)) {
+		return ""
+	}
+	return HiddenNote(p, rec.Hidden, rec.HiddenCapped, since)
 }
 
 // arrivedLine is the one line logged when a root recorded on the root
 // filesystem is found on its own disk and re-recorded.
 func arrivedLine(p string, now FSID, rec fsRecord) string {
-	if rec.Hidden > 0 {
-		return fmt.Sprintf("data root %s is now on its own filesystem (%s, was on the root filesystem); recorded; %s",
-			p, now.Source, HiddenNote(p, rec.Hidden, rec.HiddenCapped))
+	line := fmt.Sprintf("data root %s is now on its own filesystem (%s, was on the root filesystem); recorded", p, now.Source)
+	if note := hiddenNoteOf(p, rec); note != "" {
+		line += "; " + note
 	}
-	return fmt.Sprintf("data root %s is now on its own filesystem (%s, was on the root filesystem); recorded", p, now.Source)
+	return line
 }
 
 func logArrived(p string, now FSID, rec fsRecord) {
@@ -740,7 +770,7 @@ func bootMountSource(bm bootMount) string {
 func FilesystemReport(r Roots) map[string]any {
 	p := filepath.Clean(strings.TrimSpace(r.NooDataRoot))
 	meant, by := "unknown", ""
-	hidden, hiddenCapped := 0, false
+	note, hiddenN := "", 0
 	if fsCheckOS == "linux" {
 		resolved := p
 		if rp, err := fsEvalPath(p); err == nil && rp != "" {
@@ -749,7 +779,9 @@ func FilesystemReport(r Roots) map[string]any {
 		recordMu.Lock()
 		rec, has := loadRecordLocked().Roots[p]
 		recordMu.Unlock()
-		hidden, hiddenCapped = rec.Hidden, rec.HiddenCapped
+		if note = hiddenNoteOf(p, rec); note != "" {
+			hiddenN = rec.Hidden
+		}
 		switch bm := bootMountFor(resolved); {
 		case bm.where != "":
 			meant, by = "mount", bm.by
@@ -760,9 +792,10 @@ func FilesystemReport(r Roots) map[string]any {
 		}
 	}
 	out := map[string]any{"meant": meant, "by": by, "recorded": recorded(p)}
-	if hidden > 0 {
-		out["hidden_entries"] = hidden
-		out["hidden_capped"] = hiddenCapped
+	// Reported for HiddenNoteFor after the disk arrived, then dropped.
+	if note != "" {
+		out["hidden_note"] = note
+		out["hidden_entries"] = hiddenN
 	}
 	return out
 }

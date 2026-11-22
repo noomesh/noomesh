@@ -399,9 +399,15 @@ func TestADiskArrivingOverAnEmptyDirectoryIsAccepted(t *testing.T) {
 }
 
 // The same with 3 entries under the root at the first look: they are hidden
-// under the mount now, and the line and the report say so.
+// under the mount now. The line and the report say so, with the date, and
+// the report drops the note by itself after HiddenNoteFor.
 func TestADiskArrivingOverFilesSaysTheyAreHidden(t *testing.T) {
 	disk, _ := fakeFSCheck(t)
+	t0 := time.Date(2026, 11, 22, 12, 0, 0, 0, time.UTC)
+	now := t0
+	prevNow := fsNow
+	fsNow = func() time.Time { return now }
+	t.Cleanup(func() { fsNow = prevNow })
 	countEntries = func(string) (int, bool) { return 3, false }
 	r := Resolve(os.Getenv)
 	_ = checkFilesystems(r)
@@ -412,14 +418,22 @@ func TestADiskArrivingOverFilesSaysTheyAreHidden(t *testing.T) {
 			t.Fatalf("accept, got %v", c)
 		}
 	}
-	note := "the disk is now mounted at /data/noo; 3 files written before it was mounted are hidden under the mount point on the root filesystem: unmount to recover or remove them"
+	note := "the disk is now mounted at /data/noo since 2026-11-22: 3 files written before it was mounted are hidden under the mount point " +
+		"on the root filesystem: unmount to recover or remove them; this note clears by itself on 2026-11-29"
 	if n := strings.Count(buf.String(), note); n != 1 {
 		t.Fatalf("want the hidden-files line once, got %d:\n%s", n, buf.String())
 	}
-	if got := FilesystemReport(r); got["hidden_entries"] != 3 || got["hidden_capped"] != false {
-		t.Fatalf("%v", got)
+	for _, day := range []int{0, 6} {
+		now = t0.Add(time.Duration(day) * 24 * time.Hour)
+		if got := FilesystemReport(r); got["hidden_note"] != note || got["hidden_entries"] != 3 {
+			t.Fatalf("day %d: the note must still show: %v", day, got)
+		}
 	}
-	if got := HiddenNote("/x", 10000, true); !strings.Contains(got, "at least 10000 files") {
+	now = t0.Add(8 * 24 * time.Hour)
+	if got := FilesystemReport(r); got["hidden_note"] != nil || got["hidden_entries"] != nil {
+		t.Fatalf("day 8: the note must have cleared by itself: %v", got)
+	}
+	if got := HiddenNote("/x", 10000, true, t0); !strings.Contains(got, "at least 10000 files") {
 		t.Fatal(got)
 	}
 }
