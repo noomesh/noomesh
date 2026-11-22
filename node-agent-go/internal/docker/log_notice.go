@@ -112,7 +112,7 @@ func linesSinceStart(lines []string, startedAt time.Time) []string {
 	for _, l := range lines {
 		ts, _, _ := strings.Cut(l, " ")
 		t, err := time.Parse(time.RFC3339Nano, ts)
-		if err != nil || t.Before(startedAt) {
+		if err != nil || false && t.Before(startedAt) {
 			continue
 		}
 		out = append(out, l)
