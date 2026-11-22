@@ -3501,6 +3501,73 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The watchdog's kiosk.service restart is bounded (i1153): run for real
+    /// against a fake systemctl whose start job stays queued for ever, it
+    /// restarts with --no-block, polls the job exactly RESTART_BOUND times,
+    /// gives up and names the unit the job waits behind. The same case as
+    /// tests/test_kiosk_watchdog_bounded_restart.py, from the script as the
+    /// crate ships it, so a change under noo-cli/ alone is checked here too.
+    #[test]
+    fn the_watchdog_restart_gives_up_at_the_bound_and_names_the_blocker() {
+        use std::os::unix::fs::PermissionsExt as _;
+        if !cfg!(target_os = "linux") { return; }
+        // The functions, from the bound to the first line that uses them.
+        let start = WATCHDOG.find("RESTART_BOUND=").expect("the watchdog bounds its restart");
+        let end = WATCHDOG.find("if ! as_kiosk noo-kiosk-cdp probe").expect("the watchdog probes CDP");
+        assert!(start < end, "the restart is defined before the probe");
+        let funcs = &WATCHDOG[start..end];
+        let dir = std::env::temp_dir().join(format!("noo-wd-restart-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let log = dir.join("systemctl.log");
+        let exe = |name: &str, body: &str| {
+            let p = bin.join(name);
+            std::fs::write(&p, format!("#!/bin/sh\n{body}")).unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        // A start job (7) that never finishes, queued behind plymouth-quit-wait.
+        // Past 200 polls it reports none, so an unbounded loop ends (red: 200
+        // polls, rc=0) instead of hanging the test run: Command has no timeout.
+        exe(
+            "systemctl",
+            &format!(
+                "echo \"$*\" >> {log}\n\
+                 case \"$*\" in\n\
+                 \x20 \"show -p Job --value kiosk.service\") [ \"$(grep -c '^show -p Job' {log})\" -gt 200 ] || echo 7 ;;\n\
+                 \x20 \"show -p After --value kiosk.service\") echo \"systemd-user-sessions.service plymouth-quit-wait.service kiosk-serve.service\" ;;\n\
+                 \x20 \"list-jobs --no-legend --full --no-pager\") printf '%s\\n' \"7 kiosk.service start waiting\" \"3 plymouth-quit-wait.service start running\" \"9 other.service start running\" ;;\n\
+                 esac\n\
+                 exit 0\n",
+                log = log.display()
+            ),
+        );
+        exe("sleep", "exit 0\n");
+        let script = format!("fail() {{ echo \"FAIL: $1\"; }}\n{funcs}restart_kiosk_bounded; echo \"rc=$?\"\n");
+        let out = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(&script)
+            .env_clear()
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(stdout.contains("rc=1"), "a start job queued for ever is given up on: {stdout} / {}", String::from_utf8_lossy(&out.stderr));
+        assert!(
+            stdout.contains("FAIL: kiosk.service did not start within 60 s: a start job is queued behind plymouth-quit-wait.service"),
+            "the give-up names the blocker: {stdout}"
+        );
+        let calls = std::fs::read_to_string(&log).unwrap();
+        let calls: Vec<&str> = calls.lines().collect();
+        assert_eq!(calls.first().copied(), Some("restart kiosk.service --no-block"), "{calls:?}");
+        assert_eq!(
+            calls.iter().filter(|c| **c == "show -p Job --value kiosk.service").count(),
+            60,
+            "bounded: 60 polls, no more"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn watchdog_ticks_every_minute_as_a_oneshot() {
         assert!(render_watchdog_timer().contains("OnUnitActiveSec=60s"));
