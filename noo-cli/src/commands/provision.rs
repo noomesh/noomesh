@@ -949,7 +949,7 @@ pub(crate) fn carry_for(
         if a.is_empty() || a.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback()) {
             continue;
         }
-        if want.iter().any(|w| w.eq_ignore_ascii_case(a)) || out.iter().any(|o| o.eq_ignore_ascii_case(a)) {
+        if out.iter().any(|o| o.eq_ignore_ascii_case(a)) {
             continue;
         }
         if !dialed.iter().any(|d| d.eq_ignore_ascii_case(a)) {
