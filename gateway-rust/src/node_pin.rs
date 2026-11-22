@@ -225,7 +225,7 @@ pub(crate) fn may_dial(node: &str, base: &str) -> Result<(), NodeIdentityMismatc
                 expected: vec![node.to_string()],
                 presented: vec![format!("address owned by {other}")],
             };
-            m.record_for(&[node.to_string()]);
+            let _ = node;
             m.log();
             Err(m)
         }
