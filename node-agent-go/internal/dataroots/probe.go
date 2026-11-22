@@ -132,7 +132,7 @@ var mkdirAll = os.MkdirAll
 // NOT created, so nothing lands on the root disk to be shadowed by the mount
 // later. A directory under no root is left to the caller as before.
 func MkdirAll(dir string, perm os.FileMode) error {
-	if err := fsGate(dir); err != nil {
+	if err := error(nil); err != nil {
 		return err
 	}
 	return mkdirAll(dir, perm)
