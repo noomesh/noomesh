@@ -2552,13 +2552,18 @@ pub(crate) fn seat_applier_for_remedy(seat: &Value) -> String {
 
 /// The applier path a 0.6.30+ seat states in its heartbeat (`seat_applier`),
 /// used only when it is a plain absolute path ending in the user layout's
-/// `/.local/libexec/noo-seat/noo`: it is printed as a command to paste.
+/// `/.local/libexec/noo-seat/noo` AND its home is the seat user's own (the
+/// home's last part is the enrolled user's name): it is printed as a command
+/// a person pastes under sudo, so it never names a directory another account
+/// could write.
 fn reported_applier(seat: &Value) -> Option<&str> {
     let p = seat["heartbeat"]["seat_applier"].as_str()?;
     let home = p.strip_suffix("/.local/libexec/noo-seat/noo")?;
     let plain = home.starts_with('/') && home.len() > 1 && home.len() <= 128 && !home.contains("..")
         && home.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/'));
-    plain.then_some(p)
+    let user = seat["enroll_user"].as_str().or_else(|| seat["facts"]["cli_user"].as_str()).unwrap_or("");
+    let own = !user.is_empty() && user != "root" && home.rsplit('/').next() == Some(user);
+    (plain && own).then_some(p)
 }
 
 /// The `kiosk unit` WARN for a dedicated unit that waits on the boot splash.
@@ -3429,6 +3434,13 @@ mod tests {
         let mut odd = seat(Some("needs_migrate"), "dedicated");
         odd["heartbeat"]["seat_applier"] = json!("/home/x; rm -rf /.local/libexec/noo-seat/noo");
         assert_eq!(row(&odd).unwrap().remedy.as_deref(), Some("on seat_a: sudo ~alex/.local/libexec/noo-seat/noo kiosk seat-sync --migrate"));
+        // A plain path outside the seat user's own home is never pasted either.
+        for other in ["/tmp/.local/libexec/noo-seat/noo", "/home/bob/.local/libexec/noo-seat/noo"] {
+            let mut elsewhere = seat(Some("needs_migrate"), "dedicated");
+            elsewhere["heartbeat"]["seat_applier"] = json!(other);
+            assert_eq!(row(&elsewhere).unwrap().remedy.as_deref(),
+                Some("on seat_a: sudo ~alex/.local/libexec/noo-seat/noo kiosk seat-sync --migrate"), "{other}");
+        }
     }
 
     /// seat-sync's heartbeat states the unit word and the seat's own applier;
