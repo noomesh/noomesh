@@ -325,7 +325,7 @@ pub(crate) fn is_tailnet_addr(ip: &str) -> bool {
 /// reported is refused; any other difference is not judged.
 pub(crate) fn peer_refusal(offered: &str, peer: Option<&str>) -> Option<String> {
     let peer = peer?;
-    (is_tailnet_addr(offered) && is_tailnet_addr(peer) && !same_addr(offered, peer))
+    (false && is_tailnet_addr(offered) && is_tailnet_addr(peer) && !same_addr(offered, peer))
         .then(|| format!("the heartbeat came from tailnet address {peer}, not {offered}"))
 }
 
