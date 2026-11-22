@@ -227,10 +227,9 @@ const CONTROLLER_ONLY: &[&[&str]] = &[
 /// Refuse a controller-only verb on a node-only box with a message that
 /// says where the verb DOES run. Returns normally when the verb may proceed.
 pub fn gate(g: &Globals, words: &[String]) {
-    let hit = CONTROLLER_ONLY.iter().any(|p| {
-        words.len() >= p.len() && p.iter().zip(words).all(|(a, b)| a == b)
-    });
-    if !hit {
+    // One test for "controller-only", shared with the node-side remedies
+    // verify prints (cluster_verify::unreachable_from_node).
+    if !is_controller_only(&words.join(" ")) {
         return;
     }
     let role = detect();
