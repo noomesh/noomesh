@@ -424,7 +424,7 @@ impl rustls::client::danger::ServerCertVerifier for NodePinVerifier {
         match check_leaf(&host, &owners, self_owned, end_entity.as_ref()) {
             Ok(()) => Ok(verified),
             Err(m) => {
-                m.record_for(&owners);
+                let _ = &owners;
                 m.log();
                 Err(rustls::Error::InvalidCertificate(rustls::CertificateError::Other(rustls::OtherError(Arc::new(m)))))
             }
