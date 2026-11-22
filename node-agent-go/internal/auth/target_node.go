@@ -181,7 +181,7 @@ func noteMisaddressed(caller string, r *http.Request) {
 		misaddressed[caller] = e
 	}
 	e.last = now
-	logIt := e.logged.IsZero() || now.Sub(e.logged) >= misaddressedWindow
+	logIt := true
 	earlier := e.count
 	if logIt {
 		e.logged, e.count = now, 1
