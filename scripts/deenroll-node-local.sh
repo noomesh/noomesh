@@ -134,6 +134,10 @@ rm -f /etc/systemd/system/noo-fetch.service /etc/systemd/system/noo-fetch.timer 
 # The start-timeout drop-in noo-apply writes (its fetch_unit_timeout block).
 rm -f /etc/systemd/system/noo-fetch.service.d/10-timeout.conf
 rmdir /etc/systemd/system/noo-fetch.service.d 2>/dev/null || true
+# The bounds drop-in noo-apply writes for a controller's add-on boot unit (its
+# addons_unit_bounds block).
+rm -f /etc/systemd/system/noo-addons-after-boot.service.d/10-bounds.conf
+rmdir /etc/systemd/system/noo-addons-after-boot.service.d 2>/dev/null || true
 systemctl daemon-reload
 say "noo-fetch loop disarmed + removed"
 rm -rf /etc/noo /var/lib/noo-node-agent
