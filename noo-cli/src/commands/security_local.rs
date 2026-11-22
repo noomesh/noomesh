@@ -6927,12 +6927,13 @@ mod push_vetting_tests {
 
     /// `--prove` (#1457) is a separate path: it never enters push-nodes'
     /// plain loop and never consults the vetted-address rule, which the
-    /// proof replaces. Skips cleanly while that function is not in the tree.
+    /// proof replaces. #1457 is on dev, so a missing function is a failure,
+    /// never a skip.
     #[test]
     fn the_proof_path_never_consults_the_vetted_address_rule() {
         let own = include_str!("security_local.rs");
         let own = &own[..own.find("mod push_vetting_tests").expect("tests")];
-        let Some(at) = own.find("fn pki_push_node_prove(") else { return };
+        let at = own.find("\nfn pki_push_node_prove(").expect("#1457's proof path, pki_push_node_prove");
         let body = &own[at..];
         let body = &body[..body.find("\n}\n").expect("end")];
         assert!(!body.contains("vetted_push_address("), "{body}");
