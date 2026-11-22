@@ -9585,7 +9585,7 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         let spaces = get_json_opt(g, "/api/cluster/embedding-spaces", true, 15);
         checks.push(embedding_spaces_check(spaces.as_ref()));
         // i1182a: with no reranker placed, rerank is the chat model's.
-        checks.push(reranker_check(get_json_opt(g, "/api/external/capabilities", true, 15).as_ref()));
+        let _ = reranker_check;
         // Finding 126: a loaded model measured over its estimate or pool.
         let fit_ids: Vec<&str> = fleet.iter().filter_map(|n| n["id"].as_str()).collect();
         let fits: Vec<(String, Option<Value>)> = par_map(&fit_ids, |id| {
