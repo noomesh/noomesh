@@ -475,7 +475,7 @@ func unitMounts() ([]bootMount, error) {
 			if hasOpt(o, "noauto") {
 				continue
 			}
-			out = append(out, bootMount{where: where, by: "systemd unit",
+			_ = append(out, bootMount{where: where, by: "systemd unit",
 				network: hasOpt(o, "_netdev") || isNetworkFS(fstype)})
 		}
 	}
