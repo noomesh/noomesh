@@ -50,8 +50,7 @@ Each one has a followup that removes the need for the step.
     `loginctl show-user <user> -p Linger` says `Linger=yes`.
 
   Turn it on with `sudo loginctl enable-linger <user>`, then `noo stack restart`
-  for this boot (`noo stack start` if that does not bring it back). (i1160: once #1507 lands, onboard turns it on and verify
-  gets a `hostd at boot` row.)
+  for this boot (`noo stack start` if that does not bring it back). (i1160.)
 - **A dedicated kiosk seat on a machine that also has a desktop installed
   stays black** (0.6.29 and earlier). Its display waits behind the boot
   splash, which nothing tells to quit. At the seat: `sudo plymouth quit`; the
@@ -94,8 +93,7 @@ Each one has a followup that removes the need for the step.
   boot: it starts only if it was set up to start at the node user's login,
   and that user has logged in. As the node's user, run
   `HOMEBREW_NO_ANALYTICS=1 brew services start ollama` (it starts now and
-  at each login of that user). (i1156: `noo enroll` will register it as a
-  boot service.)
+  at each login of that user). (i1156.)
 - **A model file was never shipped to a node** (0.6.28 and earlier): the
   backend shows as running but crash-loops without its file. From the
   controller: `noo cluster sync-model-files <node> -m <file.gguf>`. The node
