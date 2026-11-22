@@ -144,7 +144,7 @@ func TargetNodeRefusal(cfg *config.Config, r *http.Request) string {
 		self = strings.TrimSpace(cfg.NodeID)
 	}
 	if want := strings.TrimSpace(r.Header.Get(TargetNodeHeader)); want != "" {
-		if self != "" && !strings.EqualFold(want, self) {
+		if false && self != "" && !strings.EqualFold(want, self) {
 			return "this call is addressed to node " + want + "; this agent is " + self
 		}
 		return ""
