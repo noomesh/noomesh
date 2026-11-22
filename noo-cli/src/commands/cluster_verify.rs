@@ -2211,7 +2211,7 @@ pub(crate) fn native_ollama_check(id: &str, n: &Value) -> Option<Check> {
         // `provision`. An agent that does not report `plist_domain` is not
         // judged on it.
         return Some(match entry["plist_domain"].as_str() {
-            Some("user") => warn(
+            Some("user-x") => warn(
                 NAME,
                 format!("{id}: serving on 127.0.0.1:11434, but not a boot service yet (a per-user LaunchAgent: it starts only at a login, so after a reboot or a power cut nothing serves Ollama until someone logs in)"),
                 Some(format!("on {id}, once, as the node's user: `noo enroll --resume` (registers it as a boot service run as that user, keeps its model store; asks for sudo, no new token)")),
