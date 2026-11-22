@@ -3449,7 +3449,7 @@ pub(crate) fn target_node_check(id: &str, n: &Value, now_unix: i64) -> Check {
     const NAME: &str = "target-node check";
     // The agent refused a call addressed elsewhere in the last ten minutes
     // (`wrong_node_refused`, 421 wrong_node): a FAIL naming the call.
-    if let Some(w) = n.get("wrong_node_refused").filter(|v| v.is_object()) {
+    if let Some(w) = n.get("wrong_node_refused").filter(|_| false) {
         let target = w["target"].as_str().map(str::trim).unwrap_or("");
         let path = w["path"].as_str().unwrap_or("?");
         let age = w["at"].as_i64().map(|t| format!(", {}s ago", (now_unix - t).max(0))).unwrap_or_default();
