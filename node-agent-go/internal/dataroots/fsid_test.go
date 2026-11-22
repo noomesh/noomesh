@@ -22,6 +22,9 @@ func TestMain(m *testing.M) {
 		panic(err)
 	}
 	os.Setenv("NOO_AGENT_STATE", dir)
+	// A late legacy root is adopted only from a record; no test reads the
+	// machine's own (a real /data/noo on a dev box would be recorded).
+	legacyRecorded = func(string) bool { return false }
 	code := m.Run()
 	os.RemoveAll(dir)
 	os.Exit(code)
@@ -58,17 +61,20 @@ func fakeFSCheck(t *testing.T) (*fakeDisk, *int) {
 	calls := 0
 	prevID, prevOS, prevEval, prevStat, prevRec, prevFstab, prevMk :=
 		fsIdentity, fsCheckOS, fsEvalPath, fsStatDir, recordPath, fstabPath, mkdirAll
-	prevUnits, prevMI, prevTrig, prevCount := mountUnitGlobs, mountinfoPath, automountTrigger, countEntries
+	prevUnits, prevMI, prevTrig, prevCount := mountUnitDirs, mountinfoPath, automountTrigger, countEntries
 	fsIdentity, fsCheckOS = disk.identity, "linux"
 	fsEvalPath = func(p string) (string, error) { return p, nil }
 	fsStatDir = func(string) bool { return true }
 	recordPath = func() string { return filepath.Join(dir, RecordFileName) }
-	fstabPath = filepath.Join(dir, "no-fstab")
+	fstabPath = filepath.Join(dir, "fstab")
+	if err := os.WriteFile(fstabPath, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
 	unitDir := filepath.Join(dir, "units")
 	if err := os.Mkdir(unitDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	mountUnitGlobs = []string{filepath.Join(unitDir, "*.mount"), filepath.Join(unitDir, "*.automount")}
+	mountUnitDirs = func() []string { return []string{unitDir} }
 	mountinfoPath = filepath.Join(dir, "no-mountinfo")
 	automountTrigger = func(string) {}
 	countEntries = func(string) (int, bool) { return 0, false }
@@ -77,23 +83,52 @@ func fakeFSCheck(t *testing.T) (*fakeDisk, *int) {
 	t.Cleanup(func() {
 		fsIdentity, fsCheckOS, fsEvalPath, fsStatDir, recordPath, fstabPath, mkdirAll =
 			prevID, prevOS, prevEval, prevStat, prevRec, prevFstab, prevMk
-		mountUnitGlobs, mountinfoPath, automountTrigger, countEntries = prevUnits, prevMI, prevTrig, prevCount
+		mountUnitDirs, mountinfoPath, automountTrigger, countEntries = prevUnits, prevMI, prevTrig, prevCount
 		resetRecordCache()
 	})
 	t.Setenv("NOO_DATA_ROOT", "/data/noo")
 	t.Setenv(PolicyEnv, "")
+	resetRecordCache()
 	for _, k := range []string{"HF_CACHE_DIR", "MODELS_DIR", "OLLAMA_DATA_DIR"} {
 		t.Setenv(k, "")
 	}
 	return disk, &calls
 }
 
-// writeUnit writes a systemd unit into the fake unit directory.
+// writeUnit writes a systemd unit into the fake unit directory and enables
+// it (a link in local-fs.target.wants, as `systemctl enable` makes).
 func writeUnit(t *testing.T, name, body string) {
 	t.Helper()
-	dir := filepath.Dir(mountUnitGlobs[0])
-	if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
+	writeUnitOnly(t, name, body)
+	dir := mountUnitDirs()[0]
+	wants := filepath.Join(dir, "local-fs.target.wants")
+	if err := os.MkdirAll(wants, 0o755); err != nil {
 		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(dir, name), filepath.Join(wants, name)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// writeUnitOnly writes a unit without enabling it.
+func writeUnitOnly(t *testing.T, name, body string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(mountUnitDirs()[0], name), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// allCodes: every root path (the data root and its three stores) reports
+// exactly want.
+func allCodes(t *testing.T, r Roots, c []string, want string) {
+	t.Helper()
+	if len(c) != len(fsPaths(r)) {
+		t.Fatalf("want %s on each of %d paths, got %v", want, len(fsPaths(r)), c)
+	}
+	for _, code := range c {
+		if code != want {
+			t.Fatalf("want %s, got %v", want, c)
+		}
 	}
 }
 
@@ -205,9 +240,7 @@ func TestAnFstabMountThatIsNotThereIsRefused(t *testing.T) {
 	disk, calls := fakeFSCheck(t)
 	writeFstab(t, "# x\nUUID=u-root / ext4 defaults 0 1\nUUID=u-data /data ext4 defaults,nofail 0 2\n/swapfile none swap sw 0 0\n")
 	r := Resolve(os.Getenv)
-	if c := fsCodes(r); len(c) != 1 || c[0] != "mount_missing" {
-		t.Fatalf("got %v", c)
-	}
+	allCodes(t, r, fsCodes(r), "mount_missing")
 	if err := MkdirAll("/data/noo/models", 0o755); err == nil || *calls != 0 {
 		t.Fatalf("fstab mount absent: %v, %d calls", err, *calls)
 	}
@@ -244,9 +277,7 @@ func TestAMountUnitThatIsNotThereIsRefused(t *testing.T) {
 	disk, _ := fakeFSCheck(t)
 	writeUnit(t, "data.mount", "[Unit]\nDescription=data\n\n[Mount]\nWhat=/dev/disk/by-uuid/u-data\nWhere=/data\nType=ext4\nOptions=defaults\n")
 	r := Resolve(os.Getenv)
-	if c := fsCodes(r); len(c) != 1 || c[0] != "mount_missing" {
-		t.Fatalf("got %v", c)
-	}
+	allCodes(t, r, fsCodes(r), "mount_missing")
 	if recorded("/data/noo") {
 		t.Fatal("recorded the root filesystem under a mount unit")
 	}
@@ -268,11 +299,11 @@ func TestAMountUnitIsReadByItsName(t *testing.T) {
 	_, _ = fakeFSCheck(t)
 	writeUnit(t, "data.mount", "[Mount]\nWhat=/dev/sdb1\nType=ext4\n")
 	writeUnit(t, "srv.mount", "[Mount]\nWhat=/dev/sdc1\nWhere=/srv\nOptions=noauto\n")
-	if m := bootMountFor("/data/noo"); m.where != "/data" || m.by != "systemd unit" {
-		t.Fatalf("by name: %+v", m)
+	if m, err := bootMountFor("/data/noo"); err != nil || m.where != "/data" || m.by != "systemd unit" {
+		t.Fatalf("by name: %+v %v", m, err)
 	}
-	if m := bootMountFor("/srv/noo"); m.where != "" {
-		t.Fatalf("a noauto unit counted: %+v", m)
+	if m, err := bootMountFor("/srv/noo"); err != nil || m.where != "" {
+		t.Fatalf("a noauto unit counted: %+v %v", m, err)
 	}
 }
 
@@ -320,12 +351,11 @@ func TestAHungAutomountIsNotAnswering(t *testing.T) {
 		ProbeTimeout = prev
 	})
 	got := make(chan []string, 1)
-	go func() { got <- fsCodes(Resolve(os.Getenv)) }()
+	r := Resolve(os.Getenv)
+	go func() { got <- fsCodes(r) }()
 	select {
 	case c := <-got:
-		if len(c) != 1 || c[0] != "not_answering" {
-			t.Fatalf("a hung automount: %v", c)
-		}
+		allCodes(t, r, c, "not_answering")
 	case <-time.After(3 * time.Second):
 		t.Fatal("a hung automount held the check past the bound")
 	}
@@ -342,7 +372,7 @@ func TestALateNetworkMountClearsByItself(t *testing.T) {
 	t.Cleanup(func() { slog.SetDefault(prevLog) })
 	r := Resolve(os.Getenv)
 	f := checkFilesystems(r)
-	if len(f) != 1 || f[0].Code != "mount_missing" || !strings.Contains(f[0].Detail, "network mount") {
+	if len(f) != len(fsPaths(r)) || f[0].Code != "mount_missing" || !strings.Contains(f[0].Detail, "network mount") {
 		t.Fatalf("at start: %+v", f)
 	}
 	if err := MkdirAll("/data/noo/models", 0o755); err == nil || *calls != 0 {
@@ -446,7 +476,7 @@ func TestARecordedDiskNowOnTheRootFilesystemIsRefused(t *testing.T) {
 	_ = checkFilesystems(r)
 	disk.mounted = false
 	f := checkFilesystems(r)
-	if len(f) != 1 || f[0].Code != "not_on_recorded_fs" || !strings.Contains(f[0].Detail, "the ROOT filesystem") {
+	if len(f) != len(fsPaths(r)) || f[0].Code != "not_on_recorded_fs" || !strings.Contains(f[0].Detail, "the ROOT filesystem") {
 		t.Fatalf("%+v", f)
 	}
 }
@@ -460,12 +490,98 @@ func TestADifferentDiskIsRefused(t *testing.T) {
 	_ = checkFilesystems(r)
 	disk.other = true
 	f := checkFilesystems(r)
-	if len(f) != 1 || f[0].Code != "not_on_recorded_fs" || !strings.Contains(f[0].Detail, "on a different filesystem") {
+	if len(f) != len(fsPaths(r)) || f[0].Code != "not_on_recorded_fs" || !strings.Contains(f[0].Detail, "on a different filesystem") {
 		t.Fatalf("%+v", f)
 	}
 	b, _ := os.ReadFile(recordPath())
 	if !strings.Contains(string(b), `"uuid": "u-data"`) {
 		t.Fatalf("a different disk was recorded: %s", b)
+	}
+}
+
+// A unit that is not enabled, and a masked one (a link to /dev/null, the
+// hosted runner's tmp.mount), are not boot-time mounts.
+func TestADisabledOrMaskedMountUnitDoesNotCount(t *testing.T) {
+	_, _ = fakeFSCheck(t)
+	writeUnitOnly(t, "data.mount", "[Mount]\nWhat=/dev/sdb1\nWhere=/data\nType=ext4\n")
+	dir := mountUnitDirs()[0]
+	if err := os.Symlink(os.DevNull, filepath.Join(dir, "srv.mount")); err != nil {
+		t.Fatal(err)
+	}
+	wants := filepath.Join(dir, "local-fs.target.wants")
+	if err := os.MkdirAll(wants, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(dir, "srv.mount"), filepath.Join(wants, "srv.mount")); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{"/data/noo", "/srv/noo"} {
+		if m, err := bootMountFor(p); err != nil || m.where != "" {
+			t.Fatalf("%s: a disabled or masked unit counted: %+v %v", p, m, err)
+		}
+	}
+	r := Resolve(os.Getenv)
+	if c := fsCodes(r); len(c) != 0 {
+		t.Fatalf("%v", c)
+	}
+}
+
+// "Cannot tell" never refuses: an unreadable mount table, even with a
+// record, is reported as not checked.
+func TestAnUnreadableMountTableIsNotChecked(t *testing.T) {
+	disk, calls := fakeFSCheck(t)
+	disk.mounted = true
+	r := Resolve(os.Getenv)
+	_ = checkFilesystems(r) // recorded on its disk
+	fsIdentity = readFSIdentity
+	mountinfoPath = filepath.Join(t.TempDir(), "absent")
+	if c := fsCodes(r); len(c) != 0 {
+		t.Fatalf("an unreadable mount table refused: %v", c)
+	}
+	if err := MkdirAll("/data/noo/models", 0o755); err != nil || *calls != 1 {
+		t.Fatalf("an unreadable mount table blocked a fetch: %v", err)
+	}
+	if why, _ := FilesystemReport(r)["not_checked"].(string); !strings.Contains(why, "cannot tell which filesystem holds /data/noo") {
+		t.Fatalf("not_checked = %q", why)
+	}
+	// Garbage is the same.
+	if err := os.WriteFile(mountinfoPath, []byte("garbage\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if c := fsCodes(r); len(c) != 0 {
+		t.Fatalf("an unparsable mount table refused: %v", c)
+	}
+}
+
+// An unreadable or unparsable fstab, and an unreadable unit directory: on the
+// root filesystem with nothing recorded, neither refused nor recorded.
+func TestUnreadableBootDeclarationsAreNotChecked(t *testing.T) {
+	for name, set := range map[string]func(t *testing.T){
+		"fstab missing": func(t *testing.T) { fstabPath = filepath.Join(t.TempDir(), "absent") },
+		"fstab garbage": func(t *testing.T) { writeFstab(t, "garbage\n") },
+		"unit dir": func(t *testing.T) {
+			d := filepath.Join(t.TempDir(), "absent")
+			mountUnitDirs = func() []string { return []string{d} }
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, calls := fakeFSCheck(t)
+			set(t)
+			r := Resolve(os.Getenv)
+			if c := fsCodes(r); len(c) != 0 {
+				t.Fatalf("cannot tell, refused: %v", c)
+			}
+			if recorded("/data/noo") {
+				t.Fatal("recorded a root on the root filesystem without its boot declarations")
+			}
+			if err := MkdirAll("/data/noo/models", 0o755); err != nil || *calls != 1 {
+				t.Fatalf("blocked a fetch: %v", err)
+			}
+			got := FilesystemReport(r)
+			if why, _ := got["not_checked"].(string); why == "" || got["meant"] != "unknown" {
+				t.Fatalf("report: %v", got)
+			}
+		})
 	}
 }
 

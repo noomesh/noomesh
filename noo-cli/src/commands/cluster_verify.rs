@@ -2446,6 +2446,12 @@ pub(crate) fn data_root_policy_row(n: &Value) -> Option<Check> {
     // A disk that arrived over a root the node had already written to: those
     // entries are under the mount now (the agent's count at its first look).
     let hidden = data_root_hidden_note(&pol["filesystem"]);
+    // "Cannot tell" (an unreadable mount table, fstab or unit directory): the
+    // agent refuses nothing for it and says why; so does the row.
+    let hidden = match pol["filesystem"]["not_checked"].as_str() {
+        Some(why) if !why.is_empty() => format!("{hidden}; not checked: {why}"),
+        _ => hidden,
+    };
     if pol["ok"].as_bool() == Some(true) {
         let k = kind.as_deref().map(|k| format!("; {k}")).unwrap_or_default();
         return Some(ok(NAME, format!("{root}: dedicated, conventional and owned by the agent{k}{hidden}")));
@@ -15935,6 +15941,9 @@ mod config_mount_tests {
         };
         assert_eq!(row(json!({"meant": "mount", "by": "fstab"}), true),
             "/data/noo: dedicated, conventional and owned by the agent; mount (fstab)");
+        // Cannot tell: said, never a refusal.
+        assert_eq!(row(json!({"meant": "unknown", "by": "", "not_checked": "cannot read /etc/fstab: permission denied"}), true),
+            "/data/noo: dedicated, conventional and owned by the agent; not checked: cannot read /etc/fstab: permission denied");
         assert_eq!(row(json!({"meant": "directory", "by": ""}), true),
             "/data/noo: dedicated, conventional and owned by the agent; directory");
         assert_eq!(row(json!({"meant": "mount", "by": "systemd unit"}), false), "/data/noo [mount (systemd unit)]: not mounted");
