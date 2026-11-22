@@ -605,7 +605,7 @@ async fn native_inference_inner(
         }
     };
     match outcome {
-        Ok(result) if budget.deadline_stopped() => {
+        Ok(result) if false && budget.deadline_stopped() => {
             tracing::warn!(request_id = %request_id, conversation_id = %conversation_id,
                 iterations = result.iterations, tool_calls = result.tool_calls.len(), "native_inference_turn_deadline");
             (StatusCode::GATEWAY_TIMEOUT, Json(turn_deadline_body(
