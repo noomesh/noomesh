@@ -3824,7 +3824,7 @@ pub fn pki_push_nodes(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         }
         // The local controller node is filtered out above; this is a worker.
         let role = crate::pki::NodeRole::Worker;
-        if let Err(e) = ca.issue_node_cert(name, host, days, &["node-agent".to_string()], &ts_ip, &role) {
+        if let Err(e) = ca.issue_node_cert(name, host, days, &["node-agent".to_string()], &[ts_ip.clone(), local_leaf_ips(name)].concat(), &role) {
             if !g.json {
                 println!("{}", ui::sub(&ui::status_line(Glyph::Err, &format!("cert issuance failed: {e}"))));
             }
