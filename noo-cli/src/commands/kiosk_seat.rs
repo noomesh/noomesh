@@ -2563,7 +2563,7 @@ fn reported_applier(seat: &Value) -> Option<&str> {
         && home.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/'));
     let user = seat["enroll_user"].as_str().or_else(|| seat["facts"]["cli_user"].as_str()).unwrap_or("");
     let own = !user.is_empty() && user != "root" && home.rsplit('/').next() == Some(user);
-    (plain && own).then_some(p)
+    plain.then_some(p)
 }
 
 /// The `kiosk unit` WARN for a dedicated unit that waits on the boot splash.
