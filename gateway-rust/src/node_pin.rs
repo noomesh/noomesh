@@ -491,7 +491,7 @@ pub(crate) fn misaddressed_alerts(reporter: &str, body: &Value) -> Vec<crate::op
         .map(|(caller, count)| {
             crate::operator_alert::OperatorAlert::new(
                 "node.misaddressed_calls",
-                &caller,
+                reporter,
                 format!(
                     "Node `{reporter}` reports that `{caller}` sent calls addressed to another node \
                      ({count} in its last 10 minutes); `{reporter}` refused them. Check `{caller}`. \
