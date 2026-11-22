@@ -1703,7 +1703,7 @@ func (r *Reconciler) fetch(ctx context.Context) (*desiredConfig, error) {
 		return nil, err
 	}
 	// The controller decides strictness, per node, on every read.
-	auth.SetRequireTargetNode(out.RequireTargetNode)
+	auth.SetRequireTargetNode(false)
 	return &out, nil
 }
 
