@@ -2,6 +2,8 @@ package docker
 
 import (
 	"bytes"
+	"context"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -155,4 +157,82 @@ func between(s, open, close string) (string, bool) {
 	}
 	v, _, ok := strings.Cut(rest, close)
 	return v, ok
+}
+
+// i1225, the offload watch: a judging read keeps only this start's lines.
+// The NUL fixture's forward read returns an EARLIER run's lines, here one
+// saying the model ran on the CPU; none of them may reach a verdict.
+func TestAJudgingReadKeepsOnlyThisStartsLines(t *testing.T) {
+	old := []string{
+		"2026-11-22T16:20:01.000000000Z load_tensors: offloaded 0/33 layers to GPU",
+		"2026-11-22T16:20:09.000000000Z main: model loaded",
+	}
+	var file bytes.Buffer
+	for _, l := range old {
+		ts, msg, _ := strings.Cut(l, " ")
+		file.WriteString(`{"log":"` + msg + `\n","stream":"stdout","time":"` + ts + `"}` + "\n")
+	}
+	file.Write(make([]byte, 4096))
+	forward := readJSONFileLikeDocker(file.Bytes(), 0)
+	if len(forward) != 2 {
+		t.Fatalf("fixture: forward read %d lines", len(forward))
+	}
+	if got := linesSinceStart(forward, started); len(got) != 0 {
+		t.Fatalf("an earlier run's lines must not be judged: %q", got)
+	}
+	// Unfiltered, those lines are a CPU verdict: the false class this guards.
+	if r, _ := llamacppOffloadVerdict("llamacpp", "m.gguf", parseLlamacppStartLog(forward), false, now); r.State != offloadCPU {
+		t.Fatalf("fixture: the old lines should read as cpu unfiltered, got %q", r.State)
+	}
+	mixed := append(append([]string{}, forward...), after...)
+	if got := linesSinceStart(mixed, started); len(got) != len(after) {
+		t.Fatalf("this start's lines are kept: %q", got)
+	}
+	if got := linesSinceStart(mixed, time.Time{}); len(got) != 0 {
+		t.Fatalf("an unknown start keeps nothing: %q", got)
+	}
+}
+
+// When Docker cannot return this start's lines, the watch ends NOT CHECKED
+// with that reason, never cpu, and nvidia-smi (the primary signal) can
+// still say gpu.
+func TestAnUnreadableLogEndsNotCheckedWithItsReason(t *testing.T) {
+	saveI, saveT := offloadWatchInterval, offloadWatchTimeout
+	t.Cleanup(func() { offloadWatchInterval, offloadWatchTimeout = saveI, saveT })
+	offloadWatchInterval, offloadWatchTimeout = time.Millisecond, 5*time.Millisecond
+	fetch := func(context.Context) ([]string, error) { return []string{}, errLogUnreadable }
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	gen := beginLlamacppOffload("llamacpp", "m.gguf", true, now)
+	watchLlamacppOffload(ctx, gen, "llamacpp", "m.gguf", fetch, nil)
+	rep, _ := LlamacppOffloadReport().([]LlamacppOffload)
+	if len(rep) != 1 || rep[0].State != offloadUnknown || rep[0].Cause != LlamacppCauseLogUnreadable || LlamacppOffloadWarns(rep[0]) {
+		t.Fatalf("report=%+v", rep)
+	}
+
+	gen = beginLlamacppOffload("llamacpp", "m.gguf", true, now)
+	watchLlamacppOffload(ctx, gen, "llamacpp", "m.gguf", fetch, func(context.Context) (int, bool) { return 5120, true })
+	rep, _ = LlamacppOffloadReport().([]LlamacppOffload)
+	if len(rep) != 1 || rep[0].State != offloadGPU {
+		t.Fatalf("nvidia-smi stays the primary signal: report=%+v", rep)
+	}
+	beginLlamacppOffload("llamacpp", "", false, now)
+}
+
+// The offload watch is the agent's log-derived verdict: it must read through
+// the since-start helper, never the display read.
+func TestTheOffloadWatchReadsOnlyThisStart(t *testing.T) {
+	src, err := os.ReadFile("llamacpp_offload.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, body, ok := strings.Cut(string(src), "func (c *Client) startLlamacppOffloadWatch(")
+	if !ok {
+		t.Fatal("startLlamacppOffloadWatch not found")
+	}
+	body, _, _ = strings.Cut(body, "\n}\n")
+	if !strings.Contains(body, "c.ContainerLogsSinceStart(") || strings.Contains(body, "c.ContainerLogs(") {
+		t.Fatal("the offload watch must fetch with ContainerLogsSinceStart, not ContainerLogs")
+	}
 }
