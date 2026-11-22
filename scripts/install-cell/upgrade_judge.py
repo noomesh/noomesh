@@ -517,6 +517,52 @@ def judge_apply_line(log, before, after, labels, target, same_tag, images=None):
         rule, len(rec), len(kept), len(created), tail, got["line"])
 
 
+def recreate_supported(target):
+    """True when the target CLI takes --recreate and prints the apply line (>= APPLY_LINE_SINCE)."""
+    ver = target_version(target or "")
+    return ver is not None and ver >= APPLY_LINE_SINCE
+
+
+def judge_forced_recreate(log, before, after, target):
+    """K4 (noomesh #1470 case 4, second half): a same-tag `noo upgrade --stack --recreate`
+    recreates EVERY container. (verdict, why) from the step's log and the k4.before/k4.after
+    recreated.py snapshots. PASS: every service's ids changed, the line is the forced form
+    and its recreated set is the services whose ids changed."""
+    target = target or ""
+    if not recreate_supported(target):
+        return "NOTE", ("the build under test (%s) predates --recreate (noomesh #1470, %s onward): "
+                        "the forced re-apply was not run, so nothing is judged"
+                        % (target.strip() or "unknown", ".".join(map(str, APPLY_LINE_SINCE))))
+    if log is None or not before or not after:
+        return "NOT REACHED", "no --recreate re-apply or no container-id snapshot %s it" % (
+            "before" if log is not None and not before else "after")
+    got = parse_apply_line(log)
+    if got is None:
+        return "FAIL", ("the --recreate re-apply printed no 'N recreated (…), M kept (…)' line although docker "
+                        "listed %d containers before and %d after" % (len(before), len(after)))
+    b, a = by_service(before), by_service(after)
+    both = sorted(s for s in a if s in b)
+    rec = sorted(s for s in both if a[s] != b[s])
+    kept = sorted(s for s in both if a[s] == b[s])
+    strip = lambda n: n[4:] if n.startswith("noo-") else n  # noqa: E731
+    line_rec = sorted(n for n in (strip(x) for x in got["recreated"]) if n in both)
+    problems = []
+    if kept:
+        problems.append("kept its container id under --recreate: " + ", ".join(kept))
+    if not got["forced"]:
+        problems.append("the line is not the forced form (no '— --recreate: every container')")
+    if got["forced"] and got["kept"]:
+        problems.append("the forced line still lists kept: " + ", ".join(got["kept"]))
+    if line_rec != rec:
+        extra, miss = sorted(set(line_rec) - set(rec)), sorted(set(rec) - set(line_rec))
+        problems.append("line recreated != ids recreated%s%s" % (
+            "; line only: " + ", ".join(extra) if extra else "", "; ids only: " + ", ".join(miss) if miss else ""))
+    if problems:
+        return "FAIL", "%s; line: %s" % ("; ".join(problems), got["line"])
+    return "PASS", "same-tag --stack --recreate: all %d services have new ids, the line is the forced form and matches: %s" % (
+        len(rec), got["line"])
+
+
 K3_SKIP_WHY = ("case 5 waits for a real third-party digest bump in an rc: a signed-lock install refuses a digest "
                "override (scripts/lib-dist.sh dist_reassert_pins, called at scripts/noomesh-start.sh:504, drops every "
                "NOO_IMAGE_DIGEST_* and re-exports only the signed stack.lock's)")
@@ -775,6 +821,13 @@ def judge():
             # every recreated container is named, each with its reason line
             say("B4", verdict, line.split(": ", 1)[1] if ": " in line else line, 4000)
 
+    # ── K4: the same-tag --stack --recreate recreated every container ──
+    v_, why = judge_forced_recreate(
+        text(os.path.join(out, "logs", "upgrade-recreate.log")),
+        recreated._read_or_empty(os.path.join(j, "k4.before")),
+        recreated._read_or_empty(os.path.join(j, "k4.after")), text(os.path.join(j, "target")))
+    say("K4", v_, why, 4000)
+
     # ── general's rows, after both ──
     v = final or after
     hf = rows(v, "hf-cache hub owner", me)
@@ -888,7 +941,9 @@ if __name__ == "__main__":
         before(*a[1:])
     elif a[:1] == ["g2wait"] and len(a) in (4, 6):
         g2wait(*a[1:])
+    elif a[:1] == ["recreate-ok"] and len(a) == 2:
+        sys.exit(0 if recreate_supported(a[1]) else 1)
     elif a[:1] == ["judge"]:
         sys.exit(judge())
     else:
-        sys.exit("usage: upgrade_judge.py resolve OWNER/REPO TAG PREV TARGET [PREV_TAG] | before VERIFY SELF | g2wait OUT J SELF [INTERVAL BOUND] | judge")
+        sys.exit("usage: upgrade_judge.py resolve OWNER/REPO TAG PREV TARGET [PREV_TAG] | before VERIFY SELF | g2wait OUT J SELF [INTERVAL BOUND] | recreate-ok TARGET | judge")
