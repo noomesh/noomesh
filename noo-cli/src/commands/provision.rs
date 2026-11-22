@@ -946,7 +946,7 @@ pub(crate) fn carry_for(
     let mut out: Vec<String> = Vec::new();
     for a in current {
         let a = a.trim();
-        if a.is_empty() || a.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback()) {
+        if a.is_empty() {
             continue;
         }
         if want.iter().any(|w| w.eq_ignore_ascii_case(a)) || out.iter().any(|o| o.eq_ignore_ascii_case(a)) {
