@@ -63,6 +63,16 @@ import (
 // A late network mount (_netdev, nfs, cifs) is refused the same way and
 // clears by itself: every use re-checks, and the first check that finds it
 // mounted logs "data root <p> is mounted now; the refusal is cleared" once.
+//
+// Which way the filesystem changed matters. A root recorded on the ROOT
+// filesystem (a plain directory, or an empty mount point at the first look)
+// that is now on a different, non-root filesystem is the disk arriving: it
+// is accepted and re-recorded, with one log line. When the root held
+// entries at that first look, they are now hidden under the mount, and the
+// line and the heartbeat (data_roots.policy.filesystem.hidden_entries) say
+// so. A root recorded on its own disk that is now on the root filesystem
+// (the empty mount point), or on another non-root filesystem (a different
+// disk), is refused.
 
 // RecordFileName is the record's name inside the agent's state directory.
 const RecordFileName = "data-root-fs.json"
@@ -89,7 +99,18 @@ type fsRecord struct {
 	FSID
 	OnRootFS   bool   `json:"on_root_fs"`
 	RecordedAt string `json:"recorded_at"`
+	// Entries is the root's top-level entry count when it was recorded on
+	// the root filesystem (at most entryCap; Capped when there were more).
+	Entries int  `json:"entries,omitempty"`
+	Capped  bool `json:"entries_capped,omitempty"`
+	// Hidden is Entries carried over when a disk arrived over the root:
+	// what the node wrote there before is now under the mount.
+	Hidden       int  `json:"hidden_entries,omitempty"`
+	HiddenCapped bool `json:"hidden_capped,omitempty"`
 }
+
+// entryCap bounds the one readdir at the first look.
+const entryCap = 10000
 
 type fsRecordFile struct {
 	Roots map[string]fsRecord `json:"roots"`
@@ -123,6 +144,20 @@ var (
 			dir = "/var/lib/noo-node-agent"
 		}
 		return filepath.Join(dir, RecordFileName)
+	}
+	// countEntries is p's top-level entry count, capped at entryCap (one
+	// readdir, at the first look only; the callers run it bounded).
+	countEntries = func(p string) (int, bool) {
+		f, err := os.Open(p)
+		if err != nil {
+			return 0, false
+		}
+		defer f.Close()
+		names, _ := f.Readdirnames(entryCap + 1)
+		if len(names) > entryCap {
+			return entryCap, true
+		}
+		return len(names), false
 	}
 	// fsIdentity is the filesystem containing p and the root filesystem's
 	// device; the empty-mount-point tests replace it.
@@ -592,13 +627,24 @@ func checkFilesystems(r Roots) []fsFinding {
 		onRootFS := rootDev != "" && now.Dev == rootDev
 		if has {
 			if !sameFS(rec.FSID, now) {
-				what := ""
-				if onRootFS {
-					what = ": the ROOT filesystem, so its mount is not there"
+				// The safe direction: recorded on the root filesystem and now
+				// on its own disk. The disk arrived: accept and record it.
+				if rec.OnRootFS && !onRootFS && rootDev != "" && fsStatDir(p) {
+					next := fsRecord{FSID: now, Hidden: rec.Entries, HiddenCapped: rec.Capped}
+					if putRecord(p, next, false) {
+						logArrived(p, now, next)
+					}
+					continue
 				}
-				out = append(out, fsFinding{p, Problem{Code: "not_on_recorded_fs", Detail: fmt.Sprintf(
-					"%s is on %s%s, not its recorded %s; refusing backend starts and fetches into it until the mount is back (nothing is created)",
-					p, now, what, rec.FSID)}})
+				var detail string
+				if onRootFS {
+					detail = fmt.Sprintf("%s is on %s: the ROOT filesystem, so its mount is not there, not its recorded %s; "+
+						"refusing backend starts and fetches into it until the mount is back (nothing is created)", p, now, rec.FSID)
+				} else {
+					detail = fmt.Sprintf("%s is on a different filesystem, %s, not its recorded %s: another disk is mounted there; "+
+						"refusing backend starts and fetches into it until the recorded one is back (nothing is created)", p, now, rec.FSID)
+				}
+				out = append(out, fsFinding{p, Problem{Code: "not_on_recorded_fs", Detail: detail}})
 			}
 			continue
 		}
@@ -617,21 +663,64 @@ func checkFilesystems(r Roots) []fsFinding {
 		if rootDev == "" || !fsStatDir(p) {
 			continue
 		}
-		recordMu.Lock()
-		rf := loadRecordLocked()
-		if _, raced := rf.Roots[p]; !raced {
-			next := fsRecordFile{Roots: map[string]fsRecord{}}
-			for k, v := range rf.Roots {
-				next.Roots[k] = v
-			}
-			next.Roots[p] = fsRecord{FSID: now, OnRootFS: onRootFS, RecordedAt: time.Now().UTC().Format(time.RFC3339)}
-			writeRecordLocked(next)
-			slog.Info("data_root.filesystem_recorded", "path", p, "filesystem", now.String(), "file", recordPath())
+		first := fsRecord{FSID: now, OnRootFS: onRootFS}
+		if onRootFS {
+			first.Entries, first.Capped = countEntries(p)
 		}
-		recordMu.Unlock()
+		if putRecord(p, first, true) {
+			slog.Info("data_root.filesystem_recorded", "path", p, "filesystem", now.String(), "entries", first.Entries, "file", recordPath())
+		}
 	}
 	noteRefusals(paths, out)
 	return out
+}
+
+// putRecord writes p's entry (stamped now); onlyIfAbsent keeps an entry
+// another check wrote first. Reports whether it wrote.
+func putRecord(p string, rec fsRecord, onlyIfAbsent bool) bool {
+	recordMu.Lock()
+	defer recordMu.Unlock()
+	rf := loadRecordLocked()
+	if cur, has := rf.Roots[p]; has && (onlyIfAbsent || sameFS(cur.FSID, rec.FSID)) {
+		return false
+	}
+	next := fsRecordFile{Roots: map[string]fsRecord{}}
+	for k, v := range rf.Roots {
+		next.Roots[k] = v
+	}
+	rec.RecordedAt = time.Now().UTC().Format(time.RFC3339)
+	next.Roots[p] = rec
+	writeRecordLocked(next)
+	return true
+}
+
+// HiddenNote is what a person is told when a disk arrived over a root that
+// held n entries (capped: at least n): they are under the mount now.
+func HiddenNote(p string, n int, capped bool) string {
+	count := strconv.Itoa(n)
+	if capped {
+		count = "at least " + count
+	}
+	return fmt.Sprintf("the disk is now mounted at %s; %s files written before it was mounted are hidden under the mount point "+
+		"on the root filesystem: unmount to recover or remove them", p, count)
+}
+
+// arrivedLine is the one line logged when a root recorded on the root
+// filesystem is found on its own disk and re-recorded.
+func arrivedLine(p string, now FSID, rec fsRecord) string {
+	if rec.Hidden > 0 {
+		return fmt.Sprintf("data root %s is now on its own filesystem (%s, was on the root filesystem); recorded; %s",
+			p, now.Source, HiddenNote(p, rec.Hidden, rec.HiddenCapped))
+	}
+	return fmt.Sprintf("data root %s is now on its own filesystem (%s, was on the root filesystem); recorded", p, now.Source)
+}
+
+func logArrived(p string, now FSID, rec fsRecord) {
+	if rec.Hidden > 0 {
+		slog.Warn(arrivedLine(p, now, rec), "event", "data_root.filesystem_arrived", "path", p, "hidden_entries", rec.Hidden, "file", recordPath())
+		return
+	}
+	slog.Info(arrivedLine(p, now, rec), "event", "data_root.filesystem_arrived", "path", p, "file", recordPath())
 }
 
 // bootMountSource names where a boot mount is declared, for a detail.
@@ -651,6 +740,7 @@ func bootMountSource(bm bootMount) string {
 func FilesystemReport(r Roots) map[string]any {
 	p := filepath.Clean(strings.TrimSpace(r.NooDataRoot))
 	meant, by := "unknown", ""
+	hidden, hiddenCapped := 0, false
 	if fsCheckOS == "linux" {
 		resolved := p
 		if rp, err := fsEvalPath(p); err == nil && rp != "" {
@@ -659,6 +749,7 @@ func FilesystemReport(r Roots) map[string]any {
 		recordMu.Lock()
 		rec, has := loadRecordLocked().Roots[p]
 		recordMu.Unlock()
+		hidden, hiddenCapped = rec.Hidden, rec.HiddenCapped
 		switch bm := bootMountFor(resolved); {
 		case bm.where != "":
 			meant, by = "mount", bm.by
@@ -668,7 +759,12 @@ func FilesystemReport(r Roots) map[string]any {
 			meant = "directory"
 		}
 	}
-	return map[string]any{"meant": meant, "by": by, "recorded": recorded(p)}
+	out := map[string]any{"meant": meant, "by": by, "recorded": recorded(p)}
+	if hidden > 0 {
+		out["hidden_entries"] = hidden
+		out["hidden_capped"] = hiddenCapped
+	}
+	return out
 }
 
 // SetFSIdentityForTest replaces how a path's filesystem is read and turns the
