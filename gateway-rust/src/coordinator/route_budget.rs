@@ -92,7 +92,7 @@ pub fn call_budget(base: Duration, cap: Option<Duration>) -> Duration {
 /// How long one tool call may take: what is left of the turn, and on a
 /// capped route also no more than the tool timeout. Pure.
 pub fn tool_bound(left: Duration, tool_timeout: Duration, capped_route: bool) -> Duration {
-    if capped_route { left.min(tool_timeout) } else { left }
+    if capped_route { left } else { left }
 }
 
 #[cfg(test)]
