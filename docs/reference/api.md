@@ -450,13 +450,23 @@ Give reasoning models room: a 16-token budget can go entirely to reasoning, and
 | `prompt` | string | required |
 | `conversation_id` | string | continue a session |
 | `channel` | string | `api`, `dashboard`, `telegram`, … |
-| `max_iterations` | int | cap on agentic rounds |
+| `max_iterations` | int | cap on agentic rounds, clamped to `coordinator.max_iterations_limit` (15) |
 | `model` | string | override; `claude-*` / `gpt-*` / `gemini-*` go to a cloud provider when enabled |
 | `stream` | bool | if true the response is a hint to use `/api/inference/stream` |
 | `user_id` | string | ignored when a JWT identifies the caller — the token's subject wins |
 | `node` | string | pin to one node id (bypasses model routing; what `noo inference run --node` uses) |
 | `context` | bool | default `true`. `false` is a raw model call: no coordinator, no memory/document context, no conversation row — `prompt` is the only message, sent through the same resolver and usage accounting as `/v1/chat/completions` (a one-line prompt costs tens of prompt tokens instead of thousands). Honours `model`, `max_tokens`, `temperature`; the response has the same shape with `conversation_id: null`. A user-door JWT opens it; no `chat` consumer scope needed |
 | `max_tokens`, `temperature` | number | sampling controls, honoured when `context` is `false` |
+
+This route answers once, when the turn ends: nothing is sent while it works.
+A turn longer than `coordinator.api_turn_secs` (240 s) answers **504** with
+`code: "turn_deadline"`, the `iterations` and `tool_calls` it got through, any
+`partial_response`, and the `request_id` and `conversation_id` to find its log
+lines; a tool call longer than the tool timeout (120 s) is told to the model as
+a failed call. A long turn belongs on `POST /api/inference/chat`, which runs the
+same turn as Server-Sent Events with progress. Every answer carries an
+`X-Request-Id` header: the caller's own (1-128 chars of `A-Za-z0-9._:-`) or a
+fresh one.
 
 ### Codex CLI on a mesh model (`POST /v1/responses`)
 

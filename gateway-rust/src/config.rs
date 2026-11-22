@@ -403,6 +403,14 @@ pub struct CoordinatorConfig {
     /// Defaults to 12288 (16K context minus 4K output reserve).
     #[serde(default)]
     pub max_context_tokens: Option<u32>,
+    /// The longest one turn on the plain `POST /api/inference` may run before
+    /// it answers 504 (that route sends nothing until the turn ends; the
+    /// streaming routes are not bounded by this). i1178a.
+    #[serde(default = "default_api_turn_secs")]
+    pub api_turn_secs: u64,
+    /// The most tool-call rounds a request's `max_iterations` may ask for.
+    #[serde(default = "default_max_iterations_limit")]
+    pub max_iterations_limit: u32,
 }
 
 impl Default for CoordinatorConfig {
@@ -413,6 +421,8 @@ impl Default for CoordinatorConfig {
             max_session_messages: default_max_session_messages(),
             enabled: true,
             max_context_tokens: None,
+            api_turn_secs: default_api_turn_secs(),
+            max_iterations_limit: default_max_iterations_limit(),
         }
     }
 }
@@ -422,6 +432,8 @@ fn default_system_prompt() -> String {
      a knowledge base, and conversation memory.".into()
 }
 fn default_max_iterations() -> u32 { 10 }
+fn default_api_turn_secs() -> u64 { 240 }
+fn default_max_iterations_limit() -> u32 { 15 }
 fn default_max_session_messages() -> u32 { 20 }
 
 #[derive(Deserialize, Clone, Default)]

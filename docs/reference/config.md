@@ -200,6 +200,8 @@ writes the values that match the deployed profile.
 | `enabled` | `true` | |
 | `system_prompt` | `"You are Mesh, a helpful AI assistant …"` | |
 | `max_iterations` | `10` | tool-call rounds per turn |
+| `max_iterations_limit` | `15` | the most rounds a request's `max_iterations` may ask for (larger values are clamped) |
+| `api_turn_secs` | `240` | the longest one turn on the plain `POST /api/inference` may run before it answers `504` with `code: turn_deadline` (that route sends nothing until the turn ends; `/api/inference/chat` streams progress and is not bounded by this) |
 | `max_session_messages` | `20` | |
 | `max_context_tokens` | unset (12288 = 16K minus the 4K reserve) | input budget |
 
