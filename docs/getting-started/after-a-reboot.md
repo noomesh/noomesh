@@ -57,9 +57,11 @@ Each one has a followup that removes the need for the step.
   splash, which nothing tells to quit. At the seat: `sudo plymouth quit`; the
   display comes up at once. From 0.6.30 a NEW seat comes back after a reboot
   by itself. An EXISTING seat needs one command, once, on the seat, because
-  a seat runs nothing as root after it is enrolled: verify's `kiosk unit`
-  row for that seat shows it (`sudo <the seat's noo> kiosk seat-sync
-  --migrate`), or re-run kiosk setup. (i1153.)
+  a seat runs nothing as root after it is enrolled. On the seat, as the seat
+  user: `sudo ~/.local/libexec/noo-seat/noo kiosk seat-sync --migrate` (a
+  seat set up before 0.6.10: `sudo /usr/local/libexec/noo-seat/noo kiosk
+  seat-sync --migrate`), or re-run kiosk setup. Verify's `kiosk unit` row
+  for that seat warns until it is done. (i1153.)
 - **`noo stack start` failed with "image pull failed 3 times"** while the
   network was still coming up (0.6.29 and earlier): a start pulled images
   even when all of them were present. Run `noo stack restart` (it never
