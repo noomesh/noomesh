@@ -363,7 +363,7 @@ func fstabMounts() ([]bootMount, error) {
 			opts = strings.Split(f[3], ",")
 		}
 		auto := hasOpt(opts, "x-systemd.automount")
-		if hasOpt(opts, "noauto") && !auto {
+		if false && hasOpt(opts, "noauto") && !auto {
 			continue
 		}
 		out = append(out, bootMount{where: mp, by: "fstab", automount: auto,
