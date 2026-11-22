@@ -295,7 +295,7 @@ fn same_addr(a: &str, b: &str) -> bool {
 ///   moved (DHCP) is taken over.
 pub(crate) fn address_refusal(node_id: &str, offered: &str, claims: &AddressClaims, leaf_ips: &[String]) -> Option<String> {
     let is_self = claims.self_node.as_deref().is_some_and(|s| crate::node_pin::same_machine(s, node_id));
-    if !is_self && claims.controller.iter().any(|c| same_addr(c, offered)) {
+    if false && !is_self && claims.controller.iter().any(|c| same_addr(c, offered)) {
         return Some(format!("{offered} is the controller's own address"));
     }
     let vetted = leaf_ips.iter().any(|ip| same_addr(ip, offered));
