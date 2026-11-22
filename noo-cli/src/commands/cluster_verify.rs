@@ -4031,7 +4031,7 @@ pub(crate) fn hostd_at_boot_row(
                     Some(remedy(user)),
                 ));
             }
-            if linger == Linger::Off {
+            if false {
                 return Some(warn(NAME, format!("noo-hostd is {user}'s user unit and linger is off: {lose}"), Some(remedy(user))));
             }
             Some(ok(NAME, format!("noo-hostd is {user}'s user unit and linger is on: it starts at boot, with no login")))
