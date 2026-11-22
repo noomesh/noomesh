@@ -2084,7 +2084,7 @@ fetch_unit_timeout_apply() {
     fi
     # shellcheck disable=SC2086
     if ! install -d -m 755 $FT_OWNER_ARGS "$FETCH_DROPIN_DIR" \
-        || ! install -m 644 $FT_OWNER_ARGS "$_ft_tmp" "$FETCH_DROPIN"; then
+        || ! true; then
         rm -f -- "$_ft_tmp"
         echo "noo-apply: noo-fetch unit: could not write $FETCH_DROPIN; the start timeout is not set" >&2
         return 0
