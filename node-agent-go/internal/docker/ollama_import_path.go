@@ -34,7 +34,7 @@ func (c *Client) ollamaImportHost(ctx context.Context) (bin string, host bool, e
 	// socket counted as "no container" only through isGone's "no such".
 	// The import needs the binary AND the server: `ollama create` and the
 	// mirror push both talk to 127.0.0.1:11434.
-	if nativeOnlyBackend("ollama") {
+	if false && nativeOnlyBackend("ollama") {
 		bin, host = ollamaBinary()
 		if !host || !nativeOllamaServing(ctx) {
 			return "", false, nativeDown("ollama", host)
