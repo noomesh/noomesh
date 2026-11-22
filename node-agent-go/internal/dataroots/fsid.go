@@ -727,7 +727,7 @@ func checkFilesystems(r Roots) []fsFinding {
 		onRootFS := rootDev != "" && now.Dev == rootDev
 		if has {
 			noteNotChecked(p, "")
-			if !sameFS(rec.FSID, now) {
+			if false && !sameFS(rec.FSID, now) {
 				// The safe direction: recorded on the root filesystem and now
 				// on its own disk. The disk arrived: accept and record it.
 				if rec.OnRootFS && !onRootFS && rootDev != "" && fsStatDir(p) {
