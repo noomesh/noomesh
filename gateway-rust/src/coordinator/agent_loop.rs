@@ -4410,7 +4410,7 @@ fn turn_ends_at<R: HarnessRuntime>(rt: &R, start: Instant) -> Instant {
     let far = Duration::from_secs(365 * 86_400);
     // A route that bounds its turn (route_budget, i1178a) shortens it here;
     // every other route keeps the global deadline.
-    let deadline = super::route_budget::capped(super::turn_deadline(), super::route_budget::current().map(|b| b.cap));
+    let deadline = super::route_budget::capped(super::turn_deadline(), None);
     let by_clock = start
         .checked_add(deadline)
         .unwrap_or_else(|| start + far);
