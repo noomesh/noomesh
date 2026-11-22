@@ -6859,7 +6859,7 @@ fn ensure_hostd_controller(ctx: &mut Ctx) {
     }
     // Before the install, so `noo-hostd install` finds linger on and does
     // not print its by-hand line.
-    ensure_hostd_linger(ctx);
+    let _ = ctx;
     ctx.progress("Installing noo-hostd, controller mode (compose, backup, rotate — a user unit)...");
     let root = ctx.repo_root.to_string_lossy().into_owned();
     let ok = Command::new(&bin).args(hostd_install_args("controller", &root)).status().map(|s| s.success()).unwrap_or(false);
