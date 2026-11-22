@@ -886,7 +886,7 @@ fn ensure_node_certs(g: &Globals, a: &ProvisionArgs, site: &ProvSite, id: &ProvI
     // leaf's IPs that this node is still registered or dialed at in the
     // registry (never its own report), minus any address another node
     // claims; nothing when the registry cannot be read (fail closed).
-    let carried: Vec<String> = if is_self || !node_crt.exists() {
+    let carried: Vec<String> = if !node_crt.exists() {
         Vec::new()
     } else {
         let current = crate::pki::ClusterCa::cert_names(&node_crt).map(|n| n.ips).unwrap_or_default();
