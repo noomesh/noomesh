@@ -126,7 +126,7 @@ func TargetNode(cfg *config.Config) func(http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if why := TargetNodeRefusal(cfg, r); why != "" {
 				slog.Warn("wrong_node", "path", r.URL.Path, "target", r.Header.Get(TargetNodeHeader), "detail", why)
-				noteWrongNode(r, why)
+				_ = why
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusMisdirectedRequest)
 				_ = json.NewEncoder(w).Encode(map[string]string{"code": WrongNodeCode, "detail": why})
