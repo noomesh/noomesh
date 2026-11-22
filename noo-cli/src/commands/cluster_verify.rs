@@ -44,6 +44,7 @@ mod warmup;
 pub(crate) mod restart_loops;
 mod gpu_held;
 mod hf_hub;
+mod network_mount;
 mod key_bindings;
 pub(crate) mod rows;
 
@@ -493,6 +494,13 @@ pub(crate) fn node_checks(n: &Value, controller_tag: &str, cli_version: &str, no
         None => out.push(warn("peer identity", "not reported (older agent)", Some(format!("noo cluster provision {id} --wait")))),
     }
 
+    // 4c. The agent refuses calls addressed to another node (i1174), and
+    //     whether the controller has made it strict yet.
+    out.push(target_node_check(id, n, now_unix));
+    //     And the controller's own pin: the latest call for this node it
+    //     refused because the address answered as another node.
+    out.extend(node_identity_check(id, n, now_unix));
+
     // 5. The fleet signing key adopted. The CA-signed bundle lane is retired
     //    So a node that has not adopted takes nothing but a
     //    rollover — which every CA-signed bundle now is, so a provision
@@ -541,6 +549,10 @@ pub(crate) fn node_checks(n: &Value, controller_tag: &str, cli_version: &str, no
     //       backend container lacks the switches that keep its vendor from
     //       phoning home (vLLM's stats.vllm.ai report above all).
     out.push(vendor_telemetry_check(n));
+    // 6c-mac. A Mac's native Ollama is its only Ollama lane (i1156): the
+    //         agent never starts an ollama container there, so a stopped
+    //         native Ollama is the whole reason nothing serves.
+    out.extend(native_ollama_check(id, n));
 
     // 6c-images. Backend images: no running backend container was created
     //            from a floating ref (`:latest` or untagged, no digest) — the
@@ -660,6 +672,11 @@ pub(crate) fn backend_starts_check(id: &str, n: &Value) -> Option<Check> {
         let target = r["target"].as_str().unwrap_or("?");
         let remedy = match reason.find(SYNC) {
             Some(i) => reason[i..].split(['`', ';']).next().unwrap_or(SYNC).trim_end().to_string(),
+            // A Mac's native Ollama is down (agent NativeDownError): its own
+            // remedy, the text after the first ": ".
+            None if reason.starts_with("the native Ollama isn't") => {
+                format!("on {id}: {}", reason.split_once(": ").map_or(reason, |(_, r)| r))
+            }
             None if is_no_space_refusal(reason) => no_space_remedy(id, target),
             None => format!("noo cluster show {id}   # the node's refusal says why"),
         };
@@ -700,6 +717,9 @@ fn no_space_remedy(id: &str, target: &str) -> String {
 /// instead: a FAIL naming the node and the reason. No row when nothing was
 /// refused.
 pub(crate) fn agent_address_check(id: &str, n: &Value) -> Option<Check> {
+    if let Some(why) = n["ip_address_refused"].as_str().filter(|s| !s.is_empty()) {
+        return Some(ip_address_refused_check(id, n, why));
+    }
     let why = n["agent_url_refused"].as_str().filter(|s| !s.is_empty())?;
     let ip = n["ip_address"].as_str().unwrap_or("its registered address");
     Some(fail(
@@ -707,6 +727,29 @@ pub(crate) fn agent_address_check(id: &str, n: &Value) -> Option<Check> {
         format!("{id}: the gateway refused the agent_url this node reported ({why}); it dials https://{ip}:8081 instead"),
         format!("on {id}, set the agent's address (NODE_IP in /etc/noo-node-agent.env) to the address it is registered at, so it reports https://<that address>:<its port>"),
     ))
+}
+
+/// The `agent address` row for an address the gateway did not store
+/// (`ip_address_refused`, i1174): another node holds it, it is the
+/// controller's own, or the heartbeat came from a different tailnet
+/// address. The record keeps its last accepted address (or none). The next
+/// command follows the reason.
+fn ip_address_refused_check(id: &str, n: &Value, why: &str) -> Check {
+    let dials = match n["ip_address"].as_str().filter(|s| !s.is_empty()) {
+        Some(ip) => format!("the controller keeps dialling it at {ip}"),
+        None => "the controller reaches it over its bus or tunnel only".to_string(),
+    };
+    let next = if let Some((_, other)) = why.split_once(" is claimed by ") {
+        let other = other.trim();
+        format!("noo cluster verify {other}   # {other} holds that address; if {id} really moved there, its certificate must carry it: noo security pki push-nodes {id} --prove")
+    } else if why.ends_with("is the controller's own address") {
+        format!("on {id}, set NODE_IP in /etc/noo-node-agent.env to {id}'s own address")
+    } else if let Some((peer, _)) = why.strip_prefix("the heartbeat came from tailnet address ").and_then(|r| r.split_once(", not ")) {
+        format!("on {id}, set NODE_IP in /etc/noo-node-agent.env to {peer}, the tailnet address it calls from")
+    } else {
+        format!("noo cluster logs {id}")
+    };
+    fail("agent address", format!("{id}: the controller did not store the address it reported ({why}); {dials}"), next)
 }
 
 /// The `backend caps` row (#1283): the capability set a node's backend
@@ -2025,6 +2068,9 @@ pub(crate) fn vendor_telemetry_check(n: &Value) -> Check {
     let mut unmanaged_set: Vec<String> = Vec::new();
     let mut unmanaged_missing: Vec<(String, &'static str)> = Vec::new();
     let mut mac_ollama = false;
+    // The native ollama's plist is a boot service (root's, enroll since
+    // i1156): the agent cannot edit it, so the remedy is sudo.
+    let mut mac_system = false;
     for (b, entry) in bc {
         // A Mac's native ollama (node-agent-go backendrt/ollama_telemetry.go):
         // `managed: false` = no brew plist, so nothing here may touch or judge it.
@@ -2062,11 +2108,19 @@ pub(crate) fn vendor_telemetry_check(n: &Value) -> Check {
                 } else {
                     problems.push(format!("{b} lacks {}", names.join(", ")));
                     mac_ollama |= entry["runtime"].as_str() == Some("native");
+                    mac_system |= entry["plist_domain"].as_str() == Some("system");
                 }
             }
         }
     }
-    let remedy = if mac_ollama {
+    let remedy = if mac_ollama && mac_system {
+        "on the Mac: L=sh.brew.ollama; [ -f /Library/LaunchDaemons/$L.plist ] || L=homebrew.mxcl.ollama; \
+         P=/Library/LaunchDaemons/$L.plist; \
+         sudo plutil -insert EnvironmentVariables -dictionary $P 2>/dev/null; \
+         sudo plutil -replace EnvironmentVariables.OLLAMA_NO_CLOUD -string 1 $P; \
+         sudo launchctl bootout system/$L; sudo launchctl bootstrap system $P   \
+         # or run `noo enroll --resume`; the agent cannot edit a boot service's plist".to_string()
+    } else if mac_ollama {
         // Either brew label (sh.brew.ollama is current Homebrew), and the
         // domain launchd actually holds the job in (user/<uid> on a headless
         // Mac over SSH, where gui/<uid> answers 125).
@@ -2117,6 +2171,68 @@ pub(crate) fn vendor_telemetry_check(n: &Value) -> Check {
         return ok(NAME, parts.join("; "));
     }
     ok(NAME, format!("{}: every vendor telemetry switch set", proven.join(", ")))
+}
+
+/// The boot-service command that starts a Mac's native Ollama as the node's
+/// user (node-agent-go backendrt `OllamaBootServiceCmd`, keep in lockstep).
+/// `--sudo-service-user` makes Homebrew write `UserName` into the system
+/// plist; without it a root `brew services start` runs Ollama as root, with
+/// root's home and an empty model store.
+pub(crate) const MAC_OLLAMA_START: &str = "sudo HOMEBREW_NO_ANALYTICS=1 brew services start --sudo-service-user \"$USER\" ollama";
+
+/// A heartbeat's `backend_containers.ollama` entry that is a Mac's native
+/// Ollama: runtime `native` (the agent's OllamaGuard report, darwin only) on
+/// a node whose `os` is darwin (an agent that does not report `os` is judged
+/// by the runtime alone).
+fn is_darwin_native_ollama(n: &Value, entry: &Value) -> bool {
+    entry["runtime"].as_str() == Some("native") && n["os"].as_str().is_none_or(|os| os == "darwin")
+}
+
+/// The `native ollama` row (followup i1156). On a Mac the native Ollama is
+/// the only Ollama lane: the agent refuses an ollama container there. The
+/// heartbeat's `backend_containers.ollama.running` says whether it answers on
+/// 127.0.0.1:11434; `binary_present` (newer agents, sent only while it is not
+/// running) picks the remedy: start the boot service, or install Ollama
+/// first. FAIL when it is not running; WARN when it runs from a per-user
+/// LaunchAgent (`plist_domain: user`: not a boot service yet); OK otherwise;
+/// no row off a Mac.
+pub(crate) fn native_ollama_check(id: &str, n: &Value) -> Option<Check> {
+    const NAME: &str = "native ollama";
+    let entry = &n["backend_containers"]["ollama"];
+    if !is_darwin_native_ollama(n, entry) {
+        return None;
+    }
+    if entry["running"].as_bool() != Some(false) {
+        // Serving, but from a per-user LaunchAgent (a Mac enrolled before
+        // i1156): it starts only at that user's login, so a rebooted headless
+        // Mac has an agent and no Ollama. Nothing on a roll fixes it: the
+        // root applier never runs Homebrew as root (node_fetch.rs, H2), so
+        // the remedy is the Mac's own `noo enroll --resume`, never
+        // `provision`. An agent that does not report `plist_domain` is not
+        // judged on it.
+        return Some(match entry["plist_domain"].as_str() {
+            Some("user") => warn(
+                NAME,
+                format!("{id}: serving on 127.0.0.1:11434, but not a boot service yet (a per-user LaunchAgent: it starts only at a login, so after a reboot or a power cut nothing serves Ollama until someone logs in)"),
+                Some(format!("on {id}, once, as the node's user: `noo enroll --resume` (registers it as a boot service run as that user, keeps its model store; asks for sudo, no new token)")),
+            ),
+            Some("system") => ok(NAME, "serving on 127.0.0.1:11434 as a boot service"),
+            _ => ok(NAME, "serving on 127.0.0.1:11434"),
+        });
+    }
+    let launcher = entry["launcher"].as_str().unwrap_or("none");
+    if entry["binary_present"].as_bool() == Some(false) {
+        return Some(fail(
+            NAME,
+            format!("{id}: the native Ollama isn't installed on this Mac, so nothing serves Ollama there (the agent never runs it in a container on a Mac)"),
+            format!("on {id}: install it: `HOMEBREW_NO_ANALYTICS=1 brew install ollama`, then start it with `{MAC_OLLAMA_START}` (a boot service), or run `noo enroll --resume`"),
+        ));
+    }
+    Some(fail(
+        NAME,
+        format!("{id}: the native Ollama isn't running on this Mac (nothing answers on 127.0.0.1:11434; launcher: {launcher}), so nothing serves Ollama there"),
+        format!("on {id}: start it with `{MAC_OLLAMA_START}` (a boot service), or run `noo enroll --resume`"),
+    ))
 }
 
 /// A leaf inside this window fails the row: the next backend recreate
@@ -3404,6 +3520,84 @@ pub(crate) fn agent_metrics_check(nodes: &[(String, String)], up: Option<&Value>
     ok(NAME, format!("{total}/{total} node agents scraped"))
 }
 
+/// The `target-node check` row (i1174): every controller call names the node
+/// it is meant for (`X-Noo-Node`) and the agent refuses one that names
+/// another. STRICT once the agent also refuses a controller call that names
+/// none, which the controller turns on per node in desired-config as soon as
+/// the agent reports the check. Tolerant otherwise, and the row says which
+/// of the two reasons holds. Read from the node record (the heartbeat's
+/// `checks_target_node` and `requires_target_node`, false when the agent
+/// does not say).
+pub(crate) fn target_node_check(id: &str, n: &Value, now_unix: i64) -> Check {
+    const NAME: &str = "target-node check";
+    // The agent refused a call addressed elsewhere in the last ten minutes
+    // (`wrong_node_refused`, 421 wrong_node): a FAIL naming the call.
+    if let Some(w) = n.get("wrong_node_refused").filter(|v| v.is_object()) {
+        let target = w["target"].as_str().map(str::trim).unwrap_or("");
+        let path = w["path"].as_str().unwrap_or("?");
+        let age = w["at"].as_i64().map(|t| format!(", {}s ago", (now_unix - t).max(0))).unwrap_or_default();
+        if target.is_empty() {
+            return fail(
+                NAME,
+                format!("{id}'s agent refused a controller call that named no node ({path}, 421 wrong_node{age}): it is strict and the call did not carry X-Noo-Node"),
+                format!("noo cluster logs {id}   # the agent's wrong_node line names the call"),
+            );
+        }
+        return fail(
+            NAME,
+            format!("{id}'s agent refused a call addressed to {target} ({path}, 421 wrong_node{age}): the controller dialled {id}'s address for {target}"),
+            format!("noo cluster verify {target}   # its node identity and agent address rows say where the controller dials {target}"),
+        );
+    }
+    let checks = n["checks_target_node"].as_bool() == Some(true);
+    let requires = n["requires_target_node"].as_bool() == Some(true);
+    if checks && requires {
+        return ok(NAME, "strict: the agent refuses a call addressed to another node, and a controller call that names none");
+    }
+    if checks {
+        return warn(
+            NAME,
+            "tolerant: not yet told (the agent refuses a call addressed to another node; the controller's flag to refuse a call that names none applies at its next desired-config read)",
+            Some(format!("noo cluster verify {id}   # re-run after the node's next reconcile")),
+        );
+    }
+    warn(
+        NAME,
+        format!("tolerant: the agent is older than the controller (upgrade it: `noo cluster provision {id}`)"),
+        Some(format!("noo cluster provision {id}")),
+    )
+}
+
+/// The `node identity` row (i1174): the controller refused a call meant for
+/// this node in the last ten minutes because the address answered as
+/// another node (`node_identity_mismatch` on `/api/cluster/nodes`, the
+/// gateway's 502), or because its address book gives the dialled address to
+/// another node. FAIL with the fact and the next command; no row otherwise.
+pub(crate) fn node_identity_check(id: &str, n: &Value, now_unix: i64) -> Option<Check> {
+    const NAME: &str = "node identity";
+    let m = n.get("node_identity_mismatch").filter(|v| v.is_object())?;
+    let host = m["host"].as_str().unwrap_or("?");
+    let presented: Vec<&str> = m["presented"].as_array().map(|a| a.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
+    let age = m["at"].as_i64().map(|t| format!(", {}s ago", (now_unix - t).max(0))).unwrap_or_default();
+    let owner = presented.iter().find_map(|p| p.strip_prefix("address owned by "));
+    let detail = match owner {
+        Some(other) => format!(
+            "{host} was not dialled for {id} (502 node_identity_mismatch{age}): the controller's address book gives {host} to {other}, and {id}'s record still names it"
+        ),
+        None => format!(
+            "{host} answered with {}'s certificate when dialled for {id} (502 node_identity_mismatch{age}): the controller's address book gives {host} to {id}",
+            if presented.is_empty() { "another".to_string() } else { presented.join(", ") }
+        ),
+    };
+    // `--prove` is the proof form of push-nodes (#1457): it mints an address
+    // only once the node there shows it holds the node's current key.
+    Some(fail(
+        NAME,
+        detail,
+        format!("noo cluster verify {id} --json   # the agent address and agent certificate rows show the address {id} reports; if {id} really moved to {host}: noo security pki push-nodes {id} --prove"),
+    ))
+}
+
 /// The `agent certificate` row: the node's leaf (the controller's copy under
 /// `pki/nodes/<id>/node.crt`) must cover the host of the `agent_url` the
 /// gateway dials. When it does not, every gateway call to the node fails TLS
@@ -3417,6 +3611,10 @@ pub(crate) fn agent_metrics_check(nodes: &[(String, String)], up: Option<&Value>
 /// node claims that address (`other`: its registered or dialed address, or a
 /// SAN in its leaf). A leaf for another node's address would let this node
 /// answer as that one; then it is a finding to investigate, with no remedy.
+/// An address the leaf does not carry is not one push-nodes mints on its own
+/// (it mints only vetted addresses: the enrollment, tailnet and current-leaf
+/// ones, i1174), so the remedy is the proof form, `--prove`, which mints it
+/// once the node at that address shows it holds the node's current key.
 pub(crate) fn agent_cert_check(id: &str, host: &str, covers: Option<bool>, other: Option<&str>) -> Option<Check> {
     match covers {
         Some(true) => return None,
@@ -3439,10 +3637,13 @@ pub(crate) fn agent_cert_check(id: &str, host: &str, covers: Option<bool>, other
             ),
             remedy: None,
         }.checked(),
+        // Unclaimed: re-issued only on proof that the node serves the address
+        // (`--prove`: a dial-back pinned to the node's own key, #1457), private
+        // or public alike, since plain push-nodes mints only vetted addresses.
         None => fail(
             "agent certificate",
-            format!("{id}: its certificate does not cover the address the controller dials it at ({host}), so every call to it fails TLS (imports, logs, metrics); `noo security pki push-nodes {id}` will issue it a certificate for {host}"),
-            format!("noo security pki push-nodes {id}   # then: noo cluster verify"),
+            format!("{id}: its certificate does not cover the address the controller dials it at ({host}), so every call to it fails TLS (imports, logs, metrics); {host} is not {id}'s enrollment, tailnet or current-leaf address, so `noo security pki push-nodes {id} --prove` will issue it a certificate for {host} once the node there proves it holds {id}'s current key"),
+            format!("noo security pki push-nodes {id} --prove   # then: noo cluster verify {id}"),
         ),
     })
 }
@@ -3877,6 +4078,57 @@ fn netns_restore_row_here(root: &std::path::Path) -> Check {
     netns_restore_row(systemd, state, remedy)
 }
 
+/// The `hostd at boot` row (i1160 risk 5): does the controller's noo-hostd,
+/// whose BootRestore brings the stack back after a reboot, start at boot
+/// with no one logged in? Pure over the facts. `linger` is read only for a
+/// user unit. No row when no hostd unit or agent is installed here.
+///
+/// - systemd user unit, linger on: OK; off: WARN with the exact enable
+///   command; unreadable: WARN, cannot be checked;
+/// - systemd system unit: OK;
+/// - macOS LaunchAgent: WARN, said plainly (there is no noomesh remedy).
+pub(crate) fn hostd_at_boot_row(
+    kind: crate::hostd_boot::HostdKind,
+    user: &str,
+    linger: Option<crate::hostd_boot::Linger>,
+) -> Option<Check> {
+    use crate::hostd_boot::{remedy, HostdKind, Linger};
+    const NAME: &str = "hostd at boot";
+    let lose = format!("after a reboot nothing restores the stack until {user} logs in");
+    match kind {
+        HostdKind::Absent => None,
+        HostdKind::SystemUnit => Some(ok(NAME, "noo-hostd is a system unit: it starts at boot")),
+        HostdKind::LaunchAgent => Some(warn(
+            NAME,
+            format!("noo-hostd is {user}'s LaunchAgent, which runs only in a login session: {lose}. \
+                     noomesh has no setting for this today; macOS automatic login for {user} is the only way, and FileVault turns it off"),
+            None,
+        )),
+        HostdKind::UserUnit => {
+            let linger = linger.unwrap_or_else(|| Linger::Unreadable("not read".into()));
+            if let Linger::Unreadable(why) = &linger {
+                return Some(warn(
+                    NAME,
+                    format!("cannot be checked: linger for {user} could not be read ({why}); without it, {lose}"),
+                    Some(remedy(user)),
+                ));
+            }
+            if linger == Linger::Off {
+                return Some(warn(NAME, format!("noo-hostd is {user}'s user unit and linger is off: {lose}"), Some(remedy(user))));
+            }
+            Some(ok(NAME, format!("noo-hostd is {user}'s user unit and linger is on: it starts at boot, with no login")))
+        }
+    }
+}
+
+fn hostd_at_boot_row_here() -> Option<Check> {
+    use crate::hostd_boot as hb;
+    let kind = hb::kind_here();
+    let user = crate::netns_unit::owner();
+    let linger = (kind == hb::HostdKind::UserUnit).then(|| hb::read_linger(&user));
+    hostd_at_boot_row(kind, &user, linger)
+}
+
 /// The `ollama slots` row's advice (i802), and the command that applies it.
 pub(crate) const CPU_ONLY_SLOTS_ADVICE: &str = "CPU-only: one Ollama slot prefills about 3x faster on a 4-core CPU (~370 against ~125 tok/s) and saves cache, with no embedding loss (measured, i802)";
 pub(crate) const CPU_ONLY_SLOTS_REMEDY: &str = "noo config set compose_env '{\"OLLAMA_EMBED_NUM_PARALLEL\":\"1\"}' && noo stack restart --force ollama-embed";
@@ -4175,6 +4427,115 @@ pub(crate) fn externally_reachable_leaf_names(
         out.push((svc.to_string(), r));
     }
     out
+}
+
+/// The "controller address" row (i1173): whether the address remote nodes
+/// were handed for this controller survives its LAN address changing.
+/// Nodes keep that URL (`/etc/noo/controller-url`, the agent env) and are
+/// never told a new one, so a controller that moves strands them, and the
+/// fix cannot reach them from here.
+///
+/// `advertised` is the URL enrollment hands out (`NOO_GATEWAY_URL`, else
+/// `services.gateway_url`); `dns` is `NOO_CONTROLLER_DNS`; `local` is this
+/// machine's addresses (`None`: unknown). `None` when nothing remote can
+/// enroll (no URL, or a loopback one the mint refuses). Pure.
+pub(crate) fn controller_address_check(advertised: Option<&str>, dns: Option<&str>, local: Option<&[String]>) -> Option<Check> {
+    const NAME: &str = "controller address";
+    if let Some(n) = dns.map(str::trim).filter(|n| !n.is_empty()) {
+        return Some(ok(NAME, format!("nodes reach this controller by the name {n}, which does not change with its address")));
+    }
+    let url = advertised.map(str::trim).filter(|u| !u.is_empty())?;
+    let host = url_host(url);
+    if host.is_empty() || host.eq_ignore_ascii_case("localhost") || host.eq_ignore_ascii_case("gateway") {
+        return None;
+    }
+    let Ok(ip) = host.parse::<std::net::IpAddr>() else {
+        return Some(ok(NAME, format!("nodes reach this controller by the name {host}, which does not change with its address")));
+    };
+    if ip.is_loopback() || ip.is_unspecified() {
+        return None;
+    }
+    if let std::net::IpAddr::V4(v4) = ip {
+        let o = v4.octets();
+        if o[0] == 100 && (64..128).contains(&o[1]) {
+            return Some(ok(NAME, format!("nodes reach this controller at its tailnet address {ip}, which a local network change does not move")));
+        }
+    }
+    const KEEP: &str = "put the controller on a tailnet, the default path (`noo onboard --reconfigure`), which gives it \
+        a name that does not move; or reserve this address for it in your router (often called a DHCP reservation)";
+    let holds = local.map(|l| l.iter().any(|a| a.trim().parse::<std::net::IpAddr>().is_ok_and(|x| x == ip)));
+    match holds {
+        Some(false) => Some(fail(
+            NAME,
+            format!(
+                "nodes were told to reach this controller at {ip}, which is no longer this machine's address (it now has {}): \
+                 every node set up with it has lost the controller, and nothing sent from here can reach them",
+                local.unwrap_or(&[]).join(", ")
+            ),
+            format!(
+                "give this machine {ip} back (reserve it in your router, then restart the machine), or set \
+                 services.gateway_url to its new address and enroll each node again (docs/getting-started/add-a-node.md)"
+            ),
+        )),
+        _ => Some(warn(
+            NAME,
+            format!(
+                "nodes reach this controller at {ip}, a local network address: if the router hands this machine a new one \
+                 (after a power cut, say), every node loses the controller and cannot be fixed from here"
+            ),
+            Some(KEEP.to_string()),
+        )),
+    }
+}
+
+/// The host of a URL or a bare `host[:port]`, brackets off an IPv6 literal.
+fn url_host(url: &str) -> String {
+    let rest = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
+    let hp = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    let hp = hp.rsplit_once('@').map(|(_, h)| h).unwrap_or(hp);
+    if let Some(v6) = hp.strip_prefix('[') {
+        return v6.split(']').next().unwrap_or("").to_string();
+    }
+    match hp.matches(':').count() {
+        1 => hp.split(':').next().unwrap_or("").to_string(),
+        _ => hp.to_string(),
+    }
+}
+
+/// This machine's addresses (`hostname -I`), or `None` when they cannot be
+/// read (macOS, a container without the tool).
+pub(crate) fn local_addresses() -> Option<Vec<String>> {
+    let out = std::process::Command::new("hostname").arg("-I").output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let v: Vec<String> = String::from_utf8_lossy(&out.stdout).split_whitespace().map(str::to_string).collect();
+    (!v.is_empty()).then_some(v)
+}
+
+/// The URL enrollment hands remote nodes, and `NOO_CONTROLLER_DNS`, as this
+/// controller declares them (process env, the repo `.env`, noomesh.yaml).
+pub(crate) fn advertised_controller() -> (Option<String>, Option<String>) {
+    crate::envfile::ensure_repo_env();
+    let root = crate::envfile::repo_root();
+    let read = |k: &str| {
+        std::env::var(k).ok().filter(|v| !v.trim().is_empty())
+            .or_else(|| Some(crate::onboard::env::read_env_key(&root.join(".env"), k)).filter(|v| !v.trim().is_empty()))
+    };
+    let url = read("NOO_GATEWAY_URL").or_else(|| {
+        std::fs::read_to_string(root.join("noomesh.yaml"))
+            .ok()
+            .and_then(|t| serde_yaml::from_str::<serde_yaml::Value>(&t).ok())
+            .and_then(|d| d.get("services")?.get("gateway_url")?.as_str().map(str::to_string))
+    });
+    (url, read("NOO_CONTROLLER_DNS"))
+}
+
+/// The row as judged on this machine.
+pub(crate) fn controller_address_row_here() -> Option<Check> {
+    let (url, dns) = advertised_controller();
+    let local = local_addresses();
+    controller_address_check(url.as_deref(), dns.as_deref(), local.as_deref())
 }
 
 /// The "service cert names" row. A leaf that serves remote
@@ -4998,14 +5359,36 @@ const UNPROBED_GUESSES: [&str; 2] = [
     "(postgres container not running, or no routable address)",
 ];
 
-/// A live-probe row that could not probe, when docker refused this account:
-/// its guessed cause becomes docker's own words and the remedy the docker
-/// one. Any other row, or no refusal, is returned unchanged.
-pub(crate) fn docker_refused(mut c: Check, refusal: Option<&str>) -> Check {
-    let Some(e) = refusal else { return c };
-    if let Some(g) = UNPROBED_GUESSES.iter().find(|g| c.detail.contains(*g)) {
-        c.detail = c.detail.replace(g, &format!("— {e}"));
-        c.remedy = Some(crate::commands::secrets_delivery::DOCKER_REFUSED_REMEDY.into());
+/// The compose services whose state each [`UNPROBED_GUESSES`] entry guessed
+/// at, same order: a row hears only about its own containers.
+const UNPROBED_SERVICES: [&[&str]; 2] = [&["gateway", "sandbox"], &["postgres"]];
+
+/// A live-probe row that could not probe, when docker did not answer this
+/// account: its guessed cause becomes what was observed and the remedy the
+/// one for that cause. Any other row, or nothing observed, is unchanged.
+pub(crate) fn docker_refused(c: Check, refusal: Option<&crate::commands::secrets_delivery::DockerRefusal>) -> Check {
+    docker_unprobed(c, refusal, &crate::commands::secrets::unknown_notes())
+}
+
+/// [`docker_refused`], pure over what was observed.
+pub(crate) fn docker_unprobed(
+    mut c: Check,
+    refusal: Option<&crate::commands::secrets_delivery::DockerRefusal>,
+    notes: &[(String, String)],
+) -> Check {
+    let Some(i) = UNPROBED_GUESSES.iter().position(|g| c.detail.contains(*g)) else { return c };
+    let g = UNPROBED_GUESSES[i];
+    if let Some(e) = refusal {
+        c.detail = c.detail.replace(g, &format!("— {}", e.detail()));
+        c.remedy = Some(e.remedy());
+    } else if let Some(note) = UNPROBED_SERVICES[i]
+        .iter()
+        .find_map(|svc| crate::commands::secrets::note_for(notes, &crate::envfile::container(svc)))
+    {
+        // docker answers `version`, yet an inspect did not: "not running" is
+        // not what was seen.
+        c.detail = c.detail.replace(g, &format!("— {note}"));
+        c.remedy = Some("docker info".into());
     }
     c
 }
@@ -8718,6 +9101,28 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             // verified" (0.6.16-rc.3: an older gateway's node list waited on
             // NATS KV past this 10 s bound).
             let bus = unanswered_nodes_rows(health_body(g).as_ref());
+            // On a NODE (role from what this box has, not a switch): say what
+            // the agent says while the controller is away, and the node-side
+            // checks; never a controller's command (`noo stack status`).
+            if let Some(node) = crate::role::detect().node_only().cloned() {
+                let has_ts = std::path::Path::new("/usr/bin/tailscale").is_file() || std::path::Path::new("/usr/local/bin/tailscale").is_file();
+                let (line, guide) = unreachable_from_node(&node.name, node.controller_url.as_deref(), has_ts);
+                if g.json {
+                    println!("{}", serde_json::json!({ "ok": false, "error": "controller unreachable from this node", "node": node.name,
+                        "controller_url": node.controller_url, "detail": line, "controller": { "ok": false, "checks": checks_json(&bus) },
+                        "next": guide.iter().map(|(c, _)| next_cmd(c, &[])).collect::<Vec<_>>() }));
+                } else {
+                    // The bus row, when /health answered with the bus down:
+                    // as true on a node as on the controller.
+                    if !bus.is_empty() {
+                        render("controller", &bus, true);
+                    }
+                    println!("{}", ui::status_line(Glyph::Err, &line));
+                    let g2: Vec<(&str, &str)> = guide.iter().map(|(c, w)| (c.as_str(), w.as_str())).collect();
+                    ui::guide(&g2);
+                }
+                return Ok(1);
+            }
             if g.json {
                 println!("{}", serde_json::json!({ "ok": false, "error": "gateway unreachable", "controller": { "ok": false, "checks": checks_json(&bus) },
                     "next": GATEWAY_UNREACHABLE_NEXT.iter().map(|(c, _)| next_cmd(c, &[])).collect::<Vec<_>>() }));
@@ -8956,6 +9361,9 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         }
         checks.push(noo_data_bound_row(&crate::envfile::repo_root()));
         checks.push(netns_restore_row_here(&crate::envfile::repo_root()));
+        if let Some(row) = hostd_at_boot_row_here() {
+            checks.push(row);
+        }
         // i802: advisory only, on a CPU-only controller.
         if let Some(row) = cpu_only_ollama_slots_row_here(&crate::envfile::repo_root()) {
             checks.push(row);
@@ -9036,6 +9444,9 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                 &crate::commands::provision::cli_asset_cache_dir(&root), &fleet, &toks) {
                 checks.push(c);
             }
+        }
+        if let Some(c) = controller_address_row_here() {
+            checks.push(c);
         }
         let (id_host, id_ip, id_ts) = crate::onboard::steps::local_cert_identity();
         checks.push(service_cert_names_check(&externally_reachable_leaf_names(
@@ -9168,13 +9579,13 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         // said as that, not as "container not running" (failed lookup is not
         // absence; rc.3 stranger cell, docker group not active).
         let refused = crate::commands::secrets_delivery::docker_refusal();
-        checks.push(docker_refused(sandbox_listener_check(compose.as_deref(), sandbox_probe.as_ref()), refused.as_deref()));
+        checks.push(docker_refused(sandbox_listener_check(compose.as_deref(), sandbox_probe.as_ref()), refused.as_ref()));
         // The sandbox executor (i161): the health body that probe read over
         // the gateway's leaf says which uid model-written code runs as.
         // Which form of the AppArmor profile is installed (bundled, or the
         // AppArmor 3.x form without its `userns,` rule): stated, not silent.
         checks.push(with_profile_form(
-            docker_refused(sandbox_executor_check(sandbox_probe.as_ref()), refused.as_deref()),
+            docker_refused(sandbox_executor_check(sandbox_probe.as_ref()), refused.as_ref()),
             crate::onboard::sandbox_apparmor::installed_form(
                 std::fs::read_to_string(crate::onboard::sandbox_apparmor::INSTALLED).ok().as_deref()),
         ));
@@ -9229,7 +9640,7 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         checks.push(docker_refused(postgres_client_cert_check(
             no_cert.as_ref().map(|(ok, e)| (*ok, e.as_str())),
             plaintext.as_ref().map(|(ok, e)| (*ok, e.as_str())),
-        ), refused.as_deref()));
+        ), refused.as_ref()));
         // `cluster.postgres_memory` (unset = standard): the sizes asked for,
         // and "recreate needed" while the running postgres has others.
         checks.push(pg_memory::live(&root));
@@ -9239,6 +9650,9 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         // cache judged is the self-node AGENT's (its heartbeat in `fleet`),
         // plus the compose cache's own row when that is another directory.
         checks.extend(hf_hub::live(Some(&Value::Array(fleet.clone()))));
+        // Every network mount under the data roots answers a bounded stat
+        // (i1149: a hung hard NFS mount made calls hang with no word why).
+        checks.push(network_mount::live());
         // One "<name> at rest" row per directory that holds state in the
         // clear (`at_rest_dirs`): the process env is what the launcher
         // resolved from `.env`, so the paths are the ones compose bound.
@@ -9613,6 +10027,39 @@ pub(crate) fn cert_expiry_row(certs: &[(String, i64)]) -> Check {
     ok(NAME, format!("{} certificate(s); the soonest, {}, in {} days", certs.len(), sorted[0].0, sorted[0].1))
 }
 
+/// The refusals of one report, each with Docker's reason (at most five
+/// named, then a count). An entry whose reason is empty came from an older
+/// hostd that read Docker's message from stdout and lost it; on the
+/// containerd image store most of those were images an earlier ref's removal
+/// had already deleted (2026-11-22). Said as such, with the check. Pure.
+pub(crate) fn refused_detail(refused: &[&Value], when: &str) -> String {
+    const SHOWN: usize = 5;
+    let name = |i: &Value| i["refs"].get(0).and_then(|r| r.as_str()).or(i["id"].as_str()).unwrap_or("?").to_string();
+    let reason = |i: &Value| i["result"].as_str().unwrap_or("").trim_start_matches("refused:").trim().to_string();
+    let (silent, said): (Vec<&Value>, Vec<&Value>) = refused.iter().copied().partition(|i| reason(i).is_empty());
+    let mut parts: Vec<String> = said.iter().take(SHOWN).map(|i| format!("{}: {}", name(i), reason(i))).collect();
+    if said.len() > SHOWN {
+        parts.push(format!("{} more", said.len() - SHOWN));
+    }
+    let mut out = String::new();
+    if !said.is_empty() {
+        out = format!("{} superseded image(s) Docker refused to remove at {when}: {}", said.len(), parts.join("; "));
+    }
+    if !silent.is_empty() {
+        if !out.is_empty() {
+            out.push_str(". ");
+        }
+        out.push_str(&format!(
+            "{} more reported refused at {when} with no reason recorded (an older hostd lost Docker's message; on the containerd \
+             image store most were already removed): `docker image inspect {}` answering \"No such image\" means it is gone; \
+             the next roll's cleanup reports them correctly",
+            silent.len(),
+            silent[0]["id"].as_str().unwrap_or("<id>")
+        ));
+    }
+    out
+}
+
 /// `image retention`: what hostd's rung 5 last judged on this controller, read
 /// from the report it writes beside the keep file
 /// (`<root>/.noo-host-spool/image-retention-report.json`). Read-only: it
@@ -9662,16 +10109,7 @@ pub(crate) fn image_retention_row(report: Option<Result<Value, String>>, blocked
         format!("{} MB", bytes / 1_000_000)
     };
     if !refused.is_empty() {
-        let first = refused[0]["refs"].get(0).and_then(|r| r.as_str()).or(refused[0]["id"].as_str()).unwrap_or("?");
-        return warn(
-            NAME,
-            format!(
-                "{} superseded image(s) Docker refused to remove at {when} (first: {first}: {})",
-                refused.len(),
-                refused[0]["result"].as_str().unwrap_or("")
-            ),
-            None,
-        );
+        return warn(NAME, refused_detail(&refused, when), None);
     }
     if marked.is_empty() {
         return ok(NAME, format!("nothing superseded at {when}; {} image(s) judged", images.len()));
@@ -10069,6 +10507,43 @@ fn tier_json(t: Option<Tier>) -> Option<&'static str> {
 
 /// What a verify that could not read the node list suggests, in the text
 /// guide and as `next` under --json.
+/// What verify says on a NODE that cannot reach the controller: the agent's
+/// own story while it is away (nothing is reconciled; what runs keeps
+/// running) and the checks that live on this node: the URL it uses and where
+/// that is set, whether this machine has a route to it, the tailnet when it
+/// has one, then the controller itself. Never a controller-only command
+/// (`role::is_controller_only`). Pure.
+pub(crate) fn unreachable_from_node(node: &str, controller_url: Option<&str>, has_tailscale: bool) -> (String, Vec<(String, String)>) {
+    let url = controller_url.map(str::trim).filter(|u| !u.is_empty());
+    let line = match url {
+        Some(u) => format!(
+            "this machine is node '{node}' and cannot reach the controller at {u}: nothing is reconciled on this node until it answers; running backends keep running"
+        ),
+        None => format!(
+            "this machine is node '{node}' and has no controller URL ({} is missing or empty), so it cannot reach the controller: nothing is reconciled until it can; running backends keep running",
+            crate::role::NODE_CONTROLLER_URL
+        ),
+    };
+    let host = url
+        .and_then(|u| u.split_once("://").map(|(_, r)| r).or(Some(u)))
+        .and_then(|r| r.split(['/', '?']).next())
+        .map(|hp| match hp.strip_prefix('[') {
+            Some(v6) => v6.split(']').next().unwrap_or("").to_string(),
+            None => hp.rsplit_once(':').map(|(h, _)| h).unwrap_or(hp).to_string(),
+        })
+        .filter(|h| !h.is_empty())
+        .unwrap_or_else(|| "<controller host>".to_string());
+    let mut guide = vec![
+        (format!("cat {}", crate::role::NODE_CONTROLLER_URL), "the controller URL this node uses (written at enroll)".to_string()),
+        (format!("ip route get {host}"), "whether this machine has a route to the controller".to_string()),
+    ];
+    if has_tailscale {
+        guide.push(("tailscale status".to_string(), "whether this node is on the tailnet and sees the controller".to_string()));
+    }
+    guide.push(("noo health".to_string(), "asks the controller at that URL directly".to_string()));
+    (line, guide)
+}
+
 const GATEWAY_UNREACHABLE_NEXT: &[(&str, &str)] = &[("noo health", "is the controller up"), ("noo stack status", "which container is not")];
 
 /// The `seats` field of --json: the seats judged, `[]` when the registry has
@@ -11278,7 +11753,7 @@ mod tests {
         let c = node_checks(&healthy(now), "v0.2.70", "0.5.57", now, Some(true));
         let failed: Vec<_> = c.iter().filter(|c| c.verdict == Verdict::Fail).map(|c| c.name).collect();
         assert!(failed.is_empty(), "{failed:?}");
-        assert_eq!(c.len(), 24, "eighteen node invariants (the log shipper, peer identity, control over bus, streaming over tunnel, backend doors, vendor telemetry, backend images, data root, lanes and harness egress among them) plus six host-fact rows (boot partition and host telemetry among them), each judged");
+        assert_eq!(c.len(), 25, "nineteen node invariants (the log shipper, peer identity, control over bus, streaming over tunnel, backend doors, vendor telemetry, backend images, data root, lanes, harness egress and the target-node check among them) plus six host-fact rows (boot partition and host telemetry among them), each judged");
         let lanes = c.iter().find(|c| c.name == "lanes").expect("the lanes row");
         assert_eq!((lanes.verdict, lanes.detail.as_str()), (Verdict::Ok, "1 chat lane(s): 1 serving, 0 on demand"));
     }
@@ -13741,6 +14216,96 @@ mod tests {
         assert_eq!(vendor_telemetry_check(&older).verdict, Verdict::Warn);
         let none = serde_json::json!({"id": "host3", "backend_containers": {}});
         assert_eq!(vendor_telemetry_check(&none).verdict, Verdict::Ok);
+    }
+
+    // Followup i1156: a Mac's native Ollama is its only Ollama lane; a stopped
+    // one FAILs with the remedy that fits (start vs install first); a Linux
+    // node gets no row.
+    #[test]
+    fn native_ollama_row_fails_on_a_mac_whose_ollama_is_down() {
+        let down = serde_json::json!({"id": "node_a", "os": "darwin", "backend_containers": {
+            "ollama": {"running": false, "runtime": "native", "launcher": "brew-service", "managed": true, "binary_present": true}}});
+        let c = native_ollama_check("node_a", &down).expect("a row on a Mac");
+        assert_eq!(c.verdict, Verdict::Fail, "{c:?}");
+        assert!(c.detail.contains("the native Ollama isn't running on this Mac"), "{}", c.detail);
+        let r = c.remedy.as_deref().unwrap();
+        assert!(r.contains("sudo HOMEBREW_NO_ANALYTICS=1 brew services start --sudo-service-user \"$USER\" ollama"), "{r}");
+        assert!(r.contains("run `noo enroll --resume`") && !r.contains("brew install"), "{r}");
+
+        let absent = serde_json::json!({"id": "node_a", "os": "darwin", "backend_containers": {
+            "ollama": {"running": false, "runtime": "native", "launcher": "none", "managed": false, "binary_present": false}}});
+        let c = native_ollama_check("node_a", &absent).expect("a row on a Mac");
+        assert_eq!(c.verdict, Verdict::Fail, "{c:?}");
+        assert!(c.detail.contains("isn't installed"), "{}", c.detail);
+        assert!(c.remedy.as_deref().unwrap().contains("`HOMEBREW_NO_ANALYTICS=1 brew install ollama`, then start it"), "{c:?}");
+
+        // An older agent (no `os`, no `binary_present`): judged by the
+        // runtime, the start remedy.
+        let older = serde_json::json!({"id": "node_a", "backend_containers": {
+            "ollama": {"running": false, "runtime": "native"}}});
+        assert_eq!(native_ollama_check("node_a", &older).map(|c| c.verdict), Some(Verdict::Fail));
+
+        let up = serde_json::json!({"id": "node_a", "os": "darwin", "backend_containers": {
+            "ollama": {"running": true, "runtime": "native", "managed": true}}});
+        assert_eq!(native_ollama_check("node_a", &up).map(|c| c.verdict), Some(Verdict::Ok));
+
+        // Serving from a per-user LaunchAgent (enrolled before i1156): WARN,
+        // and the remedy is the Mac's own `noo enroll --resume`, never
+        // `provision` (a roll cannot register a boot service).
+        let user = serde_json::json!({"id": "node_a", "os": "darwin", "backend_containers": {
+            "ollama": {"running": true, "runtime": "native", "managed": true, "plist_domain": "user"}}});
+        let c = native_ollama_check("node_a", &user).expect("a row on a Mac");
+        assert_eq!(c.verdict, Verdict::Warn, "{c:?}");
+        assert!(c.detail.contains("not a boot service yet"), "{}", c.detail);
+        let r = c.remedy.as_deref().unwrap();
+        assert!(r.contains("`noo enroll --resume`") && !r.contains("provision"), "{r}");
+        let system = serde_json::json!({"id": "node_a", "os": "darwin", "backend_containers": {
+            "ollama": {"running": true, "runtime": "native", "managed": true, "plist_domain": "system"}}});
+        let c = native_ollama_check("node_a", &system).expect("a row on a Mac");
+        assert_eq!(c.verdict, Verdict::Ok, "{c:?}");
+        assert_eq!(c.detail, "serving on 127.0.0.1:11434 as a boot service");
+        // No row's remedy on a Mac names provision: it cannot fix any of them.
+        for n in [&down, &absent, &older, &user] {
+            let c = native_ollama_check("node_a", n).unwrap();
+            assert!(!c.remedy.as_deref().unwrap_or("").contains("provision"), "{c:?}");
+        }
+
+        // Linux: a stopped container ollama, or a native-looking entry on a
+        // node that says it is not a Mac: no row.
+        let linux = serde_json::json!({"id": "node_b", "os": "linux", "backend_containers": {
+            "ollama": {"running": false, "started_at": 1, "telemetry_missing": []}}});
+        assert!(native_ollama_check("node_b", &linux).is_none());
+        let not_mac = serde_json::json!({"id": "node_b", "os": "linux", "backend_containers": {
+            "ollama": {"running": false, "runtime": "native"}}});
+        assert!(native_ollama_check("node_b", &not_mac).is_none());
+        // The self-node's adopted stack ollama is not a Mac's.
+        let stack = serde_json::json!({"id": "ctrl", "backend_containers": {
+            "ollama": {"running": false, "runtime": "stack"}}});
+        assert!(native_ollama_check("ctrl", &stack).is_none());
+    }
+
+    // The agent's native-down refusal surfaces its own remedy in `backend
+    // starts`, not `noo cluster show`.
+    #[test]
+    fn backend_starts_row_surfaces_the_native_ollama_remedy() {
+        let n = serde_json::json!({"id": "node_a", "reconcile_refusals": [{"scope": "backend_start", "target": "ollama",
+            "reason": "the native Ollama isn't running on this Mac: start it with `sudo HOMEBREW_NO_ANALYTICS=1 brew services start --sudo-service-user nodeuser ollama` (a boot service), or run `noo enroll --resume`"}]});
+        let c = backend_starts_check("node_a", &n).unwrap();
+        let r = c.remedy.as_deref().unwrap();
+        assert!(r.starts_with("on node_a: start it with `sudo HOMEBREW_NO_ANALYTICS=1 brew services start"), "{r}");
+        assert!(!r.contains("noo cluster show"), "{r}");
+    }
+
+    // A boot-service plist (root's) gets the sudo remedy in `vendor telemetry`.
+    #[test]
+    fn vendor_telemetry_row_gives_sudo_for_a_boot_service_plist() {
+        let n = serde_json::json!({"id": "node_a", "backend_containers": {
+            "ollama": {"running": true, "runtime": "native", "managed": true, "plist_label": "sh.brew.ollama",
+                       "plist_domain": "system", "telemetry_missing": ["OLLAMA_NO_CLOUD"]}}});
+        let c = vendor_telemetry_check(&n);
+        assert_eq!(c.verdict, Verdict::Fail, "{c:?}");
+        let r = c.remedy.as_deref().unwrap();
+        assert!(r.contains("sudo launchctl bootstrap system $P") && !r.contains("LaunchAgents"), "{r}");
     }
 
     // host8 2026-10-03: an old agent-created noo-ollama beside the stack's
@@ -16904,6 +17469,58 @@ mod netns_restore_row_tests {
 }
 
 #[cfg(test)]
+mod hostd_at_boot_row_tests {
+    use super::*;
+    use crate::hostd_boot::{HostdKind, Linger};
+
+    /// i1160 risk 5: a user unit with linger off is the controller that
+    /// stays down after a power cut until someone logs in.
+    #[test]
+    fn hostd_at_boot_warns_when_linger_is_off() {
+        let c = hostd_at_boot_row(HostdKind::UserUnit, "alex", Some(Linger::Off)).expect("a row");
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert_eq!(c.detail, "noo-hostd is alex's user unit and linger is off: after a reboot nothing restores the stack until alex logs in");
+        assert_eq!(c.remedy.as_deref(), Some("sudo loginctl enable-linger alex"));
+    }
+
+    #[test]
+    fn hostd_at_boot_is_ok_with_linger_on_or_a_system_unit() {
+        let c = hostd_at_boot_row(HostdKind::UserUnit, "alex", Some(Linger::On)).expect("a row");
+        assert_eq!(c.verdict, Verdict::Ok);
+        assert!(c.detail.contains("linger is on") && c.detail.contains("starts at boot"), "{}", c.detail);
+        assert_eq!(hostd_at_boot_row(HostdKind::SystemUnit, "alex", None).expect("a row").verdict, Verdict::Ok);
+        assert!(hostd_at_boot_row(HostdKind::Absent, "alex", None).is_none());
+    }
+
+    #[test]
+    fn hostd_at_boot_unreadable_linger_cannot_be_checked() {
+        for linger in [Some(Linger::Unreadable("Failed to connect to bus".into())), None] {
+            let c = hostd_at_boot_row(HostdKind::UserUnit, "alex", linger.clone()).expect("a row");
+            assert_eq!(c.verdict, Verdict::Warn, "{linger:?}");
+            assert!(c.detail.starts_with("cannot be checked: linger for alex could not be read"), "{}", c.detail);
+            assert!(c.detail.contains("until alex logs in"), "{}", c.detail);
+            assert_eq!(c.remedy.as_deref(), Some("sudo loginctl enable-linger alex"));
+        }
+    }
+
+    #[test]
+    fn hostd_at_boot_says_a_mac_launch_agent_waits_for_login() {
+        let c = hostd_at_boot_row(HostdKind::LaunchAgent, "alex", None).expect("a row");
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.starts_with("noo-hostd is alex's LaunchAgent") && c.detail.contains("until alex logs in"), "{}", c.detail);
+        assert!(c.detail.contains("automatic login") && c.detail.contains("FileVault"), "{}", c.detail);
+        assert_eq!(c.remedy, None);
+    }
+
+    #[test]
+    fn the_controller_run_has_the_hostd_at_boot_row() {
+        let own = crate::test_src::own_code(include_str!("cluster_verify.rs"));
+        let run = crate::test_src::fn_body(&own, "pub fn cluster_verify(");
+        assert!(run.contains("hostd_at_boot_row_here()"), "{run}");
+    }
+}
+
+#[cfg(test)]
 mod docker_refused_row_tests {
     use super::*;
 
@@ -16920,7 +17537,7 @@ mod docker_refused_row_tests {
         for r in rows {
             let name = r.name;
             let before = r.detail.clone();
-            let c = docker_refused(r, Some(DENIED));
+            let c = docker_unprobed(r, Some(&crate::commands::secrets_delivery::DockerRefusal::Denied(DENIED.to_string())), &[]);
             assert!(c.detail.contains(DENIED), "{name}: {}", c.detail);
             assert!(!c.detail.contains("not running"), "{name}: failed lookup is not absence: {}", c.detail);
             assert_eq!(c.remedy.as_deref(), Some(crate::commands::secrets_delivery::DOCKER_REFUSED_REMEDY), "{name}");
@@ -16931,14 +17548,50 @@ mod docker_refused_row_tests {
                 "sandbox executor" => sandbox_executor_check(None),
                 _ => postgres_client_cert_check(None, None),
             };
-            assert_eq!(docker_refused(again, None).detail, before, "{name}");
+            assert_eq!(docker_unprobed(again, None, &[]).detail, before, "{name}");
         }
     }
 
     #[test]
     fn a_row_that_did_probe_is_never_rewritten() {
         let c = ok("sandbox executor", "code runs as sandbox-exec (uids 65600-65663)");
-        assert_eq!(docker_refused(c.clone(), Some(DENIED)).detail, c.detail);
+        let denied = crate::commands::secrets_delivery::DockerRefusal::Denied(DENIED.to_string());
+        assert_eq!(docker_unprobed(c.clone(), Some(&denied), &[]).detail, c.detail);
+        assert_eq!(docker_unprobed(c.clone(), None, &[(crate::envfile::container("gateway").to_string(), "could not inspect x (y)".to_string())]).detail, c.detail);
+    }
+
+    /// docker answered `version` but an inspect did not (a hung bind mount):
+    /// the row says that, not "container not running", with `docker info`.
+    /// Unknown for container A is no evidence about container B: B's row
+    /// (whose container was really Stopped) keeps its own text.
+    #[test]
+    fn another_containers_unknown_is_not_this_rows_cause() {
+        let a = crate::commands::secrets::container_unknown_message(&crate::envfile::container("postgres"), "`docker inspect` did not answer in 10 s");
+        let notes = [(crate::envfile::container("postgres").to_string(), a.clone())];
+        let before = sandbox_executor_check(None);
+        let c = docker_unprobed(before.clone(), None, &notes);
+        assert_eq!(c.detail, before.detail, "the sandbox row heard about postgres");
+        assert!(!c.detail.contains("could not inspect"), "{}", c.detail);
+        assert_eq!(c.remedy, before.remedy);
+        // The postgres row does get its own container's note.
+        let pg = docker_unprobed(postgres_client_cert_check(None, None), None, &notes);
+        assert!(pg.detail.contains("could not inspect"), "{}", pg.detail);
+        assert_eq!(crate::commands::secrets::note_for(&notes, "other"), None);
+    }
+
+    #[test]
+    fn an_unknown_inspect_is_not_said_as_a_stopped_container() {
+        let note = crate::commands::secrets::container_unknown_message("noo-gateway", "`docker inspect` did not answer in 10 s");
+        let gw = crate::envfile::container("gateway").to_string();
+        let pg = crate::envfile::container("postgres").to_string();
+        let notes = [(gw, note.clone()), (pg, note.clone())];
+        for r in [sandbox_executor_check(None), postgres_client_cert_check(None, None)] {
+            let name = r.name;
+            let c = docker_unprobed(r, None, &notes);
+            assert!(c.detail.contains("could not inspect noo-gateway"), "{name}: {}", c.detail);
+            assert!(!c.detail.contains("not running"), "{name}: {}", c.detail);
+            assert_eq!(c.remedy.as_deref(), Some("docker info"), "{name}");
+        }
     }
 
     #[test]
@@ -17008,6 +17661,35 @@ mod image_retention_row_tests {
         let r = image_retention_row(Some(Ok(rep)), None);
         assert_eq!(r.verdict, Verdict::Warn);
         assert!(r.detail.contains("ghcr.io/noomesh/x:old") && r.detail.contains("being used"), "{}", r.detail);
+    }
+
+    #[test]
+    fn every_refusal_is_named_with_its_reason() {
+        let rep = json!({"written_at": "T", "dry_run": false, "bytes": 0,
+            "images": [img(true, Some("refused: conflict: container c1 is using its referenced image")),
+                       img(true, Some("refused: image has dependent child images")),
+                       img(true, Some("removed"))]});
+        let r = image_retention_row(Some(Ok(rep)), None);
+        assert_eq!(r.verdict, Verdict::Warn);
+        assert!(r.detail.starts_with("2 superseded image(s) Docker refused"), "{}", r.detail);
+        assert!(r.detail.contains("container c1 is using") && r.detail.contains("dependent child images"), "{}", r.detail);
+        let many: Vec<Value> = (0..8).map(|i| img(true, Some(&format!("refused: reason {i}")))).collect();
+        let r = image_retention_row(Some(Ok(json!({"written_at": "T", "dry_run": false, "bytes": 0, "images": many}))), None);
+        assert!(r.detail.contains("reason 4") && !r.detail.contains("reason 5") && r.detail.contains("3 more"), "{}", r.detail);
+    }
+
+    /// 2026-11-22: an older hostd lost Docker's message, so 13 images read
+    /// "refused: " with nothing after it, and every one was already gone.
+    /// Said as such, with the check, never as a bare empty refusal.
+    #[test]
+    fn a_refusal_with_no_reason_says_it_was_probably_removed_and_how_to_check() {
+        let rep = json!({"written_at": "T", "dry_run": false, "bytes": 0,
+            "images": [img(true, Some("refused: ")), img(true, Some("refused:"))]});
+        let r = image_retention_row(Some(Ok(rep)), None);
+        assert_eq!(r.verdict, Verdict::Warn);
+        assert!(r.detail.starts_with("2 more reported refused at T with no reason recorded"), "{}", r.detail);
+        assert!(r.detail.contains("docker image inspect") && r.detail.contains("No such image"), "{}", r.detail);
+        assert!(!r.detail.contains("Docker refused to remove"), "no empty refusal is shown as Docker's: {}", r.detail);
     }
 
     #[test]
@@ -17998,8 +18680,117 @@ mod docker_compose_tests {
 }
 
 #[cfg(test)]
+mod target_node_row_tests {
+    use super::*;
+
+    #[test]
+    fn the_target_node_row_tells_strict_from_the_two_tolerant_states() {
+        let strict = target_node_check("node-b", &serde_json::json!({"checks_target_node": true, "requires_target_node": true}), 0);
+        assert_eq!((strict.name, strict.verdict), ("target-node check", Verdict::Ok));
+        assert!(strict.detail.starts_with("strict"), "{}", strict.detail);
+        let untold = target_node_check("node-b", &serde_json::json!({"checks_target_node": true, "requires_target_node": false}), 0);
+        assert_eq!(untold.verdict, Verdict::Warn);
+        assert!(untold.detail.starts_with("tolerant: not yet told"), "{}", untold.detail);
+        for old in [serde_json::json!({"checks_target_node": false, "requires_target_node": false}), serde_json::json!({})] {
+            let row = target_node_check("node-b", &old, 0);
+            assert_eq!(row.verdict, Verdict::Warn);
+            assert!(row.detail.starts_with("tolerant: the agent is older than the controller"), "{}", row.detail);
+            assert_eq!(row.remedy.as_deref(), Some("noo cluster provision node-b"));
+        }
+    }
+
+    #[test]
+    fn every_node_gets_the_target_node_row() {
+        let src = include_str!("cluster_verify.rs");
+        let f = crate::test_src::fn_body(src, "pub(crate) fn node_checks(");
+        assert!(f.contains("out.push(target_node_check(id, n, now_unix));"));
+        assert!(f.contains("out.extend(node_identity_check(id, n, now_unix));"));
+    }
+
+    /// An agent's 421 wrong_node (the heartbeat's `wrong_node_refused`) is
+    /// one FAIL naming the call and the next command.
+    #[test]
+    fn a_wrong_node_refusal_fails_the_target_node_row() {
+        let n = serde_json::json!({"checks_target_node": true, "requires_target_node": true,
+            "wrong_node_refused": {"target": "node-c", "path": "/start", "at": 940}});
+        let row = target_node_check("node-b", &n, 1000);
+        assert_eq!(row.verdict, Verdict::Fail);
+        assert_eq!(
+            row.detail,
+            "node-b's agent refused a call addressed to node-c (/start, 421 wrong_node, 60s ago): the controller dialled node-b's address for node-c"
+        );
+        assert!(row.remedy.as_deref().unwrap().starts_with("noo cluster verify node-c"), "{:?}", row.remedy);
+        let headerless = serde_json::json!({"checks_target_node": true, "requires_target_node": true,
+            "wrong_node_refused": {"target": "", "path": "/start", "at": 940}});
+        let row = target_node_check("node-b", &headerless, 1000);
+        assert_eq!(row.verdict, Verdict::Fail);
+        assert!(row.detail.contains("a controller call that named no node"), "{}", row.detail);
+        assert!(row.remedy.as_deref().unwrap().starts_with("noo cluster logs node-b"), "{:?}", row.remedy);
+    }
+
+    /// The gateway's 502 node_identity_mismatch (`/api/cluster/nodes`'
+    /// `node_identity_mismatch`) is one FAIL with the fact and the next
+    /// command; no row without it.
+    #[test]
+    fn an_identity_refusal_fails_the_node_identity_row() {
+        assert!(node_identity_check("node-b", &serde_json::json!({}), 1000).is_none());
+        let n = serde_json::json!({"node_identity_mismatch": {"host": "192.0.2.41", "expected": ["node-b"], "presented": ["node-c"], "at": 990}});
+        let row = node_identity_check("node-b", &n, 1000).expect("a row");
+        assert_eq!((row.name, row.verdict), ("node identity", Verdict::Fail));
+        assert_eq!(
+            row.detail,
+            "192.0.2.41 answered with node-c's certificate when dialled for node-b (502 node_identity_mismatch, 10s ago): the controller's address book gives 192.0.2.41 to node-b"
+        );
+        let remedy = row.remedy.as_deref().unwrap();
+        assert!(remedy.starts_with("noo cluster verify node-b --json"), "{remedy}");
+        assert!(remedy.contains("noo security pki push-nodes node-b --prove"), "{remedy}");
+        assert!(!remedy.contains("provision"), "{remedy}");
+        let held = serde_json::json!({"node_identity_mismatch": {"host": "192.0.2.41:8081", "expected": ["node-b"], "presented": ["address owned by node-c"], "at": 990}});
+        let row = node_identity_check("node-b", &held, 1000).expect("a row");
+        assert!(row.detail.contains("gives 192.0.2.41:8081 to node-c, and node-b's record still names it"), "{}", row.detail);
+    }
+
+    /// `ip_address_refused` is one FAIL on the `agent address` row, with
+    /// the next command for its reason.
+    #[test]
+    fn a_refused_address_fails_the_agent_address_row() {
+        let row = |why: &str| {
+            agent_address_check("node-b", &serde_json::json!({"ip_address": "192.0.2.41", "ip_address_refused": why})).expect("a row")
+        };
+        let claimed = row("192.0.2.42 is claimed by node-c");
+        assert_eq!((claimed.name, claimed.verdict), ("agent address", Verdict::Fail));
+        assert_eq!(
+            claimed.detail,
+            "node-b: the controller did not store the address it reported (192.0.2.42 is claimed by node-c); the controller keeps dialling it at 192.0.2.41"
+        );
+        assert!(claimed.remedy.as_deref().unwrap().starts_with("noo cluster verify node-c"), "{:?}", claimed.remedy);
+        let own = row("192.0.2.1 is the controller's own address");
+        assert!(own.remedy.as_deref().unwrap().starts_with("on node-b, set NODE_IP"), "{:?}", own.remedy);
+        let peer = row("the heartbeat came from tailnet address 100.64.0.9, not 100.64.0.8");
+        assert!(peer.remedy.as_deref().unwrap().contains("to 100.64.0.9, the tailnet address it calls from"), "{:?}", peer.remedy);
+        for r in [&claimed, &own, &peer] {
+            assert!(!r.remedy.as_deref().unwrap().contains("provision"), "{:?}", r.remedy);
+        }
+        assert!(agent_address_check("node-b", &serde_json::json!({"ip_address": "192.0.2.41"})).is_none());
+    }
+}
+
+#[cfg(test)]
 mod agent_cert_tests {
     use super::*;
+
+    #[test]
+    fn an_unclaimed_address_is_reissued_only_on_proof() {
+        // Private or public, one remedy: plain push-nodes mints only vetted
+        // addresses (i1174), so the proof form is the way to a new one.
+        for host in ["10.0.0.41", "192.0.2.41"] {
+            let row = agent_cert_check("node-b", host, Some(false), None).expect("a row");
+            assert_eq!(row.verdict, Verdict::Fail);
+            assert_eq!(row.remedy.as_deref(), Some("noo security pki push-nodes node-b --prove   # then: noo cluster verify node-b"));
+        }
+        // A claimed one gets none.
+        assert!(agent_cert_check("node-b", "10.0.0.41", Some(false), Some("node-c")).unwrap().remedy.is_none());
+    }
 
     #[test]
     fn a_leaf_that_misses_the_dialed_address_fails_naming_both() {
@@ -18007,8 +18798,9 @@ mod agent_cert_tests {
         assert_eq!(row.name, "agent certificate");
         assert_eq!(row.verdict, Verdict::Fail);
         assert!(row.detail.contains("node-b") && row.detail.contains("192.0.2.41") && row.detail.contains("fails TLS"), "{}", row.detail);
-        assert!(row.remedy.as_deref().unwrap().contains("noo security pki push-nodes node-b"));
+        assert!(row.remedy.as_deref().unwrap().contains("noo security pki push-nodes node-b --prove"), "{:?}", row.remedy);
         assert!(row.detail.contains("will issue it a certificate for 192.0.2.41"), "the row says what it would certify: {}", row.detail);
+        assert!(row.detail.contains("not node-b's enrollment, tailnet or current-leaf address"), "{}", row.detail);
     }
 
     /// The address is another node's: a finding, never a remedy that would
@@ -18098,6 +18890,46 @@ mod json_parity_tests {
     fn unreachable_next_is_the_text_guide() {
         let cmds: Vec<&str> = GATEWAY_UNREACHABLE_NEXT.iter().map(|(c, _)| *c).collect();
         assert_eq!(cmds, ["noo health", "noo stack status"]);
+    }
+
+    /// On a node the gateway-unreachable verify says the agent's own story
+    /// and node-side checks, never a controller-only command.
+    #[test]
+    fn a_node_that_cannot_reach_the_controller_gets_node_checks_only() {
+        for (url, ts) in [(Some("https://ctrl.example.ts.net:8080"), true), (Some("https://100.64.0.1:8080"), false), (Some("https://[fd00::1]:8080/"), false), (None, false)] {
+            let (line, guide) = unreachable_from_node("node_a", url, ts);
+            assert!(line.contains("nothing is reconciled") && line.contains("running backends keep running"), "{line}");
+            assert!(line.contains("node 'node_a'"), "{line}");
+            for (c, _) in &guide {
+                assert!(!crate::role::is_controller_only(c), "a node is told to run a controller-only command: {c}");
+            }
+            assert!(guide.iter().any(|(c, _)| c == "cat /etc/noo/controller-url"), "{guide:?}");
+            assert_eq!(guide.iter().any(|(c, _)| c == "tailscale status"), ts, "tailnet check only with tailscale: {guide:?}");
+            assert_eq!(guide.last().map(|(c, _)| c.as_str()), Some("noo health"));
+        }
+        let (_, g) = unreachable_from_node("node_a", Some("https://100.64.0.1:8080"), false);
+        assert!(g.iter().any(|(c, _)| c == "ip route get 100.64.0.1"), "{g:?}");
+        let (_, g) = unreachable_from_node("node_a", Some("https://[fd00::1]:8080/"), false);
+        assert!(g.iter().any(|(c, _)| c == "ip route get fd00::1"), "{g:?}");
+        let (line, _) = unreachable_from_node("node_a", None, false);
+        assert!(line.contains("/etc/noo/controller-url"), "{line}");
+    }
+
+    /// The controller's own guide names a controller-only verb (it is one),
+    /// so the predicate is not vacuous.
+    #[test]
+    fn is_controller_only_knows_stack() {
+        assert!(crate::role::is_controller_only("noo stack status"));
+        assert!(!crate::role::is_controller_only("noo health"));
+        assert!(!crate::role::is_controller_only("tailscale status"));
+    }
+
+    #[test]
+    fn verify_takes_the_node_branch_before_the_controller_guide() {
+        let src = include_str!("cluster_verify.rs");
+        let node = src.find("if let Some(node) = crate::role::detect().node_only().cloned() {").expect("the node branch");
+        let ctl = src.find("ui::guide(GATEWAY_UNREACHABLE_NEXT);").expect("the controller guide");
+        assert!(node < ctl);
     }
 
     /// `seats: []` is "none enrolled"; null is "the gateway did not say".
@@ -18320,5 +19152,71 @@ mod default_chat_fleet_shape_tests {
         assert_eq!(brief_split(std::slice::from_ref(&c)).passed, 1);
         assert_eq!(fleet_node_count(&[]), None);
         assert_eq!(fleet_node_count(&[json!({"id": "ctrl"})]), Some(1));
+    }
+}
+
+#[cfg(test)]
+mod controller_address_tests {
+    use super::*;
+
+    fn s(v: &[&str]) -> Vec<String> {
+        v.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn a_name_or_a_tailnet_address_survives_a_move() {
+        let c = controller_address_check(Some("https://ctrl.example.ts.net:8080"), None, None).unwrap();
+        assert_eq!(c.verdict, Verdict::Ok, "{}", c.detail);
+        let c = controller_address_check(Some("https://100.64.0.1:8080"), None, Some(&s(&["192.0.2.5"]))).unwrap();
+        assert_eq!(c.verdict, Verdict::Ok, "{}", c.detail);
+        assert!(c.detail.contains("tailnet address"), "{}", c.detail);
+        let c = controller_address_check(Some("https://192.0.2.5:8080"), Some("noo.example.lan"), Some(&s(&["192.0.2.9"]))).unwrap();
+        assert_eq!(c.verdict, Verdict::Ok, "NOO_CONTROLLER_DNS wins: {}", c.detail);
+    }
+
+    /// i1173: a LAN IP this machine holds works today and strands every
+    /// node the day the router hands out another one: said, with the fix.
+    #[test]
+    fn a_local_ip_it_holds_warns_with_the_tailnet_first() {
+        let c = controller_address_check(Some("https://192.0.2.5:8080"), None, Some(&s(&["192.0.2.5", "100.64.0.3"]))).unwrap();
+        assert_eq!(c.verdict, Verdict::Warn, "{}", c.detail);
+        assert!(c.detail.contains("cannot be fixed from here"), "{}", c.detail);
+        let r = c.remedy.unwrap();
+        assert!(r.starts_with("put the controller on a tailnet, the default path"), "{r}");
+        assert!(r.contains("DHCP reservation"), "{r}");
+        let unknown = controller_address_check(Some("https://192.0.2.5:8080"), None, None).unwrap();
+        assert_eq!(unknown.verdict, Verdict::Warn, "unknown local addresses never FAIL");
+    }
+
+    /// The controller moved: the address nodes hold is no longer its own.
+    #[test]
+    fn a_local_ip_it_no_longer_holds_fails_naming_both() {
+        let c = controller_address_check(Some("https://192.0.2.5:8080/"), None, Some(&s(&["192.0.2.77"]))).unwrap();
+        assert_eq!(c.verdict, Verdict::Fail, "{}", c.detail);
+        assert!(c.detail.contains("192.0.2.5") && c.detail.contains("192.0.2.77"), "{}", c.detail);
+        assert!(c.remedy.unwrap().contains("enroll each node again"));
+    }
+
+    #[test]
+    fn nothing_to_judge_without_a_remote_url() {
+        for u in [None, Some(""), Some("https://localhost:8080"), Some("https://127.0.0.1:8080"), Some("https://gateway:8080")] {
+            assert!(controller_address_check(u, None, Some(&s(&["192.0.2.5"]))).is_none(), "{u:?}");
+        }
+    }
+
+    #[test]
+    fn hosts_parse_from_urls_and_bare_forms() {
+        assert_eq!(url_host("https://192.0.2.5:8080/x"), "192.0.2.5");
+        assert_eq!(url_host("192.0.2.5"), "192.0.2.5");
+        assert_eq!(url_host("https://[fd00::5]:8080"), "fd00::5");
+        assert_eq!(url_host("https://u@ctrl.lan:8080"), "ctrl.lan");
+    }
+
+    #[test]
+    fn verify_runs_the_row_beside_the_service_cert_names() {
+        let src = include_str!("cluster_verify.rs");
+        let row = src.find("if let Some(c) = controller_address_row_here() {").expect("called");
+        let svc = src.find("checks.push(service_cert_names_check(").expect("anchor");
+        assert!(row < svc);
     }
 }

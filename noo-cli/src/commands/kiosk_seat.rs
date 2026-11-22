@@ -1047,8 +1047,13 @@ if [ -f @R@/etc/systemd/system/kiosk.service ]; then
   # never runs a script the seat can write, so it is never a link into @DIR@.
   install -m 0755 -o root -g root @WORK@/noo-kiosk-watchdog @R@@BIN@/noo-kiosk-watchdog
 @CLEAN@  systemctl daemon-reload
-  systemctl restart kiosk-serve.service || true
-  systemctl restart kiosk.service || true
+  # This release's [Install] (a dedicated display is also wanted by
+  # multi-user.target): re-link an enabled unit, never enable a disabled one.
+  if systemctl is-enabled --quiet kiosk.service 2>/dev/null; then systemctl reenable kiosk.service || true; fi
+  # --no-block: a start queued behind a boot job that never finishes must
+  # not hang this script; the self-check below is the bound (i1153).
+  systemctl restart kiosk-serve.service --no-block || true
+  systemctl restart kiosk.service --no-block || true
   # Self-check: never report success with a dead display.
   ok=0; i=0; a=unknown; s=unknown
   while [ "$i" -lt @WAIT@ ]; do
@@ -1066,6 +1071,13 @@ if [ -f @R@/etc/systemd/system/kiosk.service ]; then
   if [ "$ok" -lt 3 ]; then
     echo "" >&2
     echo "noo-seat: ERROR - THE DISPLAY IS NOT RUNNING: kiosk.service is '$a', kiosk-serve.service is '$s' after @WAIT@ s" >&2
+    if [ -n "$(systemctl show -p Job --value kiosk.service 2>/dev/null || true)" ]; then
+      after=" $(systemctl show -p After --value kiosk.service 2>/dev/null || true) "
+      behind=$(systemctl list-jobs --no-legend --full --no-pager 2>/dev/null | while read -r _ u _ st _; do
+        case "$after" in *" $u "*) echo "$st $u" ;; esac
+      done | sort | sed -n '1s/^[a-z]* //p')
+      echo "noo-seat: kiosk.service did not start within @WAIT@ s: a start job is queued behind ${behind:-a unit systemctl list-jobs names}" >&2
+    fi
     echo "noo-seat: why: journalctl -u kiosk.service -n 50 --no-pager   (and: journalctl -u kiosk-serve.service -n 50 --no-pager)" >&2
     exit 1
   fi
@@ -1378,6 +1390,22 @@ fn sh_out(cmd: &mut Command) -> Option<String> {
 
 fn unit_state(unit: &str) -> String {
     sh_out(Command::new("systemctl").args(["is-active", unit])).filter(|s| !s.is_empty()).unwrap_or_else(|| "unknown".into())
+}
+
+/// The sync's display restart: `--no-block` plus a bounded wait, never a
+/// blocking `systemctl restart`. One queued behind a boot job that never
+/// finishes held the whole sync (and the roll waiting on its report) for
+/// the unit's 15 minutes, then again on the next tick (i1153). A start
+/// that does not happen in the bound is a failed restart, said in the
+/// journal with what it waits behind.
+fn restart_display_bounded() -> bool {
+    match super::kiosk::restart_kiosk_bounded(false) {
+        Ok(_) => true,
+        Err(e) => {
+            eprintln!("noo-seat-sync: {e}");
+            false
+        }
+    }
 }
 
 fn unit_exists(unit: &str) -> bool {
@@ -1884,7 +1912,7 @@ fn apply_blob(blob: &[u8], cfg: &SeatConfig, state: &mut SeatState) -> Result<Ap
             vouched.is_ok(),
             &|| unit_state("kiosk.service") == "active",
             &|| Command::new(format!("{KIOSK_BIN}/noo-kiosk-cdp")).arg("reload").status().map(|s| s.success()).unwrap_or(false),
-            &|| Command::new("systemctl").args(["restart", "kiosk.service"]).status().map(|s| s.success()).unwrap_or(false),
+            &restart_display_bounded,
         );
         let replaced = prevs.borrow().clone();
         o.display = settle_display(
@@ -1893,7 +1921,7 @@ fn apply_blob(blob: &[u8], cfg: &SeatConfig, state: &mut SeatState) -> Result<Ap
             &|| display_stays_up(&|| unit_state("kiosk.service") == "active",
                 &|| std::thread::sleep(std::time::Duration::from_secs(1)), 20, 3),
             &|| replaced.iter().all(|(d, p)| std::fs::rename(p, d).is_ok()),
-            &|| Command::new("systemctl").args(["restart", "kiosk.service"]).status().map(|s| s.success()).unwrap_or(false),
+            &restart_display_bounded,
             &|| for (_, p) in &replaced { let _ = std::fs::remove_file(p); },
         );
         if !console.is_empty() && display_settled(o.display) {
@@ -2720,6 +2748,28 @@ pub(crate) fn seat_checks_after_apply(seat: &Value, controller_cli: &str, contro
     out
 }
 
+/// The roll's seat status answer says nothing about the seat: no answer at
+/// all (`Null`), or a record with neither a `last_seen` nor a heartbeat.
+/// Judged as a record, that read as three unrelated faults ("never heard
+/// from since it enrolled", "no CLI version reported", "no kiosk set up on
+/// this seat") on a seat whose sync was stuck in a queued display restart
+/// (i1153).
+pub(crate) fn seat_record_empty(st: &Value) -> bool {
+    let hb_empty = match &st["heartbeat"] {
+        Value::Null => true,
+        Value::Object(m) => m.is_empty(),
+        _ => false,
+    };
+    !st.is_object() || (st["last_seen"].as_str().filter(|s| !s.is_empty()).is_none() && hb_empty)
+}
+
+/// The one check the roll prints for an empty seat record.
+pub(crate) fn seat_did_not_report(name: &str) -> super::cluster_verify::Check {
+    check("seat online", super::cluster_verify::Verdict::Fail,
+        "the seat did not report: its sync may be stuck (a start job queued?)".into(),
+        Some(format!("on {name}: systemctl list-jobs   (and: journalctl -u noo-seat-sync -n 30)")))
+}
+
 /// The seats stage of `noo upgrade` (after the nodes, or alone with
 /// `--seats`): stage every enrolled seat, wait for all of them together with
 /// the nodes' combined wait, then one verify block per seat. No enrolled
@@ -2775,7 +2825,8 @@ pub(crate) fn upgrade_seats(g: &Globals) -> i32 {
                 }
             }
             let st = with_listed_user(st.unwrap_or(Value::Null), &seats, &n);
-            let checks = if ok_apply { seat_checks_after_apply(&st, env!("CARGO_PKG_VERSION"), &console, now_unix()) }
+            let checks = if seat_record_empty(&st) { vec![seat_did_not_report(&n)] }
+                else if ok_apply { seat_checks_after_apply(&st, env!("CARGO_PKG_VERSION"), &console, now_unix()) }
                 else { seat_checks(&st, env!("CARGO_PKG_VERSION"), &console, now_unix()) };
             let seat_ok = ok_apply && checks.iter().all(|c| c.verdict != super::cluster_verify::Verdict::Fail);
             if let Some(h) = checks.iter().find(|c| c.name == "display held") {
@@ -3891,7 +3942,14 @@ exec {real_install} "$@"
 "#));
             shim("runuser", "while [ \"$1\" != \"--\" ]; do shift; done\nshift\nexec \"$@\"\n".into());
             shim("id", "if [ \"$1\" = -gn ] && [ \"$2\" = kiosk ]; then echo kiosk; exit 0; fi\necho \"id: '$2': no such user\" >&2\nexit 1\n".into());
-            shim("systemctl", "echo \"systemctl $*\" >> \"$SHIM_LOG\"\nif [ \"$1\" = is-active ]; then echo \"${FAKE_STATE:-active}\"; [ \"${FAKE_STATE:-active}\" = active ]; exit $?; fi\nexit 0\n".into());
+            shim("systemctl", concat!(
+                "echo \"systemctl $*\" >> \"$SHIM_LOG\"\n",
+                "if [ \"$1\" = is-active ]; then echo \"${FAKE_STATE:-active}\"; [ \"${FAKE_STATE:-active}\" = active ]; exit $?; fi\n",
+                // A queued start (i1153): FAKE_JOB names kiosk.service's job.
+                "if [ \"$*\" = \"show -p Job --value kiosk.service\" ]; then echo \"${FAKE_JOB:-}\"; fi\n",
+                "if [ \"$*\" = \"show -p After --value kiosk.service\" ]; then echo \"systemd-user-sessions.service plymouth-quit-wait.service kiosk-serve.service\"; fi\n",
+                "if [ \"$1\" = list-jobs ] && [ -n \"${FAKE_JOB:-}\" ]; then echo \"$FAKE_JOB kiosk.service start waiting\"; echo \"3 plymouth-quit-wait.service start running\"; fi\n",
+                "exit 0\n").into());
             shim("sleep", "exit 0\n".into());
             shim("chown", "echo \"chown $*\" >> \"$SHIM_LOG\"\nexit 0\n".into());
             let work = root.join("_work");
@@ -4012,6 +4070,31 @@ exec {real_install} "$@"
             // A seat with a dead display still has its sync timer back.
             assert!(f.log().contains("systemctl enable --now noo-seat-sync.timer"));
         }
+    }
+
+    /// `--migrate`'s display restart does not block, and when the start is
+    /// still queued after the self-check it says behind what (i1153).
+    #[test]
+    fn the_root_step_names_a_start_job_queued_behind_another_unit() {
+        if !cfg!(target_os = "linux") { return; }
+        let f = FakeRoot::new("queued").with_display();
+        let script = seat_install_script_at(&f.root.to_string_lossy(), &f.work, &f.work.join("noo"), &f.cfg, "alex", SeatScript::Migrate);
+        let sp = f.root.join("_script.sh");
+        std::fs::write(&sp, &script).unwrap();
+        let out = Command::new("sh").arg(&sp)
+            .env("PATH", format!("{}:{}", f.root.join("_shims").display(), std::env::var("PATH").unwrap_or_default()))
+            .env("SHIM_LOG", &f.log)
+            .env("FAKE_STATE", "inactive")
+            .env("FAKE_JOB", "7")
+            .output().unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{err}");
+        assert!(err.contains(&format!("kiosk.service did not start within {DISPLAY_SELF_CHECK_SECS} s: a start job is queued behind plymouth-quit-wait.service")), "{err}");
+        assert!(f.log().contains("systemctl restart kiosk.service --no-block"), "{}", f.log());
+        // No job: the old message only.
+        let g = FakeRoot::new("dead-nojob").with_display();
+        let out = g.run(SeatScript::Migrate, "inactive");
+        assert!(!String::from_utf8_lossy(&out.stderr).contains("a start job is queued"));
     }
 
     /// node-h after 0.6.10: re-running `--migrate` on the user layout is
@@ -4620,5 +4703,27 @@ mod console_identity_tests {
         assert!(or.contains("\"/api/cluster/console-build\"") && or.contains(".filter(|id| id.starts_with(\"ui-\"))"), "{or}");
         let verify = crate::test_src::own_code(include_str!("cluster_verify.rs"));
         assert!(verify.contains("crate::commands::kiosk_seat::controller_console_or(g,"), "cluster verify compares against the gateway's console");
+    }
+}
+
+/// The roll's seat stage on an empty status record (i1153).
+#[cfg(test)]
+mod empty_record_tests {
+    use super::*;
+
+    #[test]
+    fn an_empty_seat_record_is_one_said_cause_not_three_faults() {
+        assert!(seat_record_empty(&Value::Null));
+        assert!(seat_record_empty(&json!({"seat_name": "a", "enroll_user": "u"})), "the listed user alone says nothing about the seat");
+        assert!(seat_record_empty(&json!({"seat_name": "a", "heartbeat": {}, "last_seen": ""})));
+        assert!(!seat_record_empty(&json!({"seat_name": "a", "last_seen": "2026-11-20T10:00:00Z"})));
+        assert!(!seat_record_empty(&json!({"seat_name": "a", "heartbeat": {"cli_version": "0.6.30"}})));
+        let c = seat_did_not_report("seat-a");
+        assert_eq!(c.verdict, super::super::cluster_verify::Verdict::Fail);
+        assert_eq!(c.detail, "the seat did not report: its sync may be stuck (a start job queued?)");
+        assert!(c.remedy.as_deref().unwrap_or("").contains("systemctl list-jobs"));
+        let own = crate::test_src::own_code(include_str!("kiosk_seat.rs"));
+        let roll = crate::test_src::fn_body(&own, "pub(crate) fn upgrade_seats(");
+        assert!(roll.contains("if seat_record_empty(&st) { vec![seat_did_not_report(&n)] }"), "{roll}");
     }
 }

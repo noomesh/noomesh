@@ -242,6 +242,110 @@ pub(crate) fn acceptable_node_ip(ip: &str) -> bool {
     }
 }
 
+/// What a node's reported address is checked against (i1174): the hosts
+/// other nodes' agents are reached at, and the controller's own.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct AddressClaims {
+    /// `(node, host)` for every agent address the gateway's address book
+    /// gives to ANOTHER node (`node_pin::hosts_claimed_by_others`).
+    pub others: Vec<(String, String)>,
+    /// The controller's own hosts: its self node's agent, its self-agent
+    /// URL and its controller URL.
+    pub controller: Vec<String>,
+    /// The self node's id, when known.
+    pub self_node: Option<String>,
+}
+
+impl AddressClaims {
+    /// The claims as the gateway holds them now, for `node_id`. The self
+    /// node is the one the address book knows; before the book knows one
+    /// (a gateway that just started), a node whose report says `self_node`.
+    pub(crate) fn current(node_id: &str, says_self: bool) -> Self {
+        let mut controller = crate::node_pin::self_node_hosts();
+        for url in [crate::routes::self_agent_base().unwrap_or_default(), super::bootstrap::controller_url()] {
+            if let Some(host) = reqwest::Url::parse(url.trim()).ok().and_then(|u| u.host_str().map(str::to_string)) {
+                controller.push(host.trim_matches(|c| c == '[' || c == ']').to_ascii_lowercase());
+            }
+        }
+        controller.sort();
+        controller.dedup();
+        let self_node = crate::node_pin::self_node().or_else(|| says_self.then(|| node_id.to_string()));
+        Self { others: crate::node_pin::hosts_claimed_by_others(node_id), controller, self_node }
+    }
+}
+
+fn same_addr(a: &str, b: &str) -> bool {
+    let norm = |s: &str| s.trim().trim_matches(|c| c == '[' || c == ']').to_ascii_lowercase();
+    match (norm(a).parse::<std::net::IpAddr>(), norm(b).parse::<std::net::IpAddr>()) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => norm(a) == norm(b),
+    }
+}
+
+/// Why a heartbeat (or registration) may NOT store `offered` as `node_id`'s
+/// address, or `None` when it may: a heartbeat cannot claim another node's
+/// address, nor the controller's own (i1174).
+///
+/// - The controller's own addresses belong to the self node (and its sensor
+///   companion) only.
+/// - An address the gateway already gives to another node is refused,
+///   UNLESS the node's own CA-signed leaf (`leaf_ips`, the client
+///   certificate this very heartbeat presented) carries it: the cluster CA
+///   vetted it for this node, which is how an address that legitimately
+///   moved (DHCP) is taken over.
+pub(crate) fn address_refusal(node_id: &str, offered: &str, claims: &AddressClaims, leaf_ips: &[String]) -> Option<String> {
+    let is_self = claims.self_node.as_deref().is_some_and(|s| crate::node_pin::same_machine(s, node_id));
+    if !is_self && claims.controller.iter().any(|c| same_addr(c, offered)) {
+        return Some(format!("{offered} is the controller's own address"));
+    }
+    let vetted = leaf_ips.iter().any(|ip| same_addr(ip, offered));
+    if let Some((other, _)) = claims.others.iter().find(|(_, host)| same_addr(host, offered)) {
+        if !vetted {
+            return Some(format!("{offered} is claimed by {other}"));
+        }
+    }
+    None
+}
+
+/// A tailnet address (100.64.0.0/10, fd7a:115c:a1e0::/48): unique to one
+/// machine on the tailnet, so two different ones are two machines.
+pub(crate) fn is_tailnet_addr(ip: &str) -> bool {
+    match ip.trim().trim_matches(|c| c == '[' || c == ']').parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(v4)) => v4.octets()[0] == 100 && (v4.octets()[1] & 0xc0) == 64,
+        Ok(std::net::IpAddr::V6(v6)) => v6.segments()[0] == 0xfd7a && v6.segments()[1] == 0x115c && v6.segments()[2] == 0xa1e0,
+        Err(_) => false,
+    }
+}
+
+/// The heartbeat's reported address against the connection's PEER address.
+/// Only a tailnet peer is meaningful here: behind docker's userland proxy,
+/// NAT or a bridge the peer is a gateway or router address and legitimately
+/// differs from what the node reports. A node reaches the controller from
+/// ONE tailnet address, so a tailnet peer and a DIFFERENT tailnet address
+/// reported is refused; any other difference is not judged.
+pub(crate) fn peer_refusal(offered: &str, peer: Option<&str>) -> Option<String> {
+    let peer = peer?;
+    (is_tailnet_addr(offered) && is_tailnet_addr(peer) && !same_addr(offered, peer))
+        .then(|| format!("the heartbeat came from tailnet address {peer}, not {offered}"))
+}
+
+/// A refused address is never stored. The stored one stays, unless it is
+/// itself another node's (or the controller's): then the record drops it,
+/// and the node is reached over its bus or tunnel until it reports one that
+/// is its own.
+pub(crate) fn hold_stored_address(data: &mut Value, node_id: &str, claims: &AddressClaims, leaf_ips: &[String]) {
+    let stored = data.get("ip_address").and_then(Value::as_str).unwrap_or("").to_string();
+    if !stored.is_empty() && address_refusal(node_id, &stored, claims, leaf_ips).is_some() {
+        if let Some(m) = data.as_object_mut() {
+            m.remove("ip_address");
+            m.remove("agent_url");
+        }
+    }
+}
+
+/// How often the same node's refused address is alerted.
+const ADDRESS_REFUSED_ALERT_COOLDOWN_SECS: i64 = 3_600;
+
 /// A node's `agent_url` must be https on an explicit port at its registered
 /// address: the URL's host is an IP literal equal to `ip` (itself a dialable
 /// node address), with no user info, query, fragment or path. The agent
@@ -321,6 +425,26 @@ pub(crate) fn apply_agent_url(data: &mut Value, offered: Option<&str>, node_id: 
     if !stored.is_empty() && acceptable_agent_url(&stored, &ip_now).is_err() {
         if let Some(m) = data.as_object_mut() {
             m.remove("agent_url");
+        }
+    }
+}
+
+/// The target-node fields (i1174), written EVERY beat and false when
+/// absent: a capability the gateway acts on (desired-config's
+/// `require_target_node`), so an agent rolled back to a build that does not
+/// report it must read as not checking, never inherit the record's `true`.
+pub(crate) fn carry_target_node(data: &mut Value, body: &Value) {
+    for key in [crate::node_pin::CHECKS_TARGET_FIELD, crate::node_pin::REQUIRES_TARGET_FIELD] {
+        data[key] = json!(body.get(key).and_then(Value::as_bool) == Some(true));
+    }
+    // The agent's latest `wrong_node` refusal, while it reports one: gone
+    // from the record the beat it stops.
+    match body.get(crate::node_pin::WRONG_NODE_FIELD).filter(|v| v.is_object()) {
+        Some(w) => data[crate::node_pin::WRONG_NODE_FIELD] = w.clone(),
+        None => {
+            if let Some(m) = data.as_object_mut() {
+                m.remove(crate::node_pin::WRONG_NODE_FIELD);
+            }
         }
     }
 }
@@ -648,6 +772,8 @@ pub(crate) fn heartbeat_body(
 async fn node_heartbeat(
     State(state): State<Arc<AppState>>,
     Path(node_id): Path<String>,
+    verified: Option<axum::Extension<Option<crate::node_identity::VerifiedPeer>>>,
+    connect: Option<axum::Extension<axum::extract::ConnectInfo<std::net::SocketAddr>>>,
     headers: axum::http::HeaderMap,
     raw: axum::body::Bytes,
 ) -> Result<AppJson, (axum::http::StatusCode, Json<Value>)> {
@@ -706,9 +832,52 @@ async fn node_heartbeat(
     // `127.0.1.1` — what host3's hostname resolves to, and what its agent
     // registered on 2026-09-22 whenever source-IP detection failed — had the
     // gateway dial itself and answer ~200 chat completions a minute with 502.
+    // i1174: a heartbeat cannot claim another node's address or the
+    // controller's own (`address_refusal`), and a tailnet peer must be the
+    // address reported (`peer_refusal`). A refusal keeps the last good
+    // address, is recorded as `ip_address_refused` and alerted.
+    let leaf_ips: Vec<String> = verified
+        .as_ref()
+        .and_then(|axum::Extension(p)| p.as_ref())
+        .filter(|p| p.node.eq_ignore_ascii_case(&node_id))
+        .map(|p| p.ips.clone())
+        .unwrap_or_default();
+    let peer_ip = connect.as_ref().map(|axum::Extension(axum::extract::ConnectInfo(a))| a.ip().to_string());
+    let claims = AddressClaims::current(&node_id, body.get("self_node").and_then(Value::as_bool) == Some(true));
     if let Some(v) = body.get("ip_address") {
         match v.as_str() {
-            Some(ip) if acceptable_node_ip(ip) => data["ip_address"] = v.clone(),
+            Some(ip) if acceptable_node_ip(ip) => {
+                let refused = address_refusal(&node_id, ip, &claims, &leaf_ips)
+                    .or_else(|| peer_refusal(ip, peer_ip.as_deref()));
+                match refused {
+                    None => {
+                        data["ip_address"] = v.clone();
+                        if let Some(m) = data.as_object_mut() {
+                            m.remove("ip_address_refused");
+                        }
+                    }
+                    Some(why) => {
+                        tracing::warn!(node = %node_id, offered = %ip, reason = %why, "ip_address_refused");
+                        data["ip_address_refused"] = json!(why);
+                        hold_stored_address(&mut data, &node_id, &claims, &leaf_ips);
+                        crate::operator_alert::send_operator_alert_with(
+                            &state,
+                            crate::operator_alert::OperatorAlert::new(
+                                "node.ip_address_refused",
+                                &node_id,
+                                format!(
+                                    "Node `{node_id}` reported an address the controller did not accept \
+                                     ({why}). Its calls keep going to its last accepted address."
+                                ),
+                            )
+                            .detail(why.clone())
+                            .investigate(format!("noo cluster verify {node_id}")),
+                            ADDRESS_REFUSED_ALERT_COOLDOWN_SECS,
+                        )
+                        .await;
+                    }
+                }
+            }
             Some(ip) if !ip.trim().is_empty() => tracing::warn!(
                 node = %node_id, offered = %ip,
                 "heartbeat named an address the controller cannot dial a node at — keeping the registered one"
@@ -813,6 +982,17 @@ async fn node_heartbeat(
     // tunnel). Written every beat; an agent that does not say is an older
     // one and reads as the HTTPS listener only.
     data[crate::node_link::TRANSPORTS_FIELD] = crate::node_link::reported_transports(&body);
+    // Whether the agent checks `X-Noo-Node` and whether it refuses a
+    // header-less controller call now (i1174): desired-config turns the
+    // second on per node once the first is reported; verify's `target-node
+    // check` row reads both.
+    carry_target_node(&mut data, &body);
+    // The peers this agent refused calls from as addressed to another node:
+    // its report on each CALLER, alerted on the caller (i1174).
+    for alert in crate::node_pin::misaddressed_alerts(&node_id, &body) {
+        crate::operator_alert::send_operator_alert_with(&state, alert, crate::node_pin::MISADDRESSED_ALERT_COOLDOWN_SECS)
+            .await;
+    }
     // Which image the node's backend-door sidecars run on
     // B: "published", or "fallback-alpine" — stunnel installed from the
     // alpine mirror at every sidecar start. `noo cluster verify <node>`
@@ -988,6 +1168,8 @@ async fn node_heartbeat(
 
     // Which credential the gateway presents to this agent from now on.
     crate::node_agent_auth::note(&node_id, &data);
+    // Which agent addresses this node owns: the pin's address book (i1174).
+    crate::node_pin::note(&node_id, &data);
 
     // Write to NATS KV mesh_nodes bucket (live source of truth)
     if let Ok(kv) = state.js.get_key_value("mesh_nodes").await {
@@ -1244,6 +1426,8 @@ async fn node_forget(
         kv_had_entry = matches!(kv.entry(&node_id).await, Ok(Some(_)));
         kv_purged = kv.purge(&node_id).await.is_ok();
     }
+    // Its agent addresses are no longer its own (i1174's address book).
+    crate::node_pin::forget(&node_id);
     // Nothing anywhere answered to that name: say so, rather than report a
     // typo as a node forgotten. A verb that returns "ok" for a name it
     // never held teaches the operator nothing about the row they meant.
@@ -1413,7 +1597,19 @@ async fn node_register_body(
     // tunnel). Written every beat; an agent that does not say is an older
     // one and reads as the HTTPS listener only.
     data[crate::node_link::TRANSPORTS_FIELD] = crate::node_link::reported_transports(&body);
+    // i1174: a registration cannot claim another node's address or the
+    // controller's own either (no leaf override here: a registration
+    // rebuilds the record, and the next heartbeat may take a vetted one).
+    if let Some(ip) = data.get("ip_address").and_then(Value::as_str).map(str::to_string) {
+        if let Some(why) = address_refusal(node_id, &ip, &AddressClaims::current(node_id, body.get("self_node").and_then(Value::as_bool) == Some(true)), &[]) {
+            tracing::warn!(node = %node_id, offered = %ip, reason = %why, "ip_address_refused");
+            data["ip_address"] = Value::Null;
+            data["ip_address_refused"] = json!(why);
+        }
+    }
+    carry_target_node(&mut data, &body);
     crate::node_agent_auth::note(node_id, &data);
+    crate::node_pin::note(node_id, &data);
 
     // Write full registration to NATS KV, keeping the routing fields the
     // node offered a second ago (`carry_stored`). A forgotten node's record
@@ -2024,6 +2220,11 @@ pub(crate) async fn cluster_nodes(State(state): State<Arc<AppState>>) -> AppJson
     for n in nodes.iter_mut() {
         if let Some(id) = n.get("id").and_then(Value::as_str).map(str::to_string) {
             n["control_calls"] = crate::node_rpc::counts_json(&id);
+            // The latest call for this node the pin refused (i1174), for
+            // verify's `node identity` row; absent when none in ten minutes.
+            if let Some(m) = crate::node_pin::last_mismatch(&id) {
+                n[crate::node_pin::MISMATCH_FIELD] = m;
+            }
         }
     }
 
@@ -4461,7 +4662,20 @@ async fn desired_config_get(
     // `node_workloads` fragment is decoded strictly by the agent, a new field
     // inside it would make an old agent refuse). Omitted at epoch 0.
     super::model_set_retry::apply(&mut body, super::model_set_retry::retry_for(&state, &node_id).await.as_ref());
+    // i1174: this gateway sends `X-Noo-Node` on every call to an agent, so
+    // a node whose agent reports it checks the header is told to refuse a
+    // controller call that names no node. Per node: an older or silent node
+    // stays tolerant itself and strands nobody else. A step-back controller
+    // omits the field and the agent goes tolerant again.
+    body[crate::node_pin::REQUIRE_TARGET_DESIRED] = json!(require_target_node(&record));
     Ok(Json(body))
+}
+
+/// Whether desired-config tells this node to refuse a header-less
+/// controller call: exactly when its agent reports it checks the target
+/// node (`checks_target_node`, i1174).
+pub(crate) fn require_target_node(record: &Value) -> bool {
+    record.get(crate::node_pin::CHECKS_TARGET_FIELD).and_then(Value::as_bool) == Some(true)
 }
 
 /// One row per RUNNING Ollama chat placement with a model (i802), for `noo
@@ -11104,5 +11318,118 @@ mod ollama_tag_check_tests {
         assert!(put.contains("let self_node = crate::self_node::is_self_node(&node_id) || record.as_ref().is_some_and(|r| r[\"self_node\"].as_bool() == Some(true));"),
             "self is this gateway's NOO_SELF_NODE or the node's own heartbeat");
         assert!(put.contains("if ollama_tag_check_applies(&backend, &desired, self_node) {"), "the route asks");
+    }
+}
+
+#[cfg(test)]
+mod address_claim_tests {
+    //! i1174: a heartbeat cannot claim another node's address, nor the
+    //! controller's own; a tailnet peer must be the address reported; and
+    //! desired-config makes a node strict only once it reports the check.
+    use super::*;
+
+    fn claims() -> AddressClaims {
+        AddressClaims {
+            others: vec![("node_b".into(), "100.64.0.12".into())],
+            controller: vec!["100.64.0.1".into(), "ctrl.example".into()],
+            self_node: Some("ctrl".into()),
+        }
+    }
+
+    #[test]
+    fn a_heartbeat_cannot_claim_another_nodes_address() {
+        let why = address_refusal("node_a", "100.64.0.12", &claims(), &[]).expect("refused");
+        assert!(why.contains("claimed by node_b"), "{why}");
+        assert_eq!(address_refusal("node_a", "100.64.0.11", &claims(), &[]), None, "its own address");
+    }
+
+    #[test]
+    fn an_address_the_nodes_own_leaf_carries_is_vetted() {
+        let leaf = vec!["100.64.0.12".to_string()];
+        assert_eq!(address_refusal("node_a", "100.64.0.12", &claims(), &leaf), None);
+    }
+
+    #[test]
+    fn a_heartbeat_cannot_claim_the_controllers_address() {
+        let why = address_refusal("node_a", "100.64.0.1", &claims(), &[]).expect("refused");
+        assert!(why.contains("controller's own address"), "{why}");
+        // Not even with a leaf that carries it.
+        assert!(address_refusal("node_a", "100.64.0.1", &claims(), &["100.64.0.1".to_string()]).is_some());
+        // The self node and its companion own it.
+        assert_eq!(address_refusal("ctrl", "100.64.0.1", &claims(), &[]), None);
+        assert_eq!(address_refusal("ctrl-sensors", "100.64.0.1", &claims(), &[]), None);
+    }
+
+    #[test]
+    fn a_tailnet_peer_must_be_the_address_reported() {
+        assert!(peer_refusal("100.64.0.12", Some("100.64.0.11")).is_some());
+        assert_eq!(peer_refusal("100.64.0.11", Some("100.64.0.11")), None);
+        // NAT, a bridge, docker's userland proxy: the peer is not the node's
+        // own address and is not judged.
+        assert_eq!(peer_refusal("100.64.0.12", Some("172.20.0.1")), None);
+        assert_eq!(peer_refusal("192.0.2.10", Some("100.64.0.11")), None);
+        assert_eq!(peer_refusal("100.64.0.12", None), None);
+    }
+
+    #[test]
+    fn a_stored_address_another_node_holds_is_dropped_not_kept() {
+        let mut data = json!({"ip_address": "100.64.0.12", "agent_url": "https://100.64.0.12:8081"});
+        hold_stored_address(&mut data, "node_a", &claims(), &[]);
+        assert!(data.get("ip_address").is_none() && data.get("agent_url").is_none(), "{data}");
+        let mut good = json!({"ip_address": "100.64.0.11"});
+        hold_stored_address(&mut good, "node_a", &claims(), &[]);
+        assert_eq!(good["ip_address"], "100.64.0.11", "the last good address stays");
+    }
+
+    #[test]
+    fn the_heartbeat_checks_the_claim_and_the_peer_before_storing() {
+        let code = crate::test_src::own_code(include_str!("cluster.rs"));
+        let beat = crate::test_src::fn_body(&code, "async fn node_heartbeat(");
+        let check = beat.find("address_refusal(&node_id, ip, &claims, &leaf_ips)").expect("the claim check");
+        let peer = beat.find("peer_refusal(ip, peer_ip.as_deref())").expect("the peer check");
+        let store = beat.find("data[\"ip_address\"] = v.clone();").expect("the store");
+        assert!(check < store && peer < store, "{beat}");
+        assert!(beat.contains("crate::node_pin::note(&node_id, &data);"));
+        assert!(beat.contains("carry_target_node(&mut data, &body);"));
+        let reg = crate::test_src::fn_body(&code, "async fn node_register_body(");
+        assert!(reg.contains("address_refusal(node_id, &ip, &AddressClaims::current("), "{reg}");
+        assert!(reg.contains("crate::node_pin::note(node_id, &data);"));
+    }
+
+    #[test]
+    fn a_node_is_told_to_require_the_target_only_once_it_checks_it() {
+        assert!(require_target_node(&json!({"checks_target_node": true})));
+        assert!(!require_target_node(&json!({"checks_target_node": false})));
+        assert!(!require_target_node(&json!({})), "an older agent stays tolerant");
+        let mut data = json!({"checks_target_node": true, "requires_target_node": true});
+        carry_target_node(&mut data, &json!({}));
+        assert_eq!(data["checks_target_node"], false, "a rolled-back agent never inherits true");
+        assert_eq!(data["requires_target_node"], false);
+        carry_target_node(&mut data, &json!({"checks_target_node": true, "requires_target_node": false}));
+        assert_eq!(data["checks_target_node"], true);
+    }
+
+    /// i1174: an agent's latest `wrong_node` refusal reaches the node record
+    /// (verify's `target-node check` row reads it), and leaves it the beat
+    /// the agent stops reporting one.
+    #[test]
+    fn a_wrong_node_refusal_rides_the_record_while_reported() {
+        let mut data = json!({});
+        let w = json!({"target": "node_b", "path": "/start", "at": 1});
+        carry_target_node(&mut data, &json!({"checks_target_node": true, "wrong_node_refused": w}));
+        assert_eq!(data["wrong_node_refused"], w);
+        carry_target_node(&mut data, &json!({"checks_target_node": true}));
+        assert!(data.get("wrong_node_refused").is_none(), "{data}");
+    }
+
+    /// i1174: the node list carries the pin's latest refusal per node, the
+    /// field verify's `node identity` row reads.
+    #[test]
+    fn the_node_list_carries_the_latest_identity_refusal() {
+        let code = crate::test_src::own_code(include_str!("cluster.rs"));
+        let list = crate::test_src::fn_body(&code, "pub(crate) async fn cluster_nodes(");
+        assert!(list.contains("if let Some(m) = crate::node_pin::last_mismatch(&id) {"), "{list}");
+        assert!(list.contains("n[crate::node_pin::MISMATCH_FIELD] = m;"), "{list}");
+        assert_eq!(crate::node_pin::MISMATCH_FIELD, "node_identity_mismatch");
     }
 }

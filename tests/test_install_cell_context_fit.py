@@ -561,3 +561,72 @@ def test_timed_turn_appends_the_gateway_reason_to_the_turn_error(monkeypatch):
     chat, facts, _ = CF.timed_turn("hi", "https://g", 5)
     assert chat["error"].startswith("Authentication failed [gateway reason: the access token behind this ticket has expired")
     assert facts["auth_failures"]
+
+
+# --- the rag chat miss: evidence kept (rag_chat_evidence.py) ------------------
+
+RCE = _load("rag_chat_evidence", ROOT / "scripts/install-cell/rag_chat_evidence.py")
+
+
+def _rag_probe_text() -> str:
+    t = (ROOT / "scripts/install-cell/run.sh").read_text()
+    return t[t.index("step probe-rag-chat"):t.index("step rag-chat 60")]
+
+
+def test_the_rag_chat_judged_command_is_unchanged_and_evidence_follows_it():
+    run_sh = (ROOT / "scripts/install-cell/run.sh").read_text()
+    probe = _rag_probe_text()
+    # the judged call: still the plain, non-json one-shot, only a t0 before it
+    assert 'chat) c0="$(date +%s)"; out="$(noo chat --message "$RAG_CHAT_LINE" 2>&1)" ;;' in probe
+    assert "--json" not in probe.split("chat) c0=")[1].split(";;")[0]
+    assert 'echo "got=$got indexed=$indexed" > "$RAG_VERDICT"' in probe
+    # evidence only after the verdict is written, on a miss or on the default model
+    after = probe.split('> "$RAG_VERDICT"')[1]
+    assert '[ "$got" = no ] || [ "$MODEL" = default ]' in after
+    assert '"$RAG_CHAT_EVIDENCE" --since "$c0"' in after
+    assert "| python3 \"$CELL_PY\" redact > \"$RAG_EVIDENCE_LOG\"" in after
+    assert 'RAG_EVIDENCE_LOG="$OUT/logs/rag-chat-evidence.log"' in run_sh
+    for v in ("RAG_CHAT_EVIDENCE", "RAG_EVIDENCE_LOG", "CELL_PY"):
+        assert v in run_sh[run_sh.index("export RAG_QUERY_LINE"):].split("\n", 1)[0]
+
+
+def test_the_rag_chat_judge_lines_are_unchanged_and_fail_names_the_evidence():
+    run_sh = (ROOT / "scripts/install-cell/run.sh").read_text()
+    judge = run_sh[run_sh.index("step rag-chat 60"):run_sh.index("|| fail_onboarded", run_sh.index("step rag-chat 60"))]
+    assert 'echo "RAG-CHAT PASS: noo chat returned the ingested document\'"\'"\'s fact"' in judge
+    assert "RAG-CHAT FAIL: noo chat (the coordinator route) did not return the fact the index holds (evidence: logs/rag-chat-evidence.log)" in judge
+    assert "RAG-CHAT NOTE: the tiny test model" in judge and "RAG-CHAT: not judged" in judge
+    assert "evidence:" not in judge.split("RAG-CHAT NOTE")[1]
+
+
+def test_every_new_rag_evidence_call_is_bounded_by_a_timeout():
+    probe = _rag_probe_text()
+    assert "timeout 600 python3 -I \"$RAG_CHAT_EVIDENCE\"" in probe
+    src = (ROOT / "scripts/install-cell/rag_chat_evidence.py").read_text()
+    assert 'ae.docker("logs", "--since", f"{since:.0f}", name, timeout=60)' in src
+    assert '["timeout", "60", "noo", "--json", "cluster", "show"' in src and "timeout=75" in src
+    ws = (ROOT / "scripts/install-cell/ws_chat.py").read_text()
+    chat_sse = ws[ws.index("def chat_sse"):ws.index('if __name__ == "__main__"')]
+    assert "urlopen(req, context=ctx, timeout=60)" in chat_sse or "urlopen(req, context=ctx" in chat_sse
+    assert "timeout=60)" in chat_sse and "time.time() > end" in chat_sse
+
+
+def test_the_rag_evidence_keeps_the_turns_events_and_drops_every_body_field(capsys):
+    cid = "cli-1700000000-42"
+    lines = [
+        json.dumps({"fields": {"message": "coordinator_chat_stream_start", "conversation_id": cid, "prompt_len": 30}}),
+        json.dumps({"fields": {"message": "context_injected", "has_rag": True, "dropped": 0, "chars": 812,
+                               "content": "KESTREL-SECRET"}}),
+        json.dumps({"fields": {"message": "tool_call_complete", "tool": "rag_search", "output": "KESTREL-SECRET"}}),
+        json.dumps({"fields": {"message": "unrelated", "conversation_id": "other"}}),
+        "\x1b[2m2026\x1b[0m INFO gateway: request_size chars=9 prompt=\"KESTREL-SECRET\" messages=[x]",
+        "plain unrelated line",
+    ]
+    assert RCE.conversation_id(lines) == cid
+    got = [v for v in (RCE.view(l, cid) for l in lines) if v]
+    joined = "\n".join(got)
+    assert "context_injected" in joined and '"has_rag": true' in joined and "request_size" in joined
+    assert "tool_call_complete" in joined and "rag_search" in joined
+    assert "KESTREL-SECRET" not in joined and "unrelated" not in joined and "\x1b" not in joined
+    assert RCE.conversation_id(["no start here"]) == ""
+

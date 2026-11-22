@@ -473,18 +473,48 @@ func countRemove(vs []imageVerdict) int {
 
 // removeImage untags each ref, then removes the ID if it is still there —
 // never -f, so Docker refuses an image a container started meanwhile.
+//
+// A failed `rm` is a refusal only while the image still exists. On the
+// containerd image store (Docker 29's default) removing one ref can delete
+// the image outright, and the next ref's `rm` then fails "No such image":
+// the image IS removed (2026-11-22, 13 images reported "refused: " with no
+// reason after a roll, every one of them gone). Docker's words come from
+// stderr (Run), never stdout (Capture drops stderr: that was the empty
+// reason); an empty message still records the exit code.
 func (e *Engine) removeImage(ctx context.Context, v *imageVerdict) (string, bool) {
 	for _, r := range v.Refs {
-		if rc, out := e.Runner.Capture(ctx, reclaimDir, "docker", "image", "rm", "--", r); rc != 0 {
-			return firstLine(out), false
+		if rc, msg := e.Runner.Run(ctx, reclaimDir, nil, "docker", "image", "rm", "--", r); rc != 0 {
+			if e.imageGone(ctx, v.ID) {
+				return "", true
+			}
+			return refusalReason(rc, msg), false
 		}
 	}
-	if rc, _ := e.Runner.Capture(ctx, reclaimDir, "docker", "image", "inspect", "--format", "{{.Id}}", v.ID); rc == 0 {
-		if rc, out := e.Runner.Capture(ctx, reclaimDir, "docker", "image", "rm", "--", v.ID); rc != 0 {
-			return firstLine(out), false
+	if !e.imageGone(ctx, v.ID) {
+		if rc, msg := e.Runner.Run(ctx, reclaimDir, nil, "docker", "image", "rm", "--", v.ID); rc != 0 {
+			if e.imageGone(ctx, v.ID) {
+				return "", true
+			}
+			return refusalReason(rc, msg), false
 		}
 	}
 	return "", true
+}
+
+// imageGone reports that Docker says the image does not exist: an inspect
+// that fails with "No such image". Any other failure (the daemon down) is
+// NOT gone: the image's fate is unknown, so a failed removal stays a refusal.
+func (e *Engine) imageGone(ctx context.Context, id string) bool {
+	rc, msg := e.Runner.Run(ctx, reclaimDir, nil, "docker", "image", "inspect", "--format", "{{.Id}}", id)
+	return rc != 0 && strings.Contains(strings.ToLower(msg), "no such image")
+}
+
+// refusalReason is Docker's first line, or the exit code when it said nothing.
+func refusalReason(rc int, msg string) string {
+	if l := firstLine(msg); l != "" {
+		return l
+	}
+	return fmt.Sprintf("docker image rm exited %d with no message", rc)
 }
 
 func firstLine(s string) string {

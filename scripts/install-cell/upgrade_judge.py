@@ -13,7 +13,8 @@
         The self node's rows that say what the box was before the roll.
     upgrade_judge.py judge
         One line per assert, `UPGRADE <id> PASS|FAIL|NOTE|NOT REACHED: <why>`,
-        quoting the product's own line on a FAIL. Exit 1 on any FAIL. Reads
+        quoting the product's own line on a FAIL (K1/K2: the roll's "N recreated (…),
+        M kept (…)" line against the cell's container-id snapshots). Exit 1 on any FAIL. Reads
         $OUT/logs/<step>.log and $J/* written by upgrade.sh.
 
 Standard library only (hosted runner's python3).
@@ -338,6 +339,182 @@ def judge_dockerhub(lines):
         len(pulls), fmt(by_reg), len(creates), fmt(by_img))
 
 
+# ── K1/K2: the roll's own "N recreated (…), M kept (…)" line, against the ids ─
+# `noo upgrade` (noomesh #1470) prints ONE line after a successful stack apply
+# (noo-cli upgrade.rs roll_apply_line):
+#   "<N> recreated (a, b), <M> kept (c, d)[, <K> created (e)]; --recreate restarts everything"
+#   "<N> recreated (…), 0 kept — --recreate: every container"        (forced)
+# a zero count has no parenthesis; there is no line when docker could not list
+# either side. The cell checks it against its own before/after container ids.
+APPLY_LINE = re.compile(
+    r"([0-9]+) recreated(?: \(([^)]*)\))?, ([0-9]+) kept(?: \(([^)]*)\))?"
+    r"(?:, ([0-9]+) created(?: \(([^)]*)\))?)?"
+    r"(; --recreate restarts everything| — --recreate: every container)")
+ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+# The first release that prints the line (#1470); an earlier build prints none.
+APPLY_LINE_SINCE = (0, 6, 30)
+# The services the label-driven roll keeps while their image and config are
+# unchanged: the stack's NON-first-party images, i.e. the ones in
+# docker-compose.cluster.yml that are not ${NOO_IMAGE_PREFIX}/<name>:${NOO_IMAGE_TAG}
+# (so they do not move with the stack tag): nats, redis, model-cache (nginx) and
+# the monitoring set (the ${NOO_BASE_REGISTRY} images: loki, tempo, prometheus,
+# alertmanager, grafana, node-exporter). Held to the compose by
+# tests/test_install_cell_upgrade.py. Every other service is first-party and
+# is recreated on a tag change.
+THIRD_PARTY_KEEP = frozenset({"nats", "redis", "model-cache", "loki", "tempo", "prometheus",
+                              "alertmanager", "grafana", "node-exporter"})
+
+
+def parse_apply_line(log):
+    """The roll's apply line in a step log -> {"line", "recreated", "kept",
+    "created", "forced"} (the LAST such line), or None when there is none."""
+    hit = None
+    for raw in (log or "").splitlines():
+        line = ANSI.sub("", raw).strip()
+        m = APPLY_LINE.search(line)
+        if m:
+            names = lambda g: [n.strip() for n in (g or "").split(",") if n.strip()]  # noqa: E731
+            hit = {"line": line[m.start():], "recreated": names(m.group(2)), "kept": names(m.group(4)),
+                   "created": names(m.group(6)), "forced": "every container" in m.group(7),
+                   "counts": (int(m.group(1)), int(m.group(3)), int(m.group(5) or 0))}
+    return hit
+
+
+def by_service(snapshot):
+    """{service: sorted container ids} from a recreated.py snapshot."""
+    out = {}
+    for cid, svc, _dep in snapshot.values():
+        out.setdefault(svc, []).append(cid)
+    return {k: sorted(v) for k, v in out.items()}
+
+
+def target_version(target):
+    m = re.fullmatch(r"noo-cli-v([0-9]+)\.([0-9]+)\.([0-9]+)(?:-rc\.[0-9]+)?", (target or "").strip())
+    return tuple(map(int, m.groups())) if m else None
+
+
+def _labels(path):
+    try:
+        return recreated.read_labelled(path)
+    except OSError:
+        return {}
+
+
+def _images(path):
+    try:
+        return recreated.read_images(path)
+    except OSError:
+        return {}
+
+
+def img_by_service(snapshot, images):
+    """{service: sorted image ids} for the containers whose image id was recorded."""
+    out = {}
+    for n, (_i, svc, _d) in snapshot.items():
+        if n in images:
+            out.setdefault(svc, set()).add(images[n])
+    return {k: sorted(v) for k, v in out.items()}
+
+
+def _short(ids):
+    return "+".join(i.replace("sha256:", "")[:12] for i in ids)
+
+
+def judge_apply_line(log, before, after, labels, target, same_tag, images=None):
+    """(verdict, why) for the roll's apply line against the id snapshots.
+    before/after: recreated.read() dicts; labels: recreated.read_labelled() of the
+    BEFORE snapshot; images: (before, after) recreated.read_images() dicts, or None;
+    same_tag: the same-tag --stack (nothing may be recreated)."""
+    got = parse_apply_line(log)
+    target = target or ""
+    ver = target_version(target)
+    if got is None:
+        if ver is not None and ver < APPLY_LINE_SINCE:
+            return "NOTE", ("the build under test (%s) predates the apply line (noomesh #1470, %s onward): "
+                            "no 'N recreated, M kept' line is printed, so nothing is judged"
+                            % (target.strip(), ".".join(map(str, APPLY_LINE_SINCE))))
+    if not before or not after:
+        return "NOT REACHED", "no container-id snapshot %s the %s" % ("before" if not before else "after",
+                                                                     "same-tag --stack" if same_tag else "--all roll")
+    if got is None:
+        return "FAIL", ("the roll printed no 'N recreated (…), M kept (…)' line (the build under test %s prints it "
+                        "from %s) although docker listed %d containers before and %d after"
+                        % (target.strip() if ver else "is unknown", ".".join(map(str, APPLY_LINE_SINCE)),
+                           len(before), len(after)))
+    b, a = by_service(before), by_service(after)
+    rec = sorted(s for s in a if s in b and a[s] != b[s])
+    kept = sorted(s for s in a if s in b and a[s] == b[s])
+    created = sorted(s for s in a if s not in b)
+    problems, notes = [], []
+    # Compare only the names both sides can see: the snapshot lists the stack's
+    # `noo-*` containers, the CLI every container of the compose project. A name the
+    # line gives that the snapshot lacks is a NOTE, never a FAIL.
+    strip = lambda n: n[4:] if n.startswith("noo-") else n  # noqa: E731
+    visible = set(b) | set(a)
+    unseen = set()
+    for what, line_set, snap_set in (("recreated", got["recreated"], rec), ("kept", got["kept"], kept),
+                                     ("created", got["created"], created)):
+        line_set = [strip(n) for n in line_set]
+        unseen |= {n for n in line_set if n not in visible}
+        line_set = [n for n in line_set if n in visible]
+        if sorted(line_set) != snap_set:
+            extra = sorted(set(line_set) - set(snap_set))
+            miss = sorted(set(snap_set) - set(line_set))
+            problems.append("line %s != ids %s%s%s" % (what, what,
+                            "; line only: " + ", ".join(extra) if extra else "",
+                            "; ids only: " + ", ".join(miss) if miss else ""))
+    if unseen:
+        notes.append("NOTE: not in the snapshot (not compared): " + ", ".join(sorted(unseen)))
+    if got["counts"] != (len(got["recreated"]), len(got["kept"]), len(got["created"])):
+        problems.append("the line's counts %s do not match the names it lists" % (got["counts"],))
+    # Which rule: read off the BEFORE containers' noo.inputs label, never a version string.
+    both = [s for s in b if s in a]
+    lab = {s: all(labels.get(n) for n, (_i, sv, _d) in before.items() if sv == s) for s in both}
+    nlab = sum(lab.values())
+    if same_tag:
+        rule = "same-tag --stack: nothing is out of line, so 0 recreated, 0 created"
+        if rec or created:
+            problems.append("the same-tag --stack recreated %s%s" % (", ".join(rec) or "-",
+                            "; created " + ", ".join(created) if created else ""))
+        if got["forced"]:
+            problems.append("the line says --recreate forced every container")
+    else:
+        if not labels:
+            return "NOT REACHED", "the before snapshot has no noo.inputs column (cannot tell labelled from unlabelled)"
+        regime = ("labelled -> labelled" if nlab == len(both) else
+                  "unlabelled -> labelled" if nlab == 0 else "partly labelled")
+        rule = ("%s (noo.inputs on %d of %d BEFORE services, read from the containers' labels, not the version): "
+                % (regime, nlab, len(both)))
+        rule += ("every service recreated, none kept" if got["forced"] or nlab == 0 else
+                 "third-party (%s) kept unless their image moved, every first-party service recreated" % ", ".join(sorted(THIRD_PARTY_KEEP & set(both))))
+        # A labelled third-party service keeps its id unless its IMAGE moved
+        # (before vs after image id): then it must be recreated.
+        bi, ai = (img_by_service(before, images[0]), img_by_service(after, images[1])) if images else ({}, {})
+        moved = {s for s in both if lab[s] and s in THIRD_PARTY_KEEP and s in bi and s in ai and bi[s] != ai[s]}
+        blind = sorted(s for s in both if lab[s] and s in THIRD_PARTY_KEEP and not (s in bi and s in ai))
+        want_kept = set() if got["forced"] else {s for s in both if lab[s] and s in THIRD_PARTY_KEEP} - moved
+        bad_kept = sorted(set(kept) - want_kept - (moved if not got["forced"] else set()))
+        bad_moved_kept = sorted(set(kept) & moved) if not got["forced"] else []
+        bad_rec = sorted(set(rec) & want_kept)
+        if bad_kept:
+            problems.append("kept but must be recreated: " + ", ".join(bad_kept))
+        for s_ in bad_moved_kept:
+            problems.append("%s: its image moved (%s>%s) but the container was kept" % (s_, _short(bi[s_]), _short(ai[s_])))
+        if bad_rec:
+            problems.append("recreated but must keep its id: " + ", ".join(
+                s_ + (" (its image is unchanged)" if s_ not in blind else "") for s_ in bad_rec))
+        for s_ in sorted(moved & set(rec)):
+            notes.append("recreated: %s: its image moved %s>%s" % (s_, _short(bi[s_]), _short(ai[s_])))
+        if blind and not got["forced"]:
+            notes.append("NOTE: image ids not visible in the snapshot for %s: judged by the plain rule (a moved "
+                         "image would look like a FAIL)" % ", ".join(blind))
+    tail = "".join("; " + n for n in notes)
+    if problems:
+        return "FAIL", "%s; %s%s; line: %s" % ("; ".join(problems), rule, tail, got["line"])
+    return "PASS", "%s; the line matches the ids (%d recreated, %d kept, %d created)%s: %s" % (
+        rule, len(rec), len(kept), len(created), tail, got["line"])
+
+
 def judge():
     out, j, me = os.environ["OUT"], os.environ["J"], os.environ["SELF"]
     lines, failed = [], False
@@ -446,9 +623,20 @@ def judge():
         else:
             say("A7", "FAIL", " | ".join((cut[:1] + silent[:1] + ["version: %s: %s" % (ver[0].get("verdict"), ver[0].get("detail")) if ver else "no version row"])))
 
+    # ── K1: the --all roll's apply line against the container ids ──
+    if roll is None:
+        say("K1", "NOT REACHED", "the --all roll did not run")
+    else:
+        v_, why = judge_apply_line(
+            roll, recreated._read_or_empty(os.path.join(j, "roll.before")),
+            recreated._read_or_empty(os.path.join(j, "roll.after")),
+            _labels(os.path.join(j, "roll.before")), text(os.path.join(j, "target")), False,
+            (_images(os.path.join(j, "roll.before")), _images(os.path.join(j, "roll.after"))))
+        say("K1", v_, why, 4000)
+
     # ── after the same-tag --stack ──
     if stack is None:
-        for b in ("B1", "B2", "B3", "B4"):
+        for b in ("B1", "B2", "B3", "B4", "K2"):
             say(b, "NOT REACHED", "the same-tag --stack did not run")
     else:
         s1 = "installing noo-netns-restore.service: staged to the self-node"
@@ -499,6 +687,13 @@ def judge():
             else "0 sudo commands in the journal during the same-tag --stack (operator: %s%s)"
             % (subprocess.run(["id", "-un"], capture_output=True, text=True).stdout.strip(),
                "; %d of the cell's own, matched exactly, not counted" % mine if mine else ""))
+
+        # K2: the same-tag --stack recreated nothing, and its apply line says so.
+        v_, why = judge_apply_line(
+            stack, recreated._read_or_empty(os.path.join(j, "roll.after")),
+            recreated._read_or_empty(os.path.join(j, "stack.after")), {},
+            text(os.path.join(j, "target")), True)
+        say("K2", v_, why, 4000)
 
         # B4: a plain `noo stack start` after the upgrade recreates nothing:
         # every container the upgrade made carries the start-inputs labels

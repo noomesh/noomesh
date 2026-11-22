@@ -47,6 +47,63 @@ pub(crate) fn daemon_verdict(stderr: &str) -> DaemonState {
     }
 }
 
+/// The bound on one `docker inspect` in the ghost-record sample.
+const INSPECT_SECS: u64 = 10;
+
+/// What one sampled `docker inspect` came to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InspectKind {
+    Fine,
+    /// docker answered, and said the record cannot be inspected.
+    Ghost,
+    /// docker did not answer in time, or could not be run: not evidence of
+    /// a ghost.
+    Unanswered,
+}
+
+/// Pure: one bounded inspect read as [`InspectKind`].
+pub(crate) fn inspect_kind(probe: &crate::bounded::Bounded) -> InspectKind {
+    use crate::bounded::Bounded;
+    match probe {
+        Bounded::Answered(o) if o.status.success() => InspectKind::Fine,
+        Bounded::Answered(_) => InspectKind::Ghost,
+        Bounded::TimedOut { .. } | Bounded::SpawnFailed(_) => InspectKind::Unanswered,
+    }
+}
+
+/// What a failed bounded `docker version` is: the one classifier
+/// ([`crate::commands::secrets_delivery::refusal_of`], over
+/// [`daemon_verdict`]) behind `doctor docker`, `doctor exposure` and the
+/// verify rows, so each says the cause that was seen: denied, not answering,
+/// timed out, or docker missing (i1159b rows 1 and 4).
+fn daemon_gate(g: &Globals, rerun: &str, sudo_rerun: &str) -> Option<i32> {
+    use crate::commands::secrets_delivery::{docker_version_probe, refusal_of, DockerRefusal};
+    let probe = docker_version_probe();
+    let why = refusal_of(&probe)?;
+    // A shell that cannot use the socket yet (the user joined the docker
+    // group in this login session) is not a daemon that is down: relaunch
+    // with the group first, as every other docker-gated command does.
+    if let (DockerRefusal::Denied(_), crate::bounded::Bounded::Answered(o)) = (&why, &probe) {
+        if let Some(rc) = crate::docker_group::relaunch_if_needed(&String::from_utf8_lossy(&o.stderr)) {
+            return Some(rc);
+        }
+    }
+    match &why {
+        DockerRefusal::Denied(_) => fail(g.json, ExitCode::Generic, "docker_access",
+            "the docker daemon is running, but this shell cannot use it yet (permission denied on the docker socket)",
+            Some(&format!("open a new terminal or run `newgrp docker` (after joining the docker group), or: {sudo_rerun}"))),
+        DockerRefusal::NotAnswering(_) => fail(g.json, ExitCode::Generic, "daemon_down",
+            "the docker daemon is not answering (down or still starting)",
+            Some(&format!("sudo systemctl start docker — then re-run {rerun}"))),
+        DockerRefusal::TimedOut { .. } => fail(g.json, ExitCode::Generic, "daemon_timeout",
+            &why.detail(),
+            Some(&format!("sudo systemctl status docker — then re-run {rerun}"))),
+        DockerRefusal::SpawnFailed(_) => fail(g.json, ExitCode::Generic, "docker_missing",
+            &why.detail(),
+            Some(&format!("{} — then re-run {rerun}", why.action()))),
+    }
+}
+
 /// `noo doctor docker` — detect the unclean-shutdown damage signature
 /// (ghost records, empty names, fleet-wide 255s) and print the
 /// recovery. Read-only: the repair needs root, and this box's sudo is the
@@ -62,20 +119,8 @@ pub fn doctor_docker(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     // up and answering chat, and this said "not answering" with
     // `systemctl start docker` as the remedy. Relaunch with the group first,
     // as every other docker-gated command does; then say what docker said.
-    let out = Command::new("docker").args(["version", "--format", "{{.Server.Version}}"]).output();
-    if !out.as_ref().is_ok_and(|o| o.status.success()) {
-        let err = out.as_ref().map(|o| String::from_utf8_lossy(&o.stderr).into_owned()).unwrap_or_else(|e| e.to_string());
-        if let Some(rc) = crate::docker_group::relaunch_if_needed(&err) {
-            return Ok(rc);
-        }
-        match daemon_verdict(&err) {
-            DaemonState::Denied => fail(g.json, ExitCode::Generic, "docker_access",
-                "the docker daemon is running, but this shell cannot use it yet (permission denied on the docker socket)",
-                Some("open a new terminal or run `newgrp docker` (after joining the docker group), or: sudo noo doctor docker")),
-            DaemonState::Down => fail(g.json, ExitCode::Generic, "daemon_down",
-                "the docker daemon is not answering",
-                Some("sudo systemctl start docker — then re-run noo doctor docker")),
-        }
+    if let Some(rc) = daemon_gate(g, "noo doctor docker", "sudo noo doctor docker") {
+        return Ok(rc);
     }
 
     let ids = docker_lines(&["ps", "-aq"]);
@@ -88,16 +133,16 @@ pub fn doctor_docker(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     // Ghosts: listed IDs whose inspect fails. Sample up to 25 — enough to
     // classify without hammering a damaged daemon.
     let mut ghosts = 0usize;
+    let mut unanswered = 0usize;
     for id in ids.iter().take(25) {
-        let ok = Command::new("docker")
-            .args(["inspect", "--format", "{{.Id}}", id])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        if !ok {
-            ghosts += 1;
+        let probe = crate::bounded::docker(
+            &["inspect", "--format", "{{.Id}}", id],
+            std::time::Duration::from_secs(INSPECT_SECS),
+        );
+        match inspect_kind(&probe) {
+            InspectKind::Fine => {}
+            InspectKind::Ghost => ghosts += 1,
+            InspectKind::Unanswered => unanswered += 1,
         }
     }
     let orphans = names.iter().filter(|n| {
@@ -111,7 +156,7 @@ pub fn doctor_docker(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             "status": if damaged { "damaged" } else { "healthy" },
             "containers": ids.len(), "ghosts_sampled": ghosts,
             "empty_names": empty_names, "exited_255": exited_255,
-            "rename_orphans": orphans,
+            "rename_orphans": orphans, "inspect_timeouts": unanswered,
         }));
         return Ok(if damaged { 1 } else { 0 });
     }
@@ -128,12 +173,25 @@ pub fn doctor_docker(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                     ui::muted(&format!("listed but uninspectable{}", if ids.len() > 25 { ", sampled 25" } else { "" }))
                 ),
             ),
+            (
+                "inspect timed out",
+                format!("{unanswered}  {}", ui::muted("not ghosts: docker did not answer (a hung daemon or a container's mount)")),
+            ),
             ("empty names", empty_names.to_string()),
             ("exited(255)", exited_255.to_string()),
             ("rename orphans", format!("{orphans}  {}", ui::muted("<hex>_noo-*"))),
         ])
     );
     println!();
+    if unanswered > 0 {
+        println!(
+            "{}",
+            ui::status_line(
+                Glyph::Warn,
+                &format!("{unanswered} inspect(s) did not answer in {INSPECT_SECS} s: counted apart, not as ghosts. A hung daemon, or a container's bind mount that does not answer; try `docker info`, then re-run")
+            )
+        );
+    }
     if !damaged {
         println!("{}", ui::status_line(Glyph::Ok, "no unclean-shutdown damage signature"));
         return Ok(0);
@@ -1604,15 +1662,8 @@ pub fn doctor_exposure(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     if !args.is_empty() {
         return Err(Unhandled);
     }
-    let daemon_ok = Command::new("docker")
-        .args(["version", "--format", "{{.Server.Version}}"])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-    if !daemon_ok {
-        fail(g.json, ExitCode::Generic, "daemon_down",
-            "the docker daemon is not answering",
-            Some("sudo systemctl start docker — then re-run noo doctor exposure"));
+    if let Some(rc) = daemon_gate(g, "noo doctor exposure", "sudo noo doctor exposure") {
+        return Ok(rc);
     }
 
     let rows = docker_lines(&["ps", "--format", "{{.Names}}\t{{.Ports}}"]);
@@ -2491,12 +2542,68 @@ mod docker_access_tests {
     /// command's does (docker_group::every_docker_gate_tries_the_relaunch_before_refusing).
     #[test]
     fn doctor_docker_tries_the_group_relaunch_before_refusing() {
+        // The relaunch and every refusal live in daemon_gate, which doctor
+        // docker (and doctor exposure) call before touching docker.
         let own = crate::test_src::own_code(include_str!("doctor.rs"));
-        let body = crate::test_src::fn_body(&own, "pub fn doctor_docker(");
-        let r = body.find("crate::docker_group::relaunch_if_needed(&err)").expect("doctor docker tries the relaunch");
+        let docker = crate::test_src::fn_body(&own, "pub fn doctor_docker(");
+        assert!(docker.contains("daemon_gate("), "doctor docker goes through the shared gate:\n{docker}");
+        let body = crate::test_src::fn_body(&own, "fn daemon_gate(");
+        let r = body.find("crate::docker_group::relaunch_if_needed(").expect("the gate tries the relaunch");
         let denied = body.find("\"docker_access\"").expect("the access refusal");
         let down = body.find("\"daemon_down\"").expect("the daemon-down refusal");
         assert!(r < denied && r < down, "{body}");
     }
 }
 
+
+#[cfg(test)]
+mod daemon_state_tests {
+    use super::*;
+    use crate::bounded::Bounded;
+    use std::os::unix::process::ExitStatusExt;
+
+    fn out(code: i32, stderr: &str) -> Bounded {
+        Bounded::Answered(std::process::Output {
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout: Vec::new(),
+            stderr: stderr.as_bytes().to_vec(),
+        })
+    }
+
+    /// An inspect that did not answer is not a ghost record (i1159b row 15):
+    /// only docker's own "cannot inspect" answer is.
+    #[test]
+    fn a_timed_out_inspect_is_counted_apart_from_a_ghost() {
+        assert_eq!(inspect_kind(&out(0, "")), InspectKind::Fine);
+        assert_eq!(inspect_kind(&out(1, "Error: No such object: 4f2a")), InspectKind::Ghost);
+        assert_eq!(inspect_kind(&Bounded::TimedOut { secs: 10 }), InspectKind::Unanswered);
+        let e = std::io::Error::new(std::io::ErrorKind::NotFound, "gone");
+        assert_eq!(inspect_kind(&Bounded::SpawnFailed(e)), InspectKind::Unanswered);
+    }
+
+    #[test]
+    fn the_ghost_loop_is_bounded_and_counts_unanswered_apart() {
+        assert_eq!(INSPECT_SECS, 10);
+        let own = crate::test_src::own_code(include_str!("doctor.rs"));
+        let body = crate::test_src::fn_body(&own, "pub fn doctor_docker(");
+        assert!(body.contains("crate::bounded::docker("), "{body}");
+        assert!(body.contains("Duration::from_secs(INSPECT_SECS)"), "{body}");
+        assert!(body.contains("InspectKind::Ghost => ghosts += 1"), "{body}");
+        assert!(body.contains("InspectKind::Unanswered => unanswered += 1"), "{body}");
+        assert!(!body.contains("Command::new(\"docker\")"), "no unbounded docker in doctor_docker");
+    }
+
+    /// `doctor exposure` takes the same gate as `doctor docker`, so a missing
+    /// docker group is not called "daemon down".
+    #[test]
+    fn exposure_uses_the_one_classifier() {
+        let own = crate::test_src::own_code(include_str!("doctor.rs"));
+        for f in ["pub fn doctor_exposure(", "pub fn doctor_docker("] {
+            let body = crate::test_src::fn_body(&own, f);
+            assert!(body.contains("daemon_gate("), "{f}");
+            assert!(!body.contains("Command::new(\"docker\")"), "{f}");
+        }
+        let gate = crate::test_src::fn_body(&own, "fn daemon_gate(");
+        assert!(gate.contains("refusal_of("), "{gate}");
+    }
+}

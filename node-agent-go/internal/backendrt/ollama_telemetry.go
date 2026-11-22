@@ -43,6 +43,15 @@ package backendrt
 //     gui/<uid> answers "125: Domain does not support specified action" even
 //     to root. launchd is asked where the job is, never assumed.
 //
+// A boot service (followup i1156): `noo enroll` now registers Ollama as a
+// SYSTEM LaunchDaemon, /Library/LaunchDaemons/<label>.plist with UserName =
+// the node's user, so it starts at boot and not only at a login. That plist
+// is root's: this agent (running as the node user) reads it and reports on
+// it, but never writes it or restarts the job. When it would have to, it
+// records a refusal naming the sudo commands (and `noo enroll`, which sets
+// the environment). The system plist wins over a user LaunchAgent: enroll
+// removes the latter, and two jobs would fight over the port.
+//
 // Values are written with plutil, which takes the value as its own argument:
 // PlistBuddy parses its command text, and a data root under
 // "Application Support" has a space in it.
@@ -53,6 +62,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 
@@ -82,6 +92,14 @@ func ExecCommand(name string, args ...string) (string, error) {
 // OllamaPlistPath is the brew service plist for label under home.
 func OllamaPlistPath(home, label string) string {
 	return home + "/Library/LaunchAgents/" + label + ".plist"
+}
+
+// OllamaSystemPlistDir is where a boot-time (system) brew service plist lives.
+const OllamaSystemPlistDir = "/Library/LaunchDaemons"
+
+// OllamaSystemPlistPath is the system brew service plist for label.
+func OllamaSystemPlistPath(label string) string {
+	return OllamaSystemPlistDir + "/" + label + ".plist"
 }
 
 // OllamaGuard converges and reports the native ollama's environment.
@@ -123,28 +141,46 @@ func NewOllamaGuard() *OllamaGuard {
 		}}
 }
 
-// label is the brew label whose plist exists, "" when none does.
-func (g *OllamaGuard) label() string {
+// find is the brew plist that runs ollama: a system (boot) one first, then
+// the user's LaunchAgent; label "" when none exists.
+func (g *OllamaGuard) find() (label, path string, system bool) {
 	for _, l := range OllamaPlistLabels {
-		if g.Exists(OllamaPlistPath(g.Home, l)) {
-			return l
+		if p := OllamaSystemPlistPath(l); g.Exists(p) {
+			return l, p, true
 		}
 	}
-	return ""
+	for _, l := range OllamaPlistLabels {
+		if p := OllamaPlistPath(g.Home, l); g.Exists(p) {
+			return l, p, false
+		}
+	}
+	return "", "", false
+}
+
+// label is the brew label whose plist exists, "" when none does.
+func (g *OllamaGuard) label() string {
+	l, _, _ := g.find()
+	return l
 }
 
 func (g *OllamaGuard) plist() string {
-	l := g.label()
-	if l == "" {
-		return ""
-	}
-	return OllamaPlistPath(g.Home, l)
+	_, p, _ := g.find()
+	return p
+}
+
+// system reports whether the plist is a root-owned boot service.
+func (g *OllamaGuard) system() bool {
+	_, _, sys := g.find()
+	return sys
 }
 
 // domain is the launchd domain that holds the job: gui/<uid> or user/<uid>,
 // whichever launchd says has it; when neither does, gui/<uid> if this user
 // has a GUI session, else user/<uid>.
 func (g *OllamaGuard) domain() string {
+	if g.system() {
+		return "system"
+	}
 	gui, user := fmt.Sprintf("gui/%d", g.UID), fmt.Sprintf("user/%d", g.UID)
 	if l := g.label(); l != "" {
 		for _, d := range []string{gui, user} {
@@ -275,6 +311,9 @@ func (g *OllamaGuard) Converge() (managed, restarted bool, err error) {
 		g.noteNoPlist()
 		return false, false, nil
 	}
+	if g.system() {
+		return true, false, g.reportSystemDrift()
+	}
 	plist := g.plist()
 	changed := false
 	if g.plistValue(ollamaNoCloud) != "1" {
@@ -320,6 +359,44 @@ func (g *OllamaGuard) Converge() (managed, restarted bool, err error) {
 	return true, true, g.restart()
 }
 
+// reportSystemDrift is Converge for a boot-service plist this agent cannot
+// write: it lists the keys that differ and records one refusal naming the
+// sudo commands that apply them; nothing is written and nothing restarts.
+func (g *OllamaGuard) reportSystemDrift() error {
+	plist := g.plist()
+	want := map[string]string{}
+	if g.plistValue(ollamaNoCloud) != "1" {
+		want[ollamaNoCloud] = "1"
+	}
+	for k, v := range g.tuning() {
+		if g.plistValue(k) != v {
+			want[k] = v
+		}
+	}
+	if wanted, _, move := g.modelsPlan(); move {
+		want[ollamaModels] = wanted
+	}
+	if len(want) == 0 {
+		refusals.Clear("ollama_env", "ollama")
+		return nil
+	}
+	keys := make([]string, 0, len(want))
+	for k := range want {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var cmds []string
+	for _, k := range keys {
+		cmds = append(cmds, fmt.Sprintf("sudo %s -replace EnvironmentVariables.%s -string '%s' %s", plutilBin, k, want[k], plist))
+	}
+	cmds = append(cmds, "sudo launchctl bootout system/"+g.label(), "sudo launchctl bootstrap system "+plist)
+	reason := fmt.Sprintf("the native Ollama is a boot service (%s, root's), which this agent cannot edit, and it lacks %s: "+
+		"on the Mac run `%s`, or run `noo enroll --resume`", plist, strings.Join(keys, ", "), strings.Join(cmds, "; "))
+	refusals.Record("ollama_env", "ollama", reason)
+	slog.Warn("ollama: the boot-service plist lacks noomesh's environment; the agent cannot write it", "plist", plist, "keys", keys)
+	return nil
+}
+
 func (g *OllamaGuard) restart() error {
 	domain := g.domain()
 	_, _ = g.Run("launchctl", "bootout", domain, g.plist())
@@ -343,6 +420,11 @@ func (g *OllamaGuard) restart() error {
 func (g *OllamaGuard) Report(running bool) map[string]any {
 	e := map[string]any{"running": running, "runtime": "native"}
 	e["launcher"] = g.Launcher()
+	// Picks verify's remedy for a native Ollama that is not running:
+	// start it, or install it first (followup i1156).
+	if !running {
+		e["binary_present"] = OllamaBinaryPresent()
+	}
 	if g == nil {
 		e["managed"] = false
 		return e
@@ -362,6 +444,11 @@ func (g *OllamaGuard) Report(running bool) map[string]any {
 	}
 	e["managed"] = true
 	e["plist_label"] = label
+	if g.system() {
+		e["plist_domain"] = "system"
+	} else {
+		e["plist_domain"] = "user"
+	}
 	missing := []string{}
 	if g.plistValue(ollamaNoCloud) != "1" || proc == "missing" {
 		missing = append(missing, ollamaNoCloud)

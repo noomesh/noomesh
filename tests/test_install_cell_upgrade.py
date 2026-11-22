@@ -573,3 +573,226 @@ def test_the_events_capture_keeps_only_pull_and_create_events():
     line = next(l for l in src.splitlines() if "events --format" in l)
     assert "--filter event=pull" in line and "--filter event=create" in line, line
     assert "exec" not in line, line
+
+
+# ── K1/K2: the roll's "N recreated (…), M kept (…)" line against the ids ────
+import re as _re  # noqa: E402
+
+import recreated as rc_mod  # noqa: E402
+
+_THIRD = ["nats", "redis", "model-cache", "loki", "tempo", "prometheus", "alertmanager", "grafana", "node-exporter"]
+_FIRST = ["gateway", "worker", "postgres", "sandbox"]
+
+
+def _snap(ids, labelled, services=None, imgs=None):
+    """A recreated.py snapshot: name id service depends_on L|- [image id]."""
+    rows = []
+    for svc in services or _FIRST + _THIRD:
+        img = " sha256:" + (imgs or {}).get(svc, svc + "img1" + "0" * 20) if imgs is not None else ""
+        rows.append("noo-%s %s %s - %s%s\n" % (svc, ids.get(svc, svc + "-1"), svc, "L" if labelled else "-", img))
+    return "".join(rows)
+
+
+def _line(rec, kept, created=(), forced=False):
+    def part(n, w):
+        return "%d %s (%s)" % (len(n), w, ", ".join(n)) if n else "0 %s" % w
+    s = part(rec, "recreated") + ", " + part(kept, "kept")
+    if created:
+        s += ", " + part(created, "created")
+    return "+ " + s + (" — --recreate: every container" if forced else "; --recreate restarts everything")
+
+
+def _k(tmp, before, after, roll_line=None, stack_line=None, target="noo-cli-v0.6.30-rc.1", stack_after=None):
+    out = tmp / "out"
+    rc, got = cell(tmp, roll=ROLL_OK + (roll_line + "\n" if roll_line else ""),
+                   stack=STACK_OK + (stack_line + "\n" if stack_line else ""))
+    j = out / "judge"
+    (j / "roll.before").write_text(before)
+    (j / "roll.after").write_text(after)
+    (j / "stack.after").write_text(after if stack_after is None else stack_after)
+    (j / "target").write_text(target)
+    env = dict(os.environ, OUT=str(out), J=str(j), SELF=SELF, NETNS_UNIT_ENABLED="enabled",
+               ROLL_T0=ROLL_T0, STACK_T0=STACK_T0, STACK_T1=STACK_T1, NETNS_UNIT=str(tmp / "noo-netns-restore.service"),
+               NETNS_UNIT_OWNER="%d:%d" % (os.getuid(), os.getgid()))
+    r = subprocess.run([sys.executable, str(JUDGE), "judge"], env=env, capture_output=True, text=True)
+    return {l.split()[1]: l for l in r.stdout.splitlines() if l.startswith("UPGRADE ")}
+
+
+_NEW = {s: s + "-2" for s in _FIRST}
+_ALLNEW = {s: s + "-2" for s in _FIRST + _THIRD}
+
+
+def test_the_parser_reads_every_shape_of_the_line():
+    p = uj.parse_apply_line
+    g = p(_line(["gateway", "worker"], ["nats", "redis"], ["voice"]))
+    assert (g["recreated"], g["kept"], g["created"], g["forced"]) == (["gateway", "worker"], ["nats", "redis"], ["voice"], False)
+    assert g["counts"] == (2, 2, 1)
+    z = p("\x1b[32m+\x1b[0m 0 recreated, 4 kept (gateway, nats, redis, worker); --recreate restarts everything")
+    assert (z["recreated"], z["kept"], z["created"]) == ([], ["gateway", "nats", "redis", "worker"], [])
+    f = p(_line(["a", "b"], [], forced=True))
+    assert f["forced"] and f["kept"] == [] and f["counts"] == (2, 0, 0)
+    assert p("1 running, 0 recreated\nstack now on v0.6.30") is None and p("") is None and p(None) is None
+
+
+def test_k1_labelled_to_labelled_keeps_third_party_and_recreates_first_party(tmp_path):
+    line = _line(_FIRST, _THIRD)
+    got = _k(tmp_path,
+             _snap({}, True), _snap(_NEW, True), roll_line=line, stack_line=_line([], sorted(_FIRST + _THIRD)))
+    assert got["K1"].startswith("UPGRADE K1 PASS:"), got["K1"]
+    assert "labelled -> labelled (noo.inputs on 13 of 13 BEFORE services, read from the containers' labels, not the version)" in got["K1"]
+    assert line[2:] in got["K1"], got["K1"]
+    assert got["K2"].startswith("UPGRADE K2 PASS:") and "0 recreated" in got["K2"], got["K2"]
+
+
+def test_k1_fails_when_a_kept_service_changed_ids_or_a_first_party_one_did_not(tmp_path):
+    # nats recreated although labelled -> must keep; the line agrees with the ids
+    ids = dict(_NEW, nats="nats-2")
+    got = _k(tmp_path / "a", _snap({}, True), _snap(ids, True),
+             roll_line=_line(_FIRST + ["nats"], [t for t in _THIRD if t != "nats"]))
+    assert got["K1"].startswith("UPGRADE K1 FAIL:") and "recreated but must keep its id: nats" in got["K1"], got["K1"]
+    # worker kept although first-party
+    ids = {s: s + "-2" for s in _FIRST if s != "worker"}
+    got = _k(tmp_path / "b", _snap({}, True), _snap(ids, True),
+             roll_line=_line([s for s in _FIRST if s != "worker"], ["worker"] + _THIRD))
+    assert "FAIL" in got["K1"] and "kept but must be recreated: worker" in got["K1"], got["K1"]
+
+
+def test_k1_fails_when_the_line_disagrees_with_the_ids(tmp_path):
+    # the ids say worker was kept, the line says it was recreated
+    ids = {s: s + "-2" for s in _FIRST if s != "worker"}
+    got = _k(tmp_path, _snap({}, True), _snap(ids, True), roll_line=_line(_FIRST, _THIRD))
+    assert got["K1"].startswith("UPGRADE K1 FAIL:"), got["K1"]
+    assert "line recreated != ids recreated; line only: worker" in got["K1"], got["K1"]
+    assert "line kept != ids kept; ids only: worker" in got["K1"], got["K1"]
+
+
+def test_k1_unlabelled_to_labelled_recreates_everything_and_keeps_nothing(tmp_path):
+    allsvc = sorted(_FIRST + _THIRD)
+    got = _k(tmp_path / "ok", _snap({}, False), _snap(_ALLNEW, True), roll_line=_line(allsvc, []))
+    assert got["K1"].startswith("UPGRADE K1 PASS:") and "unlabelled -> labelled (noo.inputs on 0 of 13" in got["K1"], got["K1"]
+    assert "every service recreated, none kept" in got["K1"], got["K1"]
+    # nats kept from an unlabelled start: a FAIL, even though the line agrees
+    ids = dict(_ALLNEW)
+    del ids["nats"]
+    got = _k(tmp_path / "bad", _snap({}, False), _snap(ids, True),
+             roll_line=_line([s for s in allsvc if s != "nats"], ["nats"]))
+    assert got["K1"].startswith("UPGRADE K1 FAIL:") and "kept but must be recreated: nats" in got["K1"], got["K1"]
+
+
+def test_k1_forced_recreates_everything_even_third_party(tmp_path):
+    allsvc = sorted(_FIRST + _THIRD)
+    got = _k(tmp_path, _snap({}, True), _snap(_ALLNEW, True), roll_line=_line(allsvc, [], forced=True))
+    assert got["K1"].startswith("UPGRADE K1 PASS:"), got["K1"]
+    assert "--recreate: every container" in got["K1"], got["K1"]
+
+
+def test_k1_a_created_service_is_named_and_matched(tmp_path):
+    after = _snap(_NEW, True) + "noo-voice voice-1 voice - L\n"
+    got = _k(tmp_path / "ok", _snap({}, True), after, roll_line=_line(_FIRST, _THIRD, ["voice"]))
+    assert got["K1"].startswith("UPGRADE K1 PASS:") and "1 created" in got["K1"], got["K1"]
+    got = _k(tmp_path / "bad", _snap({}, True), after, roll_line=_line(_FIRST, _THIRD))
+    assert got["K1"].startswith("UPGRADE K1 FAIL:") and "line created != ids created; ids only: voice" in got["K1"], got["K1"]
+
+
+def test_k_no_line_from_a_build_that_predates_1470_is_a_note_never_a_fail(tmp_path):
+    for i, tag in enumerate(("noo-cli-v0.6.28", "noo-cli-v0.6.29", "noo-cli-v0.6.29-rc.4")):
+        got = _k(tmp_path / str(i), _snap({}, False), _snap(_ALLNEW, True), target=tag)
+        assert got["K1"].startswith("UPGRADE K1 NOTE:") and "predates the apply line" in got["K1"] and tag in got["K1"], got["K1"]
+        assert got["K2"].startswith("UPGRADE K2 NOTE:"), got["K2"]
+
+
+def test_k_no_line_from_a_build_that_should_print_it_fails(tmp_path):
+    got = _k(tmp_path, _snap({}, True), _snap(_NEW, True), target="noo-cli-v0.6.30")
+    assert got["K1"].startswith("UPGRADE K1 FAIL:") and "printed no 'N recreated" in got["K1"], got["K1"]
+
+
+def test_k1_without_snapshots_is_not_reached(tmp_path):
+    rc, got = cell(tmp_path, roll=ROLL_OK + _line(_FIRST, _THIRD) + "\n")
+    assert got["K1"].startswith("UPGRADE K1 NOT REACHED:") or got["K1"].startswith("UPGRADE K1 NOTE:"), got["K1"]
+
+
+def test_k2_the_same_tag_stack_must_recreate_nothing(tmp_path):
+    allsvc = sorted(_FIRST + _THIRD)
+    ids = dict(_NEW)
+    # recreated gateway on a same-tag re-apply: FAIL, whether or not the line says so
+    got = _k(tmp_path / "a", _snap({}, True), _snap(_NEW, True), roll_line=_line(_FIRST, _THIRD),
+             stack_line=_line(["gateway"], [s for s in allsvc if s != "gateway"]),
+             stack_after=_snap(dict(ids, gateway="gateway-3"), True))
+    assert got["K2"].startswith("UPGRADE K2 FAIL:") and "same-tag --stack recreated gateway" in got["K2"], got["K2"]
+    # the ids held but the line claims a recreate
+    got = _k(tmp_path / "b", _snap({}, True), _snap(_NEW, True), roll_line=_line(_FIRST, _THIRD),
+             stack_line=_line(["gateway"], [s for s in allsvc if s != "gateway"]))
+    assert got["K2"].startswith("UPGRADE K2 FAIL:") and "line recreated != ids recreated; line only: gateway" in got["K2"], got["K2"]
+
+
+def test_the_keep_list_is_the_compose_s_non_first_party_services():
+    text = (ROOT / "docker-compose.cluster.yml").read_text()
+    img = {}
+    cur = None
+    for l in text.splitlines():
+        m = _re.match(r"^  ([a-z0-9_-]+):\s*$", l)
+        if m:
+            cur = m.group(1)
+        m = _re.match(r"^    image:\s*(.*)", l)
+        if m and cur:
+            img[cur] = m.group(1)
+    for svc in uj.THIRD_PARTY_KEEP:
+        assert svc in img, svc
+        assert "NOO_IMAGE_TAG" not in img[svc].split("${NOO_IMAGE_DIGEST")[0], (svc, img[svc])
+    for svc in ("gateway", "worker", "node-agent"):
+        assert svc not in uj.THIRD_PARTY_KEEP and "NOO_IMAGE_TAG" in img[svc]
+
+
+def test_snapshot_rows_carry_the_noo_inputs_column_and_old_rows_still_read(tmp_path):
+    f = tmp_path / "s"
+    f.write_text("noo-a a1 a - L\nnoo-b b1 b db:service_healthy:false -\nnoo-c c1 c -\n")
+    assert rc_mod.read_labelled(str(f)) == {"noo-a": True, "noo-b": False}
+    assert rc_mod.read(str(f))["noo-b"] == ("b1", "b", "db:service_healthy:false")
+    assert rc_mod.read(str(f))["noo-c"][2] == "-"
+    assert "noo.inputs" in rc_mod.FMT
+
+
+def test_upgrade_sh_snapshots_around_the_roll_and_after_the_stack():
+    text = (JUDGE.parent / "upgrade.sh").read_text()
+    b, t0, roll, a, s0, st, t1, sa = (text.index('snap "$J/roll.before"'), text.index('ROLL_T0="$(date +%s)"'),
+                                      text.index("step upgrade-all "), text.index('snap "$J/roll.after"'),
+                                      text.index('STACK_T0="$(date +%s)"'), text.index("step upgrade-stack-same-tag"),
+                                      text.index('STACK_T1="$(date +%s)"'), text.index('snap "$J/stack.after"'))
+    assert b < t0 < roll < a < s0 < st < t1 < sa
+
+
+def test_k1_a_moved_third_party_image_must_be_recreated_and_only_that_one(tmp_path):
+    ids = dict(_NEW, redis="redis-2")
+    first = sorted(_FIRST + ["redis"])
+    keep = [t for t in _THIRD if t != "redis"]
+    bimg, aimg = {}, {"redis": "redisimg2" + "0" * 20}
+    got = _k(tmp_path / "ok", _snap({}, True, imgs=bimg), _snap(ids, True, imgs=aimg), roll_line=_line(first, keep))
+    assert got["K1"].startswith("UPGRADE K1 PASS:"), got["K1"]
+    assert "recreated: redis: its image moved redisimg1000>redisimg2000" in got["K1"], got["K1"]
+    assert "NOTE: image ids not visible" not in got["K1"], got["K1"]
+    # moved but kept: FAIL
+    got = _k(tmp_path / "kept", _snap({}, True, imgs=bimg), _snap(_NEW, True, imgs=aimg), roll_line=_line(_FIRST, _THIRD))
+    assert got["K1"].startswith("UPGRADE K1 FAIL:") and "redis: its image moved (" in got["K1"] and "but the container was kept" in got["K1"], got["K1"]
+    # unchanged nats recreated: FAIL
+    got = _k(tmp_path / "nats", _snap({}, True, imgs={}), _snap(dict(_NEW, nats="nats-2"), True, imgs={}),
+             roll_line=_line(_FIRST + ["nats"], [t for t in _THIRD if t != "nats"]))
+    assert got["K1"].startswith("UPGRADE K1 FAIL:") and "recreated but must keep its id: nats (its image is unchanged)" in got["K1"], got["K1"]
+
+
+def test_k1_without_image_ids_falls_back_to_the_plain_rule_and_says_so(tmp_path):
+    got = _k(tmp_path, _snap({}, True), _snap(_NEW, True), roll_line=_line(_FIRST, _THIRD))
+    assert got["K1"].startswith("UPGRADE K1 PASS:") and "NOTE: image ids not visible in the snapshot for" in got["K1"], got["K1"]
+
+
+def test_k1_compares_only_names_both_sides_see(tmp_path):
+    # the line names a project container the snapshot (noo-* only) never saw: a NOTE, not a FAIL
+    got = _k(tmp_path, _snap({}, True), _snap(_NEW, True), roll_line=_line(_FIRST, _THIRD + ["init-once"]))
+    assert got["K1"].startswith("UPGRADE K1 PASS:") and "NOTE: not in the snapshot (not compared): init-once" in got["K1"], got["K1"]
+
+
+def test_snapshot_image_column_reads_and_old_rows_still_parse(tmp_path):
+    f = tmp_path / "s"
+    f.write_text("noo-a a1 a - L sha256:abc\nnoo-b b1 b - -\n")
+    assert rc_mod.read_images(str(f)) == {"noo-a": "sha256:abc"}
+    assert rc_mod.read_labelled(str(f)) == {"noo-a": True, "noo-b": False}
+    assert "{{.Image}}" in rc_mod.FMT

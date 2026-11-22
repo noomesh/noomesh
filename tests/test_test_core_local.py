@@ -152,3 +152,167 @@ def test_a_workflow_switch_with_an_expression_is_refused(tmp_path: Path) -> None
         ci_step.workflow_env("TRELLION_PUBLIC", wf)
     with pytest.raises(ci_step.StepError, match="no top-level env"):
         ci_step.workflow_env("MISSING", wf)
+
+
+# --- venv cleanup (--gc-only) -------------------------------------------------
+# The script keeps one ~1.7 GB venv per checkout path and used to never delete
+# one (a shared box reached 176 GB). `--gc-only` runs just the cleanup, with
+# XDG_CACHE_HOME pointed at a temp dir; no uv, no install.
+
+import hashlib  # noqa: E402
+import os  # noqa: E402
+import subprocess  # noqa: E402
+import time  # noqa: E402
+
+_CURRENT = hashlib.sha256(str(ROOT).encode()).hexdigest()[:16]
+_DAY = 86400
+
+
+def _venv(base: Path, name: str, *, root: Path | None = None, age_days: float = 0, used: bool = True) -> Path:
+    d = base / name
+    (d / "bin").mkdir(parents=True)
+    (d / "bin" / "python").write_text("", encoding="utf-8")
+    (d / "pyvenv.cfg").write_text("home = /usr/bin\n", encoding="utf-8")
+    if root is not None:
+        (d / ".root").write_text(f"{root}\n", encoding="utf-8")
+    t = time.time() - age_days * _DAY
+    if used:
+        (d / ".last-used").write_text("", encoding="utf-8")
+        os.utime(d / ".last-used", (t, t))
+    os.utime(d, (t, t))
+    return d
+
+
+def _gc(tmp_path: Path, **env: str) -> subprocess.CompletedProcess:
+    e = {k: v for k, v in os.environ.items() if not k.startswith("NOO_TEST_CORE_")}
+    e["XDG_CACHE_HOME"] = str(tmp_path / "cache")
+    e.update(env)
+    return subprocess.run(
+        ["bash", str(SCRIPT), "--gc-only"], cwd=ROOT, env=e, capture_output=True, text=True, timeout=60
+    )
+
+
+def _base(tmp_path: Path) -> Path:
+    b = tmp_path / "cache" / "noomesh" / "test-core-venv"
+    b.mkdir(parents=True)
+    return b
+
+
+def test_gc_removes_a_venv_whose_checkout_is_gone(tmp_path: Path) -> None:
+    base = _base(tmp_path)
+    live = tmp_path / "live-checkout"
+    live.mkdir()
+    gone = _venv(base, "a" * 16, root=tmp_path / "deleted-worktree")
+    kept = _venv(base, "b" * 16, root=live)
+    r = _gc(tmp_path)
+    assert r.returncode == 0, r.stderr
+    assert not gone.exists() and kept.exists()
+    assert f"removed venv {'a' * 16} (its checkout {tmp_path / 'deleted-worktree'} is gone," in r.stdout
+    assert "removed 1 venv(s)" in r.stdout
+
+
+def test_gc_removes_an_old_venv_with_no_root_and_keeps_a_fresh_one(tmp_path: Path) -> None:
+    base = _base(tmp_path)
+    old = _venv(base, "c" * 16, age_days=15)
+    fresh = _venv(base, "d" * 16, age_days=2)
+    old_no_stamp = _venv(base, "e" * 16, age_days=20, used=False)  # dir mtime decides
+    fresh_no_stamp = _venv(base, "f" * 16, age_days=1, used=False)
+    r = _gc(tmp_path)
+    assert r.returncode == 0, r.stderr
+    assert not old.exists() and not old_no_stamp.exists()
+    assert fresh.exists() and fresh_no_stamp.exists()
+
+
+def test_gc_caps_the_count_least_recently_used_first_and_spares_the_current(tmp_path: Path) -> None:
+    base = _base(tmp_path)
+    live = tmp_path / "live"
+    live.mkdir()
+    current = _venv(base, _CURRENT, root=ROOT, age_days=100)  # oldest, but current
+    names = ["1" * 16, "2" * 16, "3" * 16, "4" * 16]
+    venvs = [_venv(base, n, root=live, age_days=age) for n, age in zip(names, [1, 2, 3, 4])]
+    r = _gc(tmp_path, NOO_TEST_CORE_VENVS_KEEP="3")
+    assert r.returncode == 0, r.stderr
+    # current + the 2 most recently used survive; the 2 least recent go.
+    assert current.exists() and venvs[0].exists() and venvs[1].exists()
+    assert not venvs[2].exists() and not venvs[3].exists()
+    assert r.stdout.count("removed venv") == 2 and "over the cap of 3" in r.stdout
+
+
+def test_gc_default_cap_is_four(tmp_path: Path) -> None:
+    base = _base(tmp_path)
+    live = tmp_path / "live"
+    live.mkdir()
+    vs = [_venv(base, f"{i:016x}", root=live, age_days=i) for i in range(1, 7)]
+    assert _gc(tmp_path).returncode == 0
+    # the current venv does not exist here, so 4 are kept: ages 1..4.
+    assert [v.exists() for v in vs] == [True, True, True, True, False, False]
+
+
+def test_gc_leaves_odd_names_and_symlinks_alone(tmp_path: Path) -> None:
+    base = _base(tmp_path)
+    odd = _venv(base, "not-a-venv-name", age_days=400)
+    upper = _venv(base, "A" * 16, age_days=400)
+    short = _venv(base, "abc", age_days=400)
+    no_python = base / ("9" * 16)
+    no_python.mkdir()
+    os.utime(no_python, (0, 0))
+    target = _venv(tmp_path, "t" * 16, age_days=400)
+    link = base / ("8" * 16)
+    link.symlink_to(target, target_is_directory=True)
+    r = _gc(tmp_path, NOO_TEST_CORE_VENVS_KEEP="0")
+    assert r.returncode == 0, r.stderr
+    for p in (odd, upper, short, no_python, target):
+        assert p.exists(), p
+    assert link.is_symlink() and (target / "bin" / "python").exists()
+    assert "removed venv" not in r.stdout
+
+
+def test_gc_does_nothing_when_the_user_chose_the_venv(tmp_path: Path) -> None:
+    base = _base(tmp_path)
+    gone = _venv(base, "a" * 16, root=tmp_path / "deleted")
+    mine = _venv(tmp_path, "mine", age_days=400)
+    r = _gc(tmp_path, NOO_TEST_CORE_VENV=str(mine))
+    assert r.returncode == 0, r.stderr
+    assert gone.exists() and mine.exists() and r.stdout == ""
+
+
+def test_the_run_records_root_and_last_used_before_it_prunes() -> None:
+    body = SCRIPT.read_text(encoding="utf-8")
+    assert '> "$venv/.root"' in body and 'touch "$venv/.last-used"' in body
+    # The cleanup runs before pytest is exec'd.
+    assert body.index("\ngc_venvs ||") < body.index('exec pytest "$@"')
+
+
+def test_gc_never_removes_a_venv_a_live_process_is_using(tmp_path: Path) -> None:
+    if not Path("/proc/self").is_dir():
+        pytest.skip("needs Linux /proc")
+    base = _base(tmp_path)
+    busy = _venv(base, "a" * 16, root=tmp_path / "deleted", age_days=50)  # root gone AND over cap
+    idle = _venv(base, "b" * 16, root=tmp_path / "deleted", age_days=50)
+    proc = subprocess.Popen(["sleep", "30"], cwd=busy)
+    try:
+        r = _gc(tmp_path, NOO_TEST_CORE_VENVS_KEEP="0")
+    finally:
+        proc.kill()
+        proc.wait()
+    assert r.returncode == 0, r.stderr
+    assert busy.exists() and not idle.exists()
+    assert f"kept venv {'a' * 16} (in use by pid {proc.pid})" in r.stdout
+
+
+def test_gc_orders_by_the_last_used_marker_not_dir_mtime(tmp_path: Path) -> None:
+    base = _base(tmp_path)
+    live = tmp_path / "live"
+    live.mkdir()
+    old_marker = _venv(base, "1" * 16, root=live, age_days=30)
+    new_marker = _venv(base, "2" * 16, root=live, age_days=1)
+    no_marker = _venv(base, "3" * 16, root=live, age_days=0, used=False)
+    now = time.time()
+    os.utime(old_marker, (now, now))  # fresh dir mtime, old marker
+    os.utime(new_marker, (now - 90 * _DAY,) * 2)  # old dir mtime, fresh marker
+    r = _gc(tmp_path, NOO_TEST_CORE_VENVS_KEEP="2")
+    assert r.returncode == 0, r.stderr
+    assert not no_marker.exists()  # no marker sorts oldest
+    assert old_marker.exists() and new_marker.exists()
+    r = _gc(tmp_path, NOO_TEST_CORE_VENVS_KEEP="1")
+    assert not old_marker.exists() and new_marker.exists()

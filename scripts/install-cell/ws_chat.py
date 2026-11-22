@@ -219,6 +219,39 @@ def route_status(path: str, base: str = "https://localhost:8080") -> int:
     return code
 
 
+def chat_sse(prompt: str, conversation_id: str, base: str = "https://localhost:8080", timeout: float = 300,
+             max_lines: int = 400, max_chars: int = 900) -> list[str]:
+    """POST /api/inference/chat as `noo chat` does and return the raw SSE lines
+    (each cut to max_chars, at most max_lines): the stream carries the
+    tool_result events with their 500-char output preview. A probe's evidence,
+    never a verdict: errors come back as one line."""
+    ctx = ssl.create_default_context(cafile=cluster_ca())
+    body = json.dumps({"prompt": prompt, "model": None, "conversation_id": conversation_id}).encode()
+
+    def once():
+        req = urllib.request.Request(base + "/api/inference/chat", data=body, method="POST",
+                                     headers={"Authorization": "Bearer " + token(), "Content-Type": "application/json"})
+        return urllib.request.urlopen(req, context=ctx, timeout=60)
+
+    try:
+        try:
+            r = once()
+        except urllib.error.HTTPError as e:
+            if e.code != 401 or not refresh_via_cli():
+                raise
+            r = once()
+        out, end = [], time.time() + timeout
+        with r:
+            for raw in r:
+                out.append(raw.decode(errors="replace").rstrip("\r\n")[:max_chars])
+                if len(out) >= max_lines or time.time() > end:
+                    out.append("... stream cut by the probe's line/time cap")
+                    break
+        return out
+    except Exception as e:
+        return [f"SSE CAPTURE: could not read the stream: {type(e).__name__}: {e}"]
+
+
 if __name__ == "__main__":
     if len(sys.argv) == 3 and sys.argv[1] == "--probe-route":
         try:

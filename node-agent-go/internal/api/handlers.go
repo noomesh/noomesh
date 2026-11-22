@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/noomesh/noomesh/node-agent-go/internal/auth"
+	"github.com/noomesh/noomesh/node-agent-go/internal/backendrt"
 	"github.com/noomesh/noomesh/node-agent-go/internal/ctrlrpc"
 	dockerpkg "github.com/noomesh/noomesh/node-agent-go/internal/docker"
 	"github.com/noomesh/noomesh/node-agent-go/internal/gpuyield"
@@ -151,6 +152,22 @@ func (s *Server) handleStartBackend(w http.ResponseWriter, r *http.Request) {
 					"its lifecycle — start, stop and model changes are the operator's, not the "+
 					"controller's. The backend IS reported and routable.",
 				req.Backend, s.native.Runtime(), nativeModelLabel(model)),
+		})
+		return
+	}
+
+	// A Mac (followup i1156): the native lane is the ONLY lane for a backend
+	// it can serve, and nothing answers on its port. Say that, with the
+	// remedy, before any Docker check: "Docker is not answering" would name
+	// a lane this node never uses for it.
+	if s.native.NativeOnly(req.Backend) {
+		derr := s.native.DownError(req.Backend)
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+			"error":          backendrt.NativeDownCode,
+			"backend":        req.Backend,
+			"runtime":        s.native.Runtime(),
+			"binary_present": derr.BinaryPresent,
+			"detail":         derr.Error(),
 		})
 		return
 	}
@@ -484,16 +501,22 @@ func (s *Server) handleContainerLogs(w http.ResponseWriter, r *http.Request) {
 	}
 	since := r.URL.Query().Get("since")
 
-	lines, err := s.docker.ContainerLogs(r.Context(), containerName, tail, since)
+	lines, notice, err := s.docker.ContainerLogsWithNotice(r.Context(), containerName, tail, since)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"detail": err.Error()})
 		return
 	}
 
-	writeJSON(w, http.StatusOK, map[string]any{
+	body := map[string]any{
 		"container": containerName,
 		"logs":      lines,
-	})
+	}
+	// Docker could not read lines it holds (i1225): say so, so an empty or
+	// old answer is not read as a quiet backend.
+	if notice != "" {
+		body["notice"] = notice
+	}
+	writeJSON(w, http.StatusOK, body)
 }
 
 func (s *Server) handleContainerStats(w http.ResponseWriter, r *http.Request) {

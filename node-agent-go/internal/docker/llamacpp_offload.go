@@ -5,6 +5,7 @@ package docker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"regexp"
@@ -67,7 +68,15 @@ const (
 	LlamacppCauseNoLayers = "llama.cpp was started with no GPU layers (N_GPU_LAYERS resolved to 0)"
 	LlamacppCauseNoLine   = "llama-server printed no offload line before the check gave up (still loading, or it exited)"
 	LlamacppCauseNotSaid  = "llama.cpp did not report its GPU offload (this build prints no offload line)"
+	// i1225: Docker held this start's lines but could not return them (a
+	// log file damaged, e.g. by an unclean stop). Never a verdict from an
+	// earlier run's lines instead.
+	LlamacppCauseLogUnreadable = "Docker could not read this start's log lines (a damaged log file, for example after an unclean stop), so the offload was not checked from the log"
 )
+
+// errLogUnreadable is a fetch's way to say the log since this start exists
+// but Docker could not return it.
+var errLogUnreadable = errors.New("the container's log since this start could not be read")
 
 // Offload states.
 const (
@@ -309,6 +318,7 @@ var (
 // loop never waits on a model load.
 func watchLlamacppOffload(ctx context.Context, gen int, backend, model string, fetch func(context.Context) ([]string, error), procGPU func(context.Context) (int, bool)) {
 	deadline := time.Now().Add(offloadWatchTimeout)
+	unreadable := false
 	t := time.NewTicker(offloadWatchInterval)
 	defer t.Stop()
 	for {
@@ -321,8 +331,14 @@ func watchLlamacppOffload(ctx context.Context, gen int, backend, model string, f
 		if err != nil {
 			slog.Debug("llamacpp offload: log read failed", "backend", backend, "error", err)
 		}
+		if errors.Is(err, errLogUnreadable) {
+			unreadable = true
+		}
 		timedOut := !time.Now().Before(deadline)
 		r, done := llamacppOffloadVerdict(backend, model, parseLlamacppStartLog(lines), timedOut, time.Now())
+		if unreadable && r.State == offloadUnknown && r.Cause == LlamacppCauseNoLine {
+			r.Cause = LlamacppCauseLogUnreadable
+		}
 		if done && r.State == offloadUnknown && procGPU != nil {
 			mib, ok := procGPU(ctx)
 			r = applyProcessGPU(r, mib, ok)
@@ -411,8 +427,14 @@ func (c *Client) startLlamacppOffloadWatch(ctx context.Context, backend, model, 
 	if !gpu || c == nil || c.docker == nil {
 		return
 	}
+	// Only this start's lines (i1225): a verdict from an earlier run's
+	// offload line is the false "runs on the CPU" again.
 	fetch := func(ctx context.Context) ([]string, error) {
-		return c.ContainerLogs(ctx, containerName, 2000, "")
+		lines, unreadable, err := c.ContainerLogsSinceStart(ctx, containerName, 2000)
+		if err == nil && unreadable {
+			err = errLogUnreadable
+		}
+		return lines, err
 	}
 	wctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), offloadWatchTimeout+time.Minute)
 	go func() {

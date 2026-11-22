@@ -13,6 +13,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"github.com/noomesh/noomesh/node-agent-go/internal/ctrlreach"
 	"github.com/noomesh/noomesh/node-agent-go/internal/modelstats"
 	"github.com/noomesh/noomesh/node-agent-go/internal/stopdrain"
 	"io"
@@ -845,6 +846,19 @@ func (r *Reporter) noteOutcome(clk *stageClock, err error) {
 			r.silentSince = clk.start
 		}
 		r.failStreak++
+		// The controller could not be reached at all: ONE outage line for
+		// the whole node (ctrlreach, shared with the reconcile), the beats
+		// at debug. An ANSWER that is an error is a different story (the
+		// controller is there and refusing): it keeps its own WARN.
+		if ctrlreach.Unreachable(err) {
+			ctrlreach.Failed("heartbeat", r.cfg.ControllerURL, err, time.Now())
+			slog.Debug("heartbeat not delivered",
+				"error", err,
+				"streak", r.failStreak,
+				"silent_for", time.Since(r.silentSince).Round(time.Second),
+				"controller", r.cfg.ControllerURL)
+			return
+		}
 		if r.failStreak == 1 || r.failStreak%10 == 0 {
 			slog.Warn("heartbeat not delivered",
 				"error", err,
@@ -855,8 +869,9 @@ func (r *Reporter) noteOutcome(clk *stageClock, err error) {
 		return
 	}
 	r.lastStopDelivered()
+	ctrlreach.Answered("heartbeat", time.Now())
 	if r.failStreak > 0 {
-		slog.Info("heartbeat delivery resumed",
+		slog.Debug("heartbeat delivery resumed",
 			"after_failures", r.failStreak,
 			"silent_for", time.Since(r.silentSince).Round(time.Second))
 		r.failStreak = 0

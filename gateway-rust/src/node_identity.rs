@@ -54,6 +54,10 @@ use tokio_rustls::server::TlsStream;
 pub struct VerifiedPeer {
     /// The node id the certificate names.
     pub node: String,
+    /// The IP addresses the certificate's SANs carry: the addresses the
+    /// cluster CA vetted for this node. The heartbeat accepts a reported
+    /// address another node holds only when it is one of these (i1174).
+    pub ips: Vec<String>,
 }
 
 /// Pull the node id out of a verified peer certificate.
@@ -65,6 +69,7 @@ pub struct VerifiedPeer {
 pub fn identity_from_cert(der: &[u8]) -> Option<VerifiedPeer> {
     use x509_parser::prelude::FromDer;
     let (_, cert) = x509_parser::certificate::X509Certificate::from_der(der).ok()?;
+    let ips = leaf_ip_sans(&cert);
     // A service leaf (`O=Mesh Cluster Service`, CN=prometheus, grafana, …)
     // names a sidecar, not a node. Reading its CN as a node id would let the
     // scraper's certificate stand for a node called "prometheus".
@@ -80,7 +85,7 @@ pub fn identity_from_cert(der: &[u8]) -> Option<VerifiedPeer> {
     // single value rather than a set to choose from.
     if let Some(cn) = cert.subject().iter_common_name().next().and_then(|a| a.as_str().ok()) {
         if is_identity(cn) {
-            return Some(VerifiedPeer { node: cn.to_string() });
+            return Some(VerifiedPeer { node: cn.to_string(), ips });
         }
     }
     // Fall back to the first DNS SAN that is not a convenience name.
@@ -88,12 +93,30 @@ pub fn identity_from_cert(der: &[u8]) -> Option<VerifiedPeer> {
         for gn in &san.value.general_names {
             if let x509_parser::extensions::GeneralName::DNSName(d) = gn {
                 if is_identity(d) {
-                    return Some(VerifiedPeer { node: (*d).to_string() });
+                    return Some(VerifiedPeer { node: (*d).to_string(), ips });
                 }
             }
         }
     }
     None
+}
+
+/// The IP SANs of a leaf, as text.
+fn leaf_ip_sans(cert: &x509_parser::certificate::X509Certificate<'_>) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Ok(Some(san)) = cert.subject_alternative_name() {
+        for gn in &san.value.general_names {
+            if let x509_parser::extensions::GeneralName::IPAddress(b) = gn {
+                let ip = match b.len() {
+                    4 => <[u8; 4]>::try_from(*b).ok().map(|a| std::net::IpAddr::from(a).to_string()),
+                    16 => <[u8; 16]>::try_from(*b).ok().map(|a| std::net::IpAddr::from(a).to_string()),
+                    _ => None,
+                };
+                out.extend(ip);
+            }
+        }
+    }
+    out
 }
 
 /// The cluster-PKI organization of a SERVICE leaf (`noo security pki
@@ -284,7 +307,7 @@ mod tests {
     #[test]
     fn a_node_leaf_names_a_node_and_never_a_service() {
         let der = leaf("host3", "Mesh Cluster Node");
-        assert_eq!(identity_from_cert(&der), Some(VerifiedPeer { node: "host3".into() }));
+        assert_eq!(identity_from_cert(&der).map(|p| p.node), Some("host3".to_string()));
         assert_eq!(service_from_cert(&der), None);
         let gw = leaf("host8", "Mesh Cluster Gateway");
         assert_eq!(service_from_cert(&gw), None, "the controller's leaf is not a service");

@@ -30,6 +30,14 @@ type payloadSection struct {
 	add   func(r *Reporter, p map[string]any)
 }
 
+// wrongNodeReport reads the agent's latest wrong_node refusal (a seam for
+// the payload tests).
+var wrongNodeReport = auth.LastWrongNode
+
+// misaddressedReport reads the peers whose misaddressed calls this agent
+// refused (a seam for the payload tests).
+var misaddressedReport = auth.MisaddressedFrom
+
 // The sections both a registration and a heartbeat carry. Each field is
 // assembled here and nowhere else.
 var (
@@ -69,6 +77,24 @@ var (
 		// receiving the bearer — both roll orders stay safe.
 		p["controller_leaf_only"] = auth.ControllerLeafOnly(r.cfg)
 		p["control_transports"] = r.controlTransports()
+		// This agent refuses a call addressed to another node (X-Noo-Node),
+		// and whether it currently refuses a header-less controller call
+		// (the desired-config flag the controller sends once it read the
+		// first field). i1174.
+		p[auth.ChecksTargetNodeField] = true
+		p[auth.RequiresTargetNodeField] = auth.RequiresTargetNode()
+		// The latest call this agent refused as addressed elsewhere, for ten
+		// minutes after it (verify's `target-node check` row). Absent when
+		// there was none.
+		if w := wrongNodeReport(); w != nil {
+			p[auth.WrongNodeRefusedField] = w
+		}
+		// The peers (never the controller) whose calls named another node
+		// in the last ten minutes: this node's report on each caller, for an
+		// operator alert on the caller. Absent when there were none.
+		if m := misaddressedReport(); len(m) > 0 {
+			p[auth.MisaddressedFromField] = m
+		}
 	}}
 
 	secBackendLeaves = payloadSection{name: "backendLeaves", stage: "backend_leaves", add: func(r *Reporter, p map[string]any) {

@@ -616,7 +616,7 @@ fn a_replayed_stale_or_malformed_hello_is_refused() {
 #[test]
 fn admission_needs_the_token_the_certificate_and_they_must_agree() {
     use crate::node_identity::{PeerThumbprint, VerifiedPeer};
-    let peer = |n: &str| VerifiedPeer { node: n.to_string() };
+    let peer = |n: &str| VerifiedPeer { node: n.to_string(), ips: Vec::new() };
     let thumb = PeerThumbprint("tp".into());
     assert_eq!(admit(Some("host9"), Some(&peer("host9")), Some(&thumb)), Ok(("host9".to_string(), "tp".to_string())));
     // A token naming another node than the certificate: a forged node id.

@@ -170,7 +170,10 @@ func (e *Engine) BootRestore(ctx context.Context) {
 		if rc == 4 {
 			// Done, but a core service is still down. Not retried: the secret
 			// files now exist, so another pass would report "nothing to do".
-			e.logf("BOOT-RESTORE WARN: %s (run `noo stack start` to bring the controller up)", strings.TrimSpace(stderr))
+			// i1184: restart first. It rewrites the secret files and starts
+			// the stopped containers without contacting a registry, so it
+			// works while the network is still coming up; start second.
+			e.logf("BOOT-RESTORE WARN: %s (run `noo stack restart` to bring the controller up; `noo stack start` if that does not)", strings.TrimSpace(stderr))
 			return
 		}
 		e.logf("BOOT-RESTORE attempt %d failed (exit %d): %s", attempt, rc, strings.TrimSpace(stderr))
@@ -181,5 +184,5 @@ func (e *Engine) BootRestore(ctx context.Context) {
 	}
 	// A key sealed to the TPM (i10a) that did not unseal fails every attempt
 	// the same way; lib-secrets.sh names the unit in the stderr above.
-	e.logf("BOOT-RESTORE gave up: run `noo stack start` to rewrite the secret files (age key sealed to the TPM? systemctl status noo-unseal.service; a data-root refusal says why in .noo-data-root-refused)")
+	e.logf("BOOT-RESTORE gave up: run `noo stack restart` to rewrite the secret files, `noo stack start` if that does not (age key sealed to the TPM? systemctl status noo-unseal.service; a data-root refusal says why in .noo-data-root-refused)")
 }

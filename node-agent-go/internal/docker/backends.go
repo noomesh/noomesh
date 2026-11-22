@@ -792,6 +792,13 @@ const SpecHashLabel = "noo.spec.hash"
 // `overrides` lets the controller dictate image + parser
 // config; empty fields fall through to env-based resolution.
 func (c *Client) StartBackendSDK(ctx context.Context, backend, model string, gpuCount int, overrides StartOverrides) error {
+	// The backstop (followup i1156): on a Mac, Ollama runs natively or not
+	// at all. The reconciler and the start API refuse first; this catches
+	// any caller that does not, before an image is resolved or pulled.
+	if nativeOnlyBackend(backend) {
+		_, present := ollamaBinary()
+		return nativeDown(backend, present)
+	}
 	spec, ok := backendSpecs[backend]
 	if !ok {
 		return fmt.Errorf("unknown backend: %s", backend)

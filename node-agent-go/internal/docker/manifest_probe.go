@@ -241,3 +241,17 @@ func decodeArtifactManifest(body []byte) (*artifactManifest, error) {
 	m.SHA256 = strings.ToLower(m.SHA256)
 	return &m, nil
 }
+
+// manifestStillHashing reports that the manifest did not arrive because the
+// controller has the file and is still computing its hash (the 202, or the
+// wait for it running out): the artifact exists, so it is neither "not
+// staged" nor an auth failure. The controller keeps hashing between
+// requests, so a retry soon is the answer.
+func manifestStillHashing(err error) bool {
+	return errors.Is(err, ErrArtifactHashing) || errors.Is(err, ErrArtifactManifestTimeout)
+}
+
+// stillHashingMessage words it for an image tar, naming the file.
+func stillHashingMessage(tar string) string {
+	return "the controller is still hashing " + tar + "; retry shortly (it keeps hashing between requests)"
+}

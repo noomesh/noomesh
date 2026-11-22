@@ -354,14 +354,6 @@ fn gateway_env_digest(container: &str, key: &str, salt: &str) -> Option<Option<S
     Some(Some(salted_digest(salt, v)))
 }
 
-fn container_running(name: &str) -> bool {
-    Command::new("docker")
-        .args(["inspect", "-f", "{{.State.Running}}", name])
-        .output()
-        .map(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).trim() == "true")
-        .unwrap_or(false)
-}
-
 // ─────────────────────────────────────────────────────────────────────────
 // The command
 // ─────────────────────────────────────────────────────────────────────────
@@ -433,8 +425,22 @@ pub fn cluster_push_secrets(g: &Globals, args: &[String]) -> Result<i32, Unhandl
     let salt = fresh_salt();
 
     // ── The controller interlock, per key, BEFORE any bundle is built.
-    if !container_running(&gateway_container) {
-        fail(
+    match crate::commands::secrets::container_state(&gateway_container) {
+        crate::commands::secrets::ContainerState::Running => {}
+        crate::commands::secrets::ContainerState::Unknown(why) => fail(
+            g.json,
+            ExitCode::Generic,
+            "gateway_state_unknown",
+            &format!(
+                "{}, so the fleet's live reference value cannot be read",
+                crate::commands::secrets::container_unknown_message(&gateway_container, &why)
+            ),
+            Some(
+                "this says nothing about the gateway or a drifted node: docker did not answer. \
+                 Fix that and re-run.",
+            ),
+        ),
+        crate::commands::secrets::ContainerState::Stopped | crate::commands::secrets::ContainerState::Absent => fail(
             g.json,
             ExitCode::Generic,
             "gateway_down",
@@ -447,7 +453,7 @@ pub fn cluster_push_secrets(g: &Globals, args: &[String]) -> Result<i32, Unhandl
                  store has not been proven to be what the fleet authenticates with. Start it \
                  (`noo stack start`) and re-run.",
             ),
-        );
+        ),
     }
 
     let mut store_state: BTreeMap<&str, StoreState> = BTreeMap::new();

@@ -668,6 +668,12 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
+# A oneshot has no start timeout by default: a hung run stays activating and
+# its timer never fires again (i1160). 7200 s = the bundle transfer's own
+# --max-time 3600 (noo-fetch.sh) + the apply and its report (~25 min worst
+# case: service restarts, hostd heartbeat, report retries) + margin. The
+# timer starts the next run as soon as this one fails.
+TimeoutStartSec=7200
 ExecStart=/usr/local/bin/noo-fetch
 UNIT
         cat > /etc/systemd/system/noo-fetch.timer <<'UNIT'

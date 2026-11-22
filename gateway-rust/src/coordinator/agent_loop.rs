@@ -3267,12 +3267,15 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
             let repeated = repeat.is_some();
             let tool_result = match repeat {
                 Some(r) => r,
-                None => crate::mcp_bridge::CONVERSATION
-                    .scope(
+                None => bounded_tool(
+                    call,
+                    ends_at,
+                    crate::mcp_bridge::CONVERSATION.scope(
                         Some(conversation_id.to_string()),
                         crate::mcp_bridge::CALLER.scope(user_id.map(str::to_string), rt.execute_tool(call)),
-                    )
-                    .await,
+                    ),
+                )
+                .await,
             };
             let tool_elapsed_ms = tool_start.elapsed().as_millis() as u64;
 
@@ -3863,6 +3866,7 @@ async fn run_inner_bound<R: HarnessRuntime>(
             break;
         }
         result.iterations = iteration;
+        super::route_budget::note_iteration(iteration);
         let iter_start = Instant::now();
         if let Some(line) = window_refusal.take() {
             llm_failure = Some(super::backend::ContextTooSmall(line).into());
@@ -4174,12 +4178,15 @@ async fn run_inner_bound<R: HarnessRuntime>(
             let repeated = repeat.is_some();
             let tool_result = match repeat {
                 Some(r) => r,
-                None => crate::mcp_bridge::CONVERSATION
-                    .scope(
+                None => bounded_tool(
+                    call,
+                    ends_at,
+                    crate::mcp_bridge::CONVERSATION.scope(
                         Some(conversation_id.to_string()),
                         crate::mcp_bridge::CALLER.scope(user_id.map(str::to_string), rt.execute_tool(call)),
-                    )
-                    .await,
+                    ),
+                )
+                .await,
             };
             let tool_elapsed_ms = tool_start.elapsed().as_millis() as u64;
 
@@ -4187,6 +4194,7 @@ async fn run_inner_bound<R: HarnessRuntime>(
             usage.total_latency_ms += tool_elapsed_ms;
 
             let output_truncated: String = tool_result.output.chars().take(2000).collect();
+            super::route_budget::note_tool_call();
             result.tool_calls.push(json!({
                 "name": call.name,
                 "arguments": call.arguments,
@@ -4270,6 +4278,7 @@ async fn run_inner_bound<R: HarnessRuntime>(
     }
 
     if deadline_stopped {
+        super::route_budget::note_deadline_stop();
         result.response = with_deadline_note(&result.response).0;
     }
 
@@ -4399,8 +4408,11 @@ fn turn_ends_at<R: HarnessRuntime>(rt: &R, start: Instant) -> Instant {
     // checked_add: an absurd NOO_HARNESS_TURN_TIMEOUT_SECS or `exp` must
     // not panic the turn; a year is "no bound" for a turn.
     let far = Duration::from_secs(365 * 86_400);
+    // A route that bounds its turn (route_budget, i1178a) shortens it here;
+    // every other route keeps the global deadline.
+    let deadline = super::route_budget::capped(super::turn_deadline(), super::route_budget::current().map(|b| b.cap));
     let by_clock = start
-        .checked_add(super::turn_deadline())
+        .checked_add(deadline)
         .unwrap_or_else(|| start + far);
     let Some(exp) = rt.credential_expires_at() else {
         return by_clock;
@@ -4419,7 +4431,42 @@ fn turn_ends_at<R: HarnessRuntime>(rt: &R, start: Instant) -> Instant {
 /// What one more model call is expected to need: two stream idle bounds,
 /// at most five minutes.
 fn model_call_budget() -> Duration {
-    (crate::tls::stream_idle() * 2).min(Duration::from_secs(300))
+    super::route_budget::call_budget(
+        (crate::tls::stream_idle() * 2).min(Duration::from_secs(300)),
+        super::route_budget::current().map(|b| b.cap),
+    )
+}
+
+/// One tool call, bounded (i1178a): never past the turn's end, and on a
+/// route that caps its turn never past the tool timeout either. A tool that
+/// does not finish is told to the model as a failed call, so the loop goes
+/// on (the model can answer from what it has) instead of waiting in silence.
+async fn bounded_tool<F: std::future::Future<Output = crate::tools::ToolResult>>(
+    call: &crate::tools::ToolCall,
+    ends_at: Instant,
+    fut: F,
+) -> crate::tools::ToolResult {
+    let bound = super::route_budget::tool_bound(
+        ends_at.saturating_duration_since(Instant::now()),
+        crate::tools::tool_timeout(),
+        super::route_budget::current().is_some(),
+    );
+    match tokio::time::timeout(bound, fut).await {
+        Ok(r) => r,
+        Err(_) => {
+            tracing::warn!(tool = %call.name, bound_secs = bound.as_secs(), "loop.tool_timeout");
+            crate::tools::ToolResult {
+                name: call.name.clone(),
+                tool_call_id: call.id.clone(),
+                success: false,
+                output: String::new(),
+                error: Some(format!(
+                    "the tool did not finish within {}s; answer from what you already have, or say it timed out",
+                    bound.as_secs()
+                )),
+            }
+        }
+    }
 }
 
 /// Stop before model call `iteration`? Always once `ends_at` has passed;
@@ -5194,5 +5241,43 @@ mod node_restart_wiring {
         let cluster = crate::test_src::own_code(include_str!("../routes/cluster.rs"));
         let dc = crate::test_src::fn_body(&cluster, "async fn desired_config_get(");
         assert!(dc.contains("\"gateway_features\": [crate::node_restart::FEATURE],"), "the agent learns it may refuse with node_restarting");
+    }
+}
+
+#[cfg(test)]
+mod bounded_tool_tests {
+    use super::*;
+
+    fn call() -> crate::tools::ToolCall {
+        crate::tools::ToolCall { id: "c1".into(), name: "slow_tool".into(), arguments: serde_json::json!({}) }
+    }
+
+    /// i1178a: a tool that never finishes is told to the model as a failed
+    /// call within the bound, instead of holding the turn in silence. On a
+    /// capped route the bound is the tool timeout even when the turn has
+    /// longer left.
+    #[tokio::test(start_paused = true)]
+    async fn a_tool_that_does_not_finish_becomes_a_failed_call() {
+        let budget = super::super::route_budget::RouteBudget::new(Duration::from_secs(240));
+        let r = super::super::route_budget::scope(
+            budget,
+            bounded_tool(&call(), Instant::now() + Duration::from_secs(600), async {
+                tokio::time::sleep(Duration::from_secs(100_000)).await;
+                unreachable!("the bound must end it")
+            }),
+        )
+        .await;
+        assert!(!r.success);
+        let e = r.error.expect("an error the model reads");
+        assert!(e.contains(&format!("{}s", crate::tools::tool_timeout().as_secs())), "{e}");
+        assert_eq!((r.name.as_str(), r.tool_call_id.as_str()), ("slow_tool", "c1"));
+    }
+
+    /// A tool that finishes is returned as it is.
+    #[tokio::test(start_paused = true)]
+    async fn a_tool_that_finishes_is_untouched() {
+        let done = crate::tools::ToolResult { name: "t".into(), tool_call_id: "c1".into(), success: true, output: "ok".into(), error: None };
+        let r = bounded_tool(&call(), Instant::now() + Duration::from_secs(600), async move { done }).await;
+        assert!(r.success && r.output == "ok");
     }
 }

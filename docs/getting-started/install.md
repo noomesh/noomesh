@@ -43,7 +43,7 @@ on Ubuntu/Debian the wizard offers to install it). The details of each step are 
 2. `noo onboard --ci --root-ok`: exit 0. `--root-ok` runs the root steps through `sudo -n`, so it needs passwordless sudo. The admin password is generated and never shown.
 3. `noo --json cluster verify --wait`: exit 0 means done; exit 1 means run each failing row's `remedy`.
 
-**Left for a person:** storing the two backup passphrases off this machine; learning the admin password (`noo security admin-password reset --stdout --yes`); joining a tailnet (a browser login); `sudo loginctl enable-linger <user>`.
+**Left for a person:** storing the two backup passphrases off this machine; learning the admin password (`noo security admin-password reset --stdout --yes`); joining a tailnet (a browser login). Onboard turns on linger for the user it runs as (`loginctl enable-linger`, through the same sudo), so noo-hostd starts at boot with no login; `noo cluster verify`'s `hostd at boot` row WARNs when it is off and prints the `sudo loginctl enable-linger <user>` line.
 
 ### Requirements and platform
 
@@ -178,6 +178,8 @@ The install matrix runs the release path above on fresh machines; this
 from-source path is **not** covered by it (nothing installs from a fresh
 clone in CI), so treat it as the developer's path.
 
+A separate **reboot cell** (dispatch only, `cells=reboot`) installs the release in a KVM guest, reboots it and judges that the stack comes back with no command (noo-hostd's boot restore); it reports `REBOOT <check> PASS|FAIL|SKIP` lines, and a skipped cell means the runner had no `/dev/kvm`.
+
 ```bash
 git clone https://github.com/noomesh/noomesh.git ~/noomesh
 cd ~/noomesh
@@ -294,7 +296,13 @@ prints the gateway's raw body, which includes an `addons` object
 Docker. It never repairs by itself: a damaged host gets a four-step
 runbook (remove what Docker can remove, stop Docker and clear
 `/var/lib/docker/containers`, prune the builder, `noo stack start`). Exit
-code is 1 when damaged, 0 when clean.
+code is 1 when damaged, 0 when clean. An `inspect` that does not answer in
+10 s is counted on its own line (`inspect timed out`), never as a ghost:
+the daemon, or a container's bind mount, is hung. When docker itself does
+not answer, it says which of four things it saw: permission denied (join the
+docker group), not answering (`sudo systemctl start docker`), a timeout
+(`sudo systemctl status docker`), or docker missing; `noo doctor exposure`
+says the same.
 
 The exit-code contract every `noo` command follows is in the
 [CLI overview](../cli/README.md#contracts).

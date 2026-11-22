@@ -24,6 +24,8 @@
 # hooks (fa). A cell whose hook does not exist yet reports "not run".
 # scripts/install-cell/upgrade.sh drives the upgrade cell (fa); dispatch with
 # cells=upgrade to run it alone.
+# scripts/install-cell/reboot.sh drives the reboot cell (fa): dispatch with
+# cells=reboot (alone) or cells=all-plus-reboot. Never on schedule, never on `all`.
 name: install matrix
 
 on:
@@ -33,9 +35,9 @@ on:
         description: 'Which release a cell installs: latest (the README line, verbatim) or a tag (noo-cli-vX.Y.Z)'
         default: latest
       cells:
-        description: 'all (every fresh-install cell and the upgrade cell), fresh (the fresh-install cells only) or upgrade (the upgrade cell only)'
+        description: 'all (every fresh-install cell and the upgrade cell), fresh (the fresh-install cells only), upgrade (the upgrade cell only), reboot (the reboot cell only: a KVM guest) or all-plus-reboot (all, and the reboot cell)'
         type: choice
-        options: [all, fresh, upgrade]
+        options: [all, fresh, upgrade, reboot, all-plus-reboot]
         default: all
       prev_tag:
         description: 'The upgrade cell only: the final it starts from (exactly noo-cli-vX.Y.Z, a published non-prerelease release below cli_tag). Empty: the newest final below cli_tag'
@@ -55,7 +57,7 @@ concurrency:
 jobs:
   cell:
     name: ${{ matrix.cell }}
-    if: inputs.cells != 'upgrade'
+    if: inputs.cells != 'upgrade' && inputs.cells != 'reboot'
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 120
     continue-on-error: ${{ matrix.experimental }}
@@ -148,7 +150,7 @@ jobs:
   # reports WSL2 working on windows-2025. Experimental: if WSL2 or Docker in
   # it is refused, this cell says so verbatim and does not fail the run.
   wsl2:
-    if: inputs.cells != 'upgrade'
+    if: inputs.cells != 'upgrade' && inputs.cells != 'reboot'
     name: windows-2025-wsl2 (experimental)
     runs-on: windows-2025
     timeout-minutes: 120
@@ -232,7 +234,7 @@ jobs:
   # the journal, a chat answer after). Dispatch only: it judges a release.
   upgrade:
     name: upgrade-24.04
-    if: github.event_name == 'workflow_dispatch' && inputs.cells != 'fresh'
+    if: github.event_name == 'workflow_dispatch' && inputs.cells != 'fresh' && inputs.cells != 'reboot'
     runs-on: ubuntu-24.04
     timeout-minutes: 150
     steps:
@@ -289,10 +291,64 @@ jobs:
           retention-days: 14
           if-no-files-found: warn
 
+  # THE REBOOT CELL (fa): after a reboot the stack comes back with NO command
+  # (noo-hostd's BootRestore); `noo stack start` is only the remedy. A hosted
+  # runner cannot be rebooted, so the box is a QEMU/KVM Ubuntu 24.04 guest. No
+  # /dev/kvm: one `REBOOT kvm SKIP` line and a green job (never a fake pass).
+  # Dispatch only; one `REBOOT <id> PASS|FAIL|SKIP|INFO` line per assert.
+  reboot:
+    name: reboot-24.04
+    if: github.event_name == 'workflow_dispatch' && (inputs.cells == 'reboot' || inputs.cells == 'all-plus-reboot')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: Validate dispatch inputs
+        shell: bash
+        env:
+          CLI_TAG: ${{ inputs.cli_tag || 'latest' }}
+        run: |
+          export LC_ALL=C
+          re='^(latest|noo-cli-v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?)$'
+          [[ $CLI_TAG =~ $re ]] || {
+            printf '::error::cli_tag %q refused: must be exactly latest or noo-cli-vX.Y.Z with an optional -rc.N\n' "$CLI_TAG"; exit 1; }
+      - name: Checkout (the cell harness only)   # actions/checkout@v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            README.md
+            scripts/install-cell
+            noo-cli/src/commands/cluster_verify/rows.rs
+          sparse-checkout-cone-mode: false
+      - name: KVM and QEMU (the cell SKIPs by name when /dev/kvm is still unusable)
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload
+          sudo udevadm trigger --name-match=kvm
+          sudo apt-get update -q
+          sudo apt-get install -y -q qemu-system-x86 qemu-utils cloud-image-utils
+          ls -l /dev/kvm || echo "no /dev/kvm"
+          df -h / /mnt
+      - name: Run the reboot cell
+        env:
+          OUT: ${{ runner.temp }}/cell
+          CELL: reboot-24.04
+          RUNNER: ubuntu-24.04
+          CLI_TAG: ${{ inputs.cli_tag || 'latest' }}
+        run: bash scripts/install-cell/reboot.sh
+      - name: Upload the cell's report (redacted; scanned by reboot.sh, which withholds logs and judge on a secret)   # actions/upload-artifact@v7.0.2
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: install-cell-reboot-24.04
+          path: ${{ runner.temp }}/cell/
+          retention-days: 14
+          if-no-files-found: warn
+
   size:
     name: release size
     needs: cell
-    if: always() && inputs.cells != 'upgrade'
+    if: always() && inputs.cells != 'upgrade' && inputs.cells != 'reboot'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:

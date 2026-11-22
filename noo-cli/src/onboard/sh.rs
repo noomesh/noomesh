@@ -942,14 +942,49 @@ pub fn docker(args: &[&str]) -> (i32, String) {
         })
         .collect();
     let args: Vec<&str> = remapped.iter().map(String::as_str).collect();
-    match Command::new("docker").args(&args).stdin(Stdio::null()).output() {
-        Ok(o) => {
+    let limit = docker_limit(&args);
+    match crate::bounded::docker(&args, limit) {
+        crate::bounded::Bounded::Answered(o) => {
             let mut s = String::from_utf8_lossy(&o.stdout).into_owned();
             s.push_str(&String::from_utf8_lossy(&o.stderr));
             (o.status.code().unwrap_or(1), s)
         }
-        Err(e) => (1, format!("failed to spawn docker: {e}")),
+        // 124 is what `timeout(1)` exits with: a bound that passed.
+        crate::bounded::Bounded::TimedOut { secs } => (
+            DOCKER_TIMED_OUT,
+            format!(
+                "docker {} did not answer in {secs} s: a mount a container uses may be hung (a hard NFS mount resumes by \
+                 itself once its server answers; do not force-unmount it)",
+                args.first().copied().unwrap_or("")
+            ),
+        ),
+        crate::bounded::Bounded::SpawnFailed(e) => (1, format!("failed to spawn docker: {e}")),
     }
+}
+
+/// The exit code `docker()` returns when its bound passed (as `timeout(1)`).
+pub const DOCKER_TIMED_OUT: i32 = 124;
+
+/// The bound on a docker call that answers from the daemon's own state
+/// (inspect, ps, info, images, logs, a short exec): a daemon or a mount that
+/// does not answer in this long is not going to.
+const DOCKER_SHORT_SECS: u64 = 120;
+/// The bound on a docker call that moves bytes or runs a program to its end
+/// (pull, load, save, build, push, cp, run, exec, compose): minutes are
+/// legitimate there, so the bound is a backstop against a call that never
+/// returns, not a timing target. `exec` is here because the callers run
+/// `ollama list` and python probes whose length is theirs to choose.
+const DOCKER_LONG_SECS: u64 = 1800;
+
+/// The bound for `docker <args>`: by its subcommand (the first argument that
+/// is not a flag).
+fn docker_limit(args: &[&str]) -> Duration {
+    let sub = args.iter().find(|a| !a.starts_with('-')).copied().unwrap_or("");
+    let long = matches!(
+        sub,
+        "pull" | "load" | "save" | "build" | "buildx" | "push" | "cp" | "run" | "exec" | "compose" | "commit" | "import" | "export"
+    );
+    Duration::from_secs(if long { DOCKER_LONG_SECS } else { DOCKER_SHORT_SECS })
 }
 
 /// A mutating `docker <args>` (e.g. `docker exec … reset-password`), dry-run aware.
@@ -1946,5 +1981,25 @@ mod launcher_recreate_tests {
         // The real launcher has the case.
         let real = include_str!("../../../scripts/noomesh-start.sh");
         assert!(real.contains("\n        --recreate)"));
+    }
+}
+
+#[cfg(test)]
+mod docker_bound_tests {
+    use super::*;
+
+    /// i1149: every docker call here is bounded; the ones that move bytes or
+    /// run a program to its end get the long backstop, the rest the short one.
+    #[test]
+    fn docker_calls_are_bounded_by_what_they_do() {
+        let secs = |a: &[&str]| docker_limit(a).as_secs();
+        assert_eq!(secs(&["inspect", "noo-gateway"]), DOCKER_SHORT_SECS);
+        assert_eq!(secs(&["info"]), DOCKER_SHORT_SECS);
+        assert_eq!(secs(&["ps", "-a"]), DOCKER_SHORT_SECS);
+        assert_eq!(secs(&["image", "inspect", "x"]), DOCKER_SHORT_SECS);
+        assert_eq!(secs(&["pull", "x"]), DOCKER_LONG_SECS);
+        assert_eq!(secs(&["exec", "c", "ollama", "list"]), DOCKER_LONG_SECS);
+        assert_eq!(secs(&["--debug", "load"]), DOCKER_LONG_SECS, "a leading flag is skipped");
+        const { assert!(DOCKER_SHORT_SECS > 0) };
     }
 }

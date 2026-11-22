@@ -735,6 +735,23 @@ pub(crate) fn mint_tagged_auth_key(tag: &str, expiry_secs: i64, description: &st
     }
 }
 
+/// The warning a join paste carries when its controller URL can move
+/// (i1173): the `controller address` row's judgement, as one line. `None`
+/// for a name or a tailnet address.
+pub(crate) fn advertised_controller_caution() -> Option<String> {
+    let (url, dns) = super::cluster_verify::advertised_controller();
+    let local = super::cluster_verify::local_addresses();
+    enroll_url_caution_for(url.as_deref()?, dns.as_deref(), local.as_deref())
+}
+
+pub(crate) fn enroll_url_caution_for(noo_url: &str, dns: Option<&str>, local: Option<&[String]>) -> Option<String> {
+    let c = super::cluster_verify::controller_address_check(Some(noo_url), dns, local)?;
+    if c.verdict == super::cluster_verify::Verdict::Ok {
+        return None;
+    }
+    Some(format!("{}. {}", c.detail, c.remedy.unwrap_or_default()))
+}
+
 #[cfg(test)]
 mod acl_grant_tests {
     use super::acl_grant_insert;
@@ -1586,6 +1603,14 @@ pub fn cluster_bootstrap_token_create(g: &Globals, args: &[String]) -> Result<i3
     }
     say(ui::kv(&rows).trim_end());
     say("");
+    // i1173: without a tailnet the paste carries the URL the gateway hands
+    // out (NOO_GATEWAY_URL, else services.gateway_url); the node keeps it and
+    // is never told a new one. A local IP strands it when the router gives
+    // the controller another address: said where the paste is made (a
+    // warning, not a refusal: a reserved address is fine).
+    if let Some(line) = advertised_controller_caution() {
+        say(&ui::note(&line));
+    }
     say(&ui::emph("Run this on the new host:"));
     ui::value(one_liner);
     say("");
@@ -1938,4 +1963,28 @@ pub(crate) fn push_acl(policy: &str) -> Result<std::path::PathBuf, String> {
         ));
     }
     Ok(backup)
+}
+
+#[cfg(test)]
+mod enroll_url_caution_tests {
+    use super::*;
+
+    #[test]
+    fn a_paste_with_a_local_ip_warns_and_a_name_does_not() {
+        let here = vec!["192.0.2.5".to_string()];
+        let w = enroll_url_caution_for("https://192.0.2.5:8080", None, Some(&here)).expect("a local IP warns");
+        assert!(w.contains("cannot be fixed from here") && w.contains("tailnet"), "{w}");
+        assert!(enroll_url_caution_for("https://ctrl.example.ts.net:8080", None, Some(&here)).is_none());
+        assert!(enroll_url_caution_for("https://100.64.0.1:8080", None, Some(&here)).is_none());
+    }
+
+    #[test]
+    fn the_paste_says_it_before_the_enroll_line() {
+        let src = include_str!("cluster_provision.rs");
+        let code = crate::test_src::own_code(src);
+        let warn = code.find("if let Some(line) = advertised_controller_caution() {").expect("said");
+        let paste = code.find("say(&ui::emph(\"Run this on the new host:\"));").expect("the no-tailnet paste");
+        assert!(warn < paste);
+        assert_eq!(code.matches("= advertised_controller_caution() {").count(), 1, "said once, on the no-tailnet paste");
+    }
 }

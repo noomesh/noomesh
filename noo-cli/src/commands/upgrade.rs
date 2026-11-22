@@ -62,7 +62,7 @@ const TAG_PREFIX: &str = "noo-cli-v";
 /// The release installer, served by the controller mirror as `install.sh`.
 const INSTALLER: &str = include_str!("../../install.sh");
 const UPGRADE_USAGE: &str =
-    "usage: noo upgrade [--check] [--version X.Y.Z] [--stack] [--nodes] [--seats|--no-seats] [--all] [--tag vX.Y.Z] [--controller] [--allow-unsigned] [--skip-gateway-key-check] [--allow-downgrade] [--channel public|rollback|custom [--release-repo <owner/repo> --image-prefix <registry/path> [--base-registry <registry/path>]]] [--yes]";
+    "usage: noo upgrade [--check] [--version X.Y.Z] [--stack] [--nodes] [--seats|--no-seats] [--all] [--tag vX.Y.Z] [--controller] [--allow-unsigned] [--skip-gateway-key-check] [--allow-downgrade] [--recreate] [--allow-unserved] [--channel public|rollback|custom [--release-repo <owner/repo> --image-prefix <registry/path> [--base-registry <registry/path>]]] [--yes]";
 
 /// THE release repo, for every caller. `NOO_CLI_REPO` overrides the default.
 ///
@@ -109,6 +109,9 @@ fn dl_base() -> String {
 ///            (nodes fetch + apply on their own timer; no SSH).
 ///   --all    both.
 ///   --tag    override the paired stack tag (e.g. a hotfix stack release).
+///   --recreate  with --stack/--all: recreate every stack container (the
+///            escape). Without it the roll recreates only the containers
+///            that are out of line and keeps the rest (nats, redis, ...).
 /// After the binary swap the OLD process is still running — it re-execs the
 /// NEW binary (`upgrade --stage2 …`) so the paired tag and embedded assets
 /// used are the new release's, not the old one's.
@@ -134,6 +137,14 @@ pub fn upgrade(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     // an older signed version with it. Refused by default (add-ons may carry
     // database migrations).
     let mut allow_downgrade = false;
+    // The node phase: a node whose group would be left with nothing serving
+    // is staged anyway after the stagger's bound, instead of stopping the
+    // phase (roll_stagger::Release).
+    let mut allow_unserved = false;
+    // `--stack` only: the explicit escape. Every container is recreated, as
+    // every roll did before 0.6.30; without it the roll recreates only what
+    // is out of line (compose's config hash plus the `noo.inputs` label).
+    let mut recreate = false;
     // Move this install between release channels.
     let mut chan = super::channel::Flags::default();
     let mut yes = false;
@@ -152,6 +163,8 @@ pub fn upgrade(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             "--force" => force = true,
             "--skip-gateway-key-check" => skip_gw_key_check = true,
             "--allow-downgrade" => allow_downgrade = true,
+            "--allow-unserved" => allow_unserved = true,
+            "--recreate" => recreate = true,
             "--yes" | "-y" => yes = true,
             "--channel" | "--release-repo" | "--image-prefix" | "--base-registry" => match it.next() {
                 Some(v) => {
@@ -206,6 +219,17 @@ pub fn upgrade(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         fail(g.json, ExitCode::Usage, "usage", "--allow-downgrade applies to the stack roll only (--stack or --all)",
             Some(UPGRADE_USAGE));
     }
+    if recreate && !stack {
+        fail(g.json, ExitCode::Usage, "usage", "--recreate applies to the stack roll only (--stack or --all)",
+            Some(UPGRADE_USAGE));
+    }
+
+    // i1149: before the CLI self-update, the channel step and the `# Stack`
+    // work: a hung data-root mount refuses here, in one line. `--check`
+    // only reads, so it is left alone.
+    if (stack || nodes) && !check_only {
+        refuse_when_storage_hangs(g);
+    }
 
     // Stage 2: we ARE the freshly-installed binary; run the stack/node
     // stages with THIS build's paired tag + embedded assets.
@@ -213,7 +237,7 @@ pub fn upgrade(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         // The fresh binary corrects what an older one could not know about
         // (the parent of a self-update is the previous release).
         super::channel::migrate_legacy_base_registry(g, false);
-        return run_fleet_stages(g, stack, nodes, seats, tag_override.as_deref(), force, skip_gw_key_check, allow_downgrade);
+        return run_fleet_stages(g, stack, nodes, seats, tag_override.as_deref(), force, skip_gw_key_check, allow_downgrade, allow_unserved, recreate);
     }
 
     let current = env!("CARGO_PKG_VERSION").to_string();
@@ -407,7 +431,7 @@ pub fn upgrade(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         if stack || nodes || seats {
             // No swap happened — this process IS the current build, so its
             // paired tag and assets are already the right ones.
-            return run_fleet_stages(g, stack, nodes, seats, tag_override.as_deref(), force, skip_gw_key_check, allow_downgrade);
+            return run_fleet_stages(g, stack, nodes, seats, tag_override.as_deref(), force, skip_gw_key_check, allow_downgrade, allow_unserved, recreate);
         }
         return Ok(0);
     }
@@ -573,7 +597,7 @@ pub fn upgrade(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             if let Some(t) = &g.token { cmd.env("NOO_TOKEN", t); }
             cmd.args(stage2_args(g, &Stage2 {
                 stack, nodes, seats_only, no_seats, tag: tag_override.as_deref(),
-                force, skip_gw_key_check, allow_downgrade,
+                force, skip_gw_key_check, allow_downgrade, allow_unserved, recreate,
             }));
             let err = cmd.exec(); // only returns on failure
             fail(g.json, ExitCode::Generic, "reexec_failed",
@@ -778,7 +802,19 @@ fn gateway_older_than_bundle(force: bool) -> Option<String> {
     if bundle.is_empty() {
         return None;
     }
-    let running = running_gateway_tag()?;
+    bundle_gate(bundle, running_gateway_tag(), force)
+}
+
+/// [`gateway_older_than_bundle`] over what docker said about the gateway.
+fn bundle_gate(bundle: &str, gateway: GatewayTag, force: bool) -> Option<String> {
+    let running = match gateway {
+        GatewayTag::Tag(t) => t,
+        GatewayTag::Unknown => return None,
+        // A hung mount under the gateway is not "unknown": nodes are not
+        // touched until the storage answers (i1149). --force overrides the
+        // version ordering, not a mount that does not answer.
+        GatewayTag::TimedOut { secs } => return Some(gateway_hung_message(secs)),
+    };
     if !version_less_than(&running, bundle) {
         return None;
     }
@@ -797,22 +833,80 @@ fn gateway_older_than_bundle(force: bool) -> Option<String> {
     ))
 }
 
-/// The tag of the image the running gateway container was created from.
-/// `None` when docker is unreachable, the container is absent, or the ref
-/// carries no recognisable tag.
-fn running_gateway_tag() -> Option<String> {
-    let out = std::process::Command::new("docker")
-        .args(["inspect", "noo-gateway", "--format", "{{.Config.Image}}"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
+/// What asking docker for the running gateway's image came to.
+#[derive(Debug, PartialEq, Eq)]
+enum GatewayTag {
+    /// The tag of the image the container was created from.
+    Tag(String),
+    /// Docker is unreachable, the container is absent, or the ref carries no
+    /// recognisable tag: nothing to judge.
+    Unknown,
+    /// `docker inspect` did not answer within the bound: a mount the
+    /// container binds may be hung (i1149). Never folded into `Unknown`.
+    TimedOut { secs: u64 },
+}
+
+/// The tag of the image the running gateway container was created from,
+/// asked with a bounded `docker inspect`.
+fn running_gateway_tag() -> GatewayTag {
+    let name = crate::envfile::container("gateway");
+    let limit = Duration::from_secs(crate::bounded::INSPECT_SECS);
+    gateway_tag_from(&crate::bounded::docker(&["inspect", &name, "--format", "{{.Config.Image}}"], limit))
+}
+
+/// What a bounded `docker inspect --format {{.Config.Image}}` of the gateway said.
+fn gateway_tag_from(b: &crate::bounded::Bounded) -> GatewayTag {
+    use crate::bounded::Bounded;
+    match b {
+        Bounded::TimedOut { secs } => GatewayTag::TimedOut { secs: *secs },
+        Bounded::SpawnFailed(_) => GatewayTag::Unknown,
+        Bounded::Answered(out) if !out.status.success() => GatewayTag::Unknown,
+        Bounded::Answered(out) => match image_tag(String::from_utf8_lossy(&out.stdout).trim()) {
+            Some(t) => GatewayTag::Tag(t),
+            None => GatewayTag::Unknown,
+        },
     }
-    let image = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    // `ghcr.io/…/gateway:v0.2.21@sha256:…` → `v0.2.21`
+}
+
+/// The one line when the gateway's `docker inspect` did not answer: the bind
+/// sources are the data roots from the environment (`NOO_DATA_ROOT`,
+/// `MODELS_DIR`, `HF_CACHE_DIR`), because inspect is the call that hung.
+fn gateway_hung_message(secs: u64) -> String {
+    crate::bounded::inspect_hung_message(&crate::envfile::container("gateway"), secs, &crate::bounded::env_roots())
+}
+
+/// `ghcr.io/…/gateway:v0.2.21@sha256:…` → `v0.2.21`; `None` for a ref with
+/// no version-shaped tag.
+fn image_tag(image: &str) -> Option<String> {
     let no_digest = image.split('@').next()?;
     let tag = no_digest.rsplit_once(':').map(|(_, t)| t.to_string())?;
     (tag.starts_with('v') && tag.chars().nth(1).is_some_and(|c| c.is_ascii_digit())).then_some(tag)
+}
+
+/// i1149: refuse BEFORE touching anything when the storage the stack binds
+/// does not answer. Two bounded asks, neither able to hang the upgrade: a
+/// child `stat` (5 s) of every network mount under the data roots
+/// (`NOO_DATA_ROOT`, `MODELS_DIR`, `HF_CACHE_DIR`), then `docker inspect` of
+/// the gateway (30 s), whose container binds those roots. A hard NFS mount
+/// that lost its server blocks both in D state; before this the upgrade
+/// printed `# Stack` and sat silent for hours.
+fn refuse_when_storage_hangs(g: &Globals) {
+    if let Some(msg) = storage_refusal(&crate::bounded::probe_data_roots(), running_gateway_tag) {
+        fail(g.json, ExitCode::Generic, "hung_mount", &msg, None);
+    }
+}
+
+/// The refusal, or `None`: a hung mount first (the gateway is not asked
+/// then, so a refusal never costs a second wait), else a gateway whose
+/// inspect did not answer.
+fn storage_refusal(mounts: &[(crate::bounded::Mount, bool)], gateway: impl FnOnce() -> GatewayTag) -> Option<String> {
+    if let Some(msg) = crate::bounded::hung_mount_refusal(mounts) {
+        return Some(msg);
+    }
+    match gateway() {
+        GatewayTag::TimedOut { secs } => Some(gateway_hung_message(secs)),
+        GatewayTag::Tag(_) | GatewayTag::Unknown => None,
+    }
 }
 
 /// `v0.2.19 < v0.2.21`. Compares numeric components; a component that does
@@ -828,9 +922,17 @@ fn version_less_than(a: &str, b: &str) -> bool {
     }
 }
 
+/// The stack is up and healthy: have the gateway that is serving now hash
+/// every tar this roll staged, waiting for it (a 20 minute budget; never
+/// fails the roll). The in-process hash of the gateway the roll replaced is
+/// gone, and a node's pinned start refuses on "still hashing" (i1167a).
+fn warm_release_digests(g: &Globals) {
+    crate::commands::image_stage::warm_release_tars(g, &crate::commands::image_stage::staged_release_tag());
+}
+
 /// Run the requested fleet stages from a binary whose paired tag/assets are
 /// current (either freshly re-exec'd, or already-current with no swap).
-fn run_fleet_stages(g: &Globals, stack: bool, nodes: bool, seats: bool, tag_override: Option<&str>, force: bool, skip_gw_key_check: bool, allow_downgrade: bool)
+fn run_fleet_stages(g: &Globals, stack: bool, nodes: bool, seats: bool, tag_override: Option<&str>, force: bool, skip_gw_key_check: bool, allow_downgrade: bool, allow_unserved: bool, recreate: bool)
     -> Result<i32, Unhandled>
 {
     let mut rc = 0;
@@ -858,7 +960,7 @@ fn run_fleet_stages(g: &Globals, stack: bool, nodes: bool, seats: bool, tag_over
         // The containers the launcher stops on purpose are recorded here, so
         // the gate never reads one as a crash of the roll.
         let stops = launcher_stops_file(g);
-        let (stack_rc, run) = upgrade_stack(g, tag_override, force, skip_gw_key_check, allow_downgrade, stops.as_ref().map(|(_, f)| f.as_path()))?;
+        let (stack_rc, run) = upgrade_stack(g, tag_override, force, skip_gw_key_check, allow_downgrade, recreate, stops.as_ref().map(|(_, f)| f.as_path()))?;
         if let Some((dir, file)) = stops {
             match crate::commands::cluster_verify::restart_loops::read_intended(&file) {
                 Ok(s) => roll_baseline.1 = s,
@@ -898,6 +1000,9 @@ fn run_fleet_stages(g: &Globals, stack: bool, nodes: bool, seats: bool, tag_over
             } else if !post_roll_restart_loops_clear(g, roll_started, &roll_baseline) {
                 rc = 1;
                 failed_stage = "stack";
+            } else {
+                // Nodes pick up the new pins on their own from here.
+                warm_release_digests(g);
             }
         }
     }
@@ -942,8 +1047,12 @@ fn run_fleet_stages(g: &Globals, stack: bool, nodes: bool, seats: bool, tag_over
             rc = 1;
             failed_stage = "nodes";
         } else {
+            // The new gateway has hashed nothing: the pre-launch pre-warm hit
+            // the gateway this roll replaced. Wait for the digests BEFORE the
+            // node phase, so a node's first pinned start gets a 200 (i1167a).
+            warm_release_digests(g);
             if nodes {
-                rc = upgrade_nodes(g)?;
+                rc = upgrade_nodes(g, allow_unserved)?;
                 if rc != 0 { failed_stage = "nodes"; }
             }
             // Kiosk seats AFTER the nodes (i77), whatever the nodes did: a
@@ -1016,9 +1125,12 @@ fn norm_stack_tag(t: &str) -> String {
 
 /// Bump the standalone install to this build's paired stack release:
 /// refresh embedded assets, upsert the NOO_IMAGE_TAG pin, re-run the
-/// launcher (compose recreates exactly the containers whose image changed —
-/// on a standalone box compose owns every container, so this is the blessed
-/// path, unlike repo/reconciler installs).
+/// launcher (compose recreates the containers that are out of line: a moved
+/// config hash, which a new image ref, env or label moves, or a changed
+/// `noo.inputs` label, which a changed secret or mounted config file moves;
+/// `noo upgrade --recreate` recreates every one. On a standalone box compose
+/// owns every container, so this is the blessed path, unlike repo/reconciler
+/// installs).
 /// Step 0.5 of `upgrade --stack` — see the call site. Refuses the roll (before
 /// anything has moved) when users.conf names a variable and cannot be
 /// re-rendered without minting; says nothing when the file is already clean.
@@ -1168,7 +1280,7 @@ fn reconcile_addon_nats_principals(g: &Globals, root: &std::path::Path) {
 ///
 /// The phase functions follow, in list order.
 fn upgrade_stack(g: &Globals, tag_override: Option<&str>, force: bool, skip_gw_key_check: bool, allow_downgrade: bool,
-    stops: Option<&std::path::Path>)
+    recreate: bool, stops: Option<&std::path::Path>)
     -> Result<(i32, Option<crate::commands::image_stage::StageRun>), Unhandled>
 {
     // What and whether: nothing below writes anything.
@@ -1177,7 +1289,9 @@ fn upgrade_stack(g: &Globals, tag_override: Option<&str>, force: bool, skip_gw_k
     refuse_below_secrets_floor(g, &tag);
     refuse_install_without_core_secrets(g, &root);
     refuse_plaintext_install(g, &root);
-    let roll = Roll { prev: pinned_tag(&root), root, tag };
+    let prev = pinned_tag(&root);
+    let force_recreate = roll_forces_recreate(recreate, &prev, &tag);
+    let roll = Roll { prev, root, tag, force_recreate };
     refuse_unrequested_downgrade(g, &roll, tag_override, force);
     announce_roll(&roll);
     let target_stack_lock = preflight_db_compat(g, &roll);
@@ -1239,20 +1353,30 @@ fn upgrade_stack(g: &Globals, tag_override: Option<&str>, force: bool, skip_gw_k
 /// Never fails the roll.
 fn ensure_embedder_after_roll(g: &Globals) {
     let embed = crate::envfile::container("ollama-embed");
-    let running = std::process::Command::new("docker")
-        .args(["inspect", "-f", "{{.State.Running}}", &embed])
-        .output()
-        .map(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).trim() == "true")
-        .unwrap_or(false);
+    let state = embed_state(&crate::bounded::docker(
+        &["inspect", "-f", "{{.State.Running}}", &embed],
+        Duration::from_secs(crate::bounded::INSPECT_SECS),
+    ));
     let model = crate::commands::provision::release_var("PAGEINDEX_EMBEDDING_MODEL");
     let model = if model.is_empty() { "harrier".to_string() } else { model };
-    if !running {
-        if !g.json {
-            ui::warned(&format!(
-                "{embed} is not running, so the embedder ({model}) was not checked; \
-                 once it runs: noo models pull {model}"));
+    match state {
+        EmbedState::Running => {}
+        EmbedState::NotRunning => {
+            if !g.json {
+                ui::warned(&format!(
+                    "{embed} is not running, so the embedder ({model}) was not checked; \
+                     once it runs: noo models pull {model}"));
+            }
+            return;
         }
-        return;
+        EmbedState::Unknown(why) => {
+            if !g.json {
+                ui::warned(&format!(
+                    "could not inspect {embed} ({why}), so the embedder ({model}) was not checked; \
+                     once docker answers: noo models pull {model}"));
+            }
+            return;
+        }
     }
     for line in crate::onboard::steps::ensure_embed_model_core(&model) {
         if g.json {
@@ -1267,6 +1391,41 @@ fn ensure_embedder_after_roll(g: &Globals) {
     }
 }
 
+/// What a bounded `docker inspect -f {{.State.Running}}` said about the
+/// embed container.
+#[derive(Debug, PartialEq, Eq)]
+enum EmbedState {
+    Running,
+    /// A clean `false`, or no such container.
+    NotRunning,
+    /// No answer: the reason (timed out, could not be started, docker erred).
+    Unknown(String),
+}
+
+fn embed_state(b: &crate::bounded::Bounded) -> EmbedState {
+    use crate::bounded::Bounded;
+    match b {
+        Bounded::TimedOut { secs } => EmbedState::Unknown(format!("did not answer in {secs} s")),
+        Bounded::SpawnFailed(e) => EmbedState::Unknown(format!("docker could not be run: {e}")),
+        Bounded::Answered(o) => {
+            let out = String::from_utf8_lossy(&o.stdout);
+            let err = String::from_utf8_lossy(&o.stderr);
+            if o.status.success() {
+                match out.trim() {
+                    "true" => EmbedState::Running,
+                    "false" => EmbedState::NotRunning,
+                    other => EmbedState::Unknown(format!("docker said {other:?}")),
+                }
+            } else if err.contains("No such") {
+                EmbedState::NotRunning
+            } else {
+                let first = err.lines().next().unwrap_or("").trim();
+                EmbedState::Unknown(format!("docker inspect failed: {first}"))
+            }
+        }
+    }
+}
+
 /// What one `noo upgrade --stack` roll is working on, resolved once and
 /// Handed to every phase that needs it (instead of four loose locals).
 struct Roll {
@@ -1276,6 +1435,40 @@ struct Roll {
     tag: String,
     /// The tag `.env` pins now ("" when unpinned).
     prev: String,
+    /// The launcher is told `--recreate` (every container): only when the
+    /// operator asked, or on a same-tag re-apply when
+    /// [`SAME_TAG_FORCES_RECREATE`] says so. See [`roll_forces_recreate`].
+    force_recreate: bool,
+}
+
+/// THE one place that decides what a same-tag re-apply (`noo upgrade --stack
+/// --tag <the pinned tag>`) means. `false` (the 0.6.30 decision): it is
+/// label-driven like every roll, so it recreates only the containers that
+/// are out of line (compose's config hash plus the `noo.inputs` label) and
+/// says how many it kept; `noo upgrade --recreate` restarts everything.
+/// `true` restores the pre-0.6.30 meaning, "a re-apply recreates every
+/// container". The operator may flip it: nothing else reads the choice.
+const SAME_TAG_FORCES_RECREATE: bool = false;
+
+/// Whether the roll's launcher gets `--recreate` (compose `--force-recreate`,
+/// every container). `asked` is `noo upgrade --recreate`; `prev` and `tag`
+/// are the pinned tag and the target. Without either, the roll runs the same
+/// label-driven start a plain `noo stack start` runs. Pure.
+fn roll_forces_recreate(asked: bool, prev: &str, tag: &str) -> bool {
+    if asked {
+        return true;
+    }
+    SAME_TAG_FORCES_RECREATE && prev.trim() == tag.trim()
+}
+
+/// The launcher's arguments for a roll: the dist start, plus `--recreate`
+/// only when [`roll_forces_recreate`] said so. Pure.
+fn launcher_args(force_recreate: bool) -> Vec<&'static str> {
+    if force_recreate {
+        vec!["--dist", "--recreate"]
+    } else {
+        vec!["--dist"]
+    }
 }
 
 /// Which install is rolled.
@@ -1461,15 +1654,18 @@ fn refuse_unrequested_downgrade(g: &Globals, roll: &Roll, tag_override: Option<&
 /// Say what is about to happen.
 /// "rolling v0.2.43 → v0.2.43" is not a roll, it is a re-apply, and printing
 /// It as an arrow reads as a typo in the operator's own command (2026-09-13).
-/// Re-applying the same tag is a legitimate and common act — it is how a
-/// Recreate with new env is done — so it gets its own sentence.
+/// Re-applying the same tag is a legitimate and common act, so it gets its
+/// own sentence. Since 0.6.30 it is label-driven like every roll (unless
+/// [`SAME_TAG_FORCES_RECREATE`] is flipped): new env or a changed file
+/// recreates its service through compose's config hash or the `noo.inputs`
+/// label, and the rest is kept; `--recreate` restarts everything.
 fn announce_roll(roll: &Roll) {
     let root = &roll.root;
     let tag = &roll.tag;
     let prev = &roll.prev;
     if prev == tag {
-        ui::step(&format!("re-applying {tag}  (install {}) — same tag, containers recreated",
-            root.display()));
+        ui::step(&format!("re-applying {tag}  (install {}) — same tag, {}",
+            root.display(), reapply_meaning(roll.force_recreate)));
     } else if is_downgrade(prev, tag) {
         ui::warned(&format!("rolling BACK {prev} → {tag}  (install {}) — an explicit downgrade",
             root.display()));
@@ -1626,7 +1822,8 @@ fn mint_integration_key(g: &Globals, roll: &Roll) {
 ///    their own key — a store without them is a bus on which every
 ///    message is refused. Minted HERE, before anything moves, by the same
 ///    mint-only-if-absent writer as the audit key; the launcher below then
-///    recreates the gateway and every verifier with them in one `up`.
+///    recreates the gateway and every verifier with them in one `up`: each
+///    reads its key from a secret file, so its `noo.inputs` label moves.
 fn mint_bus_keys(g: &Globals, roll: &Roll) {
     let root = &roll.root;
     match reconcile_bus_keys(root) {
@@ -1798,6 +1995,37 @@ fn move_pin(g: &Globals, roll: &Roll, target_stack_lock: Option<&str>, addon_pre
     }
 }
 
+/// The roll's one line per stack apply: `N recreated (names), M kept
+/// (names)`, plus what was created, and how to restart everything when the
+/// apply was label-driven. From the container listings around the launcher
+/// (onboard's `recreated_by` / `kept_by`); None when docker could not list
+/// either side, so nothing is invented. Pure.
+fn roll_apply_line(before: &str, after: &str, forced: bool) -> Option<String> {
+    if before.trim().is_empty() || after.trim().is_empty() {
+        return None;
+    }
+    let (recreated, created) = crate::onboard::steps::recreated_by(before, after);
+    let kept = crate::onboard::steps::kept_by(before, after);
+    let named = |n: &[String], what: &str| {
+        if n.is_empty() { format!("0 {what}") } else { format!("{} {what} ({})", n.len(), n.join(", ")) }
+    };
+    let mut line = format!("{}, {}", named(&recreated, "recreated"), named(&kept, "kept"));
+    if !created.is_empty() {
+        line.push_str(&format!(", {}", named(&created, "created")));
+    }
+    line.push_str(if forced { " — --recreate: every container" } else { "; --recreate restarts everything" });
+    Some(line)
+}
+
+/// What a same-tag re-apply does, for `announce_roll`. Pure.
+fn reapply_meaning(force_recreate: bool) -> &'static str {
+    if force_recreate {
+        "every container recreated"
+    } else {
+        "only the containers out of line are recreated (--recreate restarts everything)"
+    }
+}
+
 /// Run the launcher (one retry, never for the partial-stack exit), then settle.
 /// Hands the node-image staging run back on success; joins it on the failure paths.
 ///
@@ -1827,13 +2055,22 @@ fn launch_stack(g: &Globals, roll: &Roll, staging: crate::commands::image_stage:
     let stuck_dir = crate::private_tmp::Dir::new("noo-launch-stuck")
         .unwrap_or_else(|e| crate::output::fail(g.json, crate::output::ExitCode::Generic, "stage_failed", &e, None));
     let stuck_report = stuck_dir.path().join("stuck");
+    // The containers before the launcher, to say after it which it recreated
+    // and which it kept (the same listing onboard's converge_stack reads).
+    let project = crate::commands::secrets_delivery::stack_project().unwrap_or_else(crate::envfile::compose_project);
+    let before = crate::onboard::steps::project_container_ids(&project);
     let build_launch = || {
         let mut c = std::process::Command::new("bash");
-        // `--recreate`: a roll recreates every container (new images, new
-        // config, files replaced under their bind mounts). Always this
+        // The same label-driven start a plain `noo stack start` runs: compose
+        // recreates a service whose config hash moved (a new image ref, env,
+        // ports, labels) and the `noo.inputs` label recreates one whose
+        // secret or mounted config file changed (scripts/lib-start-inputs.sh).
+        // A container an older noo started carries no `noo.inputs`, so its
+        // hash differs and it is recreated once. `--recreate` (every
+        // container) only when roll_forces_recreate said so. Always this
         // binary's own launcher: refresh_deploy_slice materialised it just
         // before (upgrade_stack), so it knows the flag.
-        c.arg(root.join("scripts/noomesh-start.sh")).arg("--dist").arg("--recreate")
+        c.arg(root.join("scripts/noomesh-start.sh")).args(launcher_args(roll.force_recreate))
             .env("NOO_IMAGE_TAG", tag)
             .env("NOO_STUCK_REPORT", &stuck_report)
             .env("NOO_CLI_BIN", &cli_bin)
@@ -1910,6 +2147,10 @@ fn launch_stack(g: &Globals, roll: &Roll, staging: crate::commands::image_stage:
             std::env::set_var("NOO_IMAGE_TAG", tag);
             record_roll();
             if !g.json {
+                let after = crate::onboard::steps::project_container_ids(&project);
+                if let Some(line) = roll_apply_line(&before, &after, roll.force_recreate) {
+                    ui::done(&line);
+                }
                 ui::close_done(&format!("stack now on {tag}"));
                 ui::guide(&[("noo cluster verify --wait",
                     "checks the stack, every node and the PKI once the rolled services settle")]);
@@ -1917,7 +2158,8 @@ fn launch_stack(g: &Globals, roll: &Roll, staging: crate::commands::image_stage:
             // Image retention: after a verified roll, the superseded images
             // that are provably ours go (the first roll only previews).
             crate::commands::image_retention::post_roll(g, root, tag);
-            // A roll recreates the gateway; the tailnet front door in front
+            // A roll recreates the gateway (its image ref carries the stack
+            // tag, so every tag move moves it); the tailnet front door in front
             // of it is written by onboard and promote and by nothing else, so
             // a controller that lost it stays lost while every line above
             // says success. Idempotent and silent when the mapping is already
@@ -2632,8 +2874,10 @@ fn reconcile_service_certs(g: &Globals) {
     // Leaves that EXIST but fall short of today's derived names
     // 1342: model-cache issued before it joined EXTERNALLY_REACHABLE was
     // kept forever, and every remote node's fetch failed hostname
-    // verification). The launcher below force-recreates the stack, which is
-    // what makes each consumer load the new leaf.
+    // verification). The launcher below recreates each consumer of a
+    // re-issued leaf, which is what makes it load the new leaf: every
+    // consumer mounts its leaf directory read-only under the PKI dir (and
+    // ca.crt as a file), so the leaf is in its `noo.inputs` label.
     reconcile_short_service_certs(g, &ca, &existing, &hostname, &node_ip, &ts_dnsname);
     if missing.is_empty() {
         return;
@@ -2705,8 +2949,10 @@ fn reconcile_short_service_certs(
 /// declared door when SSO is off, put a published address wider than that
 /// door back on it, and give Grafana's leaf the tailnet name the URL uses —
 /// before the launcher, so the roll recreates the gateway and Grafana with
-/// them. One line per change; silent when there is none. Never fails the
-/// roll: `noo cluster verify` FAILs the `grafana door` row instead.
+/// them (the values are interpolated into their compose config, so their
+/// config hash moves, and a re-issued leaf moves Grafana's `noo.inputs`).
+/// One line per change; silent when there is none. Never fails the roll:
+/// `noo cluster verify` FAILs the `grafana door` row instead.
 /// Whether the stack stage should (re)install noo-netns-restore.service. Pure.
 pub(crate) fn netns_unit_needs_install(systemd: bool, state: crate::netns_unit::State) -> bool {
     systemd && state != crate::netns_unit::State::Current
@@ -2966,7 +3212,7 @@ fn rail_names(mut names: Vec<String>, is_self: impl Fn(&str) -> bool, on_control
 /// own noo-fetch timer — no SSH, no waiting here. The controller's own node
 /// rides the same rail, last (i67): no sudo, and a refusal with the remedy
 /// when its pull units are missing.
-fn upgrade_nodes(g: &Globals) -> Result<i32, Unhandled> {
+fn upgrade_nodes(g: &Globals, allow_unserved: bool) -> Result<i32, Unhandled> {
     // A node agent's stop during THIS roll is reported (drain_bound_hits).
     let roll_started = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     // The gateway wait is the caller's Gateway phase (run_fleet_stages).
@@ -3081,16 +3327,24 @@ fn upgrade_nodes(g: &Globals) -> Result<i32, Unhandled> {
     // space) are never restarting together. The groups are read once, before
     // anything is staged; the rail is staged in an order that keeps a pair
     // apart, and each staging first waits (bounded) for every earlier-staged
-    // node sharing a group with it to apply and be offered again.
+    // node sharing a group with it to apply and SERVE again. A bound that is
+    // hit stops the phase here (unless --allow-unserved): this node and every
+    // later one are held, the staged ones are waited for as usual.
     let me = local_agent_node(&names);
-    let mut stagger = super::roll_stagger::Stagger::start(g, &names, me.as_deref());
+    let mut stagger = super::roll_stagger::Stagger::start(g, &names, me.as_deref(), allow_unserved);
     let rail_order: Vec<String> = stagger.order.iter().filter(|n| Some(n.as_str()) != me.as_deref()).cloned().collect();
+    let mut stopped: Option<String> = None;
+    let mut held: Vec<String> = Vec::new();
     for n in &rail_order {
         if let Some((_, why)) = skipped.iter().find(|(s, _)| s == n) {
             ui::blank();
             ui::say(&ui::item(n));
             ui::say(&ui::sub(&ui::status_line(Glyph::Warn,
                 &format!("{n}: skipped — offline before the roll ({why}); nothing to wait for"))));
+            continue;
+        }
+        if stopped.is_some() {
+            held.push(n.clone());
             continue;
         }
         // Each node is an item; cluster provision prints the `ui::item`
@@ -3103,7 +3357,11 @@ fn upgrade_nodes(g: &Globals) -> Result<i32, Unhandled> {
         // A node that needs the applier first gets ONLY that bundle now;
         // the combined wait restages the full one when it is in.
         let applier_first = super::provision::applier_first_for(g, n);
-        stagger.before(g, n);
+        if let super::roll_stagger::Release::Stop(line) = stagger.before(g, n) {
+            held.push(n.clone());
+            stopped = Some(line);
+            continue;
+        }
         // `--stage-only`: stage and poke, return at once. The apply is
         // waited for below, for every node together, so one slow node no
         // longer holds up staging the rest.
@@ -3138,14 +3396,21 @@ fn upgrade_nodes(g: &Globals) -> Result<i32, Unhandled> {
     if let Some(me) = &me {
         // The child prints its own `ui::item` label, as the rail nodes do.
         ui::blank();
-        stagger.before(g, me);
-        upgrade_self_node(g, me, &mut failed, &mut pending);
+        if stopped.is_some() {
+            held.push(me.clone());
+        } else if let super::roll_stagger::Release::Stop(line) = stagger.before(g, me) {
+            held.push(me.clone());
+            stopped = Some(line);
+        } else {
+            upgrade_self_node(g, me, &mut failed, &mut pending);
+        }
     }
     let waited = if pending.is_empty() { Vec::new() } else { wait_and_settle_nodes(g, &pending, me.as_deref(), &mut failed) };
     // One line per node, whatever the others did (0.6.21: "stopped at the
     // nodes stage" hid that ctrl upgraded fine beside a failed node).
     let order: Vec<String> = rail_order.iter().cloned().chain(me.clone()).collect();
     print_node_outcomes(g, &node_outcome_rows(&order, &skipped, &waited, &failed));
+    print_held_nodes(g, &held);
     if g.json && !stagger.json.is_empty() {
         println!("{}", serde_json::json!({"stagger": stagger.json}));
     }
@@ -3156,7 +3421,7 @@ fn upgrade_nodes(g: &Globals) -> Result<i32, Unhandled> {
     // A node whose first staging failed is already in `failed`; waiting
     // for it to apply a bundle it never got would only burn the budget.
     let waiting: Vec<String> = leafless.into_iter()
-        .filter(|n| !failed.contains(n) && !skipped.iter().any(|(s, _)| s == n)).collect();
+        .filter(|n| !failed.contains(n) && !held.contains(n) && !skipped.iter().any(|(s, _)| s == n)).collect();
     let mut remaining: Vec<String> = Vec::new();
     if !waiting.is_empty() {
         let outcomes = mac_leaves_pass(g, &waiting, leaf_budget);
@@ -3179,7 +3444,11 @@ fn upgrade_nodes(g: &Globals) -> Result<i32, Unhandled> {
         }));
     }
     let staged_failed: Vec<String> = failed.iter().filter(|n| !remaining.contains(n)).cloned().collect();
-    let (rc, msg) = nodes_outcome(names.len(), &skipped_names, &staged_failed, &remaining);
+    let (rc, msg) = match &stopped {
+        // The stagger's own line: who does not serve what, and how to resume.
+        Some(line) => (1, line.clone()),
+        None => nodes_outcome(names.len(), &skipped_names, &staged_failed, &remaining),
+    };
     if !waited.is_empty() || !pending.is_empty() {
         record_roll();
     }
@@ -3207,7 +3476,29 @@ fn upgrade_nodes(g: &Globals) -> Result<i32, Unhandled> {
         let why = "stages the backend door leaves once the Mac reports the new CLI";
         ui::guide(&cmds.iter().map(|c| (c.as_str(), why)).collect::<Vec<_>>());
     }
+    if stopped.is_some() && !g.json {
+        ui::guide(&[
+            ("noo cluster class list", "shows which candidates serve now (placed and healthy)"),
+            ("noo upgrade --nodes", "resumes once they serve: restages every node, the rolled ones at the release they already run"),
+            ("noo upgrade --nodes --allow-unserved", "rolls the held nodes without waiting for a serving candidate"),
+        ]);
+    }
     Ok(rc)
+}
+
+/// The nodes the stagger held (the node phase stopped before them): one
+/// line each after the table, or one `held` row with --json.
+fn print_held_nodes(g: &Globals, held: &[String]) {
+    if held.is_empty() {
+        return;
+    }
+    if g.json {
+        println!("{}", serde_json::json!({"held": held}));
+        return;
+    }
+    for n in held {
+        ui::say(&ui::status_line(Glyph::Warn, &format!("{n}: not rolled — the node phase stopped before it (see above)")));
+    }
 }
 
 /// The closing line of a clean nodes stage: restarted agents read as
@@ -5798,6 +6089,8 @@ struct Stage2<'a> {
     force: bool,
     skip_gw_key_check: bool,
     allow_downgrade: bool,
+    allow_unserved: bool,
+    recreate: bool,
 }
 
 /// The re-exec's argv after the binary: the globals first (the stage-2 run is
@@ -5815,7 +6108,7 @@ fn stage2_args(g: &Globals, s: &Stage2) -> Vec<String> {
     for (on, flag) in [
         (s.stack, "--stack"), (s.nodes, "--nodes"), (s.seats_only, "--seats"), (s.no_seats, "--no-seats"),
         (s.force, "--force"), (s.skip_gw_key_check, "--skip-gateway-key-check"),
-        (s.allow_downgrade, "--allow-downgrade"),
+        (s.allow_downgrade, "--allow-downgrade"), (s.allow_unserved, "--allow-unserved"), (s.recreate, "--recreate"),
     ] {
         if on { a.push(flag.into()); }
     }
@@ -5835,6 +6128,8 @@ mod reexec_tests {
         ("--stack", "stack"), ("--nodes", "nodes"), ("--seats", "seats_only"), ("--no-seats", "no_seats"),
         ("--tag", "tag_override"), ("--force", "force"),
         ("--skip-gateway-key-check", "skip_gw_key_check"), ("--allow-downgrade", "allow_downgrade"),
+        ("--allow-unserved", "allow_unserved"),
+        ("--recreate", "recreate"),
     ];
 
     fn all_set() -> Vec<String> {
@@ -5844,7 +6139,7 @@ mod reexec_tests {
         };
         stage2_args(&g, &Stage2 {
             stack: true, nodes: true, seats_only: true, no_seats: true, tag: Some("v0.6.16"),
-            force: true, skip_gw_key_check: true, allow_downgrade: true,
+            force: true, skip_gw_key_check: true, allow_downgrade: true, allow_unserved: true, recreate: true,
         })
     }
 
@@ -6374,7 +6669,7 @@ mod tests {
         assert_eq!(super::complete_stack_tags(|i| (i != "worker").then(|| vec!["v0.6.0".into()])), None);
     }
 
-    use super::{first_noo_on_path, local_agent_name, target_triple_for, version_less_than, running_gateway_tag};
+    use super::{first_noo_on_path, local_agent_name, target_triple_for, version_less_than, running_gateway_tag, GatewayTag};
 
     /// One deleter of superseded images: image retention. The roll's own
     /// pruner (finding #93) removed images on every roll, ignoring
@@ -6500,9 +6795,102 @@ mod tests {
     fn a_missing_gateway_container_is_unknown_not_unsafe() {
         // Whatever this box has, the call must not panic and must return an
         // Option — a tag only when it could actually read one.
-        if let Some(tag) = running_gateway_tag() {
+        if let GatewayTag::Tag(tag) = running_gateway_tag() {
             assert!(tag.starts_with('v'), "a returned tag is version-shaped: {tag}");
         }
+    }
+
+    fn answered(code: i32, so: &str) -> crate::bounded::Bounded {
+        use std::os::unix::process::ExitStatusExt;
+        crate::bounded::Bounded::Answered(std::process::Output {
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout: so.as_bytes().to_vec(),
+            stderr: Vec::new(),
+        })
+    }
+
+    /// i1149: the inspect that did not answer is its own state, and the
+    /// answers keep their meaning.
+    #[test]
+    fn a_gateway_inspect_that_timed_out_is_not_an_unknown_tag() {
+        use super::gateway_tag_from;
+        assert_eq!(gateway_tag_from(&crate::bounded::Bounded::TimedOut { secs: 30 }), GatewayTag::TimedOut { secs: 30 });
+        assert_eq!(gateway_tag_from(&answered(0, "ghcr.io/x/gateway:v0.6.29@sha256:ab\n")), GatewayTag::Tag("v0.6.29".into()));
+        assert_eq!(gateway_tag_from(&answered(1, "")), GatewayTag::Unknown);
+        assert_eq!(gateway_tag_from(&answered(0, "gateway:latest")), GatewayTag::Unknown);
+        assert_eq!(
+            gateway_tag_from(&crate::bounded::Bounded::SpawnFailed(std::io::Error::new(std::io::ErrorKind::NotFound, "x"))),
+            GatewayTag::Unknown
+        );
+    }
+
+    /// A gateway that does not answer holds the node phase even under
+    /// --force; an older gateway is refused unless forced.
+    #[test]
+    fn the_node_phase_waits_for_a_gateway_that_does_not_answer() {
+        use super::bundle_gate;
+        let hung = bundle_gate("v0.6.30", GatewayTag::TimedOut { secs: 30 }, true).expect("refused");
+        assert!(hung.contains("did not answer in 30 s") && hung.contains("Do not force-unmount"), "{hung}");
+        assert!(bundle_gate("v0.6.30", GatewayTag::Unknown, false).is_none());
+        assert!(bundle_gate("v0.6.30", GatewayTag::Tag("v0.6.30".into()), false).is_none());
+        assert!(bundle_gate("v0.6.30", GatewayTag::Tag("v0.6.29".into()), false).is_some());
+        assert!(bundle_gate("v0.6.30", GatewayTag::Tag("v0.6.29".into()), true).is_none());
+    }
+
+    #[test]
+    fn the_upgrade_refuses_a_hung_mount_or_a_silent_gateway_before_touching_anything() {
+        use super::storage_refusal;
+        use crate::bounded::Mount;
+        let nfs = Mount { point: "/srv/noo".into(), fstype: "nfs4".into(), source: "filer.example:/export/noo".into() };
+        let msg = storage_refusal(&[(nfs.clone(), false)], || panic!("the gateway is not asked after a hung mount")).expect("refused");
+        assert!(msg.starts_with("/srv/noo (nfs4 from filer.example:/export/noo) did not answer in 5 s"), "{msg}");
+        let msg = storage_refusal(&[(nfs.clone(), true)], || GatewayTag::TimedOut { secs: 30 }).expect("refused");
+        assert!(msg.contains("did not answer in 30 s: a mount the gateway uses may be hung"), "{msg}");
+        assert_eq!(storage_refusal(&[(nfs, true)], || GatewayTag::Tag("v0.6.29".into())), None);
+        assert_eq!(storage_refusal(&[], || GatewayTag::Unknown), None, "a fresh cell with no network mounts proceeds");
+        // Where it sits: the top of `upgrade`, before the self-update, the
+        // channel step and the stack work.
+        let src = crate::test_src::own_code(include_str!("upgrade.rs"));
+        let up = crate::test_src::fn_body(&src, "pub fn upgrade(");
+        let call = up.find("if (stack || nodes) && !check_only {\n        refuse_when_storage_hangs(g);").expect("the storage check");
+        for later in ["if stage2 {", "super::channel::request(&chan)", "resolve_latest(g)", "run_fleet_stages("] {
+            assert!(call < up.find(later).expect(later), "the storage check comes before {later}");
+        }
+    }
+
+    #[test]
+    fn an_image_ref_reads_as_its_version_tag_or_nothing() {
+        assert_eq!(super::image_tag("ghcr.io/x/gateway:v0.6.29@sha256:abc"), Some("v0.6.29".to_string()));
+        assert_eq!(super::image_tag("ghcr.io/x/gateway:v0.6.29"), Some("v0.6.29".to_string()));
+        assert_eq!(super::image_tag("ghcr.io/x/gateway:latest"), None);
+        assert_eq!(super::image_tag("gateway"), None);
+        assert_eq!(super::image_tag(""), None);
+    }
+
+    /// i1149: a docker that does not answer is its own state. It never
+    /// reads as "not running" (embedder) or as an unknown tag (gateway).
+    #[test]
+    fn a_docker_that_did_not_answer_is_not_a_clean_false() {
+        use super::{embed_state, EmbedState};
+        use crate::bounded::Bounded;
+        use std::os::unix::process::ExitStatusExt;
+        let out = |code: i32, so: &str, se: &str| Bounded::Answered(std::process::Output {
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout: so.as_bytes().to_vec(),
+            stderr: se.as_bytes().to_vec(),
+        });
+        assert_eq!(embed_state(&out(0, "true\n", "")), EmbedState::Running);
+        assert_eq!(embed_state(&out(0, "false\n", "")), EmbedState::NotRunning);
+        assert_eq!(embed_state(&out(1, "", "Error: No such object: noo-ollama-embed")), EmbedState::NotRunning);
+        assert_eq!(
+            embed_state(&Bounded::TimedOut { secs: 30 }),
+            EmbedState::Unknown("did not answer in 30 s".to_string())
+        );
+        assert!(matches!(embed_state(&out(1, "", "permission denied")), EmbedState::Unknown(_)));
+        assert!(matches!(
+            embed_state(&Bounded::SpawnFailed(std::io::Error::new(std::io::ErrorKind::NotFound, "no docker"))),
+            EmbedState::Unknown(_)
+        ));
     }
 
     use super::*;
@@ -8054,23 +8442,117 @@ mod stage_before_launch_tests {
     }
 }
 
+/// i1167a: the gateway the roll starts has hashed nothing (the pre-launch
+/// pre-warm hit the one it replaced), so the digests are waited for AFTER the
+/// stack is up and BEFORE any node is rolled.
+#[cfg(test)]
+mod warm_digests_tests {
+    #[test]
+    fn the_digests_are_warmed_after_the_gateway_is_up_and_before_the_node_phase() {
+        let src = crate::test_src::own_code(include_str!("upgrade.rs"));
+        let f = crate::test_src::fn_body(&src, "fn run_fleet_stages(");
+        let wait = f.find("let budget = if stack { 180 } else { 60 };").expect("the gateway wait");
+        let warm = wait + f[wait..].find("warm_release_digests(g);").expect("the nodes path warms");
+        let nodes = f.find("rc = upgrade_nodes(g, allow_unserved)?;").expect("the node phase");
+        assert!(wait < warm && warm < nodes, "warm after the gateway wait, before upgrade_nodes");
+        // The stack-only path warms too: nodes reconcile on their own.
+        assert_eq!(f.matches("warm_release_digests(g);").count(), 2, "stack-only and nodes paths");
+        let helper = crate::test_src::fn_body(&src, "fn warm_release_digests(");
+        assert!(helper.contains("warm_release_tars("), "it waits for the 200");
+        // It never runs inside the launcher phase (the old gateway is still up there).
+        let launch = crate::test_src::fn_body(&src, "fn launch_stack(");
+        assert!(!launch.contains("warm_release"), "not before the new gateway is up");
+        let up = crate::test_src::fn_body(&src, "fn upgrade_stack(");
+        assert!(!up.contains("warm_release"), "not before the new gateway is up");
+    }
+}
+
 #[cfg(test)]
 mod roll_recreates_tests {
-    /// A plain `noo stack start` recreates only the containers whose config
-    /// or secret / config file contents changed (scripts/lib-start-inputs.sh).
-    /// A roll replaces images and files under their bind mounts, so it still
-    /// asks the launcher to recreate every container, on argv: the launcher
-    /// is this binary's own, materialised by refresh_deploy_slice first.
+    use super::{launcher_args, reapply_meaning, roll_apply_line, roll_forces_recreate, SAME_TAG_FORCES_RECREATE};
+
+    /// i1122 (0.6.30): a roll is the same label-driven start a plain `noo
+    /// stack start` runs. Compose recreates what its config hash says moved
+    /// (every first-party ref carries the stack tag) and `noo.inputs` what a
+    /// changed secret or mounted file moved; nats, redis, model-cache and the
+    /// monitoring set keep their containers. `--recreate` reaches the
+    /// launcher only when `noo upgrade --recreate` asked for it.
     #[test]
-    fn the_roll_asks_the_launcher_to_recreate_every_container() {
+    fn the_roll_forces_every_container_only_when_asked() {
+        assert_eq!(launcher_args(false), ["--dist"], "a roll is label-driven by default");
+        assert_eq!(launcher_args(true), ["--dist", "--recreate"]);
+        assert!(!roll_forces_recreate(false, "v0.6.29", "v0.6.30"), "a tag move is label-driven");
+        assert!(!roll_forces_recreate(false, "", "v0.6.30"), "so is an unpinned install's first roll");
+        assert!(roll_forces_recreate(true, "v0.6.29", "v0.6.30"), "noo upgrade --recreate is the escape");
+        assert!(roll_forces_recreate(true, "v0.6.30", "v0.6.30"), "the escape forces a re-apply too");
+    }
+
+    /// A same-tag re-apply follows ONE switch, SAME_TAG_FORCES_RECREATE, and
+    /// says what it does. The release lead's decision (2026-11-20) is
+    /// label-driven: if the operator objects, flip the const and this
+    /// first assert together; nothing else changes.
+    #[test]
+    fn a_same_tag_reapply_follows_the_one_switch() {
+        // black_box: the decision is read as a value, not asserted on a const.
+        assert!(!std::hint::black_box(SAME_TAG_FORCES_RECREATE), "0.6.30: a re-apply recreates only what is out of line");
+        assert_eq!(roll_forces_recreate(false, "v0.6.30", "v0.6.30"), SAME_TAG_FORCES_RECREATE);
+        assert_eq!(roll_forces_recreate(false, " v0.6.30", "v0.6.30 "), SAME_TAG_FORCES_RECREATE);
+        assert_eq!(reapply_meaning(false), "only the containers out of line are recreated (--recreate restarts everything)");
+        assert_eq!(reapply_meaning(true), "every container recreated");
+    }
+
+    /// The roll's line per stack apply names what moved and what held, from
+    /// the container listings around the launcher.
+    #[test]
+    fn the_apply_line_names_what_was_recreated_and_what_was_kept() {
+        let before = "gateway g1\nworker w1\nnats n1\nredis r1\n";
+        let after = "gateway g2\nworker w2\nnats n1\nredis r1\nvoice v1\n";
+        assert_eq!(roll_apply_line(before, after, false).as_deref(),
+            Some("2 recreated (gateway, worker), 2 kept (nats, redis), 1 created (voice); --recreate restarts everything"));
+        // A same-tag re-apply with nothing out of line.
+        assert_eq!(roll_apply_line(before, before, false).as_deref(),
+            Some("0 recreated, 4 kept (gateway, nats, redis, worker); --recreate restarts everything"));
+        // Forced: nothing kept, and it says why.
+        let forced = "gateway g2\nworker w2\nnats n2\nredis r2\n";
+        assert_eq!(roll_apply_line(before, forced, true).as_deref(),
+            Some("4 recreated (gateway, nats, redis, worker), 0 kept — --recreate: every container"));
+        // Docker could not list a side: no line, never an invented "0 kept".
+        assert_eq!(roll_apply_line("", after, false), None);
+        assert_eq!(roll_apply_line(before, " \n", false), None);
+    }
+
+    /// The source guard: the word reaches the launcher through
+    /// `launcher_args(roll.force_recreate)` only; `force_recreate` is set in
+    /// one place, from the operator's flag and the one switch; and the slice
+    /// is refreshed before the launch (an older launcher would read the word
+    /// as a service name, 035942b0).
+    #[test]
+    fn recreate_reaches_the_launcher_only_from_the_flag_or_the_switch() {
         let src = crate::test_src::own_code(include_str!("upgrade.rs"));
         let launch = crate::test_src::fn_body(&src, "fn launch_stack(");
-        assert!(launch.contains(".arg(root.join(\"scripts/noomesh-start.sh\")).arg(\"--dist\").arg(\"--recreate\")"));
+        assert!(launch.contains(".arg(root.join(\"scripts/noomesh-start.sh\")).args(launcher_args(roll.force_recreate))"), "{launch}");
+        assert!(!launch.contains("\"--recreate\""), "no literal --recreate on the launch");
         assert!(!src.contains("NOO_START_RECREATE"), "no environment switch");
+        // Every quoted literal in the code (tests stripped): the parser arm,
+        // the stage-2 forward and launcher_args.
+        let lits = src.matches("\"--recreate\"").count();
+        assert_eq!(lits, 3, "\"--recreate\" appears in the parser, the stage-2 forward and launcher_args only");
+        assert!(src.contains("\"--recreate\" => recreate = true,"), "the parser arm sets the escape");
+        assert_eq!(src.matches("force_recreate: bool,").count(), 1, "one field");
+        assert_eq!(src.matches("Roll { ").count(), 1, "one construction");
+        assert!(src.contains("let force_recreate = roll_forces_recreate(recreate, &prev, &tag);"));
+        let same = crate::test_src::fn_body(&src, "fn roll_forces_recreate(");
+        assert!(same.contains("SAME_TAG_FORCES_RECREATE && prev.trim() == tag.trim()"), "{same}");
         let up = crate::test_src::fn_body(&src, "fn upgrade_stack(");
         let slice = up.find("refresh_deploy_slice(g, &roll);").expect("the slice is refreshed");
         let go = up.find("launch_stack(g, &roll, staging, stops)").expect("then launched");
-        assert!(slice < go, "the launcher that gets --recreate is this binary's own");
+        assert!(slice < go, "the launcher that may get --recreate is this binary's own");
+        // The apply line is printed on success, before "stack now on".
+        let ok = launch.find("Ok(s) if s.success() =>").expect("the success arm");
+        let line = launch.find("roll_apply_line(&before, &after, roll.force_recreate)").expect("the apply line");
+        let done = launch.find("stack now on").expect("the success close");
+        assert!(ok < line && line < done);
+        assert!(launch.find("let before = ").expect("listed before") < launch.find("let mut status = launch();").expect("the launch"));
     }
 }
 
@@ -8088,7 +8570,7 @@ mod embedder_after_roll_tests {
         let call = launch.find("ensure_embedder_after_roll(g)").expect("the roll ensures the embedder");
         assert!(success < done && done < call, "the embedder is ensured in the success arm, after the stack is up");
         let ensure = crate::test_src::fn_body(&src, "fn ensure_embedder_after_roll(");
-        let running = ensure.find("if !running").expect("a running check");
+        let running = ensure.find("EmbedState::NotRunning").expect("a running check");
         let create = ensure.find("ensure_embed_model_core(&model)").expect("the shared fetch-and-create");
         assert!(running < create, "nothing is created in a container that is down");
     }
@@ -8441,7 +8923,7 @@ mod drain_report_tests {
     #[test]
     fn the_nodes_stage_prints_it_after_the_table() {
         let code = include_str!("upgrade.rs");
-        let body = code.split("fn upgrade_nodes(g: &Globals)").nth(1).expect("upgrade_nodes").split("\nfn ").next().unwrap();
+        let body = crate::test_src::fn_body(code, "fn upgrade_nodes(");
         let table = body.find("print_node_outcomes(g, &node_outcome_rows(&order, &skipped, &waited, &failed));").expect("the table");
         let report = body.find("print_drain_bound_hits(g, &order, roll_started);").expect("the drain report");
         assert!(table < report, "after the table");

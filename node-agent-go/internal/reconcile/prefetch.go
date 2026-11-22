@@ -39,11 +39,12 @@ func (r *Reconciler) prefetchImages(
 	specLabels map[string]string,
 	floating map[string]string,
 	native map[string]string,
+	nativeOnly func(backend string) bool,
 ) {
 	if r.docker == nil {
 		return
 	}
-	refs, n := imagesToPrefetch(effective, running, specLabels, floating, native, r.driftRecreated)
+	refs, n := imagesToPrefetch(effective, running, specLabels, floating, native, nativeOnly, r.driftRecreated)
 	if len(refs) == 0 {
 		return
 	}
@@ -52,13 +53,16 @@ func (r *Reconciler) prefetchImages(
 
 // imagesToPrefetch returns the image refs of the placements the start loop
 // will (re)start, in placement order, and how many placements that is.
-// Dedup and "already local" are PrefetchImages' job.
+// Dedup and "already local" are PrefetchImages' job. A backend nativeOnly
+// names (a Mac's Ollama, serving or not) has no image on this node: the
+// start loop never starts it as a container (nil = none).
 func imagesToPrefetch(
 	effective []placement,
 	running map[string]string,
 	specLabels map[string]string,
 	floating map[string]string,
 	native map[string]string,
+	nativeOnly func(backend string) bool,
 	driftRecreated map[string]string,
 ) (refs []string, placements int) {
 	for _, p := range effective {
@@ -66,6 +70,9 @@ func imagesToPrefetch(
 			continue
 		}
 		if _, ok := native[p.Backend]; ok {
+			continue
+		}
+		if nativeOnly != nil && nativeOnly(p.Backend) {
 			continue
 		}
 		curModel, isRunning := running[p.Backend]

@@ -284,10 +284,17 @@ restores that. When it starts and finds the secret directory missing or empty
 
 What this relies on: noo-hostd must be running at boot, as the user who owns
 the age key. A controller installs it as a systemd **user** unit
-(`WantedBy=default.target`), which starts at boot only with linger on:
-`sudo loginctl enable-linger <user>` (`noo-hostd install` prints this line).
-Without linger the user manager, and so hostd, starts at first login, and the
-stack stays down until then or until `noo stack start`. A boot that cannot
+(`WantedBy=default.target`), which starts at boot only with linger on.
+`noo onboard` turns linger on for the user it runs as (it reads `loginctl
+show-user <user> -p Linger` first, and runs `loginctl enable-linger <user>`
+through its sudo only when it is off); a by-hand `noo-hostd install` prints
+`sudo loginctl enable-linger <user>` when linger is off. Without linger the
+user manager, and so hostd, starts at first login, and the stack stays down
+until then or until `noo stack start`. `noo cluster verify` says so in its
+`hostd at boot` row: WARN with that command when linger is off, OK when it is
+on. On a Mac a by-hand `noo-hostd install --mode controller` writes a
+LaunchAgent, which also waits for a login: the row says so, and there is no
+noomesh remedy for it today (a Mac is not a controller; onboard refuses it). A boot that cannot
 decrypt the store (age key missing) writes nothing and starts nothing, loudly,
 rather than starting services with empty credentials.
 
@@ -629,7 +636,9 @@ noo security secrets resync POSTGRES_PASSWORD NOO_APP_DB_PASSWORD
 Postgres roles are **cluster-global**, and a restored dump or a replayed
 migration chain can leave a role's password different from the store's.
 `resync` makes the role match the store — it never mints, never writes the
-store, never recreates a consumer. It refuses to act when Postgres is down
+store, never recreates a consumer. It refuses to act when Postgres is not
+running (a stopped or absent container; when docker does not answer inspecting
+it, the message says that instead and points at `docker info`)
 or when the result could not have failed (a `trust` rule on the path), and it
 re-probes after the `ALTER ROLE` rather than trusting the exit status.
 Anything that replays the migration chain into a throwaway database must

@@ -11,6 +11,7 @@ import (
 	"sort"
 	"testing"
 
+	"github.com/noomesh/noomesh/node-agent-go/internal/auth"
 	"github.com/noomesh/noomesh/node-agent-go/internal/config"
 	"github.com/noomesh/noomesh/node-agent-go/internal/hardware"
 )
@@ -58,8 +59,8 @@ func sortedKeys(m map[string]any) []string {
 // shared list; this fails if a key appears, vanishes or is renamed.
 func TestPayloadGolden_KeySets(t *testing.T) {
 	beat, reg := capturePayloads(t)
-	wantBeat := []string{"active_jobs", "active_sensors", "agent_url", "app_version", "available_models", "backend_leaves", "battery_pct", "bind_addr", "capabilities", "control_transports", "controller_leaf_only", "cpu_cores", "cpu_load", "data_roots", "gpu_model", "image_source_mode", "ip_address", "is_charging", "lanes", "legacy_lanes", "load", "location", "mem_used_gb", "model_presence", "network_type", "os", "peer_identity_enforced", "power_source", "ram_gb", "reconcile_refusals", "running_backends", "self_node", "thermal_state", "tier", "vram_gb", "vram_used_gb"}
-	wantReg := []string{"agent_url", "app_version", "backend_leaves", "capabilities", "control_transports", "controller_leaf_only", "data_roots", "hostname", "image_source_mode", "ip_address", "legacy_lanes", "model_presence", "node_id", "peer_identity_enforced"}
+	wantBeat := []string{"active_jobs", "active_sensors", "agent_url", "app_version", "available_models", "backend_leaves", "battery_pct", "bind_addr", "capabilities", "checks_target_node", "control_transports", "controller_leaf_only", "cpu_cores", "cpu_load", "data_roots", "gpu_model", "image_source_mode", "ip_address", "is_charging", "lanes", "legacy_lanes", "load", "location", "mem_used_gb", "model_presence", "network_type", "os", "peer_identity_enforced", "power_source", "ram_gb", "reconcile_refusals", "requires_target_node", "running_backends", "self_node", "thermal_state", "tier", "vram_gb", "vram_used_gb"}
+	wantReg := []string{"agent_url", "app_version", "backend_leaves", "capabilities", "checks_target_node", "control_transports", "controller_leaf_only", "data_roots", "hostname", "image_source_mode", "ip_address", "legacy_lanes", "model_presence", "node_id", "peer_identity_enforced", "requires_target_node"}
 	if got := sortedKeys(beat); !reflect.DeepEqual(got, wantBeat) {
 		t.Errorf("heartbeat keys changed:\n got %v\nwant %v", got, wantBeat)
 	}
@@ -79,7 +80,7 @@ func TestPayloadGolden_ZeroShapes(t *testing.T) {
 				t.Errorf("%s: %s must be a JSON object, got %#v", name, k, p[k])
 			}
 		}
-		for _, k := range []string{"peer_identity_enforced", "controller_leaf_only"} {
+		for _, k := range []string{"peer_identity_enforced", "controller_leaf_only", "checks_target_node", "requires_target_node"} {
 			if _, ok := p[k].(bool); !ok {
 				t.Errorf("%s: %s must be a bool, got %#v", name, k, p[k])
 			}
@@ -105,5 +106,66 @@ func TestPayloadGolden_ZeroShapes(t *testing.T) {
 	}
 	if _, ok := reg["reconcile_refusals"]; ok {
 		t.Errorf("registration must not carry reconcile_refusals")
+	}
+}
+
+// i1174: every beat and the registration say the agent checks X-Noo-Node,
+// and whether it refuses a header-less controller call now (the
+// desired-config flag it applied); the gateway turns the flag on from the
+// first and verify's `target-node check` row reads both.
+func TestPayloadReportsTheTargetNodeCheck(t *testing.T) {
+	auth.SetRequireTargetNode(true)
+	defer auth.SetRequireTargetNode(false)
+	beat, reg := capturePayloads(t)
+	for name, p := range map[string]map[string]any{"heartbeat": beat, "registration": reg} {
+		if p["checks_target_node"] != true {
+			t.Errorf("%s: checks_target_node = %#v, want true", name, p["checks_target_node"])
+		}
+		if p["requires_target_node"] != true {
+			t.Errorf("%s: requires_target_node = %#v, want the applied flag (true)", name, p["requires_target_node"])
+		}
+	}
+}
+
+// i1174: the agent's latest wrong_node refusal rides the beat while it is
+// reported (verify's `target-node check` row reads it), and is absent
+// otherwise.
+func TestPayloadCarriesTheLatestWrongNodeRefusal(t *testing.T) {
+	prev := wrongNodeReport
+	t.Cleanup(func() { wrongNodeReport = prev })
+	w := map[string]any{"target": "node_b", "path": "/start", "detail": "addressed to node_b", "at": int64(1)}
+	wrongNodeReport = func() map[string]any { return w }
+	beat, _ := capturePayloads(t)
+	got, ok := beat[auth.WrongNodeRefusedField].(map[string]any)
+	if !ok || got["target"] != "node_b" || got["path"] != "/start" {
+		t.Fatalf("wrong_node_refused = %#v, want the refusal", beat[auth.WrongNodeRefusedField])
+	}
+	wrongNodeReport = func() map[string]any { return nil }
+	beat, _ = capturePayloads(t)
+	if _, present := beat[auth.WrongNodeRefusedField]; present {
+		t.Fatalf("no refusal: the field must be absent, got %#v", beat[auth.WrongNodeRefusedField])
+	}
+}
+
+// i1174: the peers whose misaddressed calls this agent refused ride the beat
+// as misaddressed_from while reported, and the field is absent otherwise.
+func TestPayloadCarriesMisaddressedCallers(t *testing.T) {
+	prev := misaddressedReport
+	t.Cleanup(func() { misaddressedReport = prev })
+	misaddressedReport = func() []map[string]any {
+		return []map[string]any{{"caller": "node_c", "count": 3, "last_at": int64(9)}}
+	}
+	beat, _ := capturePayloads(t)
+	list, ok := beat[auth.MisaddressedFromField].([]any)
+	if !ok || len(list) != 1 {
+		t.Fatalf("misaddressed_from = %#v, want one caller", beat[auth.MisaddressedFromField])
+	}
+	if e, _ := list[0].(map[string]any); e["caller"] != "node_c" || e["count"] != float64(3) {
+		t.Fatalf("misaddressed_from[0] = %#v", list[0])
+	}
+	misaddressedReport = func() []map[string]any { return nil }
+	beat, _ = capturePayloads(t)
+	if _, present := beat[auth.MisaddressedFromField]; present {
+		t.Fatalf("no caller: the field must be absent, got %#v", beat[auth.MisaddressedFromField])
 	}
 }

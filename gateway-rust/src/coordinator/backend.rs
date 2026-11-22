@@ -585,7 +585,13 @@ async fn resolve_backend_url(gossip_url: &str, node_id: &str, backend_type: &str
                         // X-Noo-Backend header tells node-agent which
                         // local backend to dispatch to.
                         let _hint = backend_type; // documents intent for the caller
-                        let resolved = crate::node_link::NodeLink::for_ip(ip).base().to_string();
+                        // Resolved BY NODE: the link names `node_id`, so the
+                        // dial is pinned to it (i1174). An address the
+                        // gateway's book gives to another node is refused.
+                        let resolved = match crate::node_link::NodeLink::for_node_ip(node_id, ip) {
+                            Ok(link) => link.base().to_string(),
+                            Err(_) => return String::new(),
+                        };
                         note_offer_mismatch(node_id, gossip_url, ip, &resolved);
                         return resolved;
                     }

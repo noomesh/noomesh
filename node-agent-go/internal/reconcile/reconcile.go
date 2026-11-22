@@ -32,6 +32,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"github.com/noomesh/noomesh/node-agent-go/internal/addonwl"
+	"github.com/noomesh/noomesh/node-agent-go/internal/ctrlreach"
 	"github.com/noomesh/noomesh/node-agent-go/internal/diskreclaim"
 	"io"
 	"log/slog"
@@ -115,6 +116,9 @@ type desiredConfig struct {
 	// What the controller understands from this agent (stopdrain): absent on
 	// an older gateway, which then never gets the node_restarting refusal.
 	GatewayFeatures []string `json:"gateway_features"`
+	// i1174: refuse a controller call that names no target node
+	// (auth.TargetNode). Absent (an older controller) is false: tolerant.
+	RequireTargetNode bool `json:"require_target_node"`
 	// The node's resolved harness profile (tier default, override,
 	// measured). A pre-profile gateway omits it; absent means "no
 	// profile", which is exactly the behaviour before profiles existed.
@@ -245,6 +249,11 @@ type Reconciler struct {
 	// desired hash to change. Single-goroutine (ticker) access; no lock.
 	driftRecreated map[string]string
 
+	// hashWaits counts, per backend, the quick retries spent on a start the
+	// controller could not vouch for yet because it was still hashing the
+	// image tar (docker.ImageHashingError). Tick goroutine only.
+	hashWaits map[string]int
+
 	// ggufMissing: backend -> the standing refusal for a placed .gguf that
 	// is missing from the effective models dir (ggufPresent). Kept until
 	// the file is back so nothing clears the refusal meanwhile. Tick
@@ -349,6 +358,7 @@ func New(cfg *config.Config, docker *dockerpkg.Client, client *http.Client, harn
 		cliInstalled:    cliOnPath,
 		harnessEgress:   egressReaderFor(harness),
 		driftRecreated:  map[string]string{},
+		hashWaits:       map[string]int{},
 		ggufMissing:     map[string]string{},
 		ggufExists:      docker.HostFileExists,
 	}
@@ -374,6 +384,21 @@ func (r *Reconciler) nativeBackends(ctx context.Context) map[string]string {
 	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
 	return r.native.Running(ctx)
+}
+
+// nativeOnly reports whether backend runs on this node only through the
+// native lane (a Mac's Ollama): no container start, stop or image for it.
+func (r *Reconciler) nativeOnly(backend string) bool {
+	return r.native.NativeOnly(backend)
+}
+
+// nativeDownError is the refusal for a native-only backend this tick found
+// not serving (the caller has already checked it is not), nil for any other.
+func (r *Reconciler) nativeDownError(backend string) *backendrt.NativeDownError {
+	if !r.nativeOnly(backend) {
+		return nil
+	}
+	return r.native.DownError(backend)
 }
 
 // Run blocks until ctx cancels. First pass after a short delay (so
@@ -482,6 +507,7 @@ func (r *Reconciler) nudgeWhenReady(ctx context.Context, backend, model string, 
 // only backend whose next tick has work left: ensure, import, verify).
 func (r *Reconciler) backendStarted(ctx context.Context, backend, model string) {
 	r.clearBackendStart(backend)
+	delete(r.hashWaits, backend)
 	if backend == "ollama" {
 		go r.nudgeWhenReady(ctx, backend, model, startReadyWithin, startReadyEvery)
 	}
@@ -567,9 +593,19 @@ func (r *Reconciler) Once(ctx context.Context) {
 func (r *Reconciler) fetchDesired(ctx context.Context, t *tick) bool {
 	desired, err := r.fetch(ctx)
 	if err != nil {
+		// No controller, no pass: nothing is started, stopped or changed
+		// until it answers. Said ONCE per outage (ctrlreach, shared with the
+		// heartbeat); each tick's failure at debug. An answer that is an
+		// error is not an outage and keeps its WARN.
+		if ctrlreach.Unreachable(err) {
+			ctrlreach.Failed("reconcile", r.cfg.ControllerURL, err, time.Now())
+			slog.Debug("reconcile.fetch_failed", "error", err)
+			return false
+		}
 		slog.Warn("reconcile.fetch_failed", "error", err)
 		return false
 	}
+	ctrlreach.Answered("reconcile", time.Now())
 	t.desired = desired
 	return true
 }
@@ -790,7 +826,7 @@ func (r *Reconciler) sizeGpuYield(ctx context.Context, t *tick) bool {
 func (r *Reconciler) prefetch(ctx context.Context, t *tick) bool {
 	// Fetch the images this tick will start, concurrently, before the
 	// ordered start loop (which then finds them local).
-	r.prefetchImages(ctx, t.effective, t.running, t.specLabels, t.floating, t.native)
+	r.prefetchImages(ctx, t.effective, t.running, t.specLabels, t.floating, t.native, r.nativeOnly)
 	return true
 }
 
@@ -817,6 +853,11 @@ func (r *Reconciler) convergeContainer(ctx context.Context, t *tick, p placement
 			slog.Warn("reconcile.native_backend_not_stopped",
 				"backend", p.Backend,
 				"detail", "the controller asked for it to stop, but this node did not start it and will not stop a process it does not own")
+			return
+		}
+		if r.nativeOnly(p.Backend) {
+			// The native lane is this node's only lane for it: there is
+			// no container to stop, and Docker is not asked.
 			return
 		}
 		if _, ok := t.running[p.Backend]; ok {
@@ -867,6 +908,22 @@ func (r *Reconciler) convergeContainer(ctx context.Context, t *tick, p placement
 				// `--env OLLAMA_FLASH_ATTENTION=1` reaches it.
 				backendrt.SetOllamaTuning(nativeOllamaTuning(t.ollamaRows, harnessprofile.Current()))
 			}
+			// Serving again: a native-down refusal from an earlier tick
+			// no longer holds.
+			if r.native.NativeOnly(p.Backend) {
+				r.clearBackendStart(p.Backend)
+			}
+			return
+		}
+		// A Mac (followup i1156): the native lane is the ONLY lane for a
+		// backend it can serve. Nothing answers on its port, so the
+		// backend is down; never fall through to a container start, which
+		// dials a Docker a Mac may not have and reports a docker.sock error
+		// instead of the cause. Refused every tick until it serves.
+		if derr := r.nativeDownError(p.Backend); derr != nil {
+			slog.Warn("reconcile.native_backend_down", "backend", p.Backend,
+				"binary_present", derr.BinaryPresent, "detail", derr.Error())
+			refusals.Record("backend_start", p.Backend, derr.Error())
 			return
 		}
 		// Paused for other work on the GPU (internal/gpuyield): the
@@ -1071,7 +1128,7 @@ func (r *Reconciler) convergeContainer(ctx context.Context, t *tick, p placement
 			// Record it with the error verbatim so the
 			// heartbeat carries it; cleared when the backend is next
 			// seen running (above) or starts (below).
-			refusals.Record("backend_start", p.Backend, err.Error())
+			r.recordBackendStartFailure(p.Backend, err)
 			return
 		}
 		r.backendStarted(ctx, p.Backend, p.Model)
@@ -1699,6 +1756,8 @@ func (r *Reconciler) fetch(ctx context.Context) (*desiredConfig, error) {
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		return nil, err
 	}
+	// The controller decides strictness, per node, on every read.
+	auth.SetRequireTargetNode(out.RequireTargetNode)
 	return &out, nil
 }
 
