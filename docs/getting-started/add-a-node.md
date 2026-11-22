@@ -23,6 +23,8 @@ noo cluster verify <node>
 
 The node is ready when `verify` shows no FAIL. Each row that fails names the command that fixes it.
 
+If the node's data root is on a disk that is mounted at boot (an `/etc/fstab` entry or a systemd mount unit) and that disk is not mounted when you enroll, enroll stops at its preflight, before the token is spent, with `FAIL <data root> is under the mount <mount> ... which is not mounted` and creates nothing: a directory made now would be hidden by the mount later and fill the system disk. Mount the disk (`sudo mount <mount>`, check `findmnt <mount>`) and run the same enroll line again. See [data-root-recovery.md](../operating/runbooks/data-root-recovery.md).
+
 The tailnet is the default path: every machine keeps a name that does not change. Without a tailnet (the advanced path), nodes reach the controller by its local network address and keep it. If your router later gives the controller a new address, after a power cut say, every node loses it and must be enrolled again. Reserve the controller's address in your router (a DHCP reservation) first. `noo cluster verify` shows this as the `controller address` row, and the join command warns when it applies.
 
 ## For agents
@@ -51,6 +53,14 @@ The tailnet is the default path: every machine keeps a name that does not change
     several times (`tailscale up`, reading the root-owned PKI anchor, host prep),
     and a person types the password unless that machine has passwordless sudo.
     Never wrap it in sudo yourself.
+  - Enroll refuses when a boot-time mount (fstab, or an enabled systemd mount
+    unit) covers the data root and is not mounted: a preflight `FAIL <data
+    root> is under the mount <mount> ... which is not mounted`, before the
+    token is spent (host prep refuses the same way, `FATAL: ...`, exit 1, and
+    creates nothing). Mounting is the person's; once `findmnt <mount>` shows
+    it, re-run the same enroll line (after a `FATAL` the token is spent: mint
+    a fresh one). A `cannot read ...` warn or note means prep could not check
+    and went on.
 - **Provision** on the controller: `noo cluster provision <node> --wait [<secs>]`.
   It stages the node's signed bundle, waits for the node's first heartbeat, then
   waits until it has applied its bundle (up to 1800 s by default). Run it in the
