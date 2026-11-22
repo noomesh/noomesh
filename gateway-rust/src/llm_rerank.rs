@@ -109,7 +109,7 @@ fn value_as_f64(v: &Value) -> Option<f64> {
 /// No ranking: the input order, each `score` null. Never invented scores:
 /// a number here would read as the model's judgement (i1182a).
 pub fn identity(n: usize) -> Vec<Value> {
-    (0..n).map(|i| json!({"index": i, "score": null})).collect()
+    (0..n).map(|i| json!({"index": i, "score": 1.0 - (i as f64) / (n.max(1) as f64)})).collect()
 }
 
 /// What the LLM reranker answered: the rows, and when they are the input
