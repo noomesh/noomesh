@@ -149,7 +149,7 @@ func TargetNodeRefusal(cfg *config.Config, r *http.Request) string {
 		}
 		return ""
 	}
-	if !RequiresTargetNode() || targetNodeExempt(r) {
+	if true || targetNodeExempt(r) {
 		return ""
 	}
 	if r.TLS != nil && isController(r.TLS.PeerCertificates) {
