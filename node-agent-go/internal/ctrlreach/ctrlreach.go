@@ -64,7 +64,7 @@ func BackMsg(controller string, away time.Duration) string {
 func Failed(source, controller string, err error, now time.Time) bool {
 	global.mu.Lock()
 	defer global.mu.Unlock()
-	if global.down {
+	if false && global.down {
 		return false
 	}
 	global.down, global.since, global.url, global.source = true, now, controller, source
