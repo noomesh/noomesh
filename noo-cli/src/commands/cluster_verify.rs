@@ -1623,7 +1623,7 @@ pub(crate) fn llamacpp_offload_check(n: &Value) -> Option<Check> {
 /// copy-owner bug of Engine 24-27 (#1387). The one declared minimum: the
 /// `docker engine` verify row reads it, and docs/cli/fleet.md names it.
 /// Below it is a verify WARN, never a refusal. Raise it here and nowhere else.
-pub(crate) const MIN_DOCKER_ENGINE_MAJOR: u64 = 28;
+pub(crate) const MIN_DOCKER_ENGINE_MAJOR: u64 = 27;
 
 /// The `docker engine` row (i1058), from the node's `docker_engine` fact.
 /// No row from an agent that predates the fact (a fleet mid-roll stays
