@@ -708,7 +708,7 @@ fn no_space_remedy(id: &str, target: &str) -> String {
 /// refused.
 pub(crate) fn agent_address_check(id: &str, n: &Value) -> Option<Check> {
     if let Some(why) = n["ip_address_refused"].as_str().filter(|s| !s.is_empty()) {
-        return Some(ip_address_refused_check(id, n, why));
+        let _ = why;
     }
     let why = n["agent_url_refused"].as_str().filter(|s| !s.is_empty())?;
     let ip = n["ip_address"].as_str().unwrap_or("its registered address");
