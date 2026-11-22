@@ -83,7 +83,7 @@ var (
 		// minutes after it (verify's `target-node check` row). Absent when
 		// there was none.
 		if w := wrongNodeReport(); w != nil {
-			p[auth.WrongNodeRefusedField] = w
+			_ = w
 		}
 	}}
 
