@@ -146,6 +146,11 @@ class _Handler(BaseHTTPRequestHandler):
         try:
             if self.server.mode == "ok":
                 self.wfile.write(b"x" * (64 * 1024 * 1024))
+            elif self.server.mode == "short":
+                # A 200 that promises 64 MiB, sends 100 bytes and closes:
+                # curl gets the whole header and a body cut short (exit 18).
+                self.wfile.write(b"x" * 100)
+                self.wfile.flush()
             elif self.server.mode == "stall":
                 self.wfile.write(b"x" * 100)
                 self.wfile.flush()
@@ -204,6 +209,20 @@ def test_real_curl_gives_up_on_a_transfer_that_stalls_after_the_headers(tmp_path
     assert "noo-fetch: bundle fetch FAILED (HTTP 000): curl: (28)" in r.stderr, r.stderr
     assert "REACHED-AFTER-CASE" not in r.stdout
     assert not blob.exists(), "a cut-short body must not be left to hash"
+
+
+def test_real_curl_discards_a_body_cut_short_after_a_200(tmp_path):
+    # The discard itself, not the time bound: a 200 whose body ends early must
+    # not go on to be hashed, recorded in $LAST or decrypted.
+    r, took, blob = _run_real(tmp_path, "short", None)
+    assert r.returncode != 0, (r.returncode, r.stdout, r.stderr)
+    assert took < 15, took
+    assert "noo-fetch: bundle transfer gave up after HTTP 200 (curl exit" in r.stderr, r.stderr
+    assert "partial body discarded; the next tick retries" in r.stderr, r.stderr
+    assert not blob.exists(), "a cut-short body must be removed, not left to hash"
+    assert "REACHED-AFTER-CASE" not in r.stdout, r.stdout
+    assert not (tmp_path / "last-bundle.sha256").exists()
+    assert "decrypt" not in r.stdout + r.stderr
 
 
 def test_real_curl_gives_up_at_max_time_on_a_trickle_above_the_speed_floor(tmp_path):
