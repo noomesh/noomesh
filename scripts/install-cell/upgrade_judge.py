@@ -400,10 +400,31 @@ def _labels(path):
         return {}
 
 
-def judge_apply_line(log, before, after, labels, target, same_tag):
+def _images(path):
+    try:
+        return recreated.read_images(path)
+    except OSError:
+        return {}
+
+
+def img_by_service(snapshot, images):
+    """{service: sorted image ids} for the containers whose image id was recorded."""
+    out = {}
+    for n, (_i, svc, _d) in snapshot.items():
+        if n in images:
+            out.setdefault(svc, set()).add(images[n])
+    return {k: sorted(v) for k, v in out.items()}
+
+
+def _short(ids):
+    return "+".join(i.replace("sha256:", "")[:12] for i in ids)
+
+
+def judge_apply_line(log, before, after, labels, target, same_tag, images=None):
     """(verdict, why) for the roll's apply line against the id snapshots.
     before/after: recreated.read() dicts; labels: recreated.read_labelled() of the
-    BEFORE snapshot; same_tag: the same-tag --stack (nothing may be recreated)."""
+    BEFORE snapshot; images: (before, after) recreated.read_images() dicts, or None;
+    same_tag: the same-tag --stack (nothing may be recreated)."""
     got = parse_apply_line(log)
     target = target or ""
     ver = target_version(target)
@@ -424,15 +445,26 @@ def judge_apply_line(log, before, after, labels, target, same_tag):
     rec = sorted(s for s in a if s in b and a[s] != b[s])
     kept = sorted(s for s in a if s in b and a[s] == b[s])
     created = sorted(s for s in a if s not in b)
-    problems = []
+    problems, notes = [], []
+    # Compare only the names both sides can see: the snapshot lists the stack's
+    # `noo-*` containers, the CLI every container of the compose project. A name the
+    # line gives that the snapshot lacks is a NOTE, never a FAIL.
+    strip = lambda n: n[4:] if n.startswith("noo-") else n  # noqa: E731
+    visible = set(b) | set(a)
+    unseen = set()
     for what, line_set, snap_set in (("recreated", got["recreated"], rec), ("kept", got["kept"], kept),
                                      ("created", got["created"], created)):
+        line_set = [strip(n) for n in line_set]
+        unseen |= {n for n in line_set if n not in visible}
+        line_set = [n for n in line_set if n in visible]
         if sorted(line_set) != snap_set:
             extra = sorted(set(line_set) - set(snap_set))
             miss = sorted(set(snap_set) - set(line_set))
             problems.append("line %s != ids %s%s%s" % (what, what,
                             "; line only: " + ", ".join(extra) if extra else "",
                             "; ids only: " + ", ".join(miss) if miss else ""))
+    if unseen:
+        notes.append("NOTE: not in the snapshot (not compared): " + ", ".join(sorted(unseen)))
     if got["counts"] != (len(got["recreated"]), len(got["kept"]), len(got["created"])):
         problems.append("the line's counts %s do not match the names it lists" % (got["counts"],))
     # Which rule: read off the BEFORE containers' noo.inputs label, never a version string.
@@ -454,18 +486,33 @@ def judge_apply_line(log, before, after, labels, target, same_tag):
         rule = ("%s (noo.inputs on %d of %d BEFORE services, read from the containers' labels, not the version): "
                 % (regime, nlab, len(both)))
         rule += ("every service recreated, none kept" if got["forced"] or nlab == 0 else
-                 "third-party (%s) kept, every first-party service recreated" % ", ".join(sorted(THIRD_PARTY_KEEP & set(both))))
-        want_kept = set() if got["forced"] else {s for s in both if lab[s] and s in THIRD_PARTY_KEEP}
-        bad_kept = sorted(set(kept) - want_kept)
+                 "third-party (%s) kept unless their image moved, every first-party service recreated" % ", ".join(sorted(THIRD_PARTY_KEEP & set(both))))
+        # A labelled third-party service keeps its id unless its IMAGE moved
+        # (before vs after image id): then it must be recreated.
+        bi, ai = (img_by_service(before, images[0]), img_by_service(after, images[1])) if images else ({}, {})
+        moved = {s for s in both if lab[s] and s in THIRD_PARTY_KEEP and s in bi and s in ai and bi[s] != ai[s]}
+        blind = sorted(s for s in both if lab[s] and s in THIRD_PARTY_KEEP and not (s in bi and s in ai))
+        want_kept = set() if got["forced"] else {s for s in both if lab[s] and s in THIRD_PARTY_KEEP} - moved
+        bad_kept = sorted(set(kept) - want_kept - (moved if not got["forced"] else set()))
+        bad_moved_kept = sorted(set(kept) & moved) if not got["forced"] else []
         bad_rec = sorted(set(rec) & want_kept)
         if bad_kept:
             problems.append("kept but must be recreated: " + ", ".join(bad_kept))
+        for s_ in bad_moved_kept:
+            problems.append("%s: its image moved (%s>%s) but the container was kept" % (s_, _short(bi[s_]), _short(ai[s_])))
         if bad_rec:
-            problems.append("recreated but must keep its id: " + ", ".join(bad_rec))
+            problems.append("recreated but must keep its id: " + ", ".join(
+                s_ + (" (its image is unchanged)" if s_ not in blind else "") for s_ in bad_rec))
+        for s_ in sorted(moved & set(rec)):
+            notes.append("recreated: %s: its image moved %s>%s" % (s_, _short(bi[s_]), _short(ai[s_])))
+        if blind and not got["forced"]:
+            notes.append("NOTE: image ids not visible in the snapshot for %s: judged by the plain rule (a moved "
+                         "image would look like a FAIL)" % ", ".join(blind))
+    tail = "".join("; " + n for n in notes)
     if problems:
-        return "FAIL", "%s; %s; line: %s" % ("; ".join(problems), rule, got["line"])
-    return "PASS", "%s; the line matches the ids (%d recreated, %d kept, %d created): %s" % (
-        rule, len(rec), len(kept), len(created), got["line"])
+        return "FAIL", "%s; %s%s; line: %s" % ("; ".join(problems), rule, tail, got["line"])
+    return "PASS", "%s; the line matches the ids (%d recreated, %d kept, %d created)%s: %s" % (
+        rule, len(rec), len(kept), len(created), tail, got["line"])
 
 
 def judge():
@@ -583,7 +630,8 @@ def judge():
         v_, why = judge_apply_line(
             roll, recreated._read_or_empty(os.path.join(j, "roll.before")),
             recreated._read_or_empty(os.path.join(j, "roll.after")),
-            _labels(os.path.join(j, "roll.before")), text(os.path.join(j, "target")), False)
+            _labels(os.path.join(j, "roll.before")), text(os.path.join(j, "target")), False,
+            (_images(os.path.join(j, "roll.before")), _images(os.path.join(j, "roll.after"))))
         say("K1", v_, why, 4000)
 
     # ── after the same-tag --stack ──
