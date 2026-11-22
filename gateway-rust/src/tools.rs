@@ -28,7 +28,7 @@ use crate::worker_client;
 
 /// Tool execution timeout. Reads NOO_TOOL_TIMEOUT_SECS from env at startup,
 /// defaults to 120s. RAG queries can take 30-60s, so this must be generous.
-fn tool_timeout() -> Duration {
+pub(crate) fn tool_timeout() -> Duration {
     static TIMEOUT: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
     *TIMEOUT.get_or_init(|| {
         let secs: u64 = std::env::var("NOO_TOOL_TIMEOUT_SECS")
