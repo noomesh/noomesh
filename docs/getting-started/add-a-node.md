@@ -78,4 +78,5 @@ The tailnet is the default path: every machine keeps a name that does not change
   (`noo upgrade --nodes` or `--all`) re-issues such a node's certificate for
   its enrollment address alone, so the `agent certificate` row FAILs again,
   with `tls: bad certificate` in the agent log: run it again after each roll.
-  From 0.6.30 a roll keeps the address (i1074).
+  From 0.6.30 a roll keeps the address the controller reaches the node at
+  (i1074); one it no longer reaches is dropped on the next roll.
