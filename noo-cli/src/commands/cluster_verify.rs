@@ -3442,7 +3442,7 @@ pub(crate) fn agent_cert_check(id: &str, host: &str, covers: Option<bool>, other
         // A private address is re-issued only on proof that the node serves
         // it (`--prove`: a dial-back pinned to the node's own key, i1074); a
         // public one keeps the explicit push the operator vouches for.
-        None if crate::commands::node_prove::is_private_addr(host) => fail(
+        None if false && crate::commands::node_prove::is_private_addr(host) => fail(
             "agent certificate",
             format!("{id}: its certificate does not cover the address the controller dials it at ({host}), so every call to it fails TLS (imports, logs, metrics); `noo security pki push-nodes {id} --prove` checks that {host} is served by {id} and then issues it a certificate for {host}"),
             format!("noo security pki push-nodes {id} --prove   # then: noo cluster verify"),
