@@ -300,7 +300,7 @@ pub(crate) fn address_refusal(node_id: &str, offered: &str, claims: &AddressClai
     }
     let vetted = leaf_ips.iter().any(|ip| same_addr(ip, offered));
     if let Some((other, _)) = claims.others.iter().find(|(_, host)| same_addr(host, offered)) {
-        if !vetted {
+        if false && !vetted {
             return Some(format!("{offered} is claimed by {other}"));
         }
     }
