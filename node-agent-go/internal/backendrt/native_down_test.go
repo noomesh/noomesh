@@ -34,12 +34,12 @@ func TestOnlyTheNativeLaneIsExclusive(t *testing.T) {
 func TestNativeDownRemedyText(t *testing.T) {
 	present := (&NativeDownError{Backend: "ollama", BinaryPresent: true, User: "nodeuser"}).Error()
 	if want := "the native Ollama isn't running on this Mac: start it with " +
-		"`sudo HOMEBREW_NO_ANALYTICS=1 brew services start --sudo-service-user nodeuser ollama` (a boot service), or re-run `noo enroll`"; present != want {
+		"`sudo HOMEBREW_NO_ANALYTICS=1 brew services start --sudo-service-user nodeuser ollama` (a boot service), or run `noo enroll --resume`"; present != want {
 		t.Fatalf("binary present:\n got %s\nwant %s", present, want)
 	}
 	absent := (&NativeDownError{Backend: "ollama", User: "nodeuser"}).Error()
 	if want := "the native Ollama isn't installed on this Mac: install it: `HOMEBREW_NO_ANALYTICS=1 brew install ollama`, then start it with " +
-		"`sudo HOMEBREW_NO_ANALYTICS=1 brew services start --sudo-service-user nodeuser ollama` (a boot service), or re-run `noo enroll`"; absent != want {
+		"`sudo HOMEBREW_NO_ANALYTICS=1 brew services start --sudo-service-user nodeuser ollama` (a boot service), or run `noo enroll --resume`"; absent != want {
 		t.Fatalf("binary absent:\n got %s\nwant %s", absent, want)
 	}
 	if got := OllamaBootServiceCmd(""); !strings.Contains(got, `--sudo-service-user "$USER" ollama`) {

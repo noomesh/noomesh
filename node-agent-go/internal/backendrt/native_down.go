@@ -86,10 +86,10 @@ const OllamaInstallCmd = "HOMEBREW_NO_ANALYTICS=1 brew install ollama"
 func (e *NativeDownError) Error() string {
 	if e.BinaryPresent {
 		return "the native Ollama isn't running on this Mac: start it with `" + OllamaBootServiceCmd(e.User) +
-			"` (a boot service), or re-run `noo enroll`"
+			"` (a boot service), or run `noo enroll --resume`"
 	}
 	return "the native Ollama isn't installed on this Mac: install it: `" + OllamaInstallCmd +
-		"`, then start it with `" + OllamaBootServiceCmd(e.User) + "` (a boot service), or re-run `noo enroll`"
+		"`, then start it with `" + OllamaBootServiceCmd(e.User) + "` (a boot service), or run `noo enroll --resume`"
 }
 
 // ollamaBinaryPaths are where a Homebrew ollama lands when PATH does not

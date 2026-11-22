@@ -24,8 +24,14 @@ with its model store left where it was), so it comes back after a reboot or a
 power cut without a login. A Mac never runs Ollama in a container: when the
 native Ollama is not running, the node says so (the `native ollama` row of
 `noo cluster verify`, and the node's start refusal) and names the fix:
-`sudo HOMEBREW_NO_ANALYTICS=1 brew services start --sudo-service-user "$USER" ollama`,
-or re-run `noo enroll`.
+`noo enroll --resume`, run once on the Mac as the node's user (it asks for
+sudo and needs no new token).
+
+A Mac enrolled before this keeps its per-user Ollama (it starts only at a
+login) until someone runs `noo enroll --resume` on it once: an upgrade or
+`noo cluster provision` cannot register the boot service, because the Mac's
+applier never runs Homebrew as root. Until then the `native ollama` row
+warns "not a boot service yet".
 
 The tier is derived from the facts a node reports; see
 [../cli/fleet.md](../cli/fleet.md) for the rule and the override.

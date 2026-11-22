@@ -391,7 +391,7 @@ func (g *OllamaGuard) reportSystemDrift() error {
 	}
 	cmds = append(cmds, "sudo launchctl bootout system/"+g.label(), "sudo launchctl bootstrap system "+plist)
 	reason := fmt.Sprintf("the native Ollama is a boot service (%s, root's), which this agent cannot edit, and it lacks %s: "+
-		"on the Mac run `%s`, or re-run `noo enroll`", plist, strings.Join(keys, ", "), strings.Join(cmds, "; "))
+		"on the Mac run `%s`, or run `noo enroll --resume`", plist, strings.Join(keys, ", "), strings.Join(cmds, "; "))
 	refusals.Record("ollama_env", "ollama", reason)
 	slog.Warn("ollama: the boot-service plist lacks noomesh's environment; the agent cannot write it", "plist", plist, "keys", keys)
 	return nil

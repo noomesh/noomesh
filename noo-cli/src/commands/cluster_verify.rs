@@ -2119,7 +2119,7 @@ pub(crate) fn vendor_telemetry_check(n: &Value) -> Check {
          sudo plutil -insert EnvironmentVariables -dictionary $P 2>/dev/null; \
          sudo plutil -replace EnvironmentVariables.OLLAMA_NO_CLOUD -string 1 $P; \
          sudo launchctl bootout system/$L; sudo launchctl bootstrap system $P   \
-         # or re-run `noo enroll`; the agent cannot edit a boot service's plist".to_string()
+         # or run `noo enroll --resume`; the agent cannot edit a boot service's plist".to_string()
     } else if mac_ollama {
         // Either brew label (sh.brew.ollama is current Homebrew), and the
         // domain launchd actually holds the job in (user/<uid> on a headless
@@ -2193,7 +2193,9 @@ fn is_darwin_native_ollama(n: &Value, entry: &Value) -> bool {
 /// heartbeat's `backend_containers.ollama.running` says whether it answers on
 /// 127.0.0.1:11434; `binary_present` (newer agents, sent only while it is not
 /// running) picks the remedy: start the boot service, or install Ollama
-/// first. FAIL when it is not running; OK when it is; no row off a Mac.
+/// first. FAIL when it is not running; WARN when it runs from a per-user
+/// LaunchAgent (`plist_domain: user`: not a boot service yet); OK otherwise;
+/// no row off a Mac.
 pub(crate) fn native_ollama_check(id: &str, n: &Value) -> Option<Check> {
     const NAME: &str = "native ollama";
     let entry = &n["backend_containers"]["ollama"];
@@ -2201,20 +2203,35 @@ pub(crate) fn native_ollama_check(id: &str, n: &Value) -> Option<Check> {
         return None;
     }
     if entry["running"].as_bool() != Some(false) {
-        return Some(ok(NAME, "serving on 127.0.0.1:11434"));
+        // Serving, but from a per-user LaunchAgent (a Mac enrolled before
+        // i1156): it starts only at that user's login, so a rebooted headless
+        // Mac has an agent and no Ollama. Nothing on a roll fixes it: the
+        // root applier never runs Homebrew as root (node_fetch.rs, H2), so
+        // the remedy is the Mac's own `noo enroll --resume`, never
+        // `provision`. An agent that does not report `plist_domain` is not
+        // judged on it.
+        return Some(match entry["plist_domain"].as_str() {
+            Some("user") => warn(
+                NAME,
+                format!("{id}: serving on 127.0.0.1:11434, but not a boot service yet (a per-user LaunchAgent: it starts only at a login, so after a reboot or a power cut nothing serves Ollama until someone logs in)"),
+                Some(format!("on {id}, once, as the node's user: `noo enroll --resume` (registers it as a boot service run as that user, keeps its model store; asks for sudo, no new token)")),
+            ),
+            Some("system") => ok(NAME, "serving on 127.0.0.1:11434 as a boot service"),
+            _ => ok(NAME, "serving on 127.0.0.1:11434"),
+        });
     }
     let launcher = entry["launcher"].as_str().unwrap_or("none");
     if entry["binary_present"].as_bool() == Some(false) {
         return Some(fail(
             NAME,
             format!("{id}: the native Ollama isn't installed on this Mac, so nothing serves Ollama there (the agent never runs it in a container on a Mac)"),
-            format!("on {id}: install it: `HOMEBREW_NO_ANALYTICS=1 brew install ollama`, then start it with `{MAC_OLLAMA_START}` (a boot service), or re-run `noo enroll`"),
+            format!("on {id}: install it: `HOMEBREW_NO_ANALYTICS=1 brew install ollama`, then start it with `{MAC_OLLAMA_START}` (a boot service), or run `noo enroll --resume`"),
         ));
     }
     Some(fail(
         NAME,
         format!("{id}: the native Ollama isn't running on this Mac (nothing answers on 127.0.0.1:11434; launcher: {launcher}), so nothing serves Ollama there"),
-        format!("on {id}: start it with `{MAC_OLLAMA_START}` (a boot service), or re-run `noo enroll`"),
+        format!("on {id}: start it with `{MAC_OLLAMA_START}` (a boot service), or run `noo enroll --resume`"),
     ))
 }
 
@@ -14213,7 +14230,7 @@ mod tests {
         assert!(c.detail.contains("the native Ollama isn't running on this Mac"), "{}", c.detail);
         let r = c.remedy.as_deref().unwrap();
         assert!(r.contains("sudo HOMEBREW_NO_ANALYTICS=1 brew services start --sudo-service-user \"$USER\" ollama"), "{r}");
-        assert!(r.contains("re-run `noo enroll`") && !r.contains("brew install"), "{r}");
+        assert!(r.contains("run `noo enroll --resume`") && !r.contains("brew install"), "{r}");
 
         let absent = serde_json::json!({"id": "node_a", "os": "darwin", "backend_containers": {
             "ollama": {"running": false, "runtime": "native", "launcher": "none", "managed": false, "binary_present": false}}});
@@ -14231,6 +14248,27 @@ mod tests {
         let up = serde_json::json!({"id": "node_a", "os": "darwin", "backend_containers": {
             "ollama": {"running": true, "runtime": "native", "managed": true}}});
         assert_eq!(native_ollama_check("node_a", &up).map(|c| c.verdict), Some(Verdict::Ok));
+
+        // Serving from a per-user LaunchAgent (enrolled before i1156): WARN,
+        // and the remedy is the Mac's own `noo enroll --resume`, never
+        // `provision` (a roll cannot register a boot service).
+        let user = serde_json::json!({"id": "node_a", "os": "darwin", "backend_containers": {
+            "ollama": {"running": true, "runtime": "native", "managed": true, "plist_domain": "user"}}});
+        let c = native_ollama_check("node_a", &user).expect("a row on a Mac");
+        assert_eq!(c.verdict, Verdict::Warn, "{c:?}");
+        assert!(c.detail.contains("not a boot service yet"), "{}", c.detail);
+        let r = c.remedy.as_deref().unwrap();
+        assert!(r.contains("`noo enroll --resume`") && !r.contains("provision"), "{r}");
+        let system = serde_json::json!({"id": "node_a", "os": "darwin", "backend_containers": {
+            "ollama": {"running": true, "runtime": "native", "managed": true, "plist_domain": "system"}}});
+        let c = native_ollama_check("node_a", &system).expect("a row on a Mac");
+        assert_eq!(c.verdict, Verdict::Ok, "{c:?}");
+        assert_eq!(c.detail, "serving on 127.0.0.1:11434 as a boot service");
+        // No row's remedy on a Mac names provision: it cannot fix any of them.
+        for n in [&down, &absent, &older, &user] {
+            let c = native_ollama_check("node_a", n).unwrap();
+            assert!(!c.remedy.as_deref().unwrap_or("").contains("provision"), "{c:?}");
+        }
 
         // Linux: a stopped container ollama, or a native-looking entry on a
         // node that says it is not a Mac: no row.
@@ -14251,7 +14289,7 @@ mod tests {
     #[test]
     fn backend_starts_row_surfaces_the_native_ollama_remedy() {
         let n = serde_json::json!({"id": "node_a", "reconcile_refusals": [{"scope": "backend_start", "target": "ollama",
-            "reason": "the native Ollama isn't running on this Mac: start it with `sudo HOMEBREW_NO_ANALYTICS=1 brew services start --sudo-service-user nodeuser ollama` (a boot service), or re-run `noo enroll`"}]});
+            "reason": "the native Ollama isn't running on this Mac: start it with `sudo HOMEBREW_NO_ANALYTICS=1 brew services start --sudo-service-user nodeuser ollama` (a boot service), or run `noo enroll --resume`"}]});
         let c = backend_starts_check("node_a", &n).unwrap();
         let r = c.remedy.as_deref().unwrap();
         assert!(r.starts_with("on node_a: start it with `sudo HOMEBREW_NO_ANALYTICS=1 brew services start"), "{r}");

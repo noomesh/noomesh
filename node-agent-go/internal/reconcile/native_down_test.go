@@ -68,7 +68,7 @@ func TestNativeDownOllamaIsRefusedWithoutDocker(t *testing.T) {
 	why := backendStartRefusal("ollama")
 	if !strings.Contains(why, "the native Ollama isn't running on this Mac") ||
 		!strings.Contains(why, "brew services start --sudo-service-user") ||
-		!strings.Contains(why, "re-run `noo enroll`") {
+		!strings.Contains(why, "run `noo enroll --resume`") {
 		t.Fatalf("backend_start refusal = %q, want the native-down text with its remedy", why)
 	}
 	if strings.Contains(why, "docker") {
