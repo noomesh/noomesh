@@ -3488,7 +3488,8 @@ pub(crate) fn prove_target(node: &str, registry: &[serde_json::Value]) -> Result
     if host.parse::<std::net::IpAddr>().is_err() {
         return Err(format!(
             "'{node}''s agent_url {url} names a host name, not an address: --prove needs an address. \
-             Set the node's agent_url to its IP, or use the plain `noo security pki push-nodes {node}`"
+             Set the node's agent_url to its IP; the plain `noo security pki push-nodes {node}` mints only \
+             its enrollment, tailnet or current-leaf address"
         ));
     }
     if is_loopback_addr(&host) {
