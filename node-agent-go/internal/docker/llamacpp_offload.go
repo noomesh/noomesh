@@ -430,7 +430,8 @@ func (c *Client) startLlamacppOffloadWatch(ctx context.Context, backend, model, 
 	// Only this start's lines (i1225): a verdict from an earlier run's
 	// offload line is the false "runs on the CPU" again.
 	fetch := func(ctx context.Context) ([]string, error) {
-		lines, unreadable, err := c.ContainerLogsSinceStart(ctx, containerName, 2000)
+		lines, err := c.ContainerLogs(ctx, containerName, 2000, "")
+		unreadable := false
 		if err == nil && unreadable {
 			err = errLogUnreadable
 		}
