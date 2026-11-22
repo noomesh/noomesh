@@ -70,7 +70,7 @@ pub(crate) fn asset_harness_env_tmpl() -> &'static str { ASSET_HARNESS_ENV_TMPL 
 
 const USAGE: &str = "usage: noo enroll <noo1.blob> | --url <https://…> --token <t> \
 [--ca-sha256 <hex>] [--ts-authkey <k>] [--node <name>] [--skip-tailscale] [--skip-prep] [--data-root <dir>] [--controller-approvals] [--root-ok]\n\
-       noo enroll --via-tailnet <https://controller.ts.net> [--ts-authkey <k>] [--skip-prep] [--controller-approvals] [--root-ok]\n  --resume            macOS: finish the arm step (root CLI + fetch daemon) after a failure, no new token\n  --controller-approvals  Linux: let the controller approve add-on workloads on this node (asked when interactive; default no)\n  --root-ok           no terminal here, and sudo needs no password: run the root steps unattended";
+       noo enroll --via-tailnet <https://controller.ts.net> [--ts-authkey <k>] [--skip-prep] [--controller-approvals] [--root-ok]\n  --resume            macOS: re-run the arm step (Ollama boot service, root CLI, fetch daemon), no new token: after a failure, or once on a Mac enrolled before Ollama became a boot service\n  --controller-approvals  Linux: let the controller approve add-on workloads on this node (asked when interactive; default no)\n  --root-ok           no terminal here, and sudo needs no password: run the root steps unattended";
 
 #[derive(Debug)]
 struct EnrollCred {
@@ -1900,7 +1900,7 @@ fn darwin_ollama_boot_service(home: &str, user: &str, data_root: Option<&str>) {
         };
         if code != 0 {
             ui::warned(&format!(
-                "ollama boot service NOT set up ({}{}): run `{}` on this Mac, or re-run `noo enroll`; `noo cluster verify` on the controller shows the native ollama row",
+                "ollama boot service NOT set up ({}{}): run `{}` on this Mac, or run `noo enroll --resume`; `noo cluster verify` on the controller shows the native ollama row",
                 step.what,
                 if why.is_empty() { String::new() } else { format!(": {why}") },
                 crate::commands::cluster_verify::MAC_OLLAMA_START
