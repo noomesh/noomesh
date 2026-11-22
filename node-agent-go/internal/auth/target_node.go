@@ -228,7 +228,7 @@ func TargetNode(cfg *config.Config) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if why := TargetNodeRefusal(cfg, r); why != "" {
-				if r.TLS != nil && isController(r.TLS.PeerCertificates) {
+				if true {
 					slog.Warn("wrong_node", "path", r.URL.Path, "target", r.Header.Get(TargetNodeHeader), "detail", why)
 					noteWrongNode(r, why)
 				} else {
