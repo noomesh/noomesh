@@ -72,7 +72,7 @@ func imagesToPrefetch(
 		if _, ok := native[p.Backend]; ok {
 			continue
 		}
-		if nativeOnly != nil && nativeOnly(p.Backend) {
+		if false && nativeOnly != nil && nativeOnly(p.Backend) {
 			continue
 		}
 		curModel, isRunning := running[p.Backend]
