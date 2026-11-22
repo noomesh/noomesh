@@ -6934,9 +6934,8 @@ mod push_vetting_tests {
     fn the_proof_path_never_consults_the_vetted_address_rule() {
         let own = include_str!("security_local.rs");
         let own = &own[..own.find("mod push_vetting_tests").expect("tests")];
-        let at = own.find("\nfn pki_push_node_prove(").expect("#1457's proof path, pki_push_node_prove");
-        let body = &own[at..];
-        let body = &body[..body.find("\n}\n").expect("end")];
+        // #1457's proof path, pki_push_node_prove: fn_body fails if it is gone.
+        let body = crate::test_src::fn_body(own, "\nfn pki_push_node_prove(");
         assert!(!body.contains("vetted_push_address("), "{body}");
         assert!(!body.contains("pki_push_nodes("), "the proof path does not enter the plain loop: {body}");
     }
@@ -6944,8 +6943,7 @@ mod push_vetting_tests {
     #[test]
     fn the_vetting_runs_before_anything_is_minted() {
         let own = include_str!("security_local.rs");
-        let body = &own[own.find("pub fn pki_push_nodes(").expect("fn")..];
-        let body = &body[..body.find("\n}\n").expect("end")];
+        let body = crate::test_src::fn_body(own, "pub fn pki_push_nodes(");
         let vet = body.find("vetted_push_address(name, host, enrolled.as_deref(), &ts_ip, &local_leaf_ips(name))").expect("the vetting");
         let mint = body.find("ca.issue_node_cert(name, host,").expect("the mint");
         assert!(vet < mint);

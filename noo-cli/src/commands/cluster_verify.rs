@@ -11396,7 +11396,7 @@ mod tests {
         let c = node_checks(&healthy(now), "v0.2.70", "0.5.57", now, Some(true));
         let failed: Vec<_> = c.iter().filter(|c| c.verdict == Verdict::Fail).map(|c| c.name).collect();
         assert!(failed.is_empty(), "{failed:?}");
-        assert_eq!(c.len(), 24, "eighteen node invariants (the log shipper, peer identity, control over bus, streaming over tunnel, backend doors, vendor telemetry, backend images, data root, lanes and harness egress among them) plus six host-fact rows (boot partition and host telemetry among them), each judged");
+        assert_eq!(c.len(), 25, "nineteen node invariants (the log shipper, peer identity, control over bus, streaming over tunnel, backend doors, vendor telemetry, backend images, data root, lanes, harness egress and the target-node check among them) plus six host-fact rows (boot partition and host telemetry among them), each judged");
         let lanes = c.iter().find(|c| c.name == "lanes").expect("the lanes row");
         assert_eq!((lanes.verdict, lanes.detail.as_str()), (Verdict::Ok, "1 chat lane(s): 1 serving, 0 on demand"));
     }
@@ -18138,8 +18138,7 @@ mod target_node_row_tests {
     #[test]
     fn every_node_gets_the_target_node_row() {
         let src = include_str!("cluster_verify.rs");
-        let f = &src[src.find("pub(crate) fn node_checks(").expect("fn")..];
-        let f = &f[..f.find("\n}\n").expect("end")];
+        let f = crate::test_src::fn_body(src, "pub(crate) fn node_checks(");
         assert!(f.contains("out.push(target_node_check(id, n, now_unix));"));
         assert!(f.contains("out.extend(node_identity_check(id, n, now_unix));"));
     }
