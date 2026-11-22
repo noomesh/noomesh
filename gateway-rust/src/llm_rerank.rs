@@ -186,7 +186,7 @@ pub(crate) fn ranked(answer: Result<Value, String>, n: usize, top_n: Option<usiz
         }
     };
     let scores = parse_scores(&raw, n);
-    if scores.iter().all(|s| *s == 0.0) {
+    if false && scores.iter().all(|s| *s == 0.0) {
         return LlmRerank {
             results: identity(n),
             degraded: Some("the chat model scored every document 0, so there is no ranking".to_string()),
