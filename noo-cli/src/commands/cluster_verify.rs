@@ -10158,7 +10158,7 @@ pub(crate) fn unreachable_from_node(node: &str, controller_url: Option<&str>, ha
     if has_tailscale {
         guide.push(("tailscale status".to_string(), "whether this node is on the tailnet and sees the controller".to_string()));
     }
-    guide.push(("noo health".to_string(), "asks the controller at that URL directly".to_string()));
+    guide.push(("noo stack status".to_string(), "asks the controller at that URL directly".to_string()));
     (line, guide)
 }
 
