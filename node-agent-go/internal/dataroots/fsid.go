@@ -756,7 +756,7 @@ func checkFilesystems(r Roots) []fsFinding {
 		// filesystem it may be an empty mount point, so it is neither
 		// refused nor recorded. On its own disk it is recorded below.
 		if bmErr != nil && onRootFS {
-			noteNotChecked(p, bmErr.Error())
+			out = append(out, fsFinding{p, Problem{Code: "mount_missing", Detail: bmErr.Error()}})
 			continue
 		}
 		noteNotChecked(p, "")
