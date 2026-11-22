@@ -467,7 +467,7 @@ pub(crate) fn render_watchdog_service() -> String {
          \n\
          [Service]\n\
          Type=oneshot\n\
-         TimeoutStartSec=150\n\
+         After=kiosk.service\n\
          EnvironmentFile={env}\n\
          ExecStart={bin}/noo-kiosk-watchdog\n",
         env = ENV_FILE, bin = BIN_DIR,
