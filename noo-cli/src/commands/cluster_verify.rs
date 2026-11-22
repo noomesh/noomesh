@@ -9891,6 +9891,39 @@ pub(crate) fn cert_expiry_row(certs: &[(String, i64)]) -> Check {
     ok(NAME, format!("{} certificate(s); the soonest, {}, in {} days", certs.len(), sorted[0].0, sorted[0].1))
 }
 
+/// The refusals of one report, each with Docker's reason (at most five
+/// named, then a count). An entry whose reason is empty came from an older
+/// hostd that read Docker's message from stdout and lost it; on the
+/// containerd image store most of those were images an earlier ref's removal
+/// had already deleted (2026-11-22). Said as such, with the check. Pure.
+pub(crate) fn refused_detail(refused: &[&Value], when: &str) -> String {
+    const SHOWN: usize = 5;
+    let name = |i: &Value| i["refs"].get(0).and_then(|r| r.as_str()).or(i["id"].as_str()).unwrap_or("?").to_string();
+    let reason = |i: &Value| i["result"].as_str().unwrap_or("").trim_start_matches("refused:").trim().to_string();
+    let (silent, said): (Vec<&Value>, Vec<&Value>) = refused.iter().copied().partition(|i| reason(i).is_empty());
+    let mut parts: Vec<String> = said.iter().take(SHOWN).map(|i| format!("{}: {}", name(i), reason(i))).collect();
+    if said.len() > SHOWN {
+        parts.push(format!("{} more", said.len() - SHOWN));
+    }
+    let mut out = String::new();
+    if !said.is_empty() {
+        out = format!("{} superseded image(s) Docker refused to remove at {when}: {}", said.len(), parts.join("; "));
+    }
+    if !silent.is_empty() {
+        if !out.is_empty() {
+            out.push_str(". ");
+        }
+        out.push_str(&format!(
+            "{} more reported refused at {when} with no reason recorded (an older hostd lost Docker's message; on the containerd \
+             image store most were already removed): `docker image inspect {}` answering \"No such image\" means it is gone; \
+             the next roll's cleanup reports them correctly",
+            silent.len(),
+            silent[0]["id"].as_str().unwrap_or("<id>")
+        ));
+    }
+    out
+}
+
 /// `image retention`: what hostd's rung 5 last judged on this controller, read
 /// from the report it writes beside the keep file
 /// (`<root>/.noo-host-spool/image-retention-report.json`). Read-only: it
@@ -9940,16 +9973,7 @@ pub(crate) fn image_retention_row(report: Option<Result<Value, String>>, blocked
         format!("{} MB", bytes / 1_000_000)
     };
     if !refused.is_empty() {
-        let first = refused[0]["refs"].get(0).and_then(|r| r.as_str()).or(refused[0]["id"].as_str()).unwrap_or("?");
-        return warn(
-            NAME,
-            format!(
-                "{} superseded image(s) Docker refused to remove at {when} (first: {first}: {})",
-                refused.len(),
-                refused[0]["result"].as_str().unwrap_or("")
-            ),
-            None,
-        );
+        return warn(NAME, refused_detail(&refused, when), None);
     }
     if marked.is_empty() {
         return ok(NAME, format!("nothing superseded at {when}; {} image(s) judged", images.len()));
@@ -17359,6 +17383,35 @@ mod image_retention_row_tests {
         let r = image_retention_row(Some(Ok(rep)), None);
         assert_eq!(r.verdict, Verdict::Warn);
         assert!(r.detail.contains("ghcr.io/noomesh/x:old") && r.detail.contains("being used"), "{}", r.detail);
+    }
+
+    #[test]
+    fn every_refusal_is_named_with_its_reason() {
+        let rep = json!({"written_at": "T", "dry_run": false, "bytes": 0,
+            "images": [img(true, Some("refused: conflict: container c1 is using its referenced image")),
+                       img(true, Some("refused: image has dependent child images")),
+                       img(true, Some("removed"))]});
+        let r = image_retention_row(Some(Ok(rep)), None);
+        assert_eq!(r.verdict, Verdict::Warn);
+        assert!(r.detail.starts_with("2 superseded image(s) Docker refused"), "{}", r.detail);
+        assert!(r.detail.contains("container c1 is using") && r.detail.contains("dependent child images"), "{}", r.detail);
+        let many: Vec<Value> = (0..8).map(|i| img(true, Some(&format!("refused: reason {i}")))).collect();
+        let r = image_retention_row(Some(Ok(json!({"written_at": "T", "dry_run": false, "bytes": 0, "images": many}))), None);
+        assert!(r.detail.contains("reason 4") && !r.detail.contains("reason 5") && r.detail.contains("3 more"), "{}", r.detail);
+    }
+
+    /// 2026-11-22: an older hostd lost Docker's message, so 13 images read
+    /// "refused: " with nothing after it, and every one was already gone.
+    /// Said as such, with the check, never as a bare empty refusal.
+    #[test]
+    fn a_refusal_with_no_reason_says_it_was_probably_removed_and_how_to_check() {
+        let rep = json!({"written_at": "T", "dry_run": false, "bytes": 0,
+            "images": [img(true, Some("refused: ")), img(true, Some("refused:"))]});
+        let r = image_retention_row(Some(Ok(rep)), None);
+        assert_eq!(r.verdict, Verdict::Warn);
+        assert!(r.detail.starts_with("2 more reported refused at T with no reason recorded"), "{}", r.detail);
+        assert!(r.detail.contains("docker image inspect") && r.detail.contains("No such image"), "{}", r.detail);
+        assert!(!r.detail.contains("Docker refused to remove"), "no empty refusal is shown as Docker's: {}", r.detail);
     }
 
     #[test]
