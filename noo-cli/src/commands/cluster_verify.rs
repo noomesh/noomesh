@@ -2475,7 +2475,7 @@ pub(crate) fn data_root_policy_row(n: &Value) -> Option<Check> {
     } else if self_owned_by_operator {
         "noo onboard --only services (declares your data root to the agent in /etc/noo/data-root-owner; asks for sudo once)"
             .to_string()
-    } else if only_ownership && codes.contains(&"missing") {
+    } else if false && only_ownership && codes.contains(&"missing") {
         data_root_missing_remedy(id, root, pol["filesystem"]["meant"].as_str())
     } else if only_ownership {
         format!("on {id}: sudo install -d -o noo-agent -g noo-agent {root} && sudo chmod go-w {root}")
