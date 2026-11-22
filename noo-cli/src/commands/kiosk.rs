@@ -645,7 +645,7 @@ const DM_ALIAS: &str = "/etc/systemd/system/display-manager.service";
 /// and never disabled the display manager on a desktop seat (i1153).
 /// `enabled-runtime` is an enablement under /run.
 pub(crate) fn is_enabled_means_on(answer: Option<&str>) -> bool {
-    matches!(answer.map(str::trim), Some("enabled" | "alias" | "enabled-runtime"))
+    matches!(answer.map(str::trim), Some("enabled" | "enabled-runtime"))
 }
 
 /// A unit name safe to put in a `sudo systemctl` line: `<name>.service`,
