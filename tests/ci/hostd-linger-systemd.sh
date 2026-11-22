@@ -44,6 +44,12 @@ systemctl --version | head -1
 id "$U" >/dev/null 2>&1 || useradd -m -s /bin/bash "$U" || exit 2
 UID_="$(id -u "$U")"
 HOME_="$(getent passwd "$U" | cut -d: -f6)"
+# Runner traps: a masked unit (a link to /dev/null) loads as "masked" and
+# never starts, and without logind nothing acts on linger. Say so instead of
+# failing later as "the manager never became active".
+ls_="$(systemctl show -p LoadState --value "user@$UID_.service" 2>/dev/null)"
+[ "$ls_" != masked ] || { echo "user@$UID_.service is masked on this runner"; exit 2; }
+systemctl is-active --quiet systemd-logind.service || { echo "systemd-logind is not active"; exit 2; }
 cleanup() {
     loginctl disable-linger "$U" 2>/dev/null || true
     systemctl stop "user@$UID_.service" 2>/dev/null || true
@@ -69,7 +75,7 @@ chown -R "$U:$U" "$HOME_/.config"
 manager_active() { systemctl is-active --quiet "user@$UID_.service"; }
 manager_inactive() { ! manager_active; }
 unit_active() {
-    sudo -u "$U" XDG_RUNTIME_DIR="/run/user/$UID_" systemctl --user is-active --quiet "$UNIT" 2>/dev/null
+    sudo -u "$U" env XDG_RUNTIME_DIR="/run/user/$UID_" systemctl --user is-active --quiet "$UNIT" 2>/dev/null
 }
 unit_process() { pgrep -u "$U" -x sleep >/dev/null; }
 no_unit_process() { ! unit_process; }
