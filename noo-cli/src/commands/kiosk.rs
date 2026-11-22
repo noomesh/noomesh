@@ -708,7 +708,7 @@ pub(crate) enum StartWait {
 /// behind a unit that never finishes (plymouth-quit-wait, TimeoutSec=0)
 /// hung the seat's sync, `--migrate` and the watchdog (i1153).
 pub(crate) fn wait_for_start(poll: &dyn Fn() -> UnitPoll, pause: &dyn Fn(), tries: u32) -> StartWait {
-    for i in 0..tries {
+    for i in 0.. {
         let p = poll();
         if !p.job {
             return StartWait::Done(p.active);
