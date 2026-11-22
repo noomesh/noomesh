@@ -79,7 +79,7 @@ pub(crate) fn inspect_kind(probe: &crate::bounded::Bounded) -> InspectKind {
 fn daemon_gate(g: &Globals, rerun: &str, sudo_rerun: &str) -> Option<i32> {
     use crate::commands::secrets_delivery::{docker_version_probe, refusal_of, DockerRefusal};
     let probe = docker_version_probe();
-    let Some(why) = refusal_of(&probe) else { return None };
+    let why = refusal_of(&probe)?;
     // A shell that cannot use the socket yet (the user joined the docker
     // group in this login session) is not a daemon that is down: relaunch
     // with the group first, as every other docker-gated command does.
