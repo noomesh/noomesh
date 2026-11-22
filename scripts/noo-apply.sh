@@ -156,6 +156,8 @@ fi
 CA="$PKI/ca.crt"
 [ -f "$CA" ] || { echo "noo-apply: no trusted CA at $CA — enroll this node first" >&2; NOO_REFUSAL=not_enrolled; exit 78; }
 
+# i1182a: accepted for one release after TEI's removal; drop in 0.6.31: svc-tei.crt and svc-tei.key stay in the list below,
+# and `tei` in the leaf install loop, so a bundle from a 0.6.29 controller still applies.
 KNOWN_KINDS="ca.crt node.crt node.key agent-env agent-unit agent-binary teardown applier hostd-binary restart-backends host-telemetry cli-binary cli-user fetcher nats-creds fleet-secrets signing-pub harness-binary harness-env harness-unit svc-vllm.crt svc-vllm.key svc-llamacpp.crt svc-llamacpp.key svc-ollama.crt svc-ollama.key svc-tei.crt svc-tei.key svc-reranker.crt svc-reranker.key vendor-cli vendor-cli-manifest vendor-cli-2 vendor-cli-2-manifest vendor-cli-3 vendor-cli-3-manifest release-sums release-sums.sig release-version release-lock release-lock.sig netns-unit"
 
 # An add-on's node workload door leaf travels as svc-addon-<addon>-<workload>

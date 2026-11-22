@@ -1087,7 +1087,7 @@ mod reconcile_tests {
         let ca = scratch("node");
         let (_, a) = ca.issue_node_cert("a", "10.0.0.4", 90, &[], &[], &crate::pki::NodeRole::Worker).unwrap();
         let (_, b) = ca.issue_node_cert("b", "10.0.0.5", 90, &[], &[], &crate::pki::NodeRole::Worker).unwrap();
-        let (_, door) = ca.issue_node_service_cert("a", "tei", &[], 90).unwrap();
+        let (_, door) = ca.issue_node_service_cert("a", "ollama", &[], 90).unwrap();
         for k in [&a, &b, &door] {
             set(k, 0o644);
         }

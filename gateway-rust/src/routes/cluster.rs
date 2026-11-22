@@ -3825,7 +3825,6 @@ pub(crate) fn backend_image_ref(backend: &str, get: &dyn Fn(&str) -> Option<Stri
         // release ref (prefix:tag, rail-staged); only an operator override
         // is forwarded.
         "llamacpp" => ("LLAMACPP_IMAGE", ""),
-        "embedding" => ("TEI_IMAGE", ""),
         _ => return None,
     };
     [operator, locked]

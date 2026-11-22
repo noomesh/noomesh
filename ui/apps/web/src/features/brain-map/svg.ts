@@ -68,7 +68,7 @@ export const BRAIN_SVG = `
   <g class="brain-node" data-id="backends"><rect x="415" y="432" width="110" height="28" rx="14" fill="rgba(249,115,22,0.1)" stroke="rgba(249,115,22,0.4)" stroke-width="1"/><text x="470" y="450" text-anchor="middle" fill="#f97316" font-size="11">Backends</text></g>
   <g class="brain-node" data-id="postgresql"><rect x="545" y="432" width="110" height="28" rx="14" fill="rgba(249,115,22,0.1)" stroke="rgba(249,115,22,0.4)" stroke-width="1"/><text x="600" y="450" text-anchor="middle" fill="#f97316" font-size="11">PostgreSQL</text></g>
   <g class="brain-node" data-id="redis-nats"><rect x="675" y="432" width="110" height="28" rx="14" fill="rgba(249,115,22,0.1)" stroke="rgba(249,115,22,0.4)" stroke-width="1"/><text x="730" y="450" text-anchor="middle" fill="#f97316" font-size="11">Redis + NATS</text></g>
-  <g class="brain-node" data-id="tei"><rect x="805" y="432" width="110" height="28" rx="14" fill="rgba(249,115,22,0.1)" stroke="rgba(249,115,22,0.4)" stroke-width="1"/><text x="860" y="450" text-anchor="middle" fill="#f97316" font-size="11">TEI</text></g>
+  <g class="brain-node" data-id="embedder"><rect x="805" y="432" width="110" height="28" rx="14" fill="rgba(249,115,22,0.1)" stroke="rgba(249,115,22,0.4)" stroke-width="1"/><text x="860" y="450" text-anchor="middle" fill="#f97316" font-size="11">Embedder</text></g>
 
   <g class="brain-loop" data-id="loop-heartbeat">
     <path d="M 1100,435 C 1185,435 1185,78 1100,78" fill="none" stroke="#f97316" stroke-width="2.5" stroke-opacity="0.6" stroke-dasharray="6,4" marker-end="url(#brain-ah-orange)"/>
@@ -136,7 +136,7 @@ export const BRAIN_INFO: Record<string, NodeInfo> = {
   backends: { t: 'Inference Backends', l: 'Infrastructure', c: '#f97316', d: 'Docker-managed LLM serving: vLLM, Ollama, llama.cpp.', f: 'Docker containers', k: 'GPU Nodes, BackendManager' },
   postgresql: { t: 'PostgreSQL', l: 'Infrastructure', c: '#f97316', d: 'Primary shared memory store with pgvector extensions.', f: 'db/models.py', k: 'All memory systems' },
   'redis-nats': { t: 'Redis + NATS', l: 'Infrastructure', c: '#f97316', d: 'Redis: distributed cache. NATS JetStream: message bus.', f: 'Docker services', k: 'Cache, Job queue' },
-  tei: { t: 'TEI', l: 'Infrastructure', c: '#f97316', d: 'HuggingFace Text Embeddings Inference on GPU nodes.', f: 'Docker service', k: 'PageIndex KB, Conversation Memory' },
+  embedder: { t: 'Embedder', l: 'Infrastructure', c: '#f97316', d: 'The embedding engine on mesh nodes (an Ollama embedder serves harrier by default).', f: 'Docker service', k: 'PageIndex KB, Conversation Memory' },
   // Loops
   'loop-heartbeat': { t: 'Node Heartbeat', l: 'Infrastructure → System 1', c: '#f97316', d: 'The pulse of the cluster. Every 30s nodes report load, VRAM, running backends, GPU temp.' },
   'loop-feedback': { t: 'User Feedback', l: 'Interface → Identity', c: '#38bdf8', d: 'Human judgment shapes identity over time. Thumbs up/down and corrections become training signal.' },

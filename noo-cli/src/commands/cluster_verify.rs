@@ -5926,8 +5926,6 @@ pub(crate) const COMPOSE_BACKENDS: &[(&str, BackendFront)] = &[
     ("vllm-secondary", BackendFront::Stunnel("vllm-secondary")),
     ("llamacpp", BackendFront::Stunnel("llamacpp")),
     ("ollama", BackendFront::Stunnel("ollama")),
-    ("tei", BackendFront::Stunnel("tei")),
-    ("tei-gpu", BackendFront::Stunnel("tei-gpu")),
     ("reranker", BackendFront::Stunnel("reranker")),
     ("ollama-embed", BackendFront::Stunnel("ollama-embed")),
     ("ollama-embed-cpu", BackendFront::Stunnel("ollama-embed-cpu")),
@@ -12198,7 +12196,7 @@ mod tests {
     }
 
     /// Every shape of the `backend doors` row, one plant at a time, on a
-    /// node running vLLM and TEI in Docker and a NATIVE ollama (no door —
+    /// node running vLLM and a reranker in Docker and a NATIVE ollama (no door —
     /// the operator's loopback process, never judged here).
     #[test]
     fn the_backend_doors_row_judges_each_shape() {
@@ -12207,24 +12205,24 @@ mod tests {
         let far = now + 80 * 86_400;
         let base = || {
             let mut n = healthy(now);
-            n["running_backends"] = serde_json::json!({"vllm": "m", "embedding": "harrier", "ollama": "gemma"});
-            n["backend_runtimes"] = serde_json::json!({"vllm": "docker", "embedding": "docker", "ollama": "native"});
+            n["running_backends"] = serde_json::json!({"vllm": "m", "reranker": "bge-reranker-v2-m3-Q8_0.gguf", "ollama": "gemma"});
+            n["backend_runtimes"] = serde_json::json!({"vllm": "docker", "reranker": "docker", "ollama": "native"});
             n["backend_leaves"] = serde_json::json!({
                 "vllm": {"dns": ["vllm", "noo-vllm", "noo-vllm-secondary"], "not_after": far},
-                "tei": {"dns": ["tei", "noo-stunnel-tei"], "not_after": far},
+                "reranker": {"dns": ["reranker", "noo-stunnel-reranker"], "not_after": far},
             });
             n
         };
         let good = |svc: &str| match svc {
             "vllm" => door_leaf(&["vllm", "localhost", "noo-vllm", "noo-vllm-secondary"], far),
-            "tei" => door_leaf(&["tei", "localhost", "noo-stunnel-tei"], far),
+            "reranker" => door_leaf(&["reranker", "localhost", "noo-stunnel-reranker"], far),
             other => panic!("read a leaf for {other}, which has no docker backend here"),
         };
         let judge = |n: &Value, leaf: &dyn Fn(&str) -> LeafState| backend_doors_check(n, leaf, now);
 
         let c = judge(&base(), &good);
         assert_eq!(c.verdict, Verdict::Ok, "{}", c.detail);
-        assert!(c.detail.contains("embedding") && c.detail.contains("vllm") && !c.detail.contains("ollama"), "{}", c.detail);
+        assert!(c.detail.contains("reranker") && c.detail.contains("vllm") && !c.detail.contains("ollama"), "{}", c.detail);
 
         // Agent predates the report: WARN, never OK, never FAIL on that alone.
         let mut n = base();
@@ -12236,10 +12234,10 @@ mod tests {
         // Refusals: backend_door (plaintext) and backend_tls (refused start).
         for scope in ["backend_door", "backend_tls"] {
             let mut n = base();
-            n["reconcile_refusals"] = serde_json::json!([{ "scope": scope, "target": "embedding", "reason": "r" }]);
+            n["reconcile_refusals"] = serde_json::json!([{ "scope": scope, "target": "reranker", "reason": "r" }]);
             let c = judge(&n, &good);
             assert_eq!(c.verdict, Verdict::Fail, "{scope}");
-            assert!(c.detail.contains("embedding") && c.detail.contains(scope), "{}", c.detail);
+            assert!(c.detail.contains("reranker") && c.detail.contains(scope), "{}", c.detail);
             assert!(c.remedy.as_deref().unwrap().starts_with("noo cluster provision host3"));
         }
 
@@ -12249,21 +12247,21 @@ mod tests {
             assert_eq!(c.verdict, Verdict::Fail, "{needle}: {}", c.detail);
             assert!(c.detail.contains(needle), "{needle}: {}", c.detail);
         };
-        fails(&|s: &str| if s == "tei" { LeafState::Missing } else { good(s) }, "holds no tei leaf");
-        fails(&|s: &str| if s == "tei" { door_leaf(&["tei", "noo-tei"], far) } else { good(s) }, "does not name noo-stunnel-tei");
+        fails(&|s: &str| if s == "reranker" { LeafState::Missing } else { good(s) }, "holds no reranker leaf");
+        fails(&|s: &str| if s == "reranker" { door_leaf(&["reranker", "noo-reranker"], far) } else { good(s) }, "does not name noo-stunnel-reranker");
         fails(&|s: &str| if s == "vllm" { door_leaf(&["noo-vllm"], now + 3 * 86_400) } else { good(s) }, "expires in 3 days");
 
         // Node-side report: missing, not naming the door, expiring.
         let mut n = base();
-        n["backend_leaves"].as_object_mut().unwrap().remove("tei");
+        n["backend_leaves"].as_object_mut().unwrap().remove("reranker");
         let c = judge(&n, &good);
         assert_eq!(c.verdict, Verdict::Fail);
-        assert!(c.detail.contains("node holds no services/tei leaf"), "{}", c.detail);
+        assert!(c.detail.contains("node holds no services/reranker leaf"), "{}", c.detail);
         let mut n = base();
         n["backend_leaves"]["vllm"]["dns"] = serde_json::json!(["vllm"]);
         assert!(judge(&n, &good).detail.contains("node's services/vllm leaf does not name noo-vllm"));
         let mut n = base();
-        n["backend_leaves"]["tei"]["not_after"] = serde_json::json!(now + 86_400);
+        n["backend_leaves"]["reranker"]["not_after"] = serde_json::json!(now + 86_400);
         assert_eq!(judge(&n, &good).verdict, Verdict::Fail);
 
         // vllm-secondary shares the vllm leaf and is dialled by its own name.
@@ -12274,13 +12272,13 @@ mod tests {
     }
 
     /// A node record whose `backend doors` fails only because the node has
-    /// no tei leaf YET, with the node's `backend_containers` report as given
+    /// no reranker leaf YET, with the node's `backend_containers` report as given
     /// `far`-dated leaves otherwise.
     fn door_warmup_case(now: i64, containers: Option<Value>) -> (Value, impl Fn(&str) -> crate::commands::node_leaves::LeafState) {
         let far = now + 80 * 86_400;
         let mut n = healthy(now);
-        n["running_backends"] = serde_json::json!({"vllm": "m", "embedding": "harrier"});
-        n["backend_runtimes"] = serde_json::json!({"vllm": "docker", "embedding": "docker"});
+        n["running_backends"] = serde_json::json!({"vllm": "m", "reranker": "bge-reranker-v2-m3-Q8_0.gguf"});
+        n["backend_runtimes"] = serde_json::json!({"vllm": "docker", "reranker": "docker"});
         n["backend_leaves"] = serde_json::json!({
             "vllm": {"dns": ["vllm", "noo-vllm", "noo-vllm-secondary"], "not_after": far},
         });
@@ -12289,7 +12287,7 @@ mod tests {
         }
         let good = move |svc: &str| match svc {
             "vllm" => door_leaf(&["vllm", "localhost", "noo-vllm", "noo-vllm-secondary"], far),
-            "tei" => door_leaf(&["tei", "localhost", "noo-stunnel-tei"], far),
+            "reranker" => door_leaf(&["reranker", "localhost", "noo-stunnel-reranker"], far),
             other => panic!("read a leaf for {other}"),
         };
         (n, good)
@@ -12302,7 +12300,7 @@ mod tests {
         e
     }
 
-    /// The first verify after a bundle apply. The node's tei
+    /// The first verify after a bundle apply. The node's reranker
     /// door has no leaf yet and its container started 5s ago, health
     /// starting: `starting`, not FAIL, no remedy. Past the window the same
     /// record FAILs and names the backend.
@@ -12310,42 +12308,42 @@ mod tests {
     fn a_node_backend_five_seconds_old_and_starting_reads_starting() {
         let now = 1_800_000_000;
         let (n, leaf) = door_warmup_case(now, Some(serde_json::json!({
-            "vllm": life(now, 4000, Some("healthy")), "embedding": life(now, 5, Some("starting")) })));
+            "vllm": life(now, 4000, Some("healthy")), "reranker": life(now, 5, Some("starting")) })));
         let c = backend_doors_check(&n, &leaf, now);
         assert_eq!(c.verdict, Verdict::Starting, "{}", c.detail);
-        assert!(c.detail.starts_with("starting (embedding 5s since start, health=starting"), "{}", c.detail);
-        assert!(c.detail.contains("node holds no services/tei leaf"), "the unproven problem stays visible: {}", c.detail);
+        assert!(c.detail.starts_with("starting (reranker 5s since start, health=starting"), "{}", c.detail);
+        assert!(c.detail.contains("node holds no services/reranker leaf"), "the unproven problem stays visible: {}", c.detail);
         assert!(c.remedy.is_none(), "{:?}", c.remedy);
         assert_eq!(checks_json(&[c])[0]["verdict"], "starting");
 
         // The agent's own refusal for that missing leaf (the reason text
         // node-agent-go writes) is warm-up too.
-        let (mut n, leaf) = door_warmup_case(now, Some(serde_json::json!({ "embedding": life(now, 5, Some("starting")) })));
-        n["backend_leaves"]["tei"] = serde_json::json!({"dns": ["tei", "noo-stunnel-tei"], "not_after": now + 80 * 86_400});
-        n["reconcile_refusals"] = serde_json::json!([{ "scope": "backend_tls", "target": "embedding",
-            "reason": "this node's PKI dir has no services/tei leaf (/etc/noo/pki/services/tei/service.crt: no such file or directory); ..." }]);
+        let (mut n, leaf) = door_warmup_case(now, Some(serde_json::json!({ "reranker": life(now, 5, Some("starting")) })));
+        n["backend_leaves"]["reranker"] = serde_json::json!({"dns": ["reranker", "noo-stunnel-reranker"], "not_after": now + 80 * 86_400});
+        n["reconcile_refusals"] = serde_json::json!([{ "scope": "backend_tls", "target": "reranker",
+            "reason": "this node's PKI dir has no services/reranker leaf (/etc/noo/pki/services/reranker/service.crt: no such file or directory); ..." }]);
         n["backend_containers"]["vllm"] = life(now, 4000, Some("healthy"));
         let c = backend_doors_check(&n, &leaf, now);
         assert_eq!(c.verdict, Verdict::Starting, "{}", c.detail);
 
         // Past the window: FAIL, remedy kept, the backend named.
         let (n, leaf) = door_warmup_case(now, Some(serde_json::json!({
-            "embedding": life(now, warmup::WARMUP_WINDOW_SECS, Some("starting")) })));
+            "reranker": life(now, warmup::WARMUP_WINDOW_SECS, Some("starting")) })));
         let c = backend_doors_check(&n, &leaf, now);
         assert_eq!(c.verdict, Verdict::Fail, "{}", c.detail);
-        assert!(c.detail.contains("the embedding container has been up 180s, past the 180s warm-up"), "{}", c.detail);
+        assert!(c.detail.contains("the reranker container has been up 180s, past the 180s warm-up"), "{}", c.detail);
         assert!(c.remedy.is_some());
 
         // Inside the window but not warming: unhealthy, healthy, stopped.
         for e in [life(now, 5, Some("unhealthy")), life(now, 5, Some("healthy")),
             serde_json::json!({"running": false, "started_at": now - 5})] {
-            let (n, leaf) = door_warmup_case(now, Some(serde_json::json!({ "embedding": e.clone() })));
+            let (n, leaf) = door_warmup_case(now, Some(serde_json::json!({ "reranker": e.clone() })));
             let c = backend_doors_check(&n, &leaf, now);
             assert_eq!(c.verdict, Verdict::Fail, "{e}: {}", c.detail);
-            assert!(c.detail.contains("the embedding container"), "{}", c.detail);
+            assert!(c.detail.contains("the reranker container"), "{}", c.detail);
         }
         // No healthcheck declared: uptime alone explains it, as for Loki.
-        let (n, leaf) = door_warmup_case(now, Some(serde_json::json!({ "embedding": life(now, 40, None) })));
+        let (n, leaf) = door_warmup_case(now, Some(serde_json::json!({ "reranker": life(now, 40, None) })));
         assert_eq!(backend_doors_check(&n, &leaf, now).verdict, Verdict::Starting);
     }
 
@@ -12362,8 +12360,8 @@ mod tests {
         for report in [
             serde_json::json!({}),
             serde_json::json!({ "vllm": life(now, 5, Some("starting")) }),
-            serde_json::json!({ "embedding": {"running": true, "health": "starting"} }),
-            serde_json::json!({ "embedding": {"started_at": now - 5, "health": "starting"} }),
+            serde_json::json!({ "reranker": {"running": true, "health": "starting"} }),
+            serde_json::json!({ "reranker": {"started_at": now - 5, "health": "starting"} }),
             Value::Null,
         ] {
             let (n, leaf) = door_warmup_case(now, Some(report.clone()));
@@ -12377,7 +12375,7 @@ mod tests {
     #[test]
     fn backend_doors_security_faults_never_soften() {
         let now = 1_800_000_000;
-        let fresh = serde_json::json!({ "vllm": life(now, 5, Some("starting")), "embedding": life(now, 5, Some("starting")) });
+        let fresh = serde_json::json!({ "vllm": life(now, 5, Some("starting")), "reranker": life(now, 5, Some("starting")) });
         type Plant = Box<dyn Fn(&mut Value)>;
         let plants: Vec<(&str, Plant)> = vec![
             ("node leaf not naming its door", Box::new(|n: &mut Value| n["backend_leaves"]["vllm"]["dns"] = serde_json::json!(["vllm"]))),

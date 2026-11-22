@@ -580,7 +580,6 @@ pub fn is_embedding_model_name(model: &str) -> bool {
         .iter()
         .any(|p| base.starts_with(p))
         || base == "bge"
-        || base == "tei"
 }
 
 /// What a running `(backend, model)` on this node is for chat: the model to
@@ -2251,7 +2250,7 @@ mod tests {
     fn a_backend_with_no_model_is_unreported_and_in_no_class() {
         let data = serde_json::json!({
             "id": "host3", "ip_address": "10.0.0.3", "last_heartbeat": 1000.0,
-            "running_backends": {"vllm": "", "llamacpp": null, "ollama": "gemma4:12b", "tei": ""},
+            "running_backends": {"vllm": "", "llamacpp": null, "ollama": "gemma4:12b", "reranker": ""},
         });
         let f = node_facts_from_kv("host3", &data, &[], 1001.0);
         let mut unreported = f.unreported.clone();
@@ -2359,6 +2358,9 @@ mod tests {
         for m in ["qwen2.5:0.5b", "gemma4:12b", "llama3.2:1b"] {
             assert!(!is_embedding_model_name(m), "{m}");
         }
+        // i1182a: `tei` was the engine's name, not an embedding model's; a model
+        // called that is a chat model like any other.
+        assert!(!is_embedding_model_name("tei"));
         let rows: Vec<PlacementRow> = vec![("ctl".into(), "ollama".into(), Some("harrier-chat".into()), "chat".into())];
         let t = build_table(&[embed_node("harrier-chat")], &rows, &Declarations::default());
         pool_has_only_chat(&t, "harrier-chat");

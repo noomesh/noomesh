@@ -2586,8 +2586,11 @@ const KNOWN_KINDS: &[&str] = &[
     // A node's backend door leaves, one pair per door
     // service — `node_leaves::NODE_DOOR_LEAVES`.
     "svc-vllm.crt", "svc-vllm.key", "svc-llamacpp.crt", "svc-llamacpp.key",
-    "svc-ollama.crt", "svc-ollama.key", "svc-tei.crt", "svc-tei.key",
+    "svc-ollama.crt", "svc-ollama.key",
     "svc-reranker.crt", "svc-reranker.key",
+    // i1182a: accepted for one release after TEI's removal; drop in 0.6.31
+    // (0.6.30's controller no longer issues or packs it; a 0.6.29 controller's bundle still carries it.)
+    "svc-tei.crt", "svc-tei.key",
     // The vendor CLIs a node carries, each with its manifest (i83 E1e;
     // `cluster_vendor::VENDOR_SLOTS`).
     "vendor-cli", "vendor-cli-manifest",
@@ -4433,13 +4436,34 @@ mod tests {
     }
 
     /// The Mac's verifier accepts a bundle carrying the leaf kinds, signed
-    /// the way the controller signs.
+    /// the way the controller signs. This is a 0.6.30 bundle: no `svc-tei`
+    /// (the controller stopped issuing it; i1182a).
     #[test]
     fn a_bundle_carrying_door_leaves_verifies() {
         let f = fixture("leaves");
         let ca = ca_of(&f);
         ca.ensure_signing_key().unwrap();
         std::fs::copy(ca.signing_pub_path(), f.dir.join("pki/signing.pub")).unwrap();
+        for k in ["svc-vllm", "svc-llamacpp", "svc-ollama", "svc-reranker"] {
+            stage_file(&f, &format!("{k}.crt"), "c");
+            stage_file(&f, &format!("{k}.key"), "k");
+        }
+        sign_stage(&f, &ca.signing_key_path());
+        assert!(verify(&f).is_ok(), "{:?}", verify(&f));
+    }
+
+    /// i1182a (expand then contract): a bundle from a 0.6.29 controller still
+    /// carries `svc-tei.crt`/`.key`; a 0.6.30 verifier must accept it, so the
+    /// rolling upgrade never refuses a bundle whole (exit 76 on an unknown
+    /// kind). Dropped in 0.6.31.
+    #[test]
+    fn a_bundle_from_0_6_29_carrying_svc_tei_still_verifies() {
+        let f = fixture("leaves-tei");
+        let ca = ca_of(&f);
+        ca.ensure_signing_key().unwrap();
+        std::fs::copy(ca.signing_pub_path(), f.dir.join("pki/signing.pub")).unwrap();
+        stage_file(&f, "svc-vllm.crt", "c");
+        stage_file(&f, "svc-vllm.key", "k");
         stage_file(&f, "svc-tei.crt", "c");
         stage_file(&f, "svc-tei.key", "k");
         sign_stage(&f, &ca.signing_key_path());

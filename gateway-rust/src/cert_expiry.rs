@@ -184,7 +184,7 @@ mod tests {
     fn role_matches_python_layout() {
         assert_eq!(role_of(&pki(), Path::new("/pki/gateway/server.crt")), "gateway");
         assert_eq!(role_of(&pki(), Path::new("/pki/nodes/host9.crt")), "node");
-        assert_eq!(role_of(&pki(), Path::new("/pki/services/tei.crt")), "service");
+        assert_eq!(role_of(&pki(), Path::new("/pki/services/reranker.crt")), "service");
         assert_eq!(role_of(&pki(), Path::new("/pki/ca.crt")), "ca");
         assert_eq!(role_of(&pki(), Path::new("/pki/stray.crt")), "other");
     }
