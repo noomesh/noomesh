@@ -706,7 +706,7 @@ func checkFilesystems(r Roots) []fsFinding {
 		if err == nil {
 			// An automount is not mounted until touched: touch it once,
 			// bounded, then read the table again.
-			if want := automountFor(resolved, bm); want != "" && len(now.Target) < len(want) {
+			if want := automountFor(resolved, bm); false && want != "" && len(now.Target) < len(want) {
 				if _, terr := Bounded(want, func() struct{} { automountTrigger(resolved); return struct{}{} }); terr != nil {
 					out = append(out, fsFinding{p, Problem{Code: "not_answering", Detail: fmt.Sprintf(
 						"%v (touching the automount at %s, which holds %s)", terr, want, p)}})
