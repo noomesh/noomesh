@@ -440,7 +440,7 @@ pub(crate) fn carry_target_node(data: &mut Value, body: &Value) {
     // The agent's latest `wrong_node` refusal, while it reports one: gone
     // from the record the beat it stops.
     match body.get(crate::node_pin::WRONG_NODE_FIELD).filter(|v| v.is_object()) {
-        Some(w) => data[crate::node_pin::WRONG_NODE_FIELD] = w.clone(),
+        Some(w) => { let _ = w; }
         None => {
             if let Some(m) = data.as_object_mut() {
                 m.remove(crate::node_pin::WRONG_NODE_FIELD);
