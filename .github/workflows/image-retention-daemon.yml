@@ -1,0 +1,96 @@
+# A REAL-daemon proof of hostd rung 5's image removal (noomesh-internal
+# i1206): one leg per image store, each asserting the store it was given,
+# then the gated Go tests in node-agent-go/internal/hostd/
+# image_retention_daemon_test.go against that daemon.
+#
+# The bug this guards lived between a model and a daemon: on the containerd
+# image store removing one ref can delete the image, and the later refs'
+# "No such image" read as refusals, with the reason lost to stderr.
+name: image-retention-daemon
+
+on:
+  pull_request:
+    branches: [ main, staging, develop, dev ]
+    paths:
+      - 'node-agent-go/internal/hostd/image_retention*.go'
+      - 'node-agent-go/internal/hostd/exec.go'
+      - '.github/workflows/image-retention-daemon.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: image-retention-daemon-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  removal:
+    name: removal (${{ matrix.daemon }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        daemon: [ runner-classic, docker-29-containerd, docker-29-classic ]
+    env:
+      DIND_IMAGE: docker:29-dind@sha256:7bf70dcb85c822e3fa6f2d332143e474b99147b9d7b39102b0cfe8b04a7dd61b
+      DIND_HOST: tcp://127.0.0.1:2375
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e   # v7.0.0
+        with:
+          go-version-file: node-agent-go/go.mod
+
+      - name: Start a Docker 29 daemon (dind) with the store this leg names
+        if: matrix.daemon != 'runner-classic'
+        run: |
+          set -eu
+          case "${{ matrix.daemon }}" in
+            docker-29-containerd) feat=true ;;
+            docker-29-classic)    feat=false ;;
+          esac
+          # No TLS: plain tcp 2375, published on the runner's loopback only.
+          docker run -d --privileged --name dind -e DOCKER_TLS_CERTDIR= \
+            -p 127.0.0.1:2375:2375 "$DIND_IMAGE" --feature "containerd-snapshotter=$feat"
+          for i in $(seq 1 60); do
+            docker -H "$DIND_HOST" version >/dev/null 2>&1 && break
+            sleep 2
+          done
+          ver="$(docker -H "$DIND_HOST" version --format '{{.Server.Version}}')"
+          echo "dind daemon: Docker $ver"
+          case "$ver" in
+            29.*) ;;
+            *) echo "::error::$DIND_IMAGE answered as Docker $ver, not 29: this leg would prove nothing"; exit 1 ;;
+          esac
+          echo "DOCKER_HOST=$DIND_HOST" >> "$GITHUB_ENV"
+
+      - name: Assert the image store this leg is meant to test
+        run: |
+          set -eu
+          status="$(docker info --format '{{.Driver}} {{json .DriverStatus}}')"
+          echo "store: $status"
+          case "${{ matrix.daemon }}" in
+            docker-29-containerd)
+              echo "$status" | grep -q 'io.containerd.snapshotter' \
+                || { echo "::error::the containerd snapshotter is not on: this leg would prove nothing"; exit 1; } ;;
+            *)
+              if echo "$status" | grep -q 'io.containerd.snapshotter'; then
+                echo "::error::the containerd snapshotter is on in a classic leg: this leg would prove nothing"; exit 1
+              fi ;;
+          esac
+
+      - name: Rung 5 removes every ref of an image with no refusal, and a real refusal carries Docker's words
+        working-directory: node-agent-go
+        env:
+          NOO_REAL_DAEMON_RETENTION_TEST: "1"
+        run: |
+          set -eu
+          echo "DOCKER_HOST=${DOCKER_HOST:-the runner socket}"
+          go test -count=1 -v -run '^TestRealDaemon(RemovesEveryRefOfAnImageWithNoRefusal|RefusesAnImageAStoppedContainerUsesWithDockersWords)$' ./internal/hostd/
+
+      - name: dind log
+        if: always() && matrix.daemon != 'runner-classic'
+        run: env -u DOCKER_HOST docker logs dind 2>&1 | tail -n 50 || true
