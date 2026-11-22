@@ -194,23 +194,6 @@ pub(crate) fn prove_node_at(ca_pem: &[u8], pinned_cert_pem: &[u8], addr: &str, p
     Err(reason.unwrap_or_else(|| format!("the TLS handshake with {addr}:{port} ended before the node proved its key")))
 }
 
-/// Is `addr` a private address (RFC 1918, CGNAT 100.64/10, link-local, IPv6
-/// unique-local or link-local)? Only a private, unclaimed address gets the
-/// `--prove` remedy in verify; a public one keeps the explicit push.
-pub(crate) fn is_private_addr(addr: &str) -> bool {
-    match addr.trim().parse::<std::net::IpAddr>() {
-        Ok(std::net::IpAddr::V4(v4)) => {
-            let o = v4.octets();
-            v4.is_private() || v4.is_link_local() || (o[0] == 100 && (64..128).contains(&o[1]))
-        }
-        Ok(std::net::IpAddr::V6(v6)) => {
-            let s = v6.segments()[0];
-            (s & 0xfe00) == 0xfc00 || (s & 0xffc0) == 0xfe80
-        }
-        Err(_) => false,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -390,15 +373,5 @@ mod tests {
         let code = include_str!("node_prove.rs");
         let body = crate::test_src::fn_body(code, "pub(crate) fn prove_node_at(");
         assert!(body.contains("config.resumption = rustls::client::Resumption::disabled();"), "a resumed session would skip CertificateVerify");
-    }
-
-    #[test]
-    fn private_addresses_are_rfc1918_cgnat_link_local_and_ula() {
-        for a in ["10.1.2.3", "172.16.0.9", "192.168.1.5", "100.64.0.7", "100.64.0.255", "169.254.1.1", "fd00::1", "fe80::1"] {
-            assert!(is_private_addr(a), "{a}");
-        }
-        for a in ["8.8.8.8", "100.128.0.1", "100.63.255.255", "2001:db8::1", "node_a", ""] {
-            assert!(!is_private_addr(a), "{a}");
-        }
     }
 }

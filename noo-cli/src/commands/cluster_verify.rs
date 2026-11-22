@@ -3554,14 +3554,9 @@ pub(crate) fn agent_cert_check(id: &str, host: &str, covers: Option<bool>, other
             ),
             remedy: None,
         }.checked(),
-        // A private address is re-issued only on proof that the node serves
-        // it (`--prove`: a dial-back pinned to the node's own key, i1074); a
-        // public one keeps the explicit push the operator vouches for.
-        None if crate::commands::node_prove::is_private_addr(host) => fail(
-            "agent certificate",
-            format!("{id}: its certificate does not cover the address the controller dials it at ({host}), so every call to it fails TLS (imports, logs, metrics); `noo security pki push-nodes {id} --prove` checks that {host} is served by {id} and then issues it a certificate for {host}"),
-            format!("noo security pki push-nodes {id} --prove   # then: noo cluster verify"),
-        ),
+        // Unclaimed: re-issued only on proof that the node serves the address
+        // (`--prove`: a dial-back pinned to the node's own key, #1457), private
+        // or public alike, since plain push-nodes mints only vetted addresses.
         None => fail(
             "agent certificate",
             format!("{id}: its certificate does not cover the address the controller dials it at ({host}), so every call to it fails TLS (imports, logs, metrics); {host} is not {id}'s enrollment, tailnet or current-leaf address, so `noo security pki push-nodes {id} --prove` will issue it a certificate for {host} once the node there proves it holds {id}'s current key"),
@@ -18222,13 +18217,15 @@ mod agent_cert_tests {
     use super::*;
 
     #[test]
-    fn a_private_address_is_reissued_only_on_proof() {
-        let row = agent_cert_check("node-b", "10.0.0.41", Some(false), None).expect("a row");
-        assert_eq!(row.verdict, Verdict::Fail);
-        assert_eq!(row.remedy.as_deref(), Some("noo security pki push-nodes node-b --prove   # then: noo cluster verify"));
-        // A public address keeps the explicit push; a claimed one gets none.
-        let public = agent_cert_check("node-b", "192.0.2.41", Some(false), None).unwrap();
-        assert!(!public.remedy.as_deref().unwrap().contains("--prove"));
+    fn an_unclaimed_address_is_reissued_only_on_proof() {
+        // Private or public, one remedy: plain push-nodes mints only vetted
+        // addresses (i1174), so the proof form is the way to a new one.
+        for host in ["10.0.0.41", "192.0.2.41"] {
+            let row = agent_cert_check("node-b", host, Some(false), None).expect("a row");
+            assert_eq!(row.verdict, Verdict::Fail);
+            assert_eq!(row.remedy.as_deref(), Some("noo security pki push-nodes node-b --prove   # then: noo cluster verify node-b"));
+        }
+        // A claimed one gets none.
         assert!(agent_cert_check("node-b", "10.0.0.41", Some(false), Some("node-c")).unwrap().remedy.is_none());
     }
 
