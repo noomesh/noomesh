@@ -8757,9 +8757,14 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                 let (line, guide) = unreachable_from_node(&node.name, node.controller_url.as_deref(), has_ts);
                 if g.json {
                     println!("{}", serde_json::json!({ "ok": false, "error": "controller unreachable from this node", "node": node.name,
-                        "controller_url": node.controller_url, "detail": line,
+                        "controller_url": node.controller_url, "detail": line, "controller": { "ok": false, "checks": checks_json(&bus) },
                         "next": guide.iter().map(|(c, _)| next_cmd(c, &[])).collect::<Vec<_>>() }));
                 } else {
+                    // The bus row, when /health answered with the bus down:
+                    // as true on a node as on the controller.
+                    if !bus.is_empty() {
+                        render("controller", &bus, true);
+                    }
                     println!("{}", ui::status_line(Glyph::Err, &line));
                     let g2: Vec<(&str, &str)> = guide.iter().map(|(c, w)| (c.as_str(), w.as_str())).collect();
                     ui::guide(&g2);
