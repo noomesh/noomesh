@@ -2439,8 +2439,13 @@ pub(crate) fn data_root_policy_row(n: &Value) -> Option<Check> {
     let pol = n.get("data_roots")?.get("policy")?;
     let id = n["id"].as_str().unwrap_or("?");
     let root = n["data_roots"]["noo_data_root"].as_str().unwrap_or("<root>");
+    // What the agent reads the root as (i1160): a boot-time mount (fstab or a
+    // systemd mount unit), a disk recorded at a known-good start, or a plain
+    // directory. Older agents do not say; then nothing is shown.
+    let kind = data_root_kind(&pol["filesystem"]);
     if pol["ok"].as_bool() == Some(true) {
-        return Some(ok(NAME, format!("{root}: dedicated, conventional and owned by the agent")));
+        let k = kind.as_deref().map(|k| format!("; {k}")).unwrap_or_default();
+        return Some(ok(NAME, format!("{root}: dedicated, conventional and owned by the agent{k}")));
     }
     let probs: Vec<&Value> = pol["problems"].as_array().map(|a| a.iter().collect()).unwrap_or_default();
     let codes: Vec<&str> = probs.iter().filter_map(|p| p["code"].as_str()).collect();
@@ -2474,7 +2479,10 @@ pub(crate) fn data_root_policy_row(n: &Value) -> Option<Check> {
         };
         format!("noo cluster set-config {id} --data-root {target} && noo cluster provision {id} --move-data --wait")
     };
-    let msg = format!("{root}: {detail}");
+    let msg = match &kind {
+        Some(k) => format!("{root} [{k}]: {detail}"),
+        None => format!("{root}: {detail}"),
+    };
     // Refused in warn mode too (the agent's safety problems, i1160): a root
     // that does not answer, or whose mount is not there.
     if codes.contains(&"not_answering") {
@@ -2493,6 +2501,18 @@ pub(crate) fn data_root_policy_row(n: &Value) -> Option<Check> {
     Some(if pol["mode"] == "enforce" { fail(NAME, msg, remedy) } else { warn(NAME, msg, Some(remedy)) })
 }
 
+/// `data_roots.policy.filesystem` as the row shows it: "mount (fstab)",
+/// "mount (systemd unit)", "mount (recorded)", "directory"; None when the
+/// agent does not say (older agents, or not Linux).
+fn data_root_kind(fs: &Value) -> Option<String> {
+    match (fs["meant"].as_str()?, fs["by"].as_str().unwrap_or("")) {
+        ("mount", "") => Some("mount".to_string()),
+        ("mount", by) => Some(format!("mount ({by})")),
+        ("directory", _) => Some("directory".to_string()),
+        _ => None,
+    }
+}
+
 /// The agent's record of each data root's filesystem
 /// (node-agent-go/internal/dataroots/fsid.go RecordFileName, in its state dir).
 const DATA_ROOT_FS_RECORD: &str = "/var/lib/noo-node-agent/data-root-fs.json";
@@ -2502,7 +2522,7 @@ const DATA_ROOT_FS_RECORD: &str = "/var/lib/noo-node-agent/data-root-fs.json";
 /// directory on the ROOT disk, which the agent then fills and the mount
 /// later hides (i1160).
 pub(crate) fn data_root_mount_remedy(id: &str, root: &str) -> String {
-    format!("on {id}: the mount for {root} is not there: mount it (check `findmnt {root}` / your fstab) — do NOT create the directory, a mount would hide it; \
+    format!("on {id}: the mount for {root} is not there: mount it (check `findmnt {root}`, your fstab or systemd mount unit) — do NOT create the directory, a mount would hide it; \
              the agent clears this by itself once the mount is back")
 }
 
@@ -15864,7 +15884,7 @@ mod config_mount_tests {
             json!({"id": "node_a", "data_roots": {"noo_data_root": "/data/noo", "policy": pol}})
         };
         let mount = super::data_root_policy_row(&missing(Some("mount"))).unwrap().remedy.unwrap();
-        assert!(mount.starts_with("on node_a: the mount for /data/noo is not there: mount it (check `findmnt /data/noo` / your fstab)"), "{mount}");
+        assert!(mount.starts_with("on node_a: the mount for /data/noo is not there: mount it (check `findmnt /data/noo`, your fstab or systemd mount unit)"), "{mount}");
         assert!(mount.contains("do NOT create the directory") && !mount.contains("install -d"), "{mount}");
         // An agent that cannot say (older, or nothing recorded): the mount first.
         let unknown = super::data_root_policy_row(&missing(None)).unwrap().remedy.unwrap();
@@ -15881,6 +15901,25 @@ mod config_mount_tests {
         let r = c.remedy.unwrap();
         assert!(r.starts_with("on node_a: the mount for /data/noo is not there") && !r.contains("install -d"), "{r}");
         assert!(r.contains("data-root-fs.json"), "{r}");
+    }
+
+    /// i1160: the row says what the agent reads the root as, from what the
+    /// machine declares (fstab, a systemd mount unit) or its record.
+    #[test]
+    fn the_data_root_row_shows_mount_or_directory() {
+        use serde_json::json;
+        let row = |fs: serde_json::Value, ok: bool| {
+            let probs = if ok { json!([]) } else { json!([{"code": "mount_missing", "detail": "not mounted"}]) };
+            let n = json!({"id": "node_a", "data_roots": {"noo_data_root": "/data/noo",
+                "policy": {"mode": "warn", "ok": ok, "problems": probs, "filesystem": fs}}});
+            super::data_root_policy_row(&n).unwrap().detail
+        };
+        assert_eq!(row(json!({"meant": "mount", "by": "fstab"}), true),
+            "/data/noo: dedicated, conventional and owned by the agent; mount (fstab)");
+        assert_eq!(row(json!({"meant": "directory", "by": ""}), true),
+            "/data/noo: dedicated, conventional and owned by the agent; directory");
+        assert_eq!(row(json!({"meant": "mount", "by": "systemd unit"}), false), "/data/noo [mount (systemd unit)]: not mounted");
+        assert_eq!(row(json!({"meant": "unknown", "by": ""}), true), "/data/noo: dedicated, conventional and owned by the agent");
     }
 
     #[test]

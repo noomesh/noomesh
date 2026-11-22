@@ -97,30 +97,104 @@ from a fresh install: record it from a healthy boot, not a degraded one.
 
 ### Nodes: the agent's own check (0.6.30)
 
-Each node agent checks its own data roots the same way, from the kernel's
-mount table, and keeps its record in its state directory
-(`/var/lib/noo-node-agent/data-root-fs.json`, one entry per root). It records
-a root the first time it sees it on its own disk. A root on the root disk is
-recorded only when the node declares it a plain directory
-(`NOO_DATA_ROOT_FS=directory` in `/etc/noo-node-agent.local.env`).
+Each Linux node agent checks its own data roots (`NOO_DATA_ROOT`, plus
+`HF_CACHE_DIR`, `MODELS_DIR` and `OLLAMA_DATA_DIR` when they are set
+elsewhere) from the kernel's mount table. It keeps a record of each root's
+filesystem in its state directory (`/var/lib/noo-node-agent/data-root-fs.json`).
+On macOS the agent does not run this check; the rest of the data-root policy
+still applies.
 
-When a mount is late at boot, or gone, the root is an empty directory on the
-root disk. The agent then **refuses, in warn mode too**: no backend start, no
-model fetch, no directory created under it. `noo cluster verify` shows `data
-root policy` as FAIL (`not_on_recorded_fs`). With nothing recorded yet, the
-agent also refuses when `/etc/fstab` mounts something above the root that is
-not mounted, or when the node declares `NOO_DATA_ROOT_FS=mount` and the root
-is on the root disk (`mount_missing`). Nothing waits: the agent checks again
-at every use, so once the mount is back the refusal clears by itself.
+**Mount or plain directory.** There is no setting for this. The agent reads
+what the machine already declares for boot. A root is a **mount** when a
+boot-time mount covers it: an `/etc/fstab` line, or a systemd mount unit in
+`/etc/systemd/system` or `/run/systemd/generator*`. A line or unit with
+`noauto` does not count, unless it is also an automount
+(`x-systemd.automount`). A unit file in `/etc/systemd/system` counts whether
+or not it is enabled. Anything else is a **plain directory**. The `data root
+policy` row in `noo cluster verify` shows which: `mount (fstab)`, `mount
+(systemd unit)`, `mount (recorded)` (it was on its own disk at a good start,
+with no boot-time mount declared) or `directory`.
 
-A data root on a hung mount (a hard NFS mount, a dead USB disk) no longer
-silences the node. Each disk probe waits at most 5 s, the heartbeat still
-goes out, and verify shows `data root <path> not answering` as FAIL.
+**What the agent refuses, and when.** There are three cases:
 
-The fix is to mount the disk (`findmnt <data root>`, your fstab), never to
-create the directory: a mount would hide it, along with anything the agent
-wrote there. After a deliberate disk change, remove the record file on the
-node; the agent records the new disk at its next check.
+- **Absent at start** (`mount_missing`): a boot-time mount covers the root and
+  nothing is recorded yet, but the mount is not there. For an automount, the
+  agent first touches the path once (bounded at 5 s) to trigger the mount,
+  then looks again.
+- **Not on its recorded filesystem** (`not_on_recorded_fs`): for example, the
+  disk did not mount, so the root is now an empty directory on the root disk.
+- **Not answering** (`not_answering`): a probe of the root, or the touch that
+  triggers an automount, takes longer than 5 s. A hard NFS mount or a failing
+  disk does this. The heartbeat still goes out.
+
+While a root is refused, the agent does not do these things:
+
+- start a backend;
+- accept a host path from the controller under that root (the placement's
+  models directory, bind sources);
+- create a directory under that root for a model fetch or import (a GGUF
+  pull, an HF weight preseed, a model set).
+
+Warn mode refuses these too. `NOO_DATA_ROOT_POLICY=warn` relaxes only the
+shape and ownership rules. The check gates starts and writes; it does not stop
+a backend that is already running.
+
+The refusal clears by itself. The agent checks again on every use: every
+backend start, every fetch, every reconcile tick and every heartbeat. The
+first check that passes logs `data root <path> is mounted now; the refusal is
+cleared` once. A network mount that is late at boot (`_netdev`, NFS, CIFS)
+clears the same way when it arrives. No command is needed.
+
+**First start, including the 0.6.30 roll on an existing node.** Nothing is
+recorded before 0.6.30, so the first start of a 0.6.30 agent is the first
+look:
+
+- A root under a boot-time mount that is mounted gets recorded.
+- A root under a boot-time mount that is NOT mounted is refused
+  (`mount_missing`), and nothing is recorded.
+- Any other root is recorded where it is, as a plain directory, even when it
+  is on the root disk.
+
+That last case has one edge. Say a disk mounted by hand, by a script or by
+the desktop (udisks), with no fstab line or mount unit, is absent at that
+first start. Its empty mount point is recorded as a directory. When the disk
+is mounted later, the agent refuses it (`not_on_recorded_fs`). It fails
+closed: verify shows the row as FAIL and names the record file. To make such
+a disk safe across reboots, give it an fstab line or a mount unit.
+
+**What noomesh creates or changes in a data root.**
+
+- **The node agent** runs as its own unprivileged account. It never chmods a
+  data root. It creates directories under a root only after the check above
+  passes:
+  - its own subdirectories (the models directory, HF cache repo folders,
+    model-set folders);
+  - the placement's models directory, under a root this node declared. The
+    agent then tries to change that directory's owner to the backend's user.
+    A change it is not permitted to make is logged once and skipped.
+
+  A plain-directory root that is missing outright is not a filesystem
+  refusal. Under the applier's systemd hold, the agent cannot create the root
+  itself, because its parent is read-only to the agent. Verify's remedy for
+  that case is `install -d`, which you run.
+- **The node applier** (`noo-apply`, root, run for each bundle) never creates
+  or chmods a data root. It does two narrower things:
+  - grants the agent's account execute-only traverse (an ACL) on an existing
+    parent directory that refuses it;
+  - re-owns `hf-cache/hub` to the agent's account, but only when that
+    directory is owned by root under an agent-owned `hf-cache`. It changes
+    the owner only, never the mode.
+- **The node's install script** (`prep-host`, which you run once with sudo
+  when you enroll the node) does more:
+  - creates the data root when it does not exist;
+  - creates `hf-cache`, `models` and `ollama`, and re-owns `hf-cache` and
+    `models` to the agent's account;
+  - grants the installing user an ACL on `models`.
+
+**The fix** is to mount the disk (`findmnt <data root>`, your fstab or mount
+unit). Never create the directory: the mount would hide it, along with
+anything written there. After a deliberate disk change, remove the record
+file on the node, and the agent records the new disk at its next check.
 
 ## For agents
 
