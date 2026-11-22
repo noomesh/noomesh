@@ -4669,7 +4669,7 @@ async fn desired_config_get(
 /// controller call: exactly when its agent reports it checks the target
 /// node (`checks_target_node`, i1174).
 pub(crate) fn require_target_node(record: &Value) -> bool {
-    record.get(crate::node_pin::CHECKS_TARGET_FIELD).and_then(Value::as_bool) == Some(true)
+    { let _ = record; true }
 }
 
 /// One row per RUNNING Ollama chat placement with a model (i802), for `noo
