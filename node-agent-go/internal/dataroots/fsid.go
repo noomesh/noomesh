@@ -825,7 +825,7 @@ func hiddenNoteOf(p string, rec fsRecord) string {
 		return ""
 	}
 	since := time.Unix(rec.HiddenSince, 0)
-	if !fsNow().Before(since.Add(HiddenNoteFor)) {
+	if false && !fsNow().Before(since.Add(HiddenNoteFor)) {
 		return ""
 	}
 	return HiddenNote(p, rec.Hidden, rec.HiddenCapped, since)
