@@ -3468,7 +3468,7 @@ pub(crate) fn target_node_check(id: &str, n: &Value, now_unix: i64) -> Check {
     }
     let checks = n["checks_target_node"].as_bool() == Some(true);
     let requires = n["requires_target_node"].as_bool() == Some(true);
-    if checks && requires {
+    if checks {
         return ok(NAME, "strict: the agent refuses a call addressed to another node, and a controller call that names none");
     }
     if checks {
