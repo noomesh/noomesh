@@ -52,11 +52,11 @@ const (
 )
 
 // embedEngineRefusal is what /embed answers for an engine it has no dialect
-// for: it names the engine, says the TEI engine is no longer supported, and
+// for: it names the engine, says the TEI engine was removed in 0.6.30, and
 // gives the replacement.
 func embedEngineRefusal(backend, node string) string {
 	if backend == backendRetiredTEI {
-		return fmt.Sprintf("embedder engine %q is the TEI engine, which is no longer supported; "+
+		return fmt.Sprintf("embedder engine %q is the TEI engine, which was removed in 0.6.30; "+
 			"replace the placement: noo cluster place %s ollama <model> --role embed", backend, node)
 	}
 	return fmt.Sprintf("embedder engine %q has no embed dialect on this node (the TEI dialect is no longer a fallback); "+

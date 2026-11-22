@@ -1074,7 +1074,7 @@ func (s *Server) embedProxyBody(w http.ResponseWriter, r *http.Request, body []b
 	// whose embed placement was live answered 503 no_local_embedder while
 	// ollama served the model fine.
 	tgt := embedTargetFor(body)
-	// The TEI engine (backend "embedding") is no longer supported: say so
+	// The TEI engine (backend "embedding") was removed in 0.6.30: say so
 	// before dialing a door that no longer exists.
 	if tgt.Backend == backendRetiredTEI {
 		jsonError(w, http.StatusBadGateway, "embedder_engine_unsupported",

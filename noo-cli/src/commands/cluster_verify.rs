@@ -1892,8 +1892,7 @@ pub(crate) fn removed_engine_check(n: &Value) -> Option<Check> {
             format!("noo cluster place {id} reranker <file>.gguf")
         };
         let who = if model.is_empty() { format!("{id} {backend}") } else { format!("{id} {backend} {model}") };
-        // PR 5 of the TEI removal changes "no longer supported" to "removed" once the code is gone (i1182a).
-        lines.push(format!("{who}: uses the TEI engine, which is no longer supported; this placement keeps running until it is replaced or unplaced: {replace} && `noo cluster unplace {id} {backend}`"));
+        lines.push(format!("{who}: uses the TEI engine, which was removed in 0.6.30; nothing runs for this placement; replace it, then unplace it: {replace} && `noo cluster unplace {id} {backend}`"));
         remedies.push(format!("{replace} && noo cluster unplace {id} {backend}"));
     }
     remedies.dedup();
@@ -1922,8 +1921,7 @@ pub(crate) fn removed_engine_space_check(body: Option<&Value>) -> Option<Check> 
     }
     let detail = stale
         .iter()
-        // PR 5 of the TEI removal changes "no longer supported" to "removed" once the code is gone (i1182a).
-        .map(|(sp, m)| format!("space {sp} model {m}: no node serves this model, and it is a Hugging Face id (the kind only the TEI engine, no longer supported, served); embed writes are refused until a node serves it or the space is migrated: `noo cluster embedding-space migrate {sp} <model>`"))
+        .map(|(sp, m)| format!("space {sp} model {m}: no node serves this model, and it is a Hugging Face id (the kind only the TEI engine, since removed, served); embed writes are refused until a node serves it or the space is migrated: `noo cluster embedding-space migrate {sp} <model>`"))
         .collect::<Vec<_>>()
         .join("; ");
     let remedy = stale
@@ -14223,7 +14221,7 @@ mod tests {
         let n = json!({"id": "node-a", "removed_engine_placements": found});
         let c = removed_engine_check(&n).expect("a row");
         assert_eq!(c.verdict, Verdict::Warn);
-        assert!(c.detail.contains("node-a embedding BAAI/bge-small-en-v1.5: uses the TEI engine, which is no longer supported; this placement keeps running until it is replaced or unplaced: noo cluster place node-a ollama <model> --role embed && `noo cluster unplace node-a embedding`"), "{}", c.detail);
+        assert!(c.detail.contains("node-a embedding BAAI/bge-small-en-v1.5: uses the TEI engine, which was removed in 0.6.30; nothing runs for this placement; replace it, then unplace it: noo cluster place node-a ollama <model> --role embed && `noo cluster unplace node-a embedding`"), "{}", c.detail);
         assert!(c.detail.contains("noo cluster place node-a reranker <file>.gguf"), "{}", c.detail);
         assert!(c.remedy.as_deref().unwrap().contains("noo cluster unplace node-a embedding"), "{:?}", c.remedy);
         assert!(c.remedy.as_deref().unwrap().contains("noo cluster unplace node-a reranker"), "{:?}", c.remedy);

@@ -384,7 +384,7 @@ def test_the_doc_names_every_switch():
         for k in TELEMETRY_SWITCHES[cls]:
             assert k in doc, f"docs/security/telemetry.md does not mention {k}"
     assert "onnxruntime" in doc and "mobile.events.data.microsoft.com" in doc, "the onnxruntime row names what it sends and where"
-    for svc in ("vLLM", "Ollama", "text-embeddings-inference", "Loki", "Tempo", "Grafana", "NATS"):
+    for svc in ("vLLM", "Ollama", "Loki", "Tempo", "Grafana", "NATS"):
         assert svc in doc, f"docs/security/telemetry.md has no row for {svc}"
 
 
