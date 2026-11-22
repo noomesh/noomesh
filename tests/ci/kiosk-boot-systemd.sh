@@ -108,6 +108,11 @@ ExecStart=/bin/touch $FLAG
 EOF
 cp "$work/kiosk.new" "$UNITS/kiosk.service"
 systemctl daemon-reload
+# The runner booted with the REAL units: plymouth-quit-wait ran then and
+# stays "active (exited)" (RemainAfterExit), so a start would be a no-op.
+# Stop both so the fake starts fresh.
+systemctl stop plymouth-quit-wait.service plymouth-quit.service >/dev/null 2>&1 || true
+systemctl reset-failed plymouth-quit-wait.service plymouth-quit.service >/dev/null 2>&1 || true
 systemctl start --no-block plymouth-quit-wait.service
 sleep 2
 check "plymouth-quit-wait is running and never returns" \
