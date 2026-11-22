@@ -176,7 +176,7 @@ data_root_mount_guard() {  # data_root_mount_guard PATH [FSTAB MOUNTINFO "UNIT_D
         $3 == "swap" { next }
         { w = clean(unesc($2)); if (w == "/" || substr(w, 1, 1) != "/") next
           auto = has($4, "x-systemd.automount")
-          if (has($4, "noauto") && !auto) next
+          if (has($4, "noauto")) next
           if (!under(p, w)) next
           if (length(w) > length(bw)) { bw = w; ba = auto } else if (w == bw && auto) ba = 1 }
         END { if (bad) print "bad"; else if (bw != "") printf "%d\t%s\t%d\n", length(bw), bw, ba }' "$fstab")" || [ "$best" = bad ]; then
