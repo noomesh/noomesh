@@ -157,9 +157,9 @@ async fn a_leaf_for_another_node_is_refused_at_dial() {
     std::fs::write(&ca_pem, ca.cert.pem()).unwrap();
     let cfg = {
         let _g = crate::tls::loopback_verification_tests::ENV.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("NOO_TLS_CA", &ca_pem);
+        std::env::set_var(crate::tls::CA_ENV, &ca_pem);
         let cfg = crate::tls::cluster_rustls_config().unwrap().expect("the cluster config");
-        std::env::remove_var("NOO_TLS_CA");
+        std::env::remove_var(crate::tls::CA_ENV);
         cfg
     };
     let client = reqwest::Client::builder().tls_backend_preconfigured((*cfg).clone()).build().unwrap();
@@ -207,9 +207,9 @@ fn pin_client(ca: &Ca, tag: &str) -> reqwest::ClientBuilder {
     std::fs::write(&ca_pem, ca.cert.pem()).unwrap();
     let cfg = {
         let _g = crate::tls::loopback_verification_tests::ENV.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("NOO_TLS_CA", &ca_pem);
+        std::env::set_var(crate::tls::CA_ENV, &ca_pem);
         let cfg = crate::tls::cluster_rustls_config().unwrap().expect("the cluster config");
-        std::env::remove_var("NOO_TLS_CA");
+        std::env::remove_var(crate::tls::CA_ENV);
         cfg
     };
     let _ = std::fs::remove_dir_all(&dir);

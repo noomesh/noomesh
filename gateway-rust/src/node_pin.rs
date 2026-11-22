@@ -55,7 +55,6 @@
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, RwLock};
 
-use rustls::client::danger::ServerCertVerifier as _;
 use serde_json::Value;
 
 /// The header the gateway sends on every call to a node agent: the id of
