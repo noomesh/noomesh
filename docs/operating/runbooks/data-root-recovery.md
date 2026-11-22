@@ -171,9 +171,11 @@ how many entries the root holds when it is on the root disk (one directory
 listing, counted up to 10 000). If that count was not zero when the disk
 arrives, whatever the node wrote there is now hidden beneath the mount. The
 log line and the `data root policy` row in verify then say: "the disk is now
-mounted at `<root>`; `<N>` files written before it was mounted are hidden
-under the mount point on the root filesystem: unmount to recover or remove
-them" ("at least `<N>`" past the cap).
+mounted at `<root>` since `<date>`: `<N>` files written before it was mounted
+are hidden under the mount point on the root filesystem: unmount to recover
+or remove them; this note clears by itself on `<date + 7 days>`" ("at least
+`<N>`" past the cap). Verify shows the note for 7 days after the disk
+arrived, then drops it; nothing on the node needs to be run to clear it.
 
 **What noomesh creates or changes in a data root.**
 

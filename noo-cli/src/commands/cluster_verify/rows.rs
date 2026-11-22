@@ -489,7 +489,7 @@ pub(crate) const ROWS: &[Row] = &[
         name: "data root policy",
         scope: Scope::Node,
         verdicts: &[Verdict::Warn, Verdict::Fail],
-        meaning: "Whether the node's data root is a dedicated, conventional directory owned by the agent (fails once the node enforces the policy, else warns), and whether it is on the filesystem recorded for it and answering (fails in either mode: the agent refuses to use it). The detail names what the agent reads the root as: mount (fstab), mount (systemd unit), mount (recorded) or directory, and, when a disk arrived over a root the node had already written to, how many entries are hidden under the mount.",
+        meaning: "Whether the node's data root is a dedicated, conventional directory owned by the agent (fails once the node enforces the policy, else warns), and whether it is on the filesystem recorded for it and answering (fails in either mode: the agent refuses to use it). The detail names what the agent reads the root as: mount (fstab), mount (systemd unit), mount (recorded) or directory, and, when a disk arrived over a root the node had already written to, how many entries are hidden under the mount (shown for 7 days, then it clears by itself).",
         clears: "Fix the owner/permissions or declare the root, e.g. `noo cluster set-config <node> --data-root <path>` then `noo cluster provision <node> --wait`; a missing mount: mount it (`findmnt <path>`, fstab or mount unit), never create the directory; not answering: the disk or NFS server.",
         findings: &[],
         shown_as: None,
