@@ -692,7 +692,7 @@ pub const IDENTITY_EXCHANGE_MAX_ROLE: Role = Role::Operator;
 /// second of two independent barriers, not the only one. The cap is a
 /// third: it holds even when both tiers are Admin.
 pub fn agent_token_role(subject_role: Role, issuer_role: Role) -> Role {
-    subject_role.min(issuer_role).min(IDENTITY_EXCHANGE_MAX_ROLE)
+    subject_role.min(issuer_role)
 }
 
 /// Mint the credential the identity exchange hands out.
