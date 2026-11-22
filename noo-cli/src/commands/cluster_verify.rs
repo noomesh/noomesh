@@ -3510,6 +3510,27 @@ pub(crate) fn default_chat_check(classes: Option<&Value>, has_gpu: Option<bool>,
     ok(NAME, format!("{detail} — {}", later.join("; ")))
 }
 
+/// The `reranker` row (i1182a): the gateway's own `capabilities.rerank`
+/// (a live node advertises rerank). Without one, `/api/external/rerank` is
+/// served by the chat model, which may answer the input order unranked.
+/// A warning: callers still get an answer, marked for what it is.
+pub(crate) fn reranker_check(caps: Option<&Value>) -> Check {
+    const NAME: &str = "reranker";
+    const PLACE: &str = "noo cluster place <node> reranker <file>.gguf --on cpu";
+    let Some(caps) = caps else {
+        return warn(NAME, "not read (GET /api/external/capabilities)", None);
+    };
+    match caps["rerank"]["available"].as_bool() {
+        Some(true) => ok(NAME, "a reranker node serves /api/external/rerank"),
+        Some(false) => warn(
+            NAME,
+            "no reranker placed; rerank requests are served by the chat model, and when it ranks nothing the answer is the input order with no scores (noo.degraded: identity)",
+            Some(PLACE.into()),
+        ),
+        None => warn(NAME, "the gateway's capabilities carry no rerank.available", None),
+    }
+}
+
 /// The `embedding spaces` row (i145): each space, its one model and how many
 /// nodes serve it. `x` when the default space (`knowledge`) has no live node
 /// (every unqualified embed fails); `!` when another space has none, or an
@@ -9563,6 +9584,8 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         checks.push(default_chat_check(model_classes.as_ref(), fleet_has_gpu(&fleet), fleet_node_count(&fleet)));
         let spaces = get_json_opt(g, "/api/cluster/embedding-spaces", true, 15);
         checks.push(embedding_spaces_check(spaces.as_ref()));
+        // i1182a: with no reranker placed, rerank is the chat model's.
+        checks.push(reranker_check(get_json_opt(g, "/api/external/capabilities", true, 15).as_ref()));
         // Finding 126: a loaded model measured over its estimate or pool.
         let fit_ids: Vec<&str> = fleet.iter().filter_map(|n| n["id"].as_str()).collect();
         let fits: Vec<(String, Option<Value>)> = par_map(&fit_ids, |id| {
@@ -19389,5 +19412,35 @@ mod controller_address_tests {
         let row = src.find("if let Some(c) = controller_address_row_here() {").expect("called");
         let svc = src.find("checks.push(service_cert_names_check(").expect("anchor");
         assert!(row < svc);
+    }
+}
+
+#[cfg(test)]
+mod reranker_row_tests {
+    use super::{reranker_check, Verdict};
+    use serde_json::json;
+
+    /// i1182a: no reranker placed WARNs with the place command; a placed one
+    /// is OK; an unread or shapeless answer is not judged as either.
+    #[test]
+    fn no_reranker_placed_warns_with_the_place_command() {
+        let c = reranker_check(Some(&json!({"rerank": {"available": false, "models": []}})));
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.contains("no reranker placed; rerank requests are served by the chat model"), "{}", c.detail);
+        assert_eq!(c.remedy.as_deref(), Some("noo cluster place <node> reranker <file>.gguf --on cpu"));
+        let ok = reranker_check(Some(&json!({"rerank": {"available": true, "models": ["default"]}})));
+        assert_eq!(ok.verdict, Verdict::Ok);
+        let unread = reranker_check(None);
+        assert_eq!(unread.verdict, Verdict::Warn);
+        assert!(unread.detail.starts_with("not read") && unread.remedy.is_none(), "{}", unread.detail);
+        let odd = reranker_check(Some(&json!({"chat": {}})));
+        assert!(odd.remedy.is_none() && !odd.detail.contains("no reranker placed"), "{}", odd.detail);
+    }
+
+    /// The row runs on the controller, from the gateway's own capabilities.
+    #[test]
+    fn the_controller_checks_read_the_gateways_capabilities() {
+        let own = crate::test_src::own_code(include_str!("cluster_verify.rs"));
+        assert!(own.contains(r#"checks.push(reranker_check(get_json_opt(g, "/api/external/capabilities", true, 15).as_ref()));"#));
     }
 }

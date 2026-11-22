@@ -598,9 +598,22 @@ async fn do_rerank(
     if !ordered.is_empty() {
         tracing::warn!(failed = ?failures, "rerank_all_nodes_failed: answering with the LLM reranker");
     }
-    let results = llm_rerank_fallback(state, query, &docs).await?;
-    let n = results.len();
-    Ok((json!({"results": results, "noo": rerank_noo("llm", None, wanted, true)}), n))
+    let answer = llm_rerank_fallback(state, query, &docs).await?;
+    let n = answer.results.len();
+    let noo = degraded_noo(rerank_noo("llm", None, wanted, true), answer.degraded.as_deref());
+    Ok((json!({"results": answer.results, "noo": noo}), n))
+}
+
+/// i1182a: when the LLM reranker ranked nothing, the answer is the input
+/// order with `score: null`, and `noo` says so: `degraded: "identity"` and
+/// the reason. `fallback: true` alone also marks a genuine LLM ranking, so
+/// it cannot tell a caller that nothing was ranked.
+pub(crate) fn degraded_noo(mut noo: Value, reason: Option<&str>) -> Value {
+    if let Some(why) = reason {
+        noo["degraded"] = json!("identity");
+        noo["degraded_reason"] = json!(why);
+    }
+    noo
 }
 
 /// The reranker order: nodes serving the requested model first (in the
@@ -682,13 +695,13 @@ async fn tei_rerank(
 /// back to this gateway's own `/v1/chat/completions` to reach the model. The
 /// loopback is gone: `llm_rerank` resolves the backend and calls it directly.
 ///
-/// Never fails: degrades to identity order, matching the contract the Python
-/// implementation documented ("never returns empty").
+/// Never fails: when the model ranks nothing it answers the input order with
+/// `score: null` and the reason (i1182a).
 async fn llm_rerank_fallback(
     state: &Arc<AppState>,
     query: &str,
     docs: &[String],
-) -> Result<Vec<Value>, ExtFail> {
+) -> Result<crate::llm_rerank::LlmRerank, ExtFail> {
     Ok(crate::llm_rerank::rerank(state, query, docs, None).await)
 }
 
@@ -1448,6 +1461,18 @@ mod rerank_preference_tests {
         assert_eq!((n["served_by"].as_str(), n["model"].as_str(), n["fallback"].as_bool()), (Some("llm"), Some("llm"), Some(true)));
         assert_eq!(n["requested_model"], "qwen3-reranker");
         assert!(rerank_noo("gpu-1", Some("bge"), None, false).get("requested_model").is_none());
+    }
+
+    /// i1182a: an unranked answer says so; a ranked one carries no flag.
+    #[test]
+    fn an_unranked_llm_answer_is_marked_degraded_with_its_reason() {
+        use super::degraded_noo;
+        let n = degraded_noo(rerank_noo("llm", None, None, true), Some("the chat model scored every document 0, so there is no ranking"));
+        assert_eq!(n["degraded"], "identity");
+        assert_eq!(n["degraded_reason"], "the chat model scored every document 0, so there is no ranking");
+        assert_eq!(n["fallback"], true);
+        let ranked = degraded_noo(rerank_noo("llm", None, None, true), None);
+        assert!(ranked.get("degraded").is_none() && ranked.get("degraded_reason").is_none(), "{ranked}");
     }
 }
 
