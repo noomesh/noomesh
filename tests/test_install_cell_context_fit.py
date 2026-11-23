@@ -691,4 +691,10 @@ def test_a_turns_window_is_attributed_honestly_and_keeps_its_injected_context():
     a = CF.log_facts(other)["attribution"]
     assert a["overlapped"] is True and "chat stream cli-other" in a["other_turn_starts"] and "POST /api/inference" in a["other_turn_starts"]
     assert CF.log_facts(own + [own[0]])["attribution"]["overlapped"] is True
+    # A heartbeat task's LLM call in the window (it logs no turn start).
+    hb = CF.log_facts(own + [json.dumps({"timestamp": "2026-11-23T14:00:02Z", "fields": {
+        "message": "heartbeat_llm_waiting_for_slot", "task_id": "t-1", "action": "daily_digest"}})])["attribution"]
+    assert hb["overlapped"] is True and hb["heartbeat"][0]["action"] == "daily_digest"
+    idle = CF.log_facts(own + [json.dumps({"fields": {"message": "heartbeat_loop_tick", "due_count": 0}})])["attribution"]
+    assert idle["overlapped"] is False and idle["heartbeat"] == []
     assert CF.log_facts(None)["attribution"] is None
