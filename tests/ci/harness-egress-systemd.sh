@@ -49,9 +49,15 @@ cleanup() {
     elif [ -s "${RS_ORIG_FILE:-}" ]; then rm -f /etc/resolv.conf; cp "$RS_ORIG_FILE" /etc/resolv.conf; fi
 }
 trap cleanup EXIT
-echo "resolv.conf at start: $(ls -l /etc/resolv.conf | awk '{print $1, $9, $10, $11}')"
 RS_ORIG_LINK=""; RS_ORIG_FILE=""
 if [ -L /etc/resolv.conf ]; then RS_ORIG_LINK="$(readlink /etc/resolv.conf)"; else RS_ORIG_FILE="$WORK/resolv.conf.orig"; cp /etc/resolv.conf "$RS_ORIG_FILE"; fi
+# The workflow's start=plain jobs: a runner that starts with a plain-file
+# /etc/resolv.conf, as some hosted runners do, made here so that path runs on
+# every run, not by luck. The runner's own layout is restored at exit.
+if [ "${NOO_CI_START_PLAIN:-}" = 1 ] && [ -L /etc/resolv.conf ]; then
+    cp --remove-destination "$(readlink -f /etc/resolv.conf)" /etc/resolv.conf
+fi
+echo "resolv.conf at start: $(ls -l /etc/resolv.conf | awk '{print $1, $9, $10, $11}')"
 case "$(readlink -f /etc/resolv.conf)" in
     /run/systemd/resolve/*) echo "runner started with: the systemd-resolved layout (/etc/resolv.conf its symlink)" ;;
     *)

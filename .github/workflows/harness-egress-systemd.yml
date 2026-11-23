@@ -38,6 +38,9 @@ jobs:
       fail-fast: false
       matrix:
         ubuntu: [ 22, 24 ]
+        # as-is: the runner's own resolver layout; plain: it starts with a
+        # plain-file /etc/resolv.conf (both layouts are judged either way).
+        start: [ as-is, plain ]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
@@ -76,4 +79,6 @@ jobs:
           test -x /usr/local/libexec/noo-ci-selftest
           echo "NOO_CI_SELFTEST=/usr/local/libexec/noo-ci-selftest" >> "$GITHUB_ENV"
       - name: Egress hold against the runner's real systemd
+        env:
+          NOO_CI_START_PLAIN: ${{ matrix.start == 'plain' && '1' || '' }}
         run: sudo -E env "PATH=$PATH" bash tests/ci/harness-egress-systemd.sh
