@@ -1819,29 +1819,161 @@ pub fn non_chat_pairs(placements: &[PlacementRow]) -> Vec<(String, String)> {
     out
 }
 
+/// The `mesh_nodes` records as last read OK: key to the stored JSON, as the
+/// bucket holds it (never the computed [`NodeFacts`]: those carry a heartbeat
+/// AGE, which must be taken again from the record's own timestamp on every
+/// read, or a node that stopped beating would stay young in the cache).
+type LastGood = Vec<(String, Value)>;
+
+/// One key's `get` in a listing that itself succeeded.
+enum KeyRead {
+    Found(Value),
+    /// A real absence (the bucket answered "no such key"): stays absent.
+    Absent,
+    /// The `get` failed: says nothing about whether the key exists.
+    Failed(String),
+}
+
+/// What one pass over the `mesh_nodes` bucket saw.
+enum KvRead {
+    /// The bucket or its key listing failed: nothing was learned.
+    Failed(String),
+    /// The listing worked; one result per listed key.
+    Listed(Vec<(String, KeyRead)>),
+}
+
+/// The first error in a read, for the one WARN per streak.
+fn kv_read_error(read: &KvRead) -> Option<&str> {
+    match read {
+        KvRead::Failed(e) => Some(e),
+        KvRead::Listed(rs) => rs.iter().find_map(|(_, r)| match r {
+            KeyRead::Failed(e) => Some(e.as_str()),
+            _ => None,
+        }),
+    }
+}
+
+/// Node facts survive a KV read error: what to serve, and the next last-good.
+/// A read that failed as a whole serves the last good set. In a listing that
+/// worked, a key whose `get` failed serves its cached record (if it has one),
+/// and a key that is absent stays absent. Never a union: the served set is
+/// the listed keys at most, and a listing that worked replaces the cache.
+fn merge_kv_read(prev: &LastGood, read: KvRead) -> (Vec<(String, Value)>, LastGood) {
+    match read {
+        KvRead::Failed(_) => (prev.clone(), prev.clone()),
+        KvRead::Listed(results) => {
+            let mut served: Vec<(String, Value)> = Vec::new();
+            for (key, r) in results {
+                match r {
+                    KeyRead::Found(v) => served.push((key, v)),
+                    KeyRead::Absent => {}
+                    KeyRead::Failed(_) => {
+                        if let Some(p) = prev.iter().find(|(k, _)| *k == key) {
+                            served.push(p.clone());
+                        }
+                    }
+                }
+            }
+            let next = served.clone();
+            (served, next)
+        }
+    }
+}
+
+#[derive(Default)]
+struct KvLastGood {
+    records: LastGood,
+    /// An error streak is open (the WARN went out, the recovery INFO has not).
+    erroring: bool,
+}
+
+static KV_LAST_GOOD: OnceLock<Mutex<KvLastGood>> = OnceLock::new();
+
+/// The facts of `records` at `now`, the reachability verdict (Redis) of each
+/// applied. Every read, fresh or cached, goes through here with the CURRENT
+/// `now`, so the heartbeat age comes from the record's own stored timestamp.
+fn facts_from_records(records: &[(String, Value)], inbound: &[Option<String>], non_chat: &[(String, String)], now: f64) -> Vec<NodeFacts> {
+    records
+        .iter()
+        .zip(inbound)
+        .map(|((key, stored), inbound)| {
+            let mut data = stored.clone();
+            // The reachability probe's verdict lives in Redis, not the KV.
+            crate::node_reachability::apply_inbound(&mut data, inbound.as_deref());
+            node_facts_from_kv(key, &data, non_chat, now)
+        })
+        .collect()
+}
+
+/// One pass over the `mesh_nodes` bucket.
+async fn read_mesh_nodes(state: &AppState) -> KvRead {
+    let kv = match state.js.get_key_value("mesh_nodes").await {
+        Ok(kv) => kv,
+        Err(e) => return KvRead::Failed(format!("{e}")),
+    };
+    let listing = match kv.keys().await {
+        Ok(k) => k,
+        Err(e) => return KvRead::Failed(format!("{e}")),
+    };
+    use tokio_stream::StreamExt;
+    let listed: Vec<_> = listing.collect::<Vec<_>>().await;
+    let mut keys: Vec<String> = Vec::new();
+    for k in listed {
+        match k {
+            Ok(k) => keys.push(k),
+            // A listing that broke part-way is not a listing.
+            Err(e) => return KvRead::Failed(format!("{e}")),
+        }
+    }
+    let mut results = Vec::new();
+    for key in keys {
+        if key == "gateway" {
+            continue;
+        }
+        let r = match kv.get(&key).await {
+            Ok(Some(entry)) => match serde_json::from_slice::<Value>(&entry) {
+                Ok(data) => KeyRead::Found(data),
+                // An unreadable record is dropped, as it always was.
+                Err(_) => KeyRead::Absent,
+            },
+            Ok(None) => KeyRead::Absent,
+            Err(e) => KeyRead::Failed(format!("{e}")),
+        };
+        results.push((key, r));
+    }
+    KvRead::Listed(results)
+}
+
 async fn kv_node_facts(state: &AppState, placements: &[PlacementRow]) -> Vec<NodeFacts> {
     let non_chat = non_chat_pairs(placements);
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs_f64())
         .unwrap_or(0.0);
-    let mut out = Vec::new();
-    let Ok(kv) = state.js.get_key_value("mesh_nodes").await else { return out };
-    let Ok(keys) = kv.keys().await else { return out };
-    use tokio_stream::StreamExt;
-    let keys: Vec<String> = keys.filter_map(|k| k.ok()).collect::<Vec<String>>().await;
-    for key in keys {
-        if key == "gateway" {
-            continue;
+    let read = read_mesh_nodes(state).await;
+    let error = kv_read_error(&read).map(str::to_string);
+    let records = {
+        let mut g = KV_LAST_GOOD.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
+        let (served, next) = merge_kv_read(&g.records, read);
+        match &error {
+            // One WARN per streak, one INFO when it ends.
+            Some(e) if !g.erroring => {
+                tracing::warn!(error = %e, nodes = served.len(), "mesh_nodes_kv_error_serving_last_good");
+            }
+            None if g.erroring => {
+                tracing::info!(nodes = served.len(), "mesh_nodes_kv_read_recovered");
+            }
+            _ => {}
         }
-        let Ok(Some(entry)) = kv.get(&key).await else { continue };
-        let Ok(mut data) = serde_json::from_slice::<Value>(&entry) else { continue };
-        // The reachability probe's verdict lives in Redis, not the KV.
-        let inbound = crate::node_reachability::read_inbound(state, &key).await;
-        crate::node_reachability::apply_inbound(&mut data, inbound.as_deref());
-        out.push(node_facts_from_kv(&key, &data, &non_chat, now));
+        g.erroring = error.is_some();
+        g.records = next;
+        served
+    };
+    let mut inbound = Vec::with_capacity(records.len());
+    for (key, _) in &records {
+        inbound.push(crate::node_reachability::read_inbound(state, key).await);
     }
-    out
+    facts_from_records(&records, &inbound, &non_chat, now)
 }
 
 /// Operator-speed cache: declarations and placements change by `noo cluster
@@ -2675,6 +2807,113 @@ mod tests {
         assert!(valid_name("has space").is_err());
         assert!(valid_name("default").is_err());
         assert!(valid_name("AUTO").is_err());
+    }
+
+    fn kv_rec(id: &str, beat: f64) -> Value {
+        serde_json::json!({"id": id, "last_heartbeat": beat, "running_backends": {"ollama": "gemma4:26b"}})
+    }
+
+    fn kv_good(ids: &[&str]) -> KvRead {
+        KvRead::Listed(ids.iter().map(|i| (i.to_string(), KeyRead::Found(kv_rec(i, 1000.0)))).collect())
+    }
+
+    fn kv_keys(set: &[(String, Value)]) -> Vec<String> {
+        let mut k: Vec<String> = set.iter().map(|(k, _)| k.clone()).collect();
+        k.sort();
+        k
+    }
+
+    #[test]
+    fn a_whole_kv_error_serves_the_last_good_set() {
+        let (_, last) = merge_kv_read(&Vec::new(), kv_good(&["a", "b"]));
+        let (served, last) = merge_kv_read(&last, KvRead::Failed("bus reload".into()));
+        assert_eq!(kv_keys(&served), vec!["a", "b"]);
+        assert_eq!(kv_keys(&last), vec!["a", "b"], "an error leaves the cache as it was");
+    }
+
+    #[test]
+    fn a_failed_get_serves_that_nodes_cached_record_and_the_rest_fresh() {
+        let (_, last) = merge_kv_read(&Vec::new(), kv_good(&["a", "b"]));
+        let read = KvRead::Listed(vec![
+            ("a".into(), KeyRead::Failed("timeout".into())),
+            ("b".into(), KeyRead::Found(kv_rec("b", 2000.0))),
+        ]);
+        let (served, _) = merge_kv_read(&last, read);
+        assert_eq!(kv_keys(&served), vec!["a", "b"]);
+        let beat = |k: &str| served.iter().find(|(n, _)| n == k).and_then(|(_, v)| v["last_heartbeat"].as_f64());
+        assert_eq!(beat("a"), Some(1000.0), "a is the cached record");
+        assert_eq!(beat("b"), Some(2000.0), "b is the new read");
+    }
+
+    #[test]
+    fn a_failed_get_with_nothing_cached_adds_no_node() {
+        let (_, last) = merge_kv_read(&Vec::new(), kv_good(&["a"]));
+        let read = KvRead::Listed(vec![
+            ("a".into(), KeyRead::Found(kv_rec("a", 1000.0))),
+            ("new".into(), KeyRead::Failed("timeout".into())),
+        ]);
+        let (served, _) = merge_kv_read(&last, read);
+        assert_eq!(kv_keys(&served), vec!["a"]);
+    }
+
+    #[test]
+    fn an_absent_key_stays_absent_and_leaves_the_cache() {
+        let (_, last) = merge_kv_read(&Vec::new(), kv_good(&["a", "b"]));
+        let read = KvRead::Listed(vec![("a".into(), KeyRead::Found(kv_rec("a", 1000.0))), ("b".into(), KeyRead::Absent)]);
+        let (served, last) = merge_kv_read(&last, read);
+        assert_eq!(kv_keys(&served), vec!["a"]);
+        let (served, _) = merge_kv_read(&last, KvRead::Failed("down".into()));
+        assert_eq!(kv_keys(&served), vec!["a"], "b was seen absent: an error never brings it back");
+    }
+
+    #[test]
+    fn a_later_error_never_serves_keys_a_good_read_dropped() {
+        let (_, last) = merge_kv_read(&Vec::new(), kv_good(&["a", "b"]));
+        let (served, last) = merge_kv_read(&last, kv_good(&["a"]));
+        assert_eq!(kv_keys(&served), vec!["a"]);
+        let (served, _) = merge_kv_read(&last, KvRead::Failed("down".into()));
+        assert_eq!(kv_keys(&served), vec!["a"], "never b: the last good read did not list it");
+    }
+
+    #[test]
+    fn a_successful_read_of_zero_keys_clears_the_cache() {
+        let (_, last) = merge_kv_read(&Vec::new(), kv_good(&["a", "b"]));
+        let (served, last) = merge_kv_read(&last, KvRead::Listed(Vec::new()));
+        assert!(served.is_empty());
+        let (served, _) = merge_kv_read(&last, KvRead::Failed("down".into()));
+        assert!(served.is_empty(), "the last good read was empty");
+    }
+
+    #[test]
+    fn an_error_with_no_last_good_serves_nothing() {
+        let (served, last) = merge_kv_read(&Vec::new(), KvRead::Failed("down".into()));
+        assert!(served.is_empty() && last.is_empty());
+    }
+
+    #[test]
+    fn the_error_text_of_a_read_is_the_first_failure() {
+        assert_eq!(kv_read_error(&KvRead::Failed("bucket".into())), Some("bucket"));
+        assert_eq!(kv_read_error(&kv_good(&["a"])), None);
+        let read = KvRead::Listed(vec![("a".into(), KeyRead::Absent), ("b".into(), KeyRead::Failed("get".into()))]);
+        assert_eq!(kv_read_error(&read), Some("get"));
+    }
+
+    #[test]
+    fn a_cached_record_ages_out_by_its_own_heartbeat() {
+        let (_, last) = merge_kv_read(&Vec::new(), kv_good(&["a"]));
+        let (served, _) = merge_kv_read(&last, KvRead::Failed("down".into()));
+        let inbound: Vec<Option<String>> = vec![None; served.len()];
+        let at = |now: f64| facts_from_records(&served, &inbound, &[], now).remove(0);
+        let young = at(1010.0);
+        assert_eq!(young.heartbeat_age_secs, Some(10.0));
+        assert_eq!(health_of(&young), (true, String::new()));
+        // The error has lasted past two heartbeat intervals: the record's own
+        // stored timestamp is now too old, whatever the cache was told.
+        let old = at(1000.0 + 2.0 * HEARTBEAT_INTERVAL_SECS + 100.0);
+        assert_eq!(old.heartbeat_age_secs, Some(2.0 * HEARTBEAT_INTERVAL_SECS + 100.0));
+        let (healthy, reason) = health_of(&old);
+        assert!(!healthy);
+        assert!(reason.starts_with("heartbeat ") && reason.ends_with("s old"), "{reason}");
     }
 
     #[test]
