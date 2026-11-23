@@ -33,7 +33,7 @@ concurrency:
 jobs:
   harness-egress-systemd:
     runs-on: ${{ matrix.ubuntu == 22 && 'ubuntu-22.04' || 'ubuntu-24.04' }}
-    timeout-minutes: 20
+    timeout-minutes: 50
     strategy:
       fail-fast: false
       matrix:
@@ -56,5 +56,24 @@ jobs:
           systemctl --version | head -1
           test "$(ps -o comm= -p 1)" = systemd
 
+      # The harness's own egress self-test (gateway-rust egress_selftest.rs),
+      # built on the host so it links this runner's libc; the script runs it
+      # as a transient unit under the drop-in's exact properties.
+      - name: Build the harness self-test
+        working-directory: gateway-rust
+        env:
+          SQLX_OFFLINE: "true"
+          CARGO_PROFILE_DEV_DEBUG: "0"
+        run: |
+          set -euo pipefail
+          cargo test --locked --no-run --message-format=json > "$RUNNER_TEMP/build.json"
+          for b in $(jq -r 'select(.reason == "compiler-artifact" and .profile.test == true and .executable != null) | .executable' "$RUNNER_TEMP/build.json"); do
+            if "$b" --list --ignored 2>/dev/null | grep -qx 'harness::egress_selftest::tests::real_hold_serves: test'; then
+              sudo install -m 755 "$b" /usr/local/libexec/noo-ci-selftest
+              break
+            fi
+          done
+          test -x /usr/local/libexec/noo-ci-selftest
+          echo "NOO_CI_SELFTEST=/usr/local/libexec/noo-ci-selftest" >> "$GITHUB_ENV"
       - name: Egress hold against the runner's real systemd
         run: sudo -E env "PATH=$PATH" bash tests/ci/harness-egress-systemd.sh
