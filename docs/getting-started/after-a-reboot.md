@@ -11,7 +11,7 @@ does not come back on its own yet. Done when `noo cluster verify` exits 0.
 | Machine | What restarts on its own |
 |---|---|
 | **The controller** | Docker restarts the stack's containers. Then `noo-hostd` runs a boot restore once: it rewrites the secret files (they live in memory and a reboot empties them), starts the containers that need them and any stopped core service, and retries for about two minutes while Docker is still starting. Where `noo-hostd` is a user service, it runs at boot only if that user has linger on (see below). |
-| **A Linux node** | Docker restarts the backends that were running, and the node agent starts at boot and reconnects. If the controller is not up yet, the backends keep serving; the agent logs once `the controller cannot be reached at <url> since <time>: nothing is reconciled until it answers; running backends keep running`, starts nothing new, and logs once more when the controller answers (`the controller at <url> answers again after <duration> away: reconciling resumes`). Meanwhile Docker restarts a backend that crashes, but a backend someone stopped stays stopped, across the reboot too; once the controller answers, the node starts it again if the cluster still places it there. |
+| **A Linux node** | Docker restarts the backends that were running, and the node agent starts at boot and reconnects. If the controller is not up yet, the backends keep serving and the agent starts nothing new: it logs `waiting for controller` every 10 seconds (with `registration request failed`) until the controller answers, then registers and carries on. A controller lost while the agent is running is logged once as `the controller cannot be reached at <url> since <time>: nothing is reconciled until it answers; running backends keep running`, and once more when it answers (`the controller at <url> answers again after <duration> away: reconciling resumes`). Meanwhile Docker restarts a backend that crashes, but a backend someone stopped stays stopped, across the reboot too; once the controller answers, the node starts it again if the cluster still places it there. |
 | **A Mac node** | Its node agent starts at boot. Its Ollama does not, yet: see below. |
 | **A kiosk seat** | Its display starts at boot, except, before 0.6.30, a dedicated seat on a machine with a desktop installed: see below. |
 
@@ -150,11 +150,13 @@ returns:
   `BOOT-RESTORE WARN … still down: <services>` when a core service did not
   come back; `noo stack restart` is then the documented next step (it never
   contacts the image registry), and `noo stack start` the one after it.
-- **A node that comes up before its controller** logs once `the controller
-  cannot be reached at <url> since <time>: nothing is reconciled until it
-  answers; running backends keep running`, and once
-  `the controller at <url> answers again after <duration> away: reconciling
-  resumes` when it does. `noo cluster verify` on that node says the same and
+- **A node that comes up before its controller** logs `waiting for
+  controller` every 10 seconds (with `registration request failed`) until the
+  controller answers, then registers and carries on. A node whose controller
+  goes away while it runs logs once `the controller cannot be reached at <url>
+  since <time>: nothing is reconciled until it answers; running backends keep
+  running`, and once `the controller at <url> answers again after <duration>
+  away: reconciling resumes` when it does. `noo cluster verify` on that node
   lists the node-side checks. Report it; the node needs nothing while it
   waits, and nothing on the node makes it reconcile sooner: it keeps no copy
   of what the cluster places, and only the controller can ask it for a pass.
