@@ -188,13 +188,17 @@ def http(method: str, path: str, body: bytes | None = None, ctype: str = "applic
         return e.code, e.read()
 
 
+def release_repo() -> str:
+    """Resolved, never typed: NOO_CLI_REPO, else the repository this workflow
+    runs in (Actions sets it). Empty: nothing to fetch from."""
+    return os.environ.get("NOO_CLI_REPO") or os.environ.get("GITHUB_REPOSITORY") or ""
+
+
 def fetch_release_file(ver: str, name: str, cache: str) -> bytes | None:
     p = os.path.join(cache, name)
     if os.path.isfile(p) and os.path.getsize(p) > 0:
         return open(p, "rb").read()
-    # Resolved, never typed: NOO_CLI_REPO, else the repository this workflow
-    # runs in (Actions sets it). Neither: nothing to fetch from.
-    repo = os.environ.get("NOO_CLI_REPO") or os.environ.get("GITHUB_REPOSITORY") or ""
+    repo = release_repo()
     if not repo:
         return None
     url = f"https://github.com/{repo}/releases/download/noo-cli-v{ver}/{name}"
@@ -261,6 +265,10 @@ def collect(ev: list[str], tmp: str, E: dict) -> None:
     asset = next((a for a in (f"noo-gateway-{arch}-unknown-linux-musl", f"noo-gateway-{arch}-unknown-linux-gnu") if a in rows), None)
     if not asset:
         return stop("NOTE", f"release {ver} lists no noo-gateway asset for {arch}")
+    cached = os.path.isfile(os.path.join(cache, asset)) and os.path.getsize(os.path.join(cache, asset)) > 0
+    if not cached and not release_repo():
+        return stop("NOTE", f"{asset} is not cached here and no release repository is known to fetch it from "
+                            "(NOO_CLI_REPO and GITHUB_REPOSITORY unset: a WSL cell gets only what WSLENV lists)")
     binary = fetch_release_file(ver, asset, cache)
     if not binary or hashlib.sha256(binary).hexdigest() != rows[asset]:
         return stop("FAIL", f"{asset} could not be fetched or does not match release {ver}'s signed sums")

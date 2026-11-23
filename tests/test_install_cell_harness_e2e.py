@@ -164,3 +164,16 @@ def test_the_evidence_lines_pass_the_cells_upload_gate():
         "cleanup: class unset rc=0, harness unplaced rc=0",
     ]
     assert cell.secret_hits("\n".join(lines) + "\n") == []
+
+
+def test_no_release_repo_and_no_cached_asset_is_a_note_not_a_fail():
+    """A WSL cell gets only what WSLENV lists: with no release repository known
+    and the asset not cached, the judge cannot fetch the harness: NOTE (rc.4
+    windows-2025-wsl2 read FAIL "could not be fetched")."""
+    src = (ROOT / "scripts" / "install-cell" / "harness_e2e.py").read_text()
+    body = src[src.index("def collect("):src.index("def verdict(")]
+    guard = body.index("if not cached and not release_repo():")
+    fetch = body.index("binary = fetch_release_file(ver, asset, cache)")
+    assert guard < fetch and 'return stop("NOTE"' in body[guard:fetch]
+    wf = (ROOT / ".github" / "workflows" / "install-matrix.yml").read_text()
+    assert "WSLENV: CLI_TAG:GITHUB_REPOSITORY" in wf
