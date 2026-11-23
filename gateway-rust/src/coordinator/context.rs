@@ -1094,10 +1094,10 @@ pub(super) const KB_FRAME_LABEL: &str = "Knowledge base";
 /// carries the knowledge base can swap it for [`KB_SHOWN_STEP`] (i1178a).
 const KB_FIRST_STEP: &str = "  1. Call noo_rag_query FIRST to ground your answer in the user's curated material.";
 /// What step 1 says when THIS turn's frame already holds the knowledge base.
-const KB_SHOWN_STEP: &str = "  1. The user's curated material for this question is already shown first in the user's message (the knowledge base block). Answer from it; call noo_rag_query (offered from your next step on) only if it is not enough.";
+const KB_SHOWN_STEP: &str = "  1. The user's curated material for this question is already shown first in the user's message (the knowledge base block). Answer from it; a retrieval tool is offered from your next step on, only if it is not enough.";
 /// The same instruction appended to a persona that has no step 1 (the
 /// persona files), so the model is told where the material is either way.
-const KB_SHOWN_NOTE: &str = "\n\n## Knowledge base (already retrieved)\nThe user's curated material for this question is already shown first in the user's message (the knowledge base block). Answer from it. Call noo_rag_query (offered from your next step on) only if it is not enough.";
+const KB_SHOWN_NOTE: &str = "\n\n## Knowledge base (already retrieved)\nThe user's curated material for this question is already shown first in the user's message (the knowledge base block). Answer from it. A retrieval tool is offered from your next step on, only if it is not enough.";
 
 /// Whether THIS turn's injected frame carries a knowledge-base layer: the
 /// frame was attached AND the layer had text (an empty layer is skipped by
