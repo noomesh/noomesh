@@ -3570,6 +3570,7 @@ fn pki_push_node_prove(g: &Globals, node: &str, days: i64, yes: bool) -> Result<
         };
         println!("  {}", ui::muted(&format!("prove that {host}:{port} is served by {node}; {then}")));
     }
+    super::confirm_destructive(g, yes, "re-key", node);
     // (b) The dial-back, pinned to the node's own current leaf. It runs for
     // a leaf that already covers the address too (i1310): only a proven one
     // is "nothing to re-issue".
