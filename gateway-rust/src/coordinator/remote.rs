@@ -1073,7 +1073,7 @@ mod tests {
 
     /// An OpenAI-shaped model that records the tool names each request
     /// offered and answers from `script(call_index, offered_names)`.
-    async fn scripted_model(offered: Arc<Mutex<Vec<Vec<String>>>>, script: fn(usize, &[String]) -> Reply) -> String {
+    async fn scripted_model(offered: Arc<Mutex<Vec<Vec<String>>>>, script: fn(usize, &[String], &str) -> Reply) -> String {
         // A fallback, not a `.route` (the openapi drift check reads route strings).
         let app = Router::new().fallback(move |Json(body): Json<Value>| {
             let offered = offered.clone();
@@ -1082,12 +1082,18 @@ mod tests {
                     .as_array()
                     .map(|a| a.iter().filter_map(|t| t["function"]["name"].as_str().map(str::to_string)).collect())
                     .unwrap_or_default();
+                let last_tool = body["messages"]
+                    .as_array()
+                    .and_then(|m| m.iter().rev().find(|x| x["role"] == "tool"))
+                    .and_then(|x| x["content"].as_str())
+                    .unwrap_or("")
+                    .to_string();
                 let n = {
                     let mut seen = offered.lock().unwrap();
                     seen.push(names.clone());
                     seen.len() - 1
                 };
-                let (delta, finish) = match script(n, &names) {
+                let (delta, finish) = match script(n, &names, &last_tool) {
                     Reply::Call(name, args) => (
                         serde_json::json!({"tool_calls": [{"index": 0, "id": format!("call_{n}"), "type": "function", "function": {"name": name, "arguments": args.to_string()}}]}),
                         "tool_calls",
@@ -1110,13 +1116,15 @@ mod tests {
 
     /// A gateway that offers four tools, answers the knowledge-base layer
     /// with `rag` (None: no knowledge-base text), and runs any tool.
-    async fn kb_gateway(rag: Option<&'static str>) -> String {
+    async fn kb_gateway(rag: Option<&'static str>, ops: Arc<Mutex<Vec<String>>>) -> String {
         let schema = |name: &str| serde_json::json!({"type": "function", "function": {"name": name, "description": "d", "parameters": {"type": "object", "properties": {}}}});
         let native = serde_json::json!([schema("noo_rag_query"), schema("noo_memory_search"), schema("web_search"), schema("noo_inference")]);
         let app = Router::new().fallback(move |Json(op): Json<Value>| {
             let native = native.clone();
+            let ops = ops.clone();
             async move {
                 let name = op["op"].as_str().unwrap_or("");
+                ops.lock().unwrap().push(name.to_string());
                 Json(match name {
                     "config" => serde_json::json!({"ok": true, "max_context_tokens": 32768, "max_session_messages": 50, "preferred_skills": []}),
                     "catalogs" => serde_json::json!({"ok": true, "skills": [], "runbooks": []}),
@@ -1138,15 +1146,17 @@ mod tests {
 
     /// One turn over the scripted model: (the tool names each model call was
     /// offered, the events the client saw, the saved answer).
-    async fn kb_turn(rag: Option<&'static str>, script: fn(usize, &[String]) -> Reply) -> (Vec<Vec<String>>, Vec<(String, Value)>, String) {
-        let gw = kb_gateway(rag).await;
+    async fn kb_turn(rag: Option<&'static str>, script: fn(usize, &[String], &str) -> Reply) -> (Vec<Vec<String>>, Vec<(String, Value)>, String, Vec<String>) {
+        let ops = Arc::new(Mutex::new(Vec::new()));
+        let gw = kb_gateway(rag, ops.clone()).await;
         let offered = Arc::new(Mutex::new(Vec::new()));
         let model = scripted_model(offered.clone(), script).await;
         let rt = RemoteRuntime::connect(&gw, "tok-123", reqwest::Client::new()).await.unwrap().pin_backend(openai_at(&model));
         let sink = Recorder::default();
         let result = super::super::run_streaming_on(&sink, &rt, "when is the launch window", "c1", 6, None, Some("alice"), false).await.unwrap();
         let offered = offered.lock().unwrap().clone();
-        (offered, sink.events(), result.response)
+        let ops = ops.lock().unwrap().clone();
+        (offered, sink.events(), result.response, ops)
     }
 
     fn rag_calls(events: &[(String, Value)]) -> Vec<Value> {
@@ -1155,7 +1165,7 @@ mod tests {
 
     const KB_ANSWER: &str = "The launch window is Tuesday, zircon-4471.";
 
-    fn answer_unless_rag_offered(_n: usize, offered: &[String]) -> Reply {
+    fn answer_unless_rag_offered(_n: usize, offered: &[String], _last_tool: &str) -> Reply {
         if offered.iter().any(|t| t == "noo_rag_query") {
             Reply::Call("noo_rag_query", serde_json::json!({"query": "launch window"}))
         } else {
@@ -1168,14 +1178,14 @@ mod tests {
     /// results, and runs no retrieval.
     #[tokio::test]
     async fn kb_in_frame_first_iteration_is_not_offered_the_retrieval_tool_and_answers() {
-        let (offered, events, response) = kb_turn(Some("the launch window is Tuesday zircon-4471"), answer_unless_rag_offered).await;
+        let (offered, events, response, _ops) = kb_turn(Some("the launch window is Tuesday zircon-4471"), answer_unless_rag_offered).await;
         assert_eq!(offered.len(), 1, "the turn ended in the first iteration: {offered:?}");
         assert!(!offered[0].iter().any(|t| t == "noo_rag_query"), "{:?}", offered[0]);
         assert!(rag_calls(&events).is_empty(), "no retrieval ran: {events:?}");
         assert_eq!(response, KB_ANSWER);
     }
 
-    fn other_tool_then_rag(n: usize, offered: &[String]) -> Reply {
+    fn other_tool_then_rag(n: usize, offered: &[String], _last_tool: &str) -> Reply {
         match n {
             0 => Reply::Call("noo_memory_search", serde_json::json!({"query": "launch"})),
             1 if offered.iter().any(|t| t == "noo_rag_query") => Reply::Call("noo_rag_query", serde_json::json!({"query": "a different query"})),
@@ -1188,7 +1198,7 @@ mod tests {
     /// query runs.
     #[tokio::test]
     async fn kb_in_frame_second_iteration_offers_the_retrieval_tool_again() {
-        let (offered, events, response) = kb_turn(Some("the launch window is Tuesday zircon-4471"), other_tool_then_rag).await;
+        let (offered, events, response, _ops) = kb_turn(Some("the launch window is Tuesday zircon-4471"), other_tool_then_rag).await;
         assert!(offered.len() >= 2, "{offered:?}");
         assert!(!offered[0].iter().any(|t| t == "noo_rag_query"), "{:?}", offered[0]);
         assert!(offered[1].iter().any(|t| t == "noo_rag_query"), "{:?}", offered[1]);
@@ -1202,7 +1212,7 @@ mod tests {
     /// iteration is offered the tool, and the model can call it.
     #[tokio::test]
     async fn without_kb_text_the_first_iteration_is_offered_the_retrieval_tool() {
-        let (offered, events, response) = kb_turn(None, |n, offered| {
+        let (offered, events, response, _ops) = kb_turn(None, |n, offered, _last_tool| {
             if n == 0 && offered.iter().any(|t| t == "noo_rag_query") {
                 Reply::Call("noo_rag_query", serde_json::json!({"query": "launch window"}))
             } else {
@@ -1219,7 +1229,7 @@ mod tests {
     /// the second's minus `noo_rag_query`, and still has the other tools.
     #[tokio::test]
     async fn kb_in_frame_withholds_only_the_retrieval_tool() {
-        let (offered, _events, _response) = kb_turn(Some("the launch window is Tuesday zircon-4471"), other_tool_then_rag).await;
+        let (offered, _events, _response, _ops) = kb_turn(Some("the launch window is Tuesday zircon-4471"), other_tool_then_rag).await;
         assert!(offered.len() >= 2, "{offered:?}");
         assert!(offered[0].iter().any(|t| t == "noo_memory_search"), "{:?}", offered[0]);
         let mut first = offered[0].clone();
@@ -1228,5 +1238,26 @@ mod tests {
         let mut second = offered[1].clone();
         second.sort();
         assert_eq!(first, second, "iteration 1 = iteration 2 without noo_rag_query");
+    }
+
+    fn rag_call_in_first_iteration_anyway(n: usize, _offered: &[String], last_tool: &str) -> Reply {
+        match n {
+            0 => Reply::Call("noo_rag_query", serde_json::json!({"query": "launch window"})),
+            _ if last_tool.contains("already in the context above") => Reply::Say(KB_ANSWER),
+            _ => Reply::Say("the fixed tool result did not arrive"),
+        }
+    }
+
+    /// (e) The model calls the unoffered tool in iteration 1 anyway: the
+    /// call is not run (no `tool_call` event, no `execute_tool` on the
+    /// gateway), the model gets the fixed result, and iteration 2 answers.
+    #[tokio::test]
+    async fn an_unoffered_retrieval_call_in_the_first_iteration_is_not_run() {
+        let (offered, events, response, ops) = kb_turn(Some("the launch window is Tuesday zircon-4471"), rag_call_in_first_iteration_anyway).await;
+        assert!(!offered[0].iter().any(|t| t == "noo_rag_query"), "{:?}", offered[0]);
+        assert!(rag_calls(&events).is_empty(), "no tool_call event: {events:?}");
+        assert!(!ops.iter().any(|o| o == "execute_tool"), "the tool never ran: {ops:?}");
+        assert_eq!(offered.len(), 2, "{offered:?}");
+        assert_eq!(response, KB_ANSWER);
     }
 }

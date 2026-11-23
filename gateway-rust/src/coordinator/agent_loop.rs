@@ -1377,6 +1377,27 @@ fn offered_tools(tool_schemas: &[Value], iteration: u32, kb_shown: bool) -> Vec<
         .collect()
 }
 
+/// What the model is told when it calls the retrieval tool in the first
+/// iteration of a turn whose frame already carries the knowledge-base results.
+const KB_DEFERRED_TEXT: &str = "The knowledge-base results for this question are already in the context above; answer from them. A retrieval tool is available from your next step if they are not enough.";
+
+/// The result for a first-iteration call to the retrieval tool the frame
+/// makes redundant: the call is not run (no retrieval, no tool audit row).
+/// `None` for every other call, and for this tool from iteration 2 on.
+fn kb_deferred_result(call: &tools::ToolCall, iteration: u32, kb_shown: bool) -> Option<tools::ToolResult> {
+    if !(kb_shown && iteration == 1 && call.name == KB_RETRIEVAL_TOOL) {
+        return None;
+    }
+    tracing::info!(iteration, has_rag = true, called = true, tool = KB_RETRIEVAL_TOOL, "coordinator.kb_tool_deferred");
+    Some(tools::ToolResult {
+        name: call.name.clone(),
+        tool_call_id: call.id.clone(),
+        success: true,
+        output: KB_DEFERRED_TEXT.to_string(),
+        error: None,
+    })
+}
+
 /// The backend's prefill time from a usage object: the node agent's
 /// `prompt_eval_ms` (from Ollama's prompt_eval_duration), when present.
 fn prefill_ms_of(usage: &Value) -> Option<u64> {
@@ -3303,13 +3324,18 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
         // tools that benefit from it (currently noo_coding_task).
         for call in &mut tool_calls {
             tools::inject_coordinator_context(call, conversation_id, "dashboard");
-            let _ = writer.send_event("tool_call", json!({
-                "name": call.name,
-                "arguments": call.arguments,
-            })).await;
+            // A call the loop will not run (the knowledge base is already in
+            // front of the model) is not announced as a tool starting.
+            let deferred = kb_deferred_result(call, iteration, kb_shown);
+            if deferred.is_none() {
+                let _ = writer.send_event("tool_call", json!({
+                    "name": call.name,
+                    "arguments": call.arguments,
+                })).await;
+            }
 
             let tool_start = Instant::now();
-            let repeat = repeat_guard.check(call, iteration);
+            let repeat = deferred.or_else(|| repeat_guard.check(call, iteration));
             let repeated = repeat.is_some();
             let tool_result = match repeat {
                 Some(r) => r,
@@ -3360,7 +3386,7 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
             }
 
             // Implicit retrieval feedback for learning loops
-            if tool_result.success {
+            if tool_result.success && !repeated {
                 rt.record_retrieval_feedback(
                     conversation_id, &call.name, true,
                 ).await;
@@ -4249,7 +4275,7 @@ async fn run_inner_bound<R: HarnessRuntime>(
         for call in &mut tool_calls {
             tools::inject_coordinator_context(call, conversation_id, channel);
             let tool_start = Instant::now();
-            let repeat = repeat_guard.check(call, iteration);
+            let repeat = kb_deferred_result(call, iteration, kb_shown).or_else(|| repeat_guard.check(call, iteration));
             let repeated = repeat.is_some();
             let tool_result = match repeat {
                 Some(r) => r,
@@ -4293,7 +4319,7 @@ async fn run_inner_bound<R: HarnessRuntime>(
             }
 
             // Implicit retrieval feedback for learning loops
-            if tool_result.success {
+            if tool_result.success && !repeated {
                 rt.record_retrieval_feedback(
                     conversation_id, &call.name, true,
                 ).await;
