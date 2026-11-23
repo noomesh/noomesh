@@ -1314,8 +1314,13 @@ fi
 
 # BEGIN harness_egress
 # Enforcement step 1: the noo-harness unit, and every vendor CLI it launches
-# (they run in its cgroup and mount namespace), reach only local and tailnet
-# addresses and cannot look up an internet name (docs/security/telemetry.md).
+# (they run in its cgroup and mount namespace), reach only loopback and the
+# controller's own addresses (the hosts of NOO_GATEWAY_URL and NATS_URL) and
+# cannot look up an internet name (docs/security/telemetry.md). Nothing else:
+# the harness resolves no name at run time (its hosts file is rendered here),
+# and its model endpoint is this node's agent on loopback. Containers it starts
+# through Docker (the jail) live in Docker's cgroup, outside this hold; the
+# jail's own network policy is their isolation.
 # Rendered here, as root, on every apply:
 #   /etc/noo/harness-net/{resolv.conf,hosts,nsswitch.conf}  what the unit sees
 #   .../noo-harness.service.d/50-noomesh-egress.conf        the drop-in
@@ -1342,11 +1347,13 @@ HE_RESOLVER_ADDR="192.0.2.53"
 # Explicit prefixes, never the symbolic `localhost`/`any`: a unit file takes
 # them, but `systemd-run -p` rejects them ("Failed to parse IP address prefix:
 # localhost", real systemd 249 and 255), and the pre-check must pass the
-# drop-in's exact lines.
-HE_BASE_ALLOW="127.0.0.1/32 ::1/128 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 fe80::/10 100.64.0.0/10 fd7a:115c:a1e0::/48"
+# drop-in's exact lines. Exactly 127.0.0.1, never 127/8: the resolver stub at
+# 127.0.0.53 stays outside. Every other allowed address is one of the
+# controller's, as a /32 or /128: no range, so no resolver, router, bridge or
+# link-local neighbour is reachable whatever answers DNS there.
+HE_LOOPBACK_ALLOW="127.0.0.1/32 ::1/128"
 HE_CHANGED=0
 HE_UNRESOLVED=""
-HE_ULA_ALLOWED=0
 
 # he_write FILE MODE SRC — install only when bytes, mode or owner differ
 # (config_unchanged); sets HE_CHANGED=1 when it wrote.
@@ -1382,9 +1389,31 @@ he_resolv_target() {
     fi
 }
 
+# he_resolv_dir — the directory the hold binds over, when the resolver file
+# lives outside /etc (systemd-resolved's /run/systemd/resolve). A bind over a
+# FILE detaches when the host replaces that file (every resolver rewrite is a
+# rename); a bind over its directory does not. Empty when the file is in /etc
+# itself (a plain /etc/resolv.conf: there is no directory to bind, and the
+# harness's self-test watches the file bind instead).
+he_resolv_dir() {
+    _he_d="$(dirname "$(he_resolv_target)")"
+    case "$_he_d" in /|"${HE_ETC_DIR:-/etc}"|"${HE_ETC_DIR:-/etc}/") printf '' ;; *) printf '%s\n' "$_he_d" ;; esac
+}
+# The names the held directory carries: the resolver file itself and the two a
+# resolver may read there. Sockets and anything else in it are hidden.
+he_resolv_dir_names() {
+    { basename "$(he_resolv_target)"; printf '%s\n' resolv.conf stub-resolv.conf; } | LC_ALL=C sort -u
+}
+
 he_props() {
-    printf '%s\n' "IPAddressDeny=0.0.0.0/0 ::/0" "IPAddressAllow=$2" \
-        "BindReadOnlyPaths=$1/resolv.conf:$(he_resolv_target)" \
+    _he_rd="$(he_resolv_dir)"
+    printf '%s\n' "IPAddressDeny=0.0.0.0/0 ::/0" "IPAddressAllow=$2" "Environment=NOO_HARNESS_EGRESS_HOLD=1"
+    if [ -n "$_he_rd" ]; then
+        printf '%s\n' "BindReadOnlyPaths=$1/resolvdir:$_he_rd"
+    else
+        printf '%s\n' "BindReadOnlyPaths=$1/resolv.conf:$(he_resolv_target)"
+    fi
+    printf '%s\n' \
         "BindReadOnlyPaths=$1/hosts:/etc/hosts" \
         "BindReadOnlyPaths=$1/nsswitch.conf:/etc/nsswitch.conf" \
         "InaccessiblePaths=-/run/systemd/resolve/io.systemd.Resolve -/run/systemd/resolve/io.systemd.Resolve.Monitor -/run/nscd -/var/run/nscd -/run/dbus/system_bus_socket -/var/run/dbus/system_bus_socket"
@@ -1483,40 +1512,9 @@ he_v4_int() {
     printf '%s\n' "$_he_o"
 }
 
-# he_covered ADDR — success when ADDR is already inside the base allowlist
-# (loopback included; fc00::/7 when HE_ULA_ALLOWED=1). IPv4-mapped IPv6
-# (::ffff:a.b.c.d, which glibc's `getent ahosts` prints for IPv4) is judged
-# as the IPv4 address.
-he_covered() {
-    _he_a="${1#::ffff:}"
-    case "$_he_a" in
-        *:*)
-            _he_l="$(printf '%s' "$_he_a" | tr 'A-F' 'a-f')"
-            case "$_he_l" in
-                ::1|fe[89ab]*:*|fd7a:115c:a1e0:*) return 0 ;;
-                fc*:*|fd*:*) [ "$HE_ULA_ALLOWED" = 1 ] && return 0 ;;
-            esac
-            return 1 ;;
-    esac
-    _he_i="$(he_v4_int "$_he_a")" || return 1
-    # base:size — 127/8, 10/8, 172.16/12, 192.168/16, 169.254/16, 100.64/10
-    for _he_r in 2130706432:16777216 167772160:16777216 2886729728:1048576 3232235520:65536 2851995648:65536 1681915904:4194304; do
-        _he_b="${_he_r%:*}"; _he_s="${_he_r#*:}"
-        if [ "$_he_i" -ge "$_he_b" ] && [ "$_he_i" -lt $((_he_b + _he_s)) ]; then return 0; fi
-    done
-    return 1
-}
-
-# he_ula_on_host — success when this host has a global IPv6 address inside
-# fc00::/7 that is not the tailnet's own (fd7a:115c:a1e0::/48 is allowed
-# already; counting it would open all of fc00::/7 on every tailnet host).
-he_ula_on_host() {
-    ip -6 -o addr 2>/dev/null | awk '/scope global/ {for (i = 1; i <= NF; i++) if ($i == "inet6") print $(i + 1)}' \
-        | sed 's#/.*##' | tr 'A-F' 'a-f' | grep -E '^f[cd]' | grep -qv '^fd7a:115c:a1e0:'
-}
-
-# he_render_hosts NAMES_FILE OUT — the hosts file. Appends the addresses
-# outside the base allowlist to $HE_EXTRA and unresolvable names to HE_UNRESOLVED.
+# he_render_hosts NAMES_FILE OUT — the hosts file. Appends every address it
+# writes to $HE_EXTRA (each becomes an allowed /32 or /128) and unresolvable
+# names to HE_UNRESOLVED.
 he_render_hosts() {
     _he_names="$(cat "$1")"
     {
@@ -1532,7 +1530,7 @@ he_render_hosts() {
             fi
             for _he_ad in $_he_addrs; do
                 printf '%s %s\n' "$_he_ad" "$_he_n"
-                he_covered "$_he_ad" || printf '%s\n' "$_he_ad" >> "$HE_EXTRA"
+                printf '%s\n' "$_he_ad" >> "$HE_EXTRA"
             done
         done
     } > "$2"
@@ -1580,32 +1578,37 @@ harness_egress_apply() {
         printf 'passwd: files\ngroup: files\nshadow: files\nhosts: files\n' > "$_he_tmp/nsswitch.conf"
     fi
     he_names > "$_he_tmp/names"
-    if he_ula_on_host; then HE_ULA_ALLOWED=1; else HE_ULA_ALLOWED=0; fi
     he_render_hosts "$_he_tmp/names" "$_he_tmp/hosts"
     # A controller URL that is a literal IPv4 address names nothing to resolve:
-    # allow the address itself when the base list does not cover it, as a name
-    # resolving to it would be.
+    # allow the address itself, as a name resolving to it would be.
     he_targets | while read -r _he_h _he_p; do
         case "$_he_h" in ""|*[!0-9.]*) continue ;; esac
         he_v4_int "$_he_h" >/dev/null || continue
-        he_covered "$_he_h" || printf '%s\n' "$_he_h"
+        printf '%s\n' "$_he_h"
     done >> "$HE_EXTRA"
+    # The held resolver directory (systemd-resolved hosts): the same held
+    # resolv.conf under every name a resolver reads there.
+    rm -rf -- "${_he_tmp:?}/resolvdir"; mkdir -m 755 "$_he_tmp/resolvdir"
+    for _he_rn in $(he_resolv_dir_names); do cp "$_he_tmp/resolv.conf" "$_he_tmp/resolvdir/$_he_rn"; done
     # The timestamp line alone is not a change: keep the installed header.
     if [ -f "$HE_NET_DIR/hosts" ] && [ "$(sed 1d "$_he_tmp/hosts")" = "$(sed 1d "$HE_NET_DIR/hosts")" ]; then
         cp "$HE_NET_DIR/hosts" "$_he_tmp/hosts"
     fi
 
-    _he_allow="$HE_BASE_ALLOW"
-    [ "$HE_ULA_ALLOWED" = 1 ] && _he_allow="$_he_allow fc00::/7"
+    _he_allow="$HE_LOOPBACK_ALLOW"
     while IFS= read -r _he_x; do
         [ -n "$_he_x" ] || continue
         case "$_he_x" in *:*) _he_allow="$_he_allow $_he_x/128" ;; *) _he_allow="$_he_allow $_he_x/32" ;; esac
     done < "$HE_EXTRA"
     # shellcheck disable=SC2086
     _he_allow="$(printf '%s\n' $_he_allow | LC_ALL=C sort -u | tr '\n' ' ' | sed 's/ *$//')"
+    # The allowed addresses, one per line, for the harness's own self-test: it
+    # asks each for DNS every minute, and an answer means not held.
+    # shellcheck disable=SC2086
+    printf '%s\n' $_he_allow | sed 's#/[0-9]*$##' > "$_he_tmp/allow"
     {
-        printf '%s\n' "# Rendered by noo-apply: the harness and every CLI it launches reach only local and tailnet" \
-            "# addresses and cannot resolve internet names (docs/security/telemetry.md)." \
+        printf '%s\n' "# Rendered by noo-apply: the harness and every CLI it launches reach only loopback and" \
+            "# the controller's addresses, and cannot resolve internet names (docs/security/telemetry.md)." \
             "[Service]"
         he_props "$HE_NET_DIR" "$_he_allow"
         printf '%s\n' "RuntimeDirectory=noo-harness" "RuntimeDirectoryMode=0755"
@@ -1617,16 +1620,24 @@ harness_egress_apply() {
     he_same "$HE_NET_DIR/hosts" 644 "$_he_tmp/hosts" || he_pending=1
     he_same "$HE_NET_DIR/nsswitch.conf" 644 "$_he_tmp/nsswitch.conf" || he_pending=1
     he_same "$HE_DROPIN" 644 "$_he_tmp/dropin" || he_pending=1
-    chmod 644 "$_he_tmp/resolv.conf" "$_he_tmp/hosts" "$_he_tmp/nsswitch.conf"
+    he_same "$HE_NET_DIR/allow" 644 "$_he_tmp/allow" || he_pending=1
+    for _he_rn in $(he_resolv_dir_names); do
+        he_same "$HE_NET_DIR/resolvdir/$_he_rn" 644 "$_he_tmp/resolvdir/$_he_rn" || he_pending=1
+    done
+    chmod 644 "$_he_tmp/resolv.conf" "$_he_tmp/hosts" "$_he_tmp/nsswitch.conf" "$_he_tmp/allow" "$_he_tmp"/resolvdir/*
     if [ "$he_pending" = 1 ]; then
         if ! _he_why="$(he_precheck "$_he_tmp" "$_he_allow")"; then
+            # Which address failed, read from the staged hosts file before the
+            # stage is removed below.
+            _he_fn="${_he_why#selfcheck-}"; _he_fn="${_he_fn%-*}"
+            _he_fa="$(awk -v n="$_he_fn" '$2 == n {print $1}' "$_he_tmp/hosts" 2>/dev/null | tr '\n' ' ' | sed 's/ *$//')"
             _he_had=0
             { [ -e "$HE_DROPIN" ] || [ -e "$HE_NET_DIR" ]; } && _he_had=1
             harness_egress_remove
             case "${_he_tmp:?}" in */noo-he-stage.??????) rm -rf -- "$_he_tmp" ;; esac
             case "$_he_why" in
                 selfcheck-unavailable) _he_how="the pre-check could not run under the hold (no systemd-run here) or answered nothing" ;;
-                *) _he_how="a controller name did not resolve or its port did not answer under the hold" ;;
+                *) _he_how="a controller name did not resolve or its port did not answer under the hold: ${_he_fn} at ${_he_fa:-$_he_fn} (allowed: $_he_allow)" ;;
             esac
             echo "noo-apply: harness-egress: the hold was NOT applied ($_he_why: $_he_how); the harness runs unrestricted and codex placements are refused" >&2
             if [ "$_he_had" = 1 ]; then need_harness_restart=1; applied="$applied harness-egress-files"; fi
@@ -1640,6 +1651,12 @@ harness_egress_apply() {
     he_write "$HE_NET_DIR/resolv.conf" 644 "$_he_tmp/resolv.conf"
     he_write "$HE_NET_DIR/hosts" 644 "$_he_tmp/hosts"
     he_write "$HE_NET_DIR/nsswitch.conf" 644 "$_he_tmp/nsswitch.conf"
+    he_write "$HE_NET_DIR/allow" 644 "$_he_tmp/allow"
+    # shellcheck disable=SC2086
+    install -d -m 755 $HE_OWNER_ARGS "$HE_NET_DIR/resolvdir"
+    for _he_rn in $(he_resolv_dir_names); do
+        he_write "$HE_NET_DIR/resolvdir/$_he_rn" 644 "$_he_tmp/resolvdir/$_he_rn"
+    done
     he_write "$HE_DROPIN" 644 "$_he_tmp/dropin"
     case "${_he_tmp:?}" in */noo-he-stage.??????) rm -rf -- "$_he_tmp" ;; esac
     if [ "$HE_CHANGED" = 1 ]; then

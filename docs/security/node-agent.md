@@ -1795,24 +1795,32 @@ contains, one of those.
 This holds on Linux with systemd and `harness-egress=enforced` only. A Mac
 (launchd) has no egress hold: its harness runs with nothing holding it off
 the internet. A failed pre-check or an old systemd also leaves the harness
-unrestricted (the tag below says so). Where it is held, private, link-local
-and tailnet ranges stay reachable.
+unrestricted (the tag below says so). Where it is held, the harness reaches
+loopback and the controller's own addresses, nothing else. Containers it
+starts through Docker (the jail) are outside this hold: the jail's own
+network policy is their isolation.
 
 The Landlock jail limits files. On Linux the network is limited by the node's applier
 (`scripts/noo-apply.sh`), as root, on every apply that carries the harness
 unit or its env. It renders `/etc/noo/harness-net/` (a `resolv.conf` that
 names only 192.0.2.53, a TEST-NET-1 address that is never allowed, so a name
 lookup fails at once with no packet sent; an `nsswitch.conf` that is the
-host's with `hosts: files dns`; and a `hosts` file that holds only the names
+host's with `hosts: files`, so no lookup asks DNS; and a `hosts` file that holds only the names
 the harness needs, the hosts of `NOO_GATEWAY_URL` and `NATS_URL`, resolved
 by the applier) and the drop-in
 `noo-harness.service.d/50-noomesh-egress.conf`. The drop-in sets
 `IPAddressDeny=0.0.0.0/0 ::/0` (every address; written as prefixes because
-`systemd-run -p`, which the pre-check uses, rejects `any` and `localhost`) and allows only loopback, private, link-local and
-tailnet ranges, `fc00::/7` only on a host that has its own global address
-there, and each controller address outside those ranges as one `/32` or
-`/128`. It also bind-mounts the three files over `/etc` for the unit and its
-CLIs and hides the host's resolver sockets. The files are rewritten only when
+`systemd-run -p`, which the pre-check uses, rejects `any` and `localhost`) and allows exactly `127.0.0.1/32` and `::1/128`
+plus each address of the controller names in the hosts file (and a literal
+controller IP) as one `/32` or `/128`: no range, so no other host on the LAN
+or the tailnet is reachable. The harness needs nothing more: its model
+endpoint is this node's agent on loopback, and it resolves no name at run
+time. The drop-in sets `NOO_HARNESS_EGRESS_HOLD=1`, binds the three files for
+the unit and its CLIs (where the host's resolver file lives in a directory
+of its own, such as systemd-resolved's, the held copy is bound over that
+directory, so a host rewrite of the file does not reach the unit), and hides
+the host's resolver sockets. The allowed addresses are also written to
+`/etc/noo/harness-net/allow`. The files are rewritten only when
 their content changes; a change reloads systemd and restarts the harness the
 applier's usual way. A name that does not resolve is left out of the hosts
 file and is never looked up through a real resolver: the harness then fails
@@ -1825,20 +1833,32 @@ unresolved name. The probe never refuses the harness unit; the node agent
 reports the state and refuses the kinds that need enforcement. A teardown
 removes the drop-in and the directory.
 
+The harness checks its hold from inside its own unit at start and again
+every minute: no internet name resolves, the loopback canary is dropped, no
+allowed address answers DNS, its private `resolv.conf` is still in place,
+and the gateway answers. Under an installed hold, a check that does not hold
+stops the harness taking new work (the gateway runs a turn itself; a task
+waits for this node) until a later check holds again.
+
 Before it installs the hold, the applier runs a pre-check under the hold's own
 settings: every controller name must resolve from the rendered `hosts` file,
 and every controller port must answer. A controller URL that is a literal IPv4
-address is connected to without a lookup, and an address outside the base
-ranges is added to the allowlist. If the pre-check fails, nothing is installed
-and the tag says why:
+address is connected to without a lookup and allowed as itself. If the
+pre-check fails, nothing is installed and the tag says why (the apply output
+names the address that did not answer and the allowed list):
 - `UNENFORCED:selfcheck-<host>-<port>`: this node cannot reach that controller
   address under the hold;
 - `UNENFORCED:selfcheck-unavailable`: no `systemd-run` on this host.
 
-`noo cluster verify`'s `harness egress` row:
-- **OK:** the unit is held and the harness's own self-test confirms it.
-- **FAIL:** not held. Codex placements are refused there.
-- **WARN:** unknown, or the node runs another runtime (launchd).
+`noo cluster verify`'s `harness egress` row reads the harness's latest check
+(no row where no harness runs):
+- **OK:** the unit is held and the harness's own check confirms it, with how
+  long ago it ran.
+- **FAIL:** not held (codex placements are refused there); or held but the
+  gateway does not answer from inside the hold, which a re-apply fixes.
+- **WARN:** unknown (including a check more than three minutes old); the
+  harness's private `resolv.conf` replaced (still held, a restart restores
+  it); or the node runs another runtime (launchd).
 - **The remedy:** `noo cluster provision <node>`. Its apply report carries the
   tag above.
 
