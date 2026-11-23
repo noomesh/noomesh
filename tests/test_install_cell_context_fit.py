@@ -630,3 +630,14 @@ def test_the_rag_evidence_keeps_the_turns_events_and_drops_every_body_field(caps
     assert "KESTREL-SECRET" not in joined and "unrelated" not in joined and "\x1b" not in joined
     assert RCE.conversation_id(["no start here"]) == ""
 
+
+
+def test_the_rag_evidence_keeps_kb_tool_deferred_which_names_no_conversation():
+    """coordinator.kb_tool_deferred carries iteration, has_rag and tool only
+    (gateway-rust/src/coordinator/agent_loop.rs), no conversation_id: the event
+    filter alone must keep it, or the evidence reads it as absent."""
+    cid = "cli-1700000000-42"
+    line = json.dumps({"fields": {"message": "coordinator.kb_tool_deferred", "iteration": 1,
+                                  "has_rag": True, "tool": "kb_search"}})
+    got = RCE.view(line, cid)
+    assert got and "kb_tool_deferred" in got and '"iteration": 1' in got

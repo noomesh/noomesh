@@ -41,8 +41,10 @@ sys.path.insert(0, HERE)  # python3 -I does not add the script's directory
 
 import agent_evidence as ae  # noqa: E402
 
+# kb_tool_deferred carries no conversation_id (agent_loop.rs), so only its
+# name keeps it: without it every cell's evidence dropped it and read 0.
 EVENTS = re.compile(r"context_injected|request_size|tool_call_|context_window_truncated|stall"
-                    r"|coordinator_chat_stream", re.IGNORECASE)
+                    r"|coordinator_chat_stream|kb_tool_deferred", re.IGNORECASE)
 START = re.compile(r"coordinator_chat_stream_start")
 MAX_LINES = 120
 ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
