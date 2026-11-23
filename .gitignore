@@ -173,3 +173,7 @@ demo-out/
 .coverage
 coverage.xml
 .noo-apparmor-noo-sandbox
+
+# The licence signer is built privately and cfg-gated in noo-cli/build.rs
+# (has_entitlement_signer); it is never committed to this public tree.
+noo-cli/src/commands/entitlement_signer.rs

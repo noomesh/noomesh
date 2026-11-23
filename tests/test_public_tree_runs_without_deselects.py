@@ -72,14 +72,17 @@ def test_the_mutants_python_lane_and_test_core_share_the_mechanism() -> None:
 
 def test_every_self_skip_reason_carries_the_prefix_the_summary_counts() -> None:
     """Each test module that skips because a file or tree is absent says so with the prefix,
-    so the summary counts it. Guarded here: the modules this change converted."""
-    for name in ("test_pro_build_cfg_excluded_from_oss.py",):
-        tree = ast.parse((TESTS / name).read_text())
+    so the summary counts it. Every module that uses the prefix is checked."""
+    for path in sorted(TESTS.glob("test_*.py")):
+        name = path.name
+        text = path.read_text()
+        if _public_tree.SELF_SKIP_PREFIX not in text or name == Path(__file__).name:
+            continue
+        tree = ast.parse(text)
         reasons = []
         for node in ast.walk(tree):
             if isinstance(node, ast.Call) and ast.unparse(node.func) == "pytest.skip" and node.args:
                 reasons.append(ast.unparse(node.args[0]))
-        assert reasons, f"{name} no longer skips itself"
         for r in reasons:
             assert _public_tree.SELF_SKIP_PREFIX in r, f"{name}: skip reason {r} lacks {_public_tree.SELF_SKIP_PREFIX!r}"
 

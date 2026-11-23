@@ -1,120 +1,100 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026 PersonifAI LLC
 
-"""Every pro file a Rust build.rs cfg-gates must be stripped by the OSS sync.
+"""Every pro file a Rust build.rs cfg-gates must be absent from this public tree.
 
-The `has_pro_*` cfg pattern exists for exactly one reason: the file is
-PRO-ONLY and gets removed on the way to the public repo, so the OSS tree has
-to compile without it. A file that is cfg-gated but NOT in PRO_EXCLUDES is
-therefore always a bug, and specifically a licence leak — the gating says
-"this is pro" while the sync ships it anyway.
-
-That is not hypothetical. `gateway-rust/migrations/0002_pro.sql` (the pro half
-of the mesh schema baseline) was added
-with its cfg gate but without its exclusion, and nothing caught it, because
-until this file there was no test over PRO_EXCLUDES at all.
+The `has_*` cfg pattern in a build.rs exists for one reason: the file is
+PRO-ONLY (today: noo-cli's licence signer, `src/commands/entitlement_signer.rs`,
+built privately), so the public tree must compile without it. The public repo
+is where work lands directly, so the guard is not an exclusion list in a sync
+script but the plainest fact: **no cfg-gated pro path is tracked here.** A
+commit that adds one fails this test, and `.gitignore` keeps a local copy (a
+private build drops the file in) out of `git add`.
 
 The requirement is DERIVED from build.rs rather than restated here, so a new
-pro file gets covered by adding it to build.rs — no one has to remember this
-test exists.
+pro file gets covered by adding its cfg gate to build.rs.
 """
 
 from __future__ import annotations
 
 import re
+import subprocess
 from pathlib import Path
 
 import pytest
 
 REPO = Path(__file__).resolve().parents[1]
-SYNC = REPO / "scripts" / "sync-to-oss.sh"
 
 # Every build.rs whose job is detecting optional pro sources.
 BUILD_SCRIPTS = ("gateway-rust/build.rs", "noo-cli/build.rs")
 
 
 def _guarded_paths(build_rs: Path) -> list[str]:
-    """Paths a build.rs watches, repo-relative.
+    """Literal paths a build.rs watches, repo-relative.
 
-    These scripts exist solely to detect pro files, so every watched path is a
-    pro path. If that ever stops being true, this assertion is the right place
-    to find out — a non-pro watched path should be given an explicit allow-list
-    here with a reason, not silently tolerated.
+    These scripts watch pro files by literal path; noo-cli/build.rs also emits
+    `rerun-if-changed={}` per embedded repo asset through a FORMAT STRING, a
+    placeholder that carries no pro meaning and is filtered out here.
     """
     text = build_rs.read_text()
     rel = re.findall(r"rerun-if-changed=([^\"\s]+)", text)
-    # Allow-listed non-pro watch (see docstring): noo-cli/build.rs also embeds
-    # the standalone deploy slice and emits rerun-if-changed per asset
-    # via a FORMAT STRING — the source literal is `rerun-if-changed={}`, a
-    # placeholder, not a path. The watched files are repo assets (compose,
-    # prompts, monitoring…), not pro sources; only literal-path watches carry
-    # this test's pro meaning.
     rel = [p for p in rel if "{" not in p]
     return [f"{build_rs.parent.name}/{p}" for p in rel]
 
 
-def _skip_unless_sync_script(sync: Path) -> None:
-    """The OSS sync script is not part of the public tree; where it is absent
-    there is nothing to check the exclusions against."""
-    if not sync.is_file():
-        pytest.skip(f"not in this tree: {sync.name} (the OSS sync script) is absent")
+def _tracked(path: str) -> bool:
+    """Whether git tracks `path` in this checkout (an untracked local copy is not a commit)."""
+    r = subprocess.run(["git", "-C", str(REPO), "ls-files", "--error-unmatch", "--", path],
+                       capture_output=True, text=True)
+    return r.returncode == 0
 
 
-def test_the_sync_guard_skips_only_when_the_script_is_absent(tmp_path: Path) -> None:
-    """Never skip when the input is present: where the script exists the guard runs."""
-    present = tmp_path / "scripts" / "sync-to-oss.sh"
-    present.parent.mkdir()
-    present.write_text("PRO_EXCLUDES\n")
-    try:
-        _skip_unless_sync_script(present)
-    except pytest.skip.Exception:
-        pytest.fail("skipped although the sync script is present")
-    with pytest.raises(pytest.skip.Exception) as gone:
-        _skip_unless_sync_script(tmp_path / "scripts" / "absent.sh")
-    assert str(gone.value).startswith("not in this tree:")
-
-
-def _pro_excludes() -> str:
-    return SYNC.read_text()
+# The pro paths a build.rs watches but that are also ordinary repo sources
+# (watched for a non-pro reason). Each needs a reason; none today besides the
+# add-on declaration parser noo-cli/build.rs includes as a module.
+NOT_PRO = {
+    "noo-cli/src/addon_decl_parse.rs": "build.rs includes it as a module (add-on declarations), not a pro source",
+}
 
 
 @pytest.mark.parametrize("script", BUILD_SCRIPTS)
-def test_cfg_gated_pro_files_are_excluded_from_the_oss_sync(script: str) -> None:
-    _skip_unless_sync_script(SYNC)
+def test_cfg_gated_pro_files_are_not_tracked_in_the_public_tree(script: str) -> None:
     build_rs = REPO / script
-    if not build_rs.exists():
-        pytest.skip(f"not in this tree: {script} is absent")
-
-    watched = _guarded_paths(build_rs)
+    assert build_rs.exists(), f"{script} is part of this tree"
+    watched = [p for p in _guarded_paths(build_rs) if p not in NOT_PRO]
     if not watched:
-        # An empty watch list is legitimate once every cfg-gated pro source
-        # is retired — the strongest exclusion is nonexistence (see the
-        # sibling test). gateway-rust reached this state on 2026-08-23:
-        # routes/pro.rs retired in the design and 0002_pro.sql deleted
-        # in phase B'. The broken-detection case the old bare assert guarded
-        # is the OTHER shape: the script still emits rerun-if-changed lines
-        # but the regex extracted none of them.
-        # noo-cli reached the same state on 2026-10-05: hloop.rs retired in
-        # #759 (add-ons bring their own `noo` commands), so its only watches
-        # left are the `{}` placeholders _guarded_paths filters on purpose.
-        # Broken-regex detection therefore asks the precise question: is any
-        # rerun-if-changed NOT a placeholder? A literal path the regex failed
-        # to extract would show up here.
+        # Every cfg-gated pro source of this build.rs is retired (gateway-rust
+        # since 2026-08-23). A literal rerun-if-changed the regex failed to
+        # parse would show up here instead.
         stray = re.findall(r"rerun-if-changed=(?!\{)", build_rs.read_text())
-        assert not stray, (
-            f"{script} emits {len(stray)} literal rerun-if-changed line(s) the "
-            "extraction did not parse — the cfg detection regex is broken"
-        )
+        stray = [m for m in stray]
+        parsed = len(_guarded_paths(build_rs))
+        assert len(stray) == parsed, f"{script}: {len(stray) - parsed} literal watch(es) the extraction did not parse"
         return
-
-    sync = _pro_excludes()
-    missing = [p for p in watched if f'"{p}"' not in sync]
-    assert not missing, (
-        f"{script} cfg-gates {missing} as pro-only, but scripts/sync-to-oss.sh "
-        "does not exclude them. The gate means the OSS tree must compile "
-        "WITHOUT the file, so shipping it is both a licence leak and a lie "
-        "about the build. Add each path to PRO_EXCLUDES."
+    tracked = [p for p in watched if _tracked(p)]
+    assert not tracked, (
+        f"{script} cfg-gates {tracked} as pro-only, and they are tracked in this public tree: "
+        "remove them from the commit (they are built privately); .gitignore lists them"
     )
+
+
+def test_every_cfg_gated_pro_file_is_gitignored() -> None:
+    """A private build drops the pro file into a checkout; .gitignore keeps `git add -A` from taking it."""
+    ignore = (REPO / ".gitignore").read_text().splitlines()
+    for script in BUILD_SCRIPTS:
+        for p in _guarded_paths(REPO / script):
+            if p in NOT_PRO:
+                continue
+            assert p in ignore or f"/{p}" in ignore, f"{p} (cfg-gated by {script}) is not in .gitignore"
+
+
+def test_the_guard_sees_a_tracked_pro_file(tmp_path: Path) -> None:
+    """The check is real: a cfg-gated path that git tracks is found."""
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    (tmp_path / "x.rs").write_text("// pro\n")
+    subprocess.run(["git", "-C", str(tmp_path), "add", "x.rs"], check=True)
+    r = subprocess.run(["git", "-C", str(tmp_path), "ls-files", "--error-unmatch", "--", "x.rs"], capture_output=True)
+    assert r.returncode == 0
 
 
 def test_the_mesh_pro_baseline_stays_deleted() -> None:
