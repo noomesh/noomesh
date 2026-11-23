@@ -612,10 +612,11 @@ const I300_BEAT_KEYS: &[(&str, BeatShape)] = &[
     // offload` verify row: 0 offloaded on a GPU start is a WARN.
     ("llamacpp_offload", BeatShape::Objects(8)),
     // i1058: the node's Docker Engine, `{state: ok, version, kind}` (kind
-    // dockerd | docker-desktop | podman), `{state: none}` (no Docker) or
-    // `{state: unreadable, error}`; read by the `docker engine` verify row.
-    // Absent is an agent that predates it.
-    ("docker_engine", BeatShape::StateObject(&["ok", "none", "unreadable"])),
+    // dockerd | docker-desktop | podman), `{state: none}` (Docker not
+    // installed), `{state: down, installed_by}` (installed, its daemon's
+    // socket gone) or `{state: unreadable, error}`; read by the `docker
+    // engine` verify row. Absent is an agent that predates it.
+    ("docker_engine", BeatShape::StateObject(&["ok", "none", "down", "unreadable"])),
     // A backend container the agent owns that no placement wants and no
     // unplace names: `{backend, container, since}`. Reported, never removed
     // (absence never reaps); read by the `unplaced backends` verify row.
@@ -10162,6 +10163,7 @@ mod i300_beat_tests {
         for good in [
             json!({"state": "ok", "version": "26.1.4", "kind": "docker-desktop"}),
             json!({"state": "none"}),
+            json!({"state": "down", "installed_by": "dockerd at /usr/bin/dockerd"}),
             json!({"state": "unreadable", "error": "Cannot connect to the Docker daemon"}),
         ] {
             carry_i300(&mut data, &json!({"docker_engine": good.clone()}));

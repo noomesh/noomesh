@@ -476,6 +476,7 @@ pub fn cluster_show(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         ("docker engine", match n["docker_engine"]["state"].as_str() {
             Some("ok") => format!("{} ({})", str_of(&n["docker_engine"]["version"]), str_of(&n["docker_engine"]["kind"])),
             Some("none") => "none (native backends only)".to_string(),
+            Some("down") => ui::warn(&format!("installed, daemon not answering ({})", str_of(&n["docker_engine"]["installed_by"]))).to_string(),
             Some("unreadable") => ui::warn(&format!("unreadable: {}", str_of(&n["docker_engine"]["error"]))).to_string(),
             _ => ui::muted("not reported (agent predates this release)").to_string(),
         }),
