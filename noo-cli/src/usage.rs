@@ -175,7 +175,7 @@ pub const USAGE: &[(&[&str], &str, &str)] = &[
     (&["security", "pki", "rotate-signing-key"], "[<node>] [--deliver-only] [-y|--yes]", "Mint the fleet code-signing key and deliver its public half to every node (-y to confirm)"),
     (&["security", "secrets", "absorb-files"], "[-y|--yes]", "Fold file credentials and legacy secrets/*.txt into env.sops; shreds what reads back (-y)"),
     (&["security", "pki", "issue-node"], "<node> [<ip>] [--days <n>] [--mint-only]", "Issue a node cert and deliver it, waiting for the node to confirm it applied"),
-    (&["security", "pki", "push-nodes"], "[<node>] [--days <n>] [--yes] [--allow-shared-address <addr>] [<node> --prove]", "Re-issue node certs and stage them on the rail; --prove first proves the node's address (covered: proves only)"),
+    (&["security", "pki", "push-nodes"], "[<node>] [--days <n>] [--yes] [--allow-shared-address <addr>] [<node> --prove]", "Re-issue node certs and stage them on the rail; --prove proves the node's address first"),
     (&["security", "trust-ca"], "[<ca_path>]", "Install the cluster CA into the OS trust store (default $NOO_PKI_DIR/ca.crt)"),
     (&["security", "untrust-ca"], "[-y|--yes]", "Remove the cluster CA (by name) from the OS trust store; asks for confirmation (-y)"),
     (&["jobs", "list"], "[--limit <n>] [--status <s>] [--node <id>] [-w|--watch [<secs>]]", "List queued and running jobs from the gateway job queue"),
