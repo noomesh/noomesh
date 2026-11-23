@@ -94,7 +94,7 @@ pub fn ship(tombstones: &[Tombstone], placements: &[Value], now_unix: i64) -> (V
     let mut expired = Vec::new();
     for t in tombstones {
         let age = now_unix - t.unplaced_unix;
-        if age > TTL_SECS || age < -TTL_SECS {
+        if !(-TTL_SECS..=TTL_SECS).contains(&age) {
             expired.push(t.key.clone());
             continue;
         }
