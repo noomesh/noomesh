@@ -126,8 +126,12 @@ noo cluster unplace gpu-2 ollama
 **Remove what a node runs.** `noo cluster unplace` records the unplace with
 the placement's removal, and the node agent stops and removes the backend's
 container (and its door) once it has read that record on two consecutive
-passes and no placement of the backend remains; its model files are never
-touched. The record is shipped to that node only and only for 24 hours, so a
+reconcile passes and no placement of the backend remains, within about 10
+minutes; its model files are never touched. `unplace` prints one line saying
+so, with `noo cluster stop-backend <node> <backend>` to stop it now (in
+`--json`, the `note` field). A controller that does not advertise
+`reap_unplaced_backends` (an older one) does not have the container stopped:
+the line says so, and `noo cluster stop-backend` is how to stop it. The record is shipped to that node only and only for 24 hours, so a
 placement made again after it always wins. The agent never removes a
 container because a placement is simply absent: a backend container it owns
 that no placement wants and no unplace names is reported by `noo cluster
