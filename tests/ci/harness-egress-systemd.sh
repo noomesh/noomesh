@@ -112,17 +112,41 @@ UNIT_EOF
 systemctl daemon-reload
 
 # ── c. the applier's block, real paths ──────────────────────────────────────
-run_block() {
+run_block() { # [APPLY_FILE]: this tree's applier, or another release's
+    local src="${1:-$APPLY}"
     {
         echo 'set -eu'
-        sed -n '/^# BEGIN config_unchanged$/,/^# END config_unchanged$/p' "$APPLY"
-        sed -n '/^# BEGIN harness_egress$/,/^# END harness_egress$/p' "$APPLY"
+        sed -n '/^# BEGIN config_unchanged$/,/^# END config_unchanged$/p' "$src"
+        sed -n '/^# BEGIN harness_egress$/,/^# END harness_egress$/p' "$src"
         echo 'applied=""; need_harness_restart=0'
         echo 'harness_egress_apply'
         echo 'echo "APPLIED=$applied"; echo "RESTART=$need_harness_restart"'
     } > "$WORK/block.sh"
     bash "$WORK/block.sh"
 }
+
+# ── c0. the upgrade: the previous release's hold first ─────────────────────
+# A node rolled from the previous release has that release's drop-in and a
+# harness running under it. The new block must replace it in one apply and
+# ask for one harness restart, after which the unit runs under the new hold.
+# PREV_STACK_TAG is the release this one upgrades from.
+PREV_STACK_TAG="${PREV_STACK_TAG:-stack-v0.6.29}"
+OLD_APPLY="$WORK/prev-noo-apply.sh"
+OLD_PID=""
+if git -c safe.directory="$REPO" -C "$REPO" fetch -q --depth=1 origin "refs/tags/$PREV_STACK_TAG:refs/tags/$PREV_STACK_TAG" 2>"$WORK/fetch.err" \
+    && git -c safe.directory="$REPO" -C "$REPO" show "$PREV_STACK_TAG:scripts/noo-apply.sh" > "$OLD_APPLY" && [ -s "$OLD_APPLY" ]; then
+    OUT0="$(run_block "$OLD_APPLY" 2>"$WORK/block0.err")"
+    echo "$OUT0"
+    check "upgrade: the previous release ($PREV_STACK_TAG) installs its hold" grep -q 'harness-egress=enforced' <<<"$OUT0"
+    systemctl daemon-reload
+    systemctl restart noo-harness
+    sleep 2
+    OLD_PID="$(systemctl show -p MainPID --value noo-harness)"
+    check "upgrade: the harness runs under the previous release's hold" test -n "$OLD_PID" -a "$OLD_PID" != 0
+else
+    cat "$WORK/fetch.err"
+    fail "upgrade: could not read the previous release's applier ($PREV_STACK_TAG)"
+fi
 
 tcpdump -i any -nn -l 'port 53' > "$WORK/dns.txt" 2>&1 &
 TCPDUMP=$!
@@ -136,8 +160,16 @@ check "applied tag says harness-egress=enforced" grep -q 'harness-egress=enforce
 check "the drop-in exists" test -f "$DROPIN"
 check "harness-net files exist" test -f /etc/noo/harness-net/resolv.conf -a -f /etc/noo/harness-net/hosts -a -f /etc/noo/harness-net/nsswitch.conf
 check "the hosts file names the controller" grep -q 'noo-ci-controller' /etc/noo/harness-net/hosts
+check "upgrade: the new block re-rendered the hold and asks for one harness restart" grep -qx 'RESTART=1' <<<"$OUT"
 systemctl daemon-reload
 systemctl restart noo-harness
+sleep 2
+NEW_PID="$(systemctl show -p MainPID --value noo-harness)"
+LIVE_ALLOW="$(systemctl show -p IPAddressAllow --value noo-harness)"
+LIVE_WIDE="$(for a in $LIVE_ALLOW; do case $a in */32|*/128) ;; *) echo "$a" ;; esac; done)"
+check "upgrade: after the restart a new harness process runs" test -n "$NEW_PID" -a "$NEW_PID" != 0 -a "$NEW_PID" != "$OLD_PID"
+check "upgrade: the running unit allows single hosts only" test -n "$LIVE_ALLOW" -a -z "$LIVE_WIDE"
+check "upgrade: the running unit carries the hold flag" bash -c "systemctl show -p Environment --value noo-harness | tr ' ' '\\n' | grep -qx NOO_HARNESS_EGRESS_HOLD=1"
 
 # ── d/e. what the unit saw ──────────────────────────────────────────────────
 for _ in $(seq 1 30); do [ -f "$RESULT" ] && break; sleep 1; done
