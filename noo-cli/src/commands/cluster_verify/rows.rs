@@ -1479,7 +1479,7 @@ pub(crate) const ROWS: &[Row] = &[
         name: "reranker",
         scope: Scope::Controller,
         verdicts: &[Verdict::Warn],
-        meaning: "Whether a reranker is placed; without one, `/api/external/rerank` is served by the chat model, which can answer the input order unranked (`score: null`, `noo.degraded: identity`).",
+        meaning: "Whether a reranker is placed and serving (a placed one still loading is a WARN naming the node); without one, `/api/external/rerank` is served by the chat model, which can answer the input order unranked (`score: null`, `noo.degraded: identity`).",
         clears: "Stage a GGUF cross-encoder with `noo cluster sync-model-files`, then `noo cluster place <node> reranker <file>.gguf --on cpu`.",
         findings: &[],
         shown_as: None,

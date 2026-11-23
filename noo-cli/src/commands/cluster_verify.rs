@@ -3747,6 +3747,13 @@ pub(crate) fn reranker_check(caps: Option<&Value>) -> Check {
     };
     match caps["rerank"]["available"].as_bool() {
         Some(true) => ok(NAME, "a reranker node serves /api/external/rerank"),
+        // Placed, but no lane routes yet (its model loading, or its agent not
+        // reachable): the gateway names the nodes.
+        Some(false) if caps["rerank"]["state"].as_str() == Some("loading") => warn(
+            NAME,
+            caps["rerank"]["reason"].as_str().unwrap_or("a reranker is placed but not serving yet").to_string(),
+            None,
+        ),
         Some(false) => warn(
             NAME,
             "no reranker placed; rerank requests are served by the chat model, and when it ranks nothing the answer is the input order with no scores (noo.degraded: identity)",
@@ -19949,6 +19956,11 @@ mod reranker_row_tests {
         let unread = reranker_check(None);
         assert_eq!(unread.verdict, Verdict::Warn);
         assert!(unread.detail.starts_with("not read") && unread.remedy.is_none(), "{}", unread.detail);
+        let loading = reranker_check(Some(&json!({"rerank": {"available": false, "models": [], "state": "loading",
+            "reason": "placed on node-a, loading: not serving yet (its model is loading or its agent is not reachable); a request now is answered by the chat model, labelled"}})));
+        assert_eq!(loading.verdict, Verdict::Warn);
+        assert!(loading.detail.starts_with("placed on node-a, loading") && loading.remedy.is_none(), "{}", loading.detail);
+        assert!(!loading.detail.contains("no reranker placed"), "a placed reranker is never called absent");
         let odd = reranker_check(Some(&json!({"chat": {}})));
         assert!(odd.remedy.is_none() && !odd.detail.contains("no reranker placed"), "{}", odd.detail);
     }
