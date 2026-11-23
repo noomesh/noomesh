@@ -2362,8 +2362,11 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
     // and runs this same loop — tools, context, session, usage, hooks.
 
     let start = Instant::now();
-    // The turn's id as the session store keys it; every loop log line carries it.
-    let turn_conv = crate::session::coerce_conversation_id(conversation_id);
+    // The turn's id exactly as the caller sent it (the same value
+    // `coordinator_chat_stream_start` logs), so a log reader can match every
+    // loop line to its turn. The session store keys the coerced form
+    // (`session::coerce_conversation_id`, a UUIDv5 of this for a non-UUID id).
+    let turn_conv = conversation_id.to_string();
     let mut usage = UsageStats::default();
 
     // 1. Resolve backend — pass user's model preference for targeted routing
@@ -3692,8 +3695,11 @@ async fn run_inner_bound<R: HarnessRuntime>(
     // and runs this same loop — tools, context, session, usage, hooks.
 
     let start = Instant::now();
-    // The turn's id as the session store keys it; every loop log line carries it.
-    let turn_conv = crate::session::coerce_conversation_id(conversation_id);
+    // The turn's id exactly as the caller sent it (the same value
+    // `coordinator_chat_stream_start` logs), so a log reader can match every
+    // loop line to its turn. The session store keys the coerced form
+    // (`session::coerce_conversation_id`, a UUIDv5 of this for a non-UUID id).
+    let turn_conv = conversation_id.to_string();
     let mut usage = UsageStats::default();
 
     // Resolve backend — pass user's model preference for targeted routing
