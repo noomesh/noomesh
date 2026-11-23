@@ -26,6 +26,15 @@ _ci_skip_guard.TESTS_DIR = Path(__file__).resolve().parent
 pytest_configure = _ci_skip_guard.pytest_configure
 pytest_sessionfinish = _ci_skip_guard.pytest_sessionfinish
 
+# What a run leaves out (trellion not public) and the count/names of tests that
+# skip themselves because their input is not in this tree. One place for
+# test-core and the mutants python lane (tests/_public_tree.py).
+from . import _public_tree as _public_tree  # noqa: E402
+
+collect_ignore = _public_tree.collect_ignore_list()
+pytest_collection_modifyitems = _public_tree.pytest_collection_modifyitems
+pytest_terminal_summary = _public_tree.pytest_terminal_summary
+
 
 def _path_without_host_nvidia_smi(path: str) -> str:
     """`path` minus every directory that holds an `nvidia-smi` (followup i142).

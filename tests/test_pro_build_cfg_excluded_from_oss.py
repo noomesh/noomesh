@@ -53,15 +53,37 @@ def _guarded_paths(build_rs: Path) -> list[str]:
     return [f"{build_rs.parent.name}/{p}" for p in rel]
 
 
+def _skip_unless_sync_script(sync: Path) -> None:
+    """The OSS sync script is not part of the public tree; where it is absent
+    there is nothing to check the exclusions against."""
+    if not sync.is_file():
+        pytest.skip(f"not in this tree: {sync.name} (the OSS sync script) is absent")
+
+
+def test_the_sync_guard_skips_only_when_the_script_is_absent(tmp_path: Path) -> None:
+    """Never skip when the input is present: where the script exists the guard runs."""
+    present = tmp_path / "scripts" / "sync-to-oss.sh"
+    present.parent.mkdir()
+    present.write_text("PRO_EXCLUDES\n")
+    try:
+        _skip_unless_sync_script(present)
+    except pytest.skip.Exception:
+        pytest.fail("skipped although the sync script is present")
+    with pytest.raises(pytest.skip.Exception) as gone:
+        _skip_unless_sync_script(tmp_path / "scripts" / "absent.sh")
+    assert str(gone.value).startswith("not in this tree:")
+
+
 def _pro_excludes() -> str:
     return SYNC.read_text()
 
 
 @pytest.mark.parametrize("script", BUILD_SCRIPTS)
 def test_cfg_gated_pro_files_are_excluded_from_the_oss_sync(script: str) -> None:
+    _skip_unless_sync_script(SYNC)
     build_rs = REPO / script
     if not build_rs.exists():
-        pytest.skip(f"{script} not present")
+        pytest.skip(f"not in this tree: {script} is absent")
 
     watched = _guarded_paths(build_rs)
     if not watched:
