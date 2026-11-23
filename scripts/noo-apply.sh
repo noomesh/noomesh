@@ -156,8 +156,9 @@ fi
 CA="$PKI/ca.crt"
 [ -f "$CA" ] || { echo "noo-apply: no trusted CA at $CA — enroll this node first" >&2; NOO_REFUSAL=not_enrolled; exit 78; }
 
-# i1182a: accepted for one release after TEI's removal; drop in 0.6.31: svc-tei.crt and svc-tei.key stay in the list below,
-# and `tei` in the leaf install loop, so a bundle from a 0.6.29 controller still applies.
+# i1182a: svc-tei.crt and svc-tei.key stay in the list below for one release after TEI's removal, ACCEPTED
+# so a bundle from a 0.6.29 controller still applies, and NOT installed (no `tei` in the leaf install loop).
+# Drop the two kinds in 0.6.31.
 KNOWN_KINDS="ca.crt node.crt node.key agent-env agent-unit agent-binary teardown applier hostd-binary restart-backends host-telemetry cli-binary cli-user fetcher nats-creds fleet-secrets signing-pub harness-binary harness-env harness-unit svc-vllm.crt svc-vllm.key svc-llamacpp.crt svc-llamacpp.key svc-ollama.crt svc-ollama.key svc-tei.crt svc-tei.key svc-reranker.crt svc-reranker.key vendor-cli vendor-cli-manifest vendor-cli-2 vendor-cli-2-manifest vendor-cli-3 vendor-cli-3-manifest release-sums release-sums.sig release-version release-lock release-lock.sig netns-unit"
 
 # An add-on's node workload door leaf travels as svc-addon-<addon>-<workload>
@@ -2277,7 +2278,48 @@ done
 # reconciler re-checks the door every tick and starts the backend once its
 # leaf is here; a RUNNING door keeps the leaf it started with until its
 # backend is next recreated.
-for _svc in vllm llamacpp ollama tei reranker; do
+# The TEI engine was removed in 0.6.30. An older controller's bundle may still
+# carry svc-tei.*: it is accepted and installs nothing. A 0.6.29 install left
+# its own leaf behind, so this applier removes exactly that leaf, on every
+# apply, bundle or no bundle. Targets are the four paths below and nothing
+# else: no glob, no `rm -r`. A symlinked directory, a symlinked or
+# non-regular file, and any other file in the directory are left alone and
+# reported; the directory is `rmdir`-ed only once it is empty.
+# BEGIN retired_tei_leaf
+if [ -f "$WORK/files/svc-tei.crt" ] || [ -f "$WORK/files/svc-tei.key" ]; then
+    echo "noo-apply: svc-tei (the TEI engine was removed in 0.6.30) is accepted from an older controller's bundle and not installed"
+fi
+for _rt in tei tei-gpu; do
+    _rd="$PKI/services/$_rt"
+    [ -e "$_rd" ] || [ -L "$_rd" ] || continue
+    if [ -L "$_rd" ]; then
+        echo "noo-apply: $_rd is a symlink — left alone (retired TEI leaf not removed)" >&2
+        continue
+    fi
+    for _rf in service.key service.crt; do
+        _rp="$_rd/$_rf"
+        [ -e "$_rp" ] || [ -L "$_rp" ] || continue
+        if [ -f "$_rp" ] && [ ! -L "$_rp" ]; then
+            if rm -f "$_rp"; then
+                echo "noo-apply: removed retired TEI leaf $_rp"
+                applied="$applied retired-tei-leaf-removed=services/$_rt/$_rf"
+            else
+                echo "noo-apply: could not remove retired TEI leaf $_rp" >&2
+            fi
+        else
+            echo "noo-apply: $_rp is a symlink or not a regular file — left alone" >&2
+        fi
+    done
+    if [ -d "$_rd" ]; then
+        if rmdir "$_rd" 2>/dev/null; then
+            echo "noo-apply: removed empty retired TEI directory $_rd"
+        else
+            echo "noo-apply: $_rd still holds other files — left alone" >&2
+        fi
+    fi
+done
+# END retired_tei_leaf
+for _svc in vllm llamacpp ollama reranker; do
     _c="$WORK/files/svc-$_svc.crt"; _k="$WORK/files/svc-$_svc.key"
     [ -f "$_c" ] || [ -f "$_k" ] || continue
     [ -f "$_c" ] && [ -f "$_k" ] || { echo "noo-apply: svc-$_svc carries half a leaf (cert and key travel together) — refusing" >&2; NOO_REFUSAL=service_leaf_invalid; exit 65; }

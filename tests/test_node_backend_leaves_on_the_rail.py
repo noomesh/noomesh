@@ -59,17 +59,19 @@ def _apply_loop() -> list[str]:
     return m.group(1).split()
 
 
-# i1182a (expand then contract): 0.6.30's controller stops issuing the `tei` leaf,
-# but the applier still installs one a 0.6.29 controller's bundle carries, for
-# ONE release. Drop `tei` from this set (and from the applier loop) in 0.6.31.
+# i1182a (expand then contract): 0.6.30's controller stops issuing the `tei` leaf.
+# The applier still ACCEPTS svc-tei.* from an older controller's bundle (the kind
+# stays in the allow-lists for ONE release) but does not install it: `tei` is not
+# in the install loop, or a 0.6.29 bundle would manufacture a fresh
+# services/tei/service.key on a 0.6.30 node. Drop the kinds in 0.6.31.
 LEGACY_ACCEPTED = ("tei",)
 
 
 def test_the_applier_installs_every_service_the_controller_packs() -> None:
     loop = _apply_loop()
-    assert [s for s in loop if s not in LEGACY_ACCEPTED] == [r["service"] for r in _rust_rows()]
+    assert loop == [r["service"] for r in _rust_rows()]
     for legacy in LEGACY_ACCEPTED:
-        assert legacy in loop, f"the applier loop dropped {legacy}: a 0.6.29 bundle's leaf would be accepted but never installed"
+        assert legacy not in loop, f"the applier loop installs {legacy} again: a 0.6.29 bundle would recreate services/{legacy}/"
         assert legacy not in [r["service"] for r in _rust_rows()], f"the controller issues {legacy} again"
 
 
