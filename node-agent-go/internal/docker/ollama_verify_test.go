@@ -414,6 +414,89 @@ func TestOllamaVerifyGGUFRebuildFailingRefuses(t *testing.T) {
 	}
 }
 
+// Tests for the post-repair re-check: a repair that returns nil is followed
+// by a second comparison against the controller's record, and the model is
+// reported rebuilt only when that comparison passes.
+
+// A repair that reports success but leaves the wrong bytes in place is
+// refused with the "still does not match afterwards" reason, on both anchors.
+func TestOllamaVerifyRepairLeavingBlobWrongRefuses(t *testing.T) {
+	t.Setenv("NOO_SELF_NODE", "1")
+	for _, tc := range []struct {
+		name  string
+		model string
+		setup func(rg *verifyRig) string
+	}{
+		{"mirror", mirrorModel, func(rg *verifyRig) string { m, _ := rg.mirrorSetup(); return m }},
+		{"gguf", ggufModel, func(rg *verifyRig) string { return rg.ggufSetup() }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rg := newVerifyRig(t, false)
+			blob := tc.setup(rg)
+			rg.writeBlobAt(blob, "tampered bytes, same name")
+			rg.repairFn = func() error { return nil } // succeeds, restores nothing
+			res := rg.v.Verify(context.Background(), tc.model)
+			if len(rg.repairs) != 1 {
+				t.Fatalf("repair not attempted once: %+v", rg.repairs)
+			}
+			if res.State != OllamaRefused {
+				t.Fatalf("got %+v, want refused", res)
+			}
+			if want := "noo models pull " + tc.model; res.Remedy != want {
+				t.Errorf("remedy = %q, want %q", res.Remedy, want)
+			}
+			for _, want := range []string{"still does not match afterwards", tc.model, "sha256:" + blob, "noo models pull " + tc.model} {
+				if !strings.Contains(res.Reason, want) {
+					t.Errorf("refusal %q does not name %q", res.Reason, want)
+				}
+			}
+		})
+	}
+}
+
+// A re-check that cannot read the controller's record after the repair is
+// refused with the "could not be re-checked" reason, on both anchors.
+func TestOllamaVerifyRecheckErrorRefuses(t *testing.T) {
+	t.Setenv("NOO_SELF_NODE", "1")
+	for _, tc := range []struct {
+		name  string
+		model string
+		setup func(rg *verifyRig) string
+	}{
+		{"mirror", mirrorModel, func(rg *verifyRig) string { m, _ := rg.mirrorSetup(); return m }},
+		{"gguf", ggufModel, func(rg *verifyRig) string { return rg.ggufSetup() }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rg := newVerifyRig(t, false)
+			blob := tc.setup(rg)
+			rg.writeBlobAt(blob, "tampered bytes, same name")
+			// The repair succeeds, then the controller's data plane stops
+			// serving, so the re-check's read of the record fails.
+			rg.repairFn = func() error {
+				for k := range rg.bodies {
+					delete(rg.bodies, k)
+				}
+				return nil
+			}
+			res := rg.v.Verify(context.Background(), tc.model)
+			if len(rg.repairs) != 1 {
+				t.Fatalf("repair not attempted once: %+v", rg.repairs)
+			}
+			if res.State != OllamaRefused {
+				t.Fatalf("got %+v, want refused", res)
+			}
+			if want := "noo models pull " + tc.model; res.Remedy != want {
+				t.Errorf("remedy = %q, want %q", res.Remedy, want)
+			}
+			for _, want := range []string{"could not be re-checked", tc.model, "sha256:" + blob, "noo models pull " + tc.model} {
+				if !strings.Contains(res.Reason, want) {
+					t.Errorf("refusal %q does not name %q", res.Reason, want)
+				}
+			}
+		})
+	}
+}
+
 func TestOllamaVerifyNoControllerRecordIsUnverifiedNeverRefused(t *testing.T) {
 	t.Setenv("NOO_SELF_NODE", "1") // the controller's own node: `noo models pull` reaches its Ollama
 	rg := newVerifyRig(t, false)
