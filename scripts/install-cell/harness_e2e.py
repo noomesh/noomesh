@@ -293,7 +293,9 @@ def collect(ev: list[str], tmp: str, E: dict) -> None:
         root_env = ""
     pki = os.environ.get("NOO_PKI_DIR") or env_value(root_env, "NOO_PKI_DIR") or os.path.expanduser("~/.config/mesh/pki")
     key = os.path.join(os.path.expanduser(pki), "signing.key")
-    ev.append(f"signing key: {'readable' if os.access(key, os.R_OK) else 'NOT readable'} in the CLI's PKI directory ({pki})")
+    # Worded with no "key: value" shape: the cell's upload gate reads one as a
+    # secret and withholds every log of the cell (rc.2 and rc.3 runs).
+    ev.append(f"the fleet signing key is {'readable' if os.access(key, os.R_OK) else 'NOT readable'} in the CLI's PKI directory ({pki})")
     if not os.access(key, os.R_OK):
         return stop("FAIL", "the fleet signing key is not readable in the CLI's PKI directory")
     rc, so = run(["openssl", "dgst", "-sha256", "-sign", key, "-out", spath, mpath])

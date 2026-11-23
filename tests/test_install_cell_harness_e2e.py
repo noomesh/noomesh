@@ -142,3 +142,25 @@ def test_a_connect_that_failed_inside_the_hold_passes_and_one_refused_by_the_far
     assert state(with_(probe_rc=1, probe_err="/bin/bash: connect: Connection timed out")) == "PASS"
     assert state(with_(probe_rc=1, probe_err="/bin/bash: connect: Connection refused")) == "FAIL"
     assert state(with_(probe_rc=1, probe_err="")) == "FAIL"
+
+
+def test_the_evidence_lines_pass_the_cells_upload_gate():
+    """Every evidence line the judge writes, shaped as on a PASS cell, passes
+    cell.py's secret scan (a `key: value` shape withheld every log of the cell)."""
+    import cell
+    lines = [
+        "node=cell-a controller_url=https://localhost:8080 nats_url=tls://localhost:4222 pki_dir=/etc/noo/pki",
+        "release=0.6.30-rc.3 asset=noo-gateway-x86_64-unknown-linux-musl sha_ok=yes",
+        "the fleet signing key is readable in the CLI's PKI directory (/home/runner/.noo/pki)",
+        "staged: HTTP 200 (6 kinds, 64103104 bytes)",
+        "place: rc=0 + cell-a: harness → auto (Running) — agent reconciles within 5 min",
+        "apply: noo-apply: applied: harness-env harness-binary harness-unit harness-egress-file",
+        "note: the applier printed no harness-egress tag (the agent's egress object below is what is judged)",
+        'harness: state=running egress={"state": "enforced", "resolver": "unit", "pid_match": true, "ip_deny": "0.0.0.0/0 ::/0", "ip_allow": "127.0.0.1/32 ::1/128"}',
+        "unit: IPAddressDeny=0.0.0.0/0 ::/0 IPAddressAllow=127.0.0.1/32 ::1/128 ControlGroup=/system.slice/noo-harness.service",
+        "class: rc=0 he-held -> cell-a/ollama=qwen2.5:0.5b",
+        "turn: conversation=7d899502-6657-4284-bc71-cb76e79689da HTTP 200 in 15.6s",
+        "probe from the unit's cgroup (/system.slice/noo-harness.service) to 1.1.1.1:443: rc=124 (); turn in flight=True; host control rc=0",
+        "cleanup: class unset rc=0, harness unplaced rc=0",
+    ]
+    assert cell.secret_hits("\n".join(lines) + "\n") == []
