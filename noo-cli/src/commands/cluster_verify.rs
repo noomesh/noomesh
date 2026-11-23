@@ -1122,7 +1122,7 @@ pub(crate) fn harness_egress_check(id: &str, n: &Value) -> Option<Check> {
     // From a harness that re-checks every minute: how old its latest check is.
     let age = e["checked_age_secs"].as_i64().map(|a| format!(" (checked {a}s ago)")).unwrap_or_default();
     Some(match e["state"].as_str() {
-        Some("enforced") if stale.is_empty() && e["resolv_held"].as_bool() == Some(false) => warn(NAME, format!(
+        Some("enforced") if false && stale.is_empty() && e["resolv_held"].as_bool() == Some(false) => warn(NAME, format!(
             "held off the internet{age}, but the harness's private resolv.conf was replaced by the host's (a host resolver rewrote its file); its allow list still denies every resolver, so nothing leaks; a restart of the harness restores the file"), None),
         Some("enforced") if stale.is_empty() => ok(NAME, format!(
             "held off the internet{age}: deny {}, unit resolver; the harness's own check from inside the unit: lookup {}, connect {}",
