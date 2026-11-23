@@ -1291,7 +1291,7 @@ fn install_findings(
         .collect(),
         pki_exposed_keys: key_issues
             .iter()
-            .filter(|k| k.kind == crate::pki::KeyIssueKind::Exposed)
+            .filter(|k| k.kind == crate::pki::KeyIssueKind::Exposed || (k.kind == crate::pki::KeyIssueKind::RetiredLeaf && k.mode & 0o077 != 0))
             .map(|k| format!("{} {:04o} ({})", k.rel, k.mode, k.reader.describe()))
             .collect(),
         pki_unknown_reader_keys: key_issues

@@ -549,8 +549,12 @@ pub fn pki_fix_modes(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                         crate::pki::KeyIssueKind::Unreadable => "unreadable",
                         crate::pki::KeyIssueKind::UnknownReader => "unknown-reader",
                         crate::pki::KeyIssueKind::WrongOwner => "wrong-owner",
+                        crate::pki::KeyIssueKind::RetiredLeaf => "retired-leaf",
                     },
-                    "needs": ca.key_grant_command(&ca.dir.join(&i.rel)),
+                    "needs": match i.kind {
+                        crate::pki::KeyIssueKind::RetiredLeaf => Some(crate::pki::retired_leaf_rm_line(&ca.dir, &i.rel)),
+                        _ => ca.key_grant_command(&ca.dir.join(&i.rel)),
+                    },
                 }))
                 .collect();
             println!("{}", serde_json::json!({ "dry_run": true, "would_change": items, "public_view_in_step": drift.is_clean() }));
@@ -568,6 +572,7 @@ pub fn pki_fix_modes(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                 crate::pki::KeyIssueKind::Unreadable => "hand to its reader",
                 crate::pki::KeyIssueKind::UnknownReader => "tighten to 0600 (no reader entry)",
                 crate::pki::KeyIssueKind::WrongOwner => "leave (owned by another uid; needs the sudo line)",
+                crate::pki::KeyIssueKind::RetiredLeaf => "tighten to 0600, never delete (retired TEI leaf; delete it by hand)",
             })])
             .collect();
         print!("{}", ui::table(&[Col::left(""), Col::left("key"), Col::left("mode"), Col::left("reader"), Col::left("action")], &rows));
@@ -1106,7 +1111,7 @@ mod reconcile_tests {
         let (_, key) = ca.issue_node_cert("host9", "10.0.0.6", 90, &[], &[], &crate::pki::NodeRole::Worker).unwrap();
         let row = || {
             let lines: Vec<String> = ca.list_keys().iter().filter_map(|k| ca.key_grant_command(k)).collect();
-            pki_key_modes_check(&ca.audit_key_modes(), &lines, ca.list_keys().len())
+            pki_key_modes_check(&ca.audit_key_modes(), &lines, ca.list_keys().len(), &ca.dir)
         };
         let clean = row();
         // A uid-read key this box cannot hand over (no setfacl, not root)
