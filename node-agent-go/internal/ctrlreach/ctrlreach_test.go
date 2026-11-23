@@ -84,7 +84,8 @@ func TestAnAnswerWithNoOutageLogsNothing(t *testing.T) {
 
 // Could not reach: a failed dial, a name that does not resolve, a timeout.
 // Not unreachable: a TLS verification failure (something else answered), an
-// HTTP answer, nil.
+// HTTP answer, nil. A reset or broken pipe is unreachable (see
+// TestUnreachable_ResetAndBrokenPipe).
 func TestUnreachableIsByTypeAndOnlyForNoAnswer(t *testing.T) {
 	yes := []error{
 		refused,
@@ -102,11 +103,28 @@ func TestUnreachableIsByTypeAndOnlyForNoAnswer(t *testing.T) {
 		nil,
 		errors.New("desired-config HTTP 503: hashing"),
 		&url.Error{Op: "Get", URL: ctl, Err: &tls.CertificateVerificationError{Err: errors.New("x509: unknown authority")}},
-		&net.OpError{Op: "read", Net: "tcp", Err: syscall.ECONNRESET},
 	}
 	for _, e := range no {
 		if Unreachable(e) {
 			t.Errorf("want NOT unreachable: %v", e)
 		}
+	}
+}
+
+// A reset or broken pipe on a kept-alive connection by the path is still
+// "could not reach"; a certificate failure is not.
+func TestUnreachable_ResetAndBrokenPipe(t *testing.T) {
+	for name, err := range map[string]error{
+		"read reset":  &url.Error{Op: "Post", URL: ctl, Err: &net.OpError{Op: "read", Net: "tcp", Err: syscall.ECONNRESET}},
+		"write reset": &url.Error{Op: "Post", URL: ctl, Err: &net.OpError{Op: "write", Net: "tcp", Err: syscall.ECONNRESET}},
+		"write pipe":  &url.Error{Op: "Post", URL: ctl, Err: &net.OpError{Op: "write", Net: "tcp", Err: syscall.EPIPE}},
+		"read pipe":   &url.Error{Op: "Post", URL: ctl, Err: &net.OpError{Op: "read", Net: "tcp", Err: syscall.EPIPE}},
+	} {
+		if !Unreachable(err) {
+			t.Errorf("%s: want unreachable", name)
+		}
+	}
+	if Unreachable(&url.Error{Op: "Post", URL: ctl, Err: &tls.CertificateVerificationError{Err: errors.New("bad cert")}}) {
+		t.Error("a TLS verification failure must not be unreachable")
 	}
 }

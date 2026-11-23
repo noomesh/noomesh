@@ -4,12 +4,17 @@
 package agent
 
 import (
+	"bytes"
 	"context"
+	"errors"
+	"log/slog"
 	"os"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/noomesh/noomesh/node-agent-go/internal/ctrlreach"
 )
 
 // 0.6.8 rehearsal (F3): a controller refusing registration (401 every try)
@@ -62,5 +67,28 @@ func TestRun_ASignalCancelsCtxBeforeRegistration(t *testing.T) {
 	}
 	if !strings.Contains(body[reader:register], "cancel()") {
 		t.Fatal("the signal goroutine must cancel ctx")
+	}
+}
+
+// While the controller is away (the onset line already said so once) the
+// per-try wait line is debug; any other failure keeps it a warning.
+func TestRegisterUntil_WaitLineLevelFollowsTheOutage(t *testing.T) {
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	defer func() { slog.SetDefault(prev); ctrlreach.Answered("test", time.Now()) }()
+
+	n := 0
+	registerUntil(context.Background(), func() bool { n++; return n == 2 }, time.Millisecond)
+	if !strings.Contains(buf.String(), "level=WARN msg=\"waiting for controller\"") {
+		t.Fatalf("a non-outage failure keeps the WARN: %s", buf.String())
+	}
+	buf.Reset()
+	ctrlreach.Failed("register", "http://c", errors.New("x"), time.Now())
+	buf.Reset()
+	n = 0
+	registerUntil(context.Background(), func() bool { n++; return n == 2 }, time.Millisecond)
+	if strings.Contains(buf.String(), "level=WARN") || !strings.Contains(buf.String(), "level=DEBUG msg=\"waiting for controller\"") {
+		t.Fatalf("during an outage the wait line is DEBUG: %s", buf.String())
 	}
 }

@@ -6,6 +6,7 @@ package reconcile
 import (
 	"context"
 	"errors"
+	"io"
 	"log/slog"
 	"net"
 	"syscall"
@@ -49,6 +50,33 @@ func doorNotUp(err error) bool {
 		return true
 	}
 	return errors.Is(err, syscall.ECONNREFUSED)
+}
+
+// importRecentStartWindow is how long after this agent (re)started ollama a
+// push cut off mid-stream is read as the door having been replaced.
+const importRecentStartWindow = 120 * time.Second
+
+// doorReplaced says whether err is a push cut off because the door went away
+// mid-stream (reset, broken pipe, early EOF) AND this agent (re)started
+// ollama within importRecentStartWindow of now. By type (errors.Is), never
+// by text; the same failure outside the window is an ordinary failure with
+// the normal backoff, and an HTTP answer from the door is never this.
+func doorReplaced(err error, startedAt, now time.Time) bool {
+	if err == nil || startedAt.IsZero() {
+		return false
+	}
+	if age := now.Sub(startedAt); age < 0 || age > importRecentStartWindow {
+		return false
+	}
+	return errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.EPIPE) ||
+		errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)
+}
+
+// noteOllamaStart records that this agent is (re)starting ollama at t.
+func (r *Reconciler) noteOllamaStart(t time.Time) {
+	r.pullMu.Lock()
+	r.ollamaStartedAt = t
+	r.pullMu.Unlock()
 }
 
 // importDoorReady is the one definition of "a started ollama is ready": the

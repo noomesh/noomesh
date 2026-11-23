@@ -277,7 +277,10 @@ def test_a_turn_records_the_wires_its_model_calls_went_out_on():
 
 def test_a_turn_records_each_model_call_in_tokens():
     t = CF.turn_tokens(_facts(DIRECT_CALL, BACKEND_CALL_2))
-    assert t["calls"][0] == {"sent_estimate": 2871, "evaluated": 1190, "prefill_ms": 1840, "ctx": 4096, "wire": "ollama"}
+    # Each call keeps its time: backend_call carries no iteration, so calls are
+    # ordered by it within the turn.
+    assert t["calls"][0] == {"sent_estimate": 2871, "evaluated": 1190, "prefill_ms": 1840, "ctx": 4096, "wire": "ollama",
+                             "ts": "2026-11-14T10:02:03.120456Z"}
     assert t["calls"][1]["prefill_ms"] == 660 and t["calls"][1]["wire"] is None
     assert (t["sent_estimate"], t["evaluated"]) == (2 * 2871, 2 * 1190)
     assert CF.turn_tokens(CF.log_facts(None)) == {"calls": [], "sent_estimate": None, "evaluated": None}
@@ -630,3 +633,118 @@ def test_the_rag_evidence_keeps_the_turns_events_and_drops_every_body_field(caps
     assert "KESTREL-SECRET" not in joined and "unrelated" not in joined and "\x1b" not in joined
     assert RCE.conversation_id(["no start here"]) == ""
 
+
+
+def test_the_rag_evidence_keeps_kb_tool_deferred_which_names_no_conversation():
+    """coordinator.kb_tool_deferred carries iteration, has_rag and tool only
+    (gateway-rust/src/coordinator/agent_loop.rs), no conversation_id: the event
+    filter alone must keep it, or the evidence reads it as absent."""
+    cid = "cli-1700000000-42"
+    line = json.dumps({"fields": {"message": "coordinator.kb_tool_deferred", "iteration": 1,
+                                  "has_rag": True, "tool": "kb_search"}})
+    got = RCE.view(line, cid)
+    assert got and "kb_tool_deferred" in got and '"iteration": 1' in got
+
+
+def test_a_turns_loop_lines_are_kept_with_their_time_and_no_body_field():
+    """Each turn's record carries the gateway's loop.* / coordinator.* lines of
+    its window (i1332: a Windows turn stopped after a tool call and nothing
+    named the iteration), with whitelisted fields only: the evidence is uploaded."""
+    lines = [
+        json.dumps({"timestamp": "2026-11-23T14:00:01.5Z", "fields": {
+            "message": "coordinator.kb_tool_deferred", "iteration": 1, "has_rag": True, "tool": "kb_search"}}),
+        json.dumps({"timestamp": "2026-11-23T14:00:03.0Z", "fields": {
+            "message": "loop.retrieval_nudge", "iteration": 2, "reason": "no retrieval used",
+            "prompt": "KESTREL-SECRET", "content": "KESTREL-SECRET"}}),
+        json.dumps({"timestamp": "2026-11-23T14:00:04.0Z", "fields": {"message": "unrelated", "iteration": 9}}),
+        json.dumps({"fields": {"message": "backend_call", "backend": "ollama", "sent_estimate": 15700}}),
+    ]
+    facts = CF.log_facts(lines)
+    loop = facts["loop"]
+    assert [e["event"] for e in loop] == ["coordinator.kb_tool_deferred", "loop.retrieval_nudge"]
+    assert loop[0]["ts"] == "2026-11-23T14:00:01.5Z" and loop[1]["iteration"] == 2 and loop[1]["reason"] == "no retrieval used"
+    assert "KESTREL-SECRET" not in json.dumps(loop)
+    rec = CF.turn_record("first-answer", "PASS", "", 1.0, facts, {"text": "", "calls": []})
+    assert rec["loop"] == loop
+    assert rec["kb_tool_deferred"] == 1
+    assert CF.log_facts(None)["loop"] == []
+
+
+def test_a_turns_window_is_attributed_honestly_and_keeps_its_injected_context():
+    """backend_call / context_injected / loop lines name no conversation, so a
+    turn's figures are its log window's: the record says so, counts the turn
+    starts in the window, and marks it overlapped when any other turn started
+    there (fa: Windows rc.3 f3's 15.7k-token first call could not be attributed)."""
+    own = [
+        json.dumps({"fields": {"message": "ws_coordinator connected", "user_id": "u1"}}),
+        json.dumps({"fields": {"message": "context_injected", "has_rag": True, "has_memory": False,
+                               "dropped": 0, "post_dedup_chars": 812, "content": "KESTREL-SECRET"}}),
+        json.dumps({"fields": {"message": "backend_call", "backend": "ollama", "sent_estimate": 6500}}),
+    ]
+    f = CF.log_facts(own)
+    assert f["attribution"]["overlapped"] is False and f["attribution"]["ws_connects"] == 1
+    assert f["injected"] == [{"has_rag": True, "has_memory": False, "dropped": 0, "post_dedup_chars": 812}]
+    rec = CF.turn_record("rag", "PASS", "", 1.0, f, {"text": "", "calls": []})
+    assert rec["context_injected"] == f["injected"] and rec["attribution"]["overlapped"] is False
+    assert "KESTREL-SECRET" not in json.dumps(rec)
+    other = own + [
+        json.dumps({"fields": {"message": "coordinator_chat_stream_start", "conversation_id": "cli-other"}}),
+        json.dumps({"fields": {"message": "request", "method": "POST", "path": "/api/inference", "status": 200}}),
+    ]
+    a = CF.log_facts(other)["attribution"]
+    assert a["overlapped"] is True and "chat stream cli-other" in a["other_turn_starts"] and "POST /api/inference" in a["other_turn_starts"]
+    assert CF.log_facts(own + [own[0]])["attribution"]["overlapped"] is True
+    # A heartbeat task's LLM call in the window (it logs no turn start).
+    hb = CF.log_facts(own + [json.dumps({"timestamp": "2026-11-23T14:00:02Z", "fields": {
+        "message": "heartbeat_llm_waiting_for_slot", "task_id": "t-1", "action": "daily_digest"}})])["attribution"]
+    assert hb["overlapped"] is True and hb["heartbeat"][0]["action"] == "daily_digest"
+    idle = CF.log_facts(own + [json.dumps({"fields": {"message": "heartbeat_loop_tick", "due_count": 0}})])["attribution"]
+    assert idle["overlapped"] is False and idle["heartbeat"] == []
+    assert CF.log_facts(None)["attribution"] is None
+
+
+def test_a_turn_is_attributed_by_its_conversation_id_when_the_gateway_names_it():
+    """With conversation_id on the turn lines (fa's gateway change), a turn's
+    calls, injected context and loop lines are those naming its id; another
+    turn's lines in the same window are left out, not counted as overlap."""
+    mine, theirs = "conv-mine", "conv-theirs"
+    lines = [
+        json.dumps({"fields": {"message": "ws_coordinator connected"}}),
+        json.dumps({"fields": {"message": "context_injected", "has_rag": True, "conversation_id": mine}}),
+        json.dumps({"fields": {"message": "backend_call", "sent_estimate": 6500, "conversation_id": mine}}),
+        json.dumps({"fields": {"message": "backend_call", "sent_estimate": 15700, "conversation_id": theirs}}),
+        json.dumps({"fields": {"message": "loop.retrieval_nudge", "iteration": 2, "conversation_id": theirs}}),
+        json.dumps({"fields": {"message": "coordinator.kb_tool_deferred", "iteration": 1, "conversation_id": mine}}),
+        json.dumps({"fields": {"message": "request_size", "tier": "Compact", "chars": 900, "conversation_id": mine}}),
+        json.dumps({"fields": {"message": "request_size", "tier": "Full", "chars": 9000, "conversation_id": theirs}}),
+        json.dumps({"fields": {"message": "coordinator.loop_started", "iteration": 1}}),
+    ]
+    f = CF.log_facts(lines, mine)
+    assert f["tiers"] == ["Compact"], "this turn's request_size only"
+    assert "coordinator.loop_started" in [e["event"] for e in f["loop"]], "a coordinator line with no id stays the window's"
+    assert [c["sent_estimate"] for c in f["backend_calls"]] == [6500]
+    assert [e["event"] for e in f["loop"]] == ["coordinator.kb_tool_deferred", "coordinator.loop_started"]
+    assert f["injected"] == [{"has_rag": True}]
+    a = f["attribution"]
+    assert a["by"] == "conversation_id" and a["conversation_id"] == mine and a["other_conversations"] == [theirs]
+    assert a["overlapped"] is False
+    # The same lines with no id known: the window, both calls, overlap unknown to the id.
+    w = CF.log_facts(lines)
+    assert len(w["backend_calls"]) == 2 and w["attribution"]["by"].startswith("time window")
+
+
+def test_an_id_the_gateway_does_not_name_keeps_the_window():
+    """A coerced or absent id (an older gateway, or a line that names another
+    form of it) must not attribute nothing: the turn keeps its window."""
+    lines = [json.dumps({"fields": {"message": "backend_call", "sent_estimate": 6500, "conversation_id": "cli-COERCED"}})]
+    f = CF.log_facts(lines, "cf-abc")
+    assert len(f["backend_calls"]) == 1 and f["attribution"]["by"].startswith("time window")
+
+
+def test_each_context_fit_turn_sends_its_own_conversation_id():
+    src = SCRIPT.read_text()
+    body = src[src.index("def timed_turn("):src.index("def cluster_show(")]
+    assert 'cid = "cf-" + os.urandom(16).hex()' in body and "chat_turn(prompt, base, timeout, cid)" in body
+    assert "log_facts(gateway_log(t0 - 0.5, t1), cid)" in body
+    chat = src[src.index("def chat_turn("):src.index("def gateway_log(")]
+    assert 'msg["conversation_id"] = conversation_id' in chat

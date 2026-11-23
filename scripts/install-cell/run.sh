@@ -705,6 +705,17 @@ if [ "$CELL" = "$CONTEXT_PIN_CELL" ] && [ -f "$CONTEXT_FIT" ]; then
     judged_ctx context-fit-doesnt-fit 300 doesnt-fit --expect-backend ollama
 fi
 
+# JUDGED (harness, i1246): a chat served through a harness held off the
+# internet, on this one-box install's own node (harness_e2e.py's header says
+# what is the test's hand: building the bundle, and nothing else). After the
+# fresh-install judges above, before the forced restart below; it unplaces
+# the harness and removes its class when done, so later turns run as before.
+# A FAIL is recorded (the cell fails) without stopping the cell; NOTE where
+# the hold cannot exist (no systemd, no systemd-run).
+if [ -f "$HERE/harness_e2e.py" ]; then
+    step harness-e2e 1500 -- env NOO_BIN="$NOO_BIN" python3 -I "$HERE/harness_e2e.py" --out "$OUT" || true
+fi
+
 # ── the real CLI's reload and forced restart (the release lead) ──────────
 # ONLY the default cell, and AFTER first-answer, the three start checks and
 # the probes that judge the fresh install: it rotates a live credential and
