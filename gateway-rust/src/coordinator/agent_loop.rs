@@ -1258,9 +1258,10 @@ fn request_size(messages: &[Value], tools: &[Value], data_frame: Option<&str>, w
 /// The line also carries the backend's calibration (i802 PR-2): the ratio
 /// learned so far (1.0 before any sample) and how many samples taught it.
 /// Token counts only, never content.
-fn log_request_size(size: &RequestSize, calib: &crate::chat_context::Calibration, tier: WindowTier, path: &'static str) {
+fn log_request_size(size: &RequestSize, calib: &crate::chat_context::Calibration, tier: WindowTier, path: &'static str, conversation_id: &str) {
     tracing::info!(
         path,
+        conversation_id,
         // Which persona tier the turn sent (Full | Compact): what a judge reads (i802).
         tier = ?tier,
         system = size.system,
@@ -2616,7 +2617,7 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
         post_dedup_chars = deduped.len(),
         "context_injected"
     );
-    log_request_size(&request_size(&session.messages, &tool_schemas, data_frame.as_deref(), max_input), &calib, tier, "stream");
+    log_request_size(&request_size(&session.messages, &tool_schemas, data_frame.as_deref(), max_input), &calib, tier, "stream", &turn_conv);
 
     // Instructions and the question alone too large for this backend's
     // context (i802 PR-2, step 5): say so instead of sending a prompt the
@@ -3909,7 +3910,7 @@ async fn run_inner_bound<R: HarnessRuntime>(
         post_dedup_chars = deduped.len(),
         "context_injected_nonstream"
     );
-    log_request_size(&request_size(&session.messages, &tool_schemas, data_frame.as_deref(), max_input), &calib, tier, "nonstream");
+    log_request_size(&request_size(&session.messages, &tool_schemas, data_frame.as_deref(), max_input), &calib, tier, "nonstream", &turn_conv);
 
     // Instructions and the question alone too large for this backend's
     // context (i802 PR-2, step 5): say so instead of sending a prompt the
@@ -5297,7 +5298,7 @@ mod window_tests {
                     }
                 }
                 let call = &rest[..end.expect("a tracing call closes")];
-                for name in ["\"backend_call\"", "\"context_injected\"", "\"coordinator.kb_tool_deferred\"", "\"loop."] {
+                for name in ["\"backend_call\"", "\"context_injected\"", "\"request_size\"", "\"coordinator.kb_tool_deferred\"", "\"loop."] {
                     if call.contains(name) {
                         *seen.entry(name).or_default() += 1;
                         assert!(call.contains("conversation_id"), "{name} without the conversation id: {call}");
@@ -5308,6 +5309,7 @@ mod window_tests {
         // Counts, so a renamed event or a moved emitter fails instead of passing empty.
         assert_eq!(seen.get("\"backend_call\"").copied(), Some(1), "{seen:?}");
         assert_eq!(seen.get("\"context_injected\"").copied(), Some(1), "{seen:?}");
+        assert_eq!(seen.get("\"request_size\"").copied(), Some(1), "{seen:?}");
         assert_eq!(seen.get("\"coordinator.kb_tool_deferred\"").copied(), Some(3), "{seen:?}");
         assert!(seen.get("\"loop.").copied().unwrap_or(0) >= 17, "{seen:?}");
     }
