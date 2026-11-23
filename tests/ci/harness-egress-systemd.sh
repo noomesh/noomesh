@@ -343,7 +343,12 @@ else
     fail "plain-file host, after a host rewrite: the node agent reports the private resolver file replaced and the hold enforced"
 fi
 check "control: the host itself resolves example.com" getent hosts example.com
-if inside getent hosts example.com >/dev/null 2>&1; then
+# Nothing resolves: not through the system resolver, and not for a client that
+# reads resolv.conf itself and asks the nameserver it names (as c-ares does).
+NS_NOW="$(awk '{print $2}' <<<"$AFTER")"
+DIRECT="$(inside /usr/local/libexec/noo-ci-dns-ask "${NS_NOW:-0.0.0.0}" 2>&1)"
+echo "plain-file host: asking ${NS_NOW:-no nameserver} directly from inside: $DIRECT"
+if inside getent hosts example.com >/dev/null 2>&1 || ! grep -q "no answer" <<<"$DIRECT"; then
     fail "plain-file host, after a host rewrite: nothing resolves from inside the unit"
 else
     pass "plain-file host, after a host rewrite: nothing resolves from inside the unit"
