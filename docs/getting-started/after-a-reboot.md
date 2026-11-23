@@ -20,9 +20,9 @@ Docker restarted, and the node's own boot steps run as usual. Until the
 controller answers, the node agent only waits: the node shows as offline in
 `noo cluster status`, nothing is started, stopped or kept warm, a shared GPU
 is not yielded, the GPU watchdog and disk reclaim do not run, and the node's
-logs do not reach the cluster's log store. On the node itself,
-`journalctl -u noo-node-agent` shows the line `the controller cannot be
-reached at …` once.
+logs do not reach the cluster's log store; the node's local API still
+answers. On the node itself, `journalctl -u noo-node-agent` shows the line
+`the controller cannot be reached at …` once (at the default log level).
 Everything starts when the controller answers; there is nothing to run on the node.
 
 Give it a few minutes, then:
@@ -164,13 +164,14 @@ returns:
   logs once `the controller cannot be reached at <url> since <time>: nothing
   is reconciled until it answers; running backends keep running`, and once
   `the controller at <url> answers again after <duration> away: reconciling
-  resumes` when it does. A controller that answers with an error (it is up but
-  refuses the node) is not an outage: after the one `answers again` line (if
-  the node was waiting), it logs `registration failed` (with `status=<code>`)
-  and `waiting for controller` on every try, every 10 seconds: report that one. `noo cluster verify` on that node
-  lists the node-side checks. Report it; the node needs nothing while it
-  waits, and nothing on the node makes it reconcile sooner: it keeps no copy
-  of what the cluster places, and only the controller can ask it for a pass.
+  resumes` when it does. `noo cluster verify` on that node lists the node-side
+  checks. Report it; the node needs nothing while it waits, and nothing on the
+  node makes it reconcile sooner: it keeps no copy of what the cluster places,
+  and only the controller can ask it for a pass. A controller that answers
+  with an error (it is up but refuses the node) is not an outage: after the
+  one `answers again` line (if the node was waiting), the agent logs
+  `registration failed` (with `status=<code>`) and `waiting for controller`
+  on every try, every 10 seconds. Report that one too, with those lines.
 - **Never** unmount (least of all force-unmount) or remount a filesystem, restart a host service
   (`systemctl`, `launchctl`, `brew services`), run `plymouth`, or reboot a
   machine. Each case above is the person's, at that machine.
