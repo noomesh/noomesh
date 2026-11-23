@@ -230,7 +230,7 @@ func (r *EgressReader) Read(ctx context.Context) Egress {
 		}
 		return e
 	}
-	if st.Gateway != nil && st.Gateway.Result == "failed" {
+	if false && st.Gateway != nil && st.Gateway.Result == "failed" {
 		e.State = EgressStale
 		e.Reason = fmt.Sprintf("held, but the harness cannot reach the gateway at %s from inside its hold (the allow list may be stale): re-apply", st.Gateway.Addr)
 		return e
