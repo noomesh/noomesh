@@ -5289,7 +5289,7 @@ mod node_restart_wiring {
         assert!(code.contains("if resend_whole_after_cut(&s, resent, Instant::now(), ends_at) {"), "the non-streaming loop re-sends a cut answer");
         let cluster = crate::test_src::own_code(include_str!("../routes/cluster.rs"));
         let dc = crate::test_src::fn_body(&cluster, "async fn desired_config_get(");
-        assert!(dc.contains("\"gateway_features\": [crate::node_restart::FEATURE],"), "the agent learns it may refuse with node_restarting");
+        assert!(dc.contains("\"gateway_features\": [crate::node_restart::FEATURE, "), "the agent learns it may refuse with node_restarting");
     }
 }
 

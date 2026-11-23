@@ -5,9 +5,11 @@ package heartbeat
 
 import (
 	"runtime"
+	"time"
 
 	"github.com/noomesh/noomesh/node-agent-go/internal/auth"
 	"github.com/noomesh/noomesh/node-agent-go/internal/backendleaves"
+	"github.com/noomesh/noomesh/node-agent-go/internal/backendreap"
 	"github.com/noomesh/noomesh/node-agent-go/internal/hardware"
 	"github.com/noomesh/noomesh/node-agent-go/internal/imagesource"
 	"github.com/noomesh/noomesh/node-agent-go/internal/modelpresence"
@@ -212,6 +214,7 @@ var heartbeatSections = []payloadSection{
 	secLlamacppOffload,
 	secNodeFacts,
 	secLastStop,
+	secBackendReap,
 }
 
 // Heartbeat-only sections.
@@ -390,6 +393,21 @@ var (
 			if hd := r.hostdState(); len(hd) > 0 {
 				p["hostd"] = hd
 			}
+		}
+	}}
+
+	secBackendReap = payloadSection{name: "backendReap", add: func(r *Reporter, p map[string]any) {
+		// The unplace reaper's account (internal/backendreap):
+		// `orphan_backends` once the reconciler has judged them (`[]` is
+		// "none"; omitted before its first judgement), and the
+		// `reaped_backends` of the last 24 h when there are any. The
+		// controller deletes the unplace record each reaped entry names.
+		rs, os, judged := backendreap.Report(time.Now())
+		if judged {
+			p["orphan_backends"] = os
+		}
+		if len(rs) > 0 {
+			p["reaped_backends"] = rs
 		}
 	}}
 

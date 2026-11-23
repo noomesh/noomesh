@@ -40,7 +40,8 @@ func TestOllamaContainerDownErrorIsTypedOnBothProducers(t *testing.T) {
 		if !errors.Is(err, errOllamaContainerDown) || !errors.Is(wrapped, errOllamaContainerDown) {
 			t.Errorf("%s: %v does not match errOllamaContainerDown (bare or wrapped)", name, err)
 		}
-		if !strings.Contains(err.Error(), "start it (`noo cluster start-backend n1 ollama`)") {
+		if !strings.Contains(err.Error(), "(`noo cluster place n1 ollama <model>`), or restart the placed one (`noo cluster restart-backends n1 noo-ollama`)") ||
+			strings.Contains(err.Error(), "cluster start-backend") {
 			t.Errorf("%s: the operator text is gone: %v", name, err)
 		}
 	}

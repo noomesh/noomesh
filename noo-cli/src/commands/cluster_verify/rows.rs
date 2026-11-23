@@ -1475,6 +1475,17 @@ pub(crate) const ROWS: &[Row] = &[
         doc: None,
     },
     Row {
+        id: "unplaced_backends",
+        name: "unplaced backends",
+        scope: Scope::Node,
+        verdicts: &[Verdict::Warn],
+        meaning: "Whether a backend container the node agent owns is running with no placement; the agent removes one only after an explicit `noo cluster unplace`, and notes each it removed in the last 24 h.",
+        clears: "`noo cluster stop-backend <node> <backend>` stops it; or place it with `noo cluster place <node> <backend> <model>`.",
+        findings: &[],
+        shown_as: None,
+        doc: None,
+    },
+    Row {
         id: "removed_engine_space",
         name: "unsupported engine space",
         scope: Scope::Controller,

@@ -5809,14 +5809,16 @@ fn post_roll_restart_loops_clear(g: &Globals, roll_started: Option<i64>, baselin
             }
             true
         }
-        Ok((v, _)) => {
+        Ok((mut v, _)) => {
+            // A node agent backend names its owner and cause (unplaced: stop
+            // it; placed: its model or engine), not a stack service's logs.
+            rl::resolve_from_gateway(g, &mut v);
             for l in &v {
                 eprintln!("{}", ui::status_line(Glyph::Err, &l.line()));
             }
-            let svc = rl::service_of(&v[0].container, &prefix).to_string();
             ui::close_failed(
                 &format!("{} stack container(s) restart-looping or crashed after the roll — the node phase does not start on a broken stack", v.len()),
-                Some(&format!("noo stack logs {svc}")),
+                Some(&v[0].remedy(&prefix)),
             );
             false
         }

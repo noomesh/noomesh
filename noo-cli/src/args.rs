@@ -372,6 +372,7 @@ mod tests {
             row(&["cluster", "unplace"], |a| { let _ = cluster::parse_unplace_with(a); }),
             row(&["cluster", "logs"], |a| { let _ = cluster::parse_logs_with(a); }),
             row(&["cluster", "down"], |a| { let _ = cluster::parse_down_with(a); }),
+            row(&["cluster", "stop-backend"], |a| { let _ = cluster::parse_stop_backend_with(a); }),
             row(&["cluster", "set-config"], |a| { let _ = cluster::parse_set_config_with(a); }),
             row(&["cluster", "sync-model-files"], |a| { let _ = cluster::parse_sync_model_files_with(a); }),
             row(&["cluster", "seed"], |a| { let _ = cluster::parse_seed_with(a); }),
