@@ -281,6 +281,14 @@ type Reconciler struct {
 	pullMu      sync.Mutex
 	ollamaPulls map[string]*ollamaPullState
 
+	// ollamaStartedAt is when this agent last started (or began to replace)
+	// the ollama container and its door; read by the import goroutine to tell
+	// a push reset by a just-replaced door (doorReplaced). Guarded by pullMu.
+	ollamaStartedAt time.Time
+	// ollamaEnsureFn: nil = ensureOllamaModels + verifyOllamaModels. A seam
+	// for tests only.
+	ollamaEnsureFn func(ctx context.Context, t *tick)
+
 	// ollamaVerify checks every placed ollama model's bytes against the
 	// controller's store, off the tick (ollama_verify.go). nil = not wired.
 	ollamaVerify *ollamaVerifyLoop
@@ -483,8 +491,14 @@ func (r *Reconciler) nudgeCh() chan struct{} {
 //   - a verify pass ends that was busy while a tick found other models due
 //     (ollamaVerifyLoop.missed), so they are checked on the next tick; a
 //     pass that skipped nothing never nudges;
-//   - an import failed because its door could not be dialled (doorNotUp):
-//     a few quick retries, one spaced nudge each (importDoorRetryAfter).
+//   - an import failed because its door could not be dialled (doorNotUp),
+//     or because its push was cut off by a door this agent replaced a
+//     moment ago (doorReplaced): a few quick retries, one spaced nudge each
+//     (importDoorRetryAfter).
+//
+// A pass that recreates ollama does not start the import or pull at all
+// (the models are ensured only when the spec is not drifting): the started
+// container's readiness nudge brings the pass that does, through the new door.
 //
 // Any other FAILED import or pull never nudges: its backoff
 // (ollamaPullRetryAfter) decides when it is tried again. Nudges coalesce (a
@@ -531,6 +545,7 @@ func (r *Reconciler) backendStarted(ctx context.Context, backend, model string) 
 	r.clearBackendStart(backend)
 	delete(r.hashWaits, backend)
 	if backend == "ollama" {
+		r.noteOllamaStart(time.Now())
 		r.ollamaVerify.markAllDue()
 		go r.nudgeWhenReady(ctx, backend, model, startReadyWithin, startReadyEvery)
 	}
@@ -1015,17 +1030,17 @@ func (r *Reconciler) convergeContainer(ctx context.Context, t *tick, p placement
 				return
 			}
 			r.clearBackendStart(p.Backend)
-			if p.Backend == "ollama" {
-				// The container is up with OLLAMA_MODEL set; that says
-				// nothing about whether the weights are there. Pull the
-				// tag if the container lacks it (off-tick; see ollamaPulls).
-				r.ensureOllamaModels(ctx, r.cfg.NodeID, t.ollamaRows, r.docker.OllamaHasModel, r.docker.OllamaPull)
-				// Then the bytes it holds, against the controller's store
-				// (off-tick; see ollama_verify.go).
-				r.verifyOllamaModels(ctx, t.ollamaRows, dockerpkg.OllamaLaneContainer)
-			}
 			curHash, hasLabel := t.specLabels[p.Backend]
-			switch decideBackendDrift(hasLabel, curHash, desiredHash, r.driftRecreated[p.Backend], t.floating[p.Backend]) {
+			// Decide drift BEFORE ensuring the models: a pass that is about
+			// to recreate ollama (and its door) must not start an import
+			// that pushes a blob through the door being replaced. The
+			// started container's readiness nudge brings the next pass,
+			// which imports through the new door.
+			drift := decideBackendDrift(hasLabel, curHash, desiredHash, r.driftRecreated[p.Backend], t.floating[p.Backend])
+			if p.Backend == "ollama" && drift != driftRecreate {
+				r.ensureHeldOllama(ctx, t)
+			}
+			switch drift {
 			case driftConverged:
 				// Fully converged — clear any prior drift bookkeeping.
 				delete(r.driftRecreated, p.Backend)
@@ -1152,6 +1167,11 @@ func (r *Reconciler) convergeContainer(ctx context.Context, t *tick, p placement
 			Target:      dockerpkg.StartTarget(p.Backend, p.Target, p.Env),
 			MemoryLimit: p.MemoryLimitBytes,
 		}
+		if p.Backend == "ollama" {
+			// Before the start: an import already pushing through the door
+			// sees its reset as soon as the old container goes.
+			r.noteOllamaStart(time.Now())
+		}
 		startErr := error(nil)
 		if r.startBackendFn != nil {
 			startErr = r.startBackendFn(ctx, p.Backend, p.Model, 0, overrides)
@@ -1182,6 +1202,21 @@ func (r *Reconciler) convergeContainer(ctx context.Context, t *tick, p placement
 		}
 		r.backendStarted(ctx, p.Backend, p.Model)
 	}
+}
+
+// ensureHeldOllama is the running ollama container's model work: the
+// container is up with OLLAMA_MODEL set, which says nothing about whether
+// the weights are there. Pull or import what it lacks (off-tick; see
+// ollamaPulls), then check the bytes it holds against the controller's
+// store (off-tick; see ollama_verify.go). ollamaEnsureFn replaces it in
+// tests.
+func (r *Reconciler) ensureHeldOllama(ctx context.Context, t *tick) {
+	if r.ollamaEnsureFn != nil {
+		r.ollamaEnsureFn(ctx, t)
+		return
+	}
+	r.ensureOllamaModels(ctx, r.cfg.NodeID, t.ollamaRows, r.docker.OllamaHasModel, r.docker.OllamaPull)
+	r.verifyOllamaModels(ctx, t.ollamaRows, dockerpkg.OllamaLaneContainer)
 }
 
 // healDoorNamespaces restarts a fronted engine whose stunnel sidecar
@@ -1412,16 +1447,22 @@ func (r *Reconciler) startOllamaImport(ctx context.Context, node, key, model, ro
 		st.inFlight = false
 		if err != nil {
 			// Never a substring of err's text: doorNotUp reads its type.
-			if doorNotUp(err) && st.doorRetries < len(importDoorRetryAfter) {
+			notUp := doorNotUp(err)
+			replaced := !notUp && doorReplaced(err, r.ollamaStartedAt, time.Now())
+			if (notUp || replaced) && st.doorRetries < len(importDoorRetryAfter) {
 				wait := importDoorRetryAfter[st.doorRetries]
 				st.doorRetries++
+				detail := "the import could not dial ollama's door (not up yet); retrying shortly, without the " + ollamaPullRetryAfter.String() + " backoff"
+				if replaced {
+					detail = "the import's push was cut off by an ollama door this agent just replaced; retrying shortly, without the " + ollamaPullRetryAfter.String() + " backoff"
+				}
 				slog.Warn("reconcile.ollama_import_door_not_up", "model", model, "backend", key,
 					"error", err, "quick_retry", st.doorRetries, "of", len(importDoorRetryAfter), "retry_in", wait.String(),
-					"detail", "the import could not dial ollama's door (not up yet); retrying shortly, without the "+ollamaPullRetryAfter.String()+" backoff")
+					"door_replaced", replaced, "detail", detail)
 				r.after(wait, r.Nudge)
 				return
 			}
-			if !doorNotUp(err) {
+			if !notUp && !replaced {
 				st.doorRetries = 0
 			} else if st.doorRetries == len(importDoorRetryAfter) {
 				st.doorRetries++ // logged once until a success or an answered failure
