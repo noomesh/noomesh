@@ -277,7 +277,10 @@ def test_a_turn_records_the_wires_its_model_calls_went_out_on():
 
 def test_a_turn_records_each_model_call_in_tokens():
     t = CF.turn_tokens(_facts(DIRECT_CALL, BACKEND_CALL_2))
-    assert t["calls"][0] == {"sent_estimate": 2871, "evaluated": 1190, "prefill_ms": 1840, "ctx": 4096, "wire": "ollama"}
+    # Each call keeps its time: backend_call carries no iteration, so calls are
+    # ordered by it within the turn.
+    assert t["calls"][0] == {"sent_estimate": 2871, "evaluated": 1190, "prefill_ms": 1840, "ctx": 4096, "wire": "ollama",
+                             "ts": "2026-11-14T10:02:03.120456Z"}
     assert t["calls"][1]["prefill_ms"] == 660 and t["calls"][1]["wire"] is None
     assert (t["sent_estimate"], t["evaluated"]) == (2 * 2871, 2 * 1190)
     assert CF.turn_tokens(CF.log_facts(None)) == {"calls": [], "sent_estimate": None, "evaluated": None}
