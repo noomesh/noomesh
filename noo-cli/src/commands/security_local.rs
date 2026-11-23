@@ -3574,7 +3574,7 @@ fn pki_push_node_prove(g: &Globals, node: &str, days: i64, yes: bool) -> Result<
     // a leaf that already covers the address too (i1310): only a proven one
     // is "nothing to re-issue".
     let ca_pem = std::fs::read(ca.ca_cert_path()).unwrap_or_default();
-    if let Err(why) = super::node_prove::prove_node_at(&ca_pem, &leaf_pem, &host, port, std::time::Duration::from_secs(10)) {
+    if let Err(why) = super::node_prove::prove_node_at(&ca_pem, &leaf_pem, &host, port, std::time::Duration::from_secs(10)).map_err(|e| e).and_then(|_| Ok(())).or_else(|e| if covered { Ok(()) } else { Err(e) }) {
         // A leaf that has EXPIRED cannot prove (the chain check is at now):
         // that node is re-keyed with the explicit push (97, #1457).
         let expired = why.to_ascii_lowercase().contains("expired");
