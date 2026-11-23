@@ -97,8 +97,10 @@ func Down() (bool, time.Time) {
 }
 
 // Unreachable reports whether err means the controller could not be reached
-// at all: a failed dial (refused, no route), a name that does not resolve, or
-// a timeout with no answer. A TLS verification failure is NOT unreachable
+// at all: a failed dial (refused, no route), a name that does not resolve, a
+// timeout with no answer, or a connection the path reset or broke before any
+// answer (ECONNRESET, EPIPE: a reset on a kept-alive connection is still
+// "could not reach"). A TLS verification failure is NOT unreachable
 // (something answered, and it is not who we expected: say that, do not
 // fold it into "away"), and neither is any HTTP answer. By the error's
 // type, never its text.
@@ -118,7 +120,8 @@ func Unreachable(err error) bool {
 	if errors.As(err, &opErr) && opErr.Op == "dial" {
 		return true
 	}
-	if errors.Is(err, syscall.ECONNREFUSED) || errors.Is(err, syscall.EHOSTUNREACH) || errors.Is(err, syscall.ENETUNREACH) {
+	if errors.Is(err, syscall.ECONNREFUSED) || errors.Is(err, syscall.EHOSTUNREACH) || errors.Is(err, syscall.ENETUNREACH) ||
+		errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.EPIPE) {
 		return true
 	}
 	var urlErr *url.Error
