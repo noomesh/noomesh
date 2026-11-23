@@ -1212,8 +1212,8 @@ func (c *Client) preseedGGUF(ctx context.Context, backend, model string) (bool, 
 	// because it holds the reconcile tick; past it the start is refused and
 	// the next tick asks again. That converges: the gateway hashes in the
 	// BACKGROUND, single-flight, and caches the digest in memory and in
-	// /data/artifact-digests.json (gateway-rust/src/routes/artifacts.rs:31-49,
-	// HASH_WAIT_SECS :294, in_flight() :308, mem_cache() :301), so each tick
+	// /data/cache/artifact-digests.json (gateway-rust/src/routes/artifacts.rs:
+	// DEFAULT_DIGEST_CACHE, HASH_WAIT_SECS, in_flight(), mem_cache()), so each tick
 	// re-joins the one running hash and the first tick after it ends gets 200.
 	man, merr := awaitArtifactManifestWithin(ctx, "gguf", model, ggufStartManifestBudget)
 	if merr != nil {

@@ -290,7 +290,7 @@ noo_prepare_gateway_data_dirs() {
     # Job `data-dirs` (CHOWN + DAC_OVERRIDE), the one volume mounted: the
     # gateway's own noo-data, since mkdir needs its root.
     if ! out="$({ helper_ensure_present && helper_run data-dirs sh "$vol":/d \
-        -c 'mkdir -p /d/ingest/working /d/ingest/archive /d/audit-archive && chown -R 65532:65532 /d/ingest /d/audit-archive'; } \
+        -c 'mkdir -p /d/ingest/working /d/ingest/archive /d/audit-archive /d/cache && chown -R 65532:65532 /d/ingest /d/audit-archive /d/cache'; } \
         2>&1)"; then
         echo "WARNING: could not prepare the gateway's data dirs on volume '$vol'" >&2
         echo "         (the gateway may fail with 'Permission denied' on /data/audit-archive):" >&2
