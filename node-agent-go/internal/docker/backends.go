@@ -1329,7 +1329,7 @@ func ggufManifestReason(model string, err error) string {
 	case errors.Is(err, ErrArtifactUnreadable):
 		var un *ArtifactUnreadableError
 		errors.As(err, &un)
-		return unreadableReason(un)
+		return unreadableReason(model, un)
 	case errors.Is(err, ErrArtifactRefused):
 		return "the controller refused to vouch for " + model + ": " + err.Error()
 	case errors.Is(err, ErrArtifactAbsent):
@@ -1339,23 +1339,24 @@ func ggufManifestReason(model string, err error) string {
 	}
 }
 
-// unreadableReason words the gateway's unreadable answer: the path, who owns
-// it and its mode (each when the gateway could stat it), and the fix it named.
-func unreadableReason(un *ArtifactUnreadableError) string {
-	who := ""
-	switch {
-	case un.Owner != "" && un.Mode != "":
-		who = " (owner " + un.Owner + ", mode " + un.Mode + ")"
-	case un.Owner != "":
-		who = " (owner " + un.Owner + ")"
-	case un.Mode != "":
-		who = " (mode " + un.Mode + ")"
+// unreadableReason words the gateway's unreadable answer: the model, who owns
+// the file and its mode (each when the gateway could stat it), the path the
+// gateway reported (its container's view, not a host path), and where the host
+// path and the fix are named.
+func unreadableReason(model string, un *ArtifactUnreadableError) string {
+	var facts []string
+	if un.Owner != "" {
+		facts = append(facts, "owner "+un.Owner)
 	}
-	fix := un.Fix
-	if fix == "" {
-		fix = "make it readable by the gateway (uid 65532)"
+	if un.Mode != "" {
+		facts = append(facts, "mode "+un.Mode)
 	}
-	return "the controller cannot read " + un.Path + who + ": " + fix
+	view := un.Path + " is the gateway container's view"
+	detail := view
+	if len(facts) > 0 {
+		detail = strings.Join(facts, ", ") + "; " + view
+	}
+	return "the controller cannot read " + model + " (" + detail + "): `noo cluster verify` on the controller names its host path and the fix (`model store readable`)"
 }
 
 // ggufStartGate runs the preseed and decides whether the start may go on. A

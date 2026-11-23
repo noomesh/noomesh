@@ -179,12 +179,12 @@ var ErrArtifactRefused = errors.New("the controller refused to vouch for it")
 // ErrArtifactUnreadable is the gateway's typed 409 `{"status":"unreadable"}`:
 // the file is in the controller's store but the gateway cannot read it, so it
 // cannot hash it. Matched with errors.Is; the *ArtifactUnreadableError carries
-// the path, owner and mode the gateway reported.
+// the gateway container's path, owner and mode the gateway reported.
 var ErrArtifactUnreadable = errors.New("the controller cannot read the file")
 
 // ArtifactUnreadableError is the body of the gateway's `unreadable` answer.
 type ArtifactUnreadableError struct {
-	Path, Owner, Mode, Fix, Detail string
+	Path, Owner, Mode, Detail string
 }
 
 func (e *ArtifactUnreadableError) Error() string {
@@ -202,12 +202,11 @@ func parseUnreadable(raw []byte) *ArtifactUnreadableError {
 		Owner  string `json:"owner"`
 		Mode   string `json:"mode"`
 		Error  string `json:"error"`
-		Fix    string `json:"fix"`
 	}
 	if json.Unmarshal(raw, &b) != nil || b.Status != "unreadable" {
 		return nil
 	}
-	return &ArtifactUnreadableError{Path: b.Path, Owner: b.Owner, Mode: b.Mode, Fix: b.Fix, Detail: b.Error}
+	return &ArtifactUnreadableError{Path: b.Path, Owner: b.Owner, Mode: b.Mode, Detail: b.Error}
 }
 
 // doArtifactRequest runs the request and returns a 200's body, or the
