@@ -323,11 +323,18 @@ sleep 3
 check "plain-file host: the hold binds its own resolver file onto /etc/resolv.conf" grep -qx "BindReadOnlyPaths=/etc/noo/harness-net/resolv.conf:/etc/resolv.conf" "$DROPIN"
 check "plain-file host: the applier restarted the harness under it" grep -q '^APPLIED=.*(harness restarted)' <<<"$OUT3"
 HP="$(systemctl show -p MainPID --value noo-harness)"; CG="$(systemctl show -p ControlGroup --value noo-harness)"
+# The restarted stand-in writes its first record after its own probes (up to
+# ~30 s): wait for one that names this process before judging anything.
+rec_of() { python3 -c 'import json,sys; d=json.load(open("/run/noo-harness/egress.json")); print(d.get("pid"), d.get("resolv_held"))' 2>/dev/null; }
+for _ in $(seq 1 60); do [ "$(rec_of | cut -d' ' -f1)" = "$HP" ] && break; sleep 1; done
+echo "plain-file host: the unit's record before the rewrite: $(rec_of || echo none)"
 inside() { sh -c 'cg=$1; hp=$2; shift 2; echo $$ > "/sys/fs/cgroup$cg/cgroup.procs" && exec nsenter -t "$hp" -m -- setpriv --reuid=65534 --regid=65534 --clear-groups "$@"' inside "$CG" "$HP" "$@"; }
 BEFORE="$(nsenter -t "$HP" -m cat /etc/resolv.conf | grep -m1 nameserver)"
 check "plain-file host: the unit reads its own resolver file" test "$BEFORE" = "nameserver 192.0.2.53"
 cp -p /etc/resolv.conf /etc/resolv.conf.noo-ci && echo "# rewritten by the CI" >> /etc/resolv.conf.noo-ci && mv -f /etc/resolv.conf.noo-ci /etc/resolv.conf
-sleep 4
+# The stand-in re-checks every 2 s: wait (bounded) for a record written after the rewrite.
+for _ in $(seq 1 15); do [ "$(rec_of)" = "$HP False" ] && break; sleep 1; done
+echo "plain-file host: the unit's record after the rewrite: $(rec_of || echo none)"
 AFTER="$(nsenter -t "$HP" -m cat /etc/resolv.conf | grep -m1 nameserver)"
 echo "plain-file host: after the host rewrite the unit reads: ${AFTER:-nothing}"
 if (cd "$REPO/node-agent-go" && NOO_REAL_SYSTEMD_RESOLV_REPLACED=1 go test ./internal/hostsvc -run '^TestRealSystemdEgressResolvReplaced$' -v -count=1); then
