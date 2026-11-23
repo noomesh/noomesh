@@ -177,3 +177,9 @@ def test_no_release_repo_and_no_cached_asset_is_a_note_not_a_fail():
     assert guard < fetch and 'return stop("NOTE"' in body[guard:fetch]
     wf = (ROOT / ".github" / "workflows" / "install-matrix.yml").read_text()
     assert "WSLENV: CLI_TAG:GITHUB_REPOSITORY" in wf
+
+
+def test_the_evidence_records_the_turns_seconds():
+    src = (ROOT / "scripts" / "install-cell" / "harness_e2e.py").read_text()
+    body = src[src.index("def collect("):src.index("def verdict(")]
+    assert 'E["turn_s"] = round(time.time() - t0, 1)' in body
