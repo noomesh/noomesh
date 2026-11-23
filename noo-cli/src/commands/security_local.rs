@@ -3524,7 +3524,10 @@ pub(crate) fn prove_target(node: &str, registry: &[serde_json::Value]) -> Result
 /// is refused if another node claims it; the dial-back; the claim checked
 /// AGAIN (a registration may have raced the dial); the mint, for exactly the
 /// dialled address (plus the controller's own view of its tailnet IP); the
-/// delivery over the birth-key rail. A fresh key pair every time.
+/// delivery over the birth-key rail. A fresh key pair every time. A leaf that
+/// already covers the dialled address is still dialled back (i1310): a proven
+/// one answers "nothing to re-issue" (exit 0, `proven: true`), one that does
+/// not prove fails `not_proven`, so `--prove` never succeeds unproven.
 fn pki_push_node_prove(g: &Globals, node: &str, days: i64, yes: bool) -> Result<i32, Unhandled> {
     use crate::output::{fail, ExitCode};
     let ca = ClusterCa::new(pki_dir());
@@ -3558,20 +3561,15 @@ fn pki_push_node_prove(g: &Globals, node: &str, days: i64, yes: bool) -> Result<
             &format!("{}: {e}: there is no current leaf to prove with", leaf.display()),
             Some(&format!("noo cluster provision {node}"))),
     };
-    if ClusterCa::cert_names(&leaf).is_ok_and(|n| n.ips.iter().chain(n.dns.iter()).any(|a| a.eq_ignore_ascii_case(&host))) {
-        if g.json {
-            println!("{}", serde_json::json!({"ok": true, "node": node, "address": host, "changed": false}));
-        } else {
-            ui::close_done(&format!("{node}'s certificate already covers {host}: nothing to re-issue"));
-        }
-        return Ok(0);
-    }
+    let covered = ClusterCa::cert_names(&leaf).is_ok_and(|n| n.ips.iter().chain(n.dns.iter()).any(|a| a.eq_ignore_ascii_case(&host)));
     if !g.json {
         println!("{}", ui::phase("plan"));
-        println!("  {}", ui::muted(&format!("prove that {host}:{port} is served by {node}, then re-issue its certificate for {host}")));
+        let then = if covered { format!("its certificate already covers {host}, so nothing is re-issued") } else { format!("then re-issue its certificate for {host}") };
+        println!("  {}", ui::muted(&format!("prove that {host}:{port} is served by {node}; {then}")));
     }
-    super::confirm_destructive(g, yes, "prove and re-key", node);
-    // (b) The dial-back, pinned to the node's own current leaf.
+    // (b) The dial-back, pinned to the node's own current leaf. It runs for
+    // a leaf that already covers the address too (i1310): only a proven one
+    // is "nothing to re-issue".
     let ca_pem = std::fs::read(ca.ca_cert_path()).unwrap_or_default();
     if let Err(why) = super::node_prove::prove_node_at(&ca_pem, &leaf_pem, &host, port, std::time::Duration::from_secs(10)) {
         // A leaf that has EXPIRED cannot prove (the chain check is at now):
@@ -3584,6 +3582,16 @@ fn pki_push_node_prove(g: &Globals, node: &str, days: i64, yes: bool) -> Result<
     if !g.json {
         println!("{}", ui::sub(&ui::status_line(Glyph::Ok, &format!("{host}:{port} answered with {node}'s own key"))));
     }
+    if covered {
+        if g.json {
+            println!("{}", serde_json::json!({"ok": true, "node": node, "address": host, "changed": false, "proven": true}));
+        } else {
+            ui::close_done(&format!("{node}'s certificate already covers {host}, and {host}:{port} answered with {node}'s own key: nothing to re-issue"));
+        }
+        return Ok(0);
+    }
+    // Asked only before a mint: the proof itself changes nothing.
+    super::confirm_destructive(g, yes, "re-key", node);
     // (c) The claim again, at mint time: a registration may have raced the dial.
     if let Some(other) = address_claimed_by_other(node, &host, &node_address_claims(&registry(), &local_leaf_ips)) {
         fail(g.json, ExitCode::Generic, "address_claimed",
@@ -6862,6 +6870,27 @@ mod address_claim_tests {
         let deliver = body.find("deliver_node_certs(").expect("the delivery");
         assert!(first < prove && prove < recheck && recheck < mint && mint < deliver, "order: claim, prove, re-check, mint, deliver");
         assert!(body[mint..].contains("&host"), "the mint names the dialled address");
+    }
+
+    /// i1310: a leaf that already covers the address is dialled back too.
+    /// "Nothing to re-issue" comes only AFTER the proof (a refactor that
+    /// returns before it makes `--prove` succeed unproven), says it proved
+    /// (`proven: true`), and the confirm is asked only before a mint.
+    #[test]
+    fn a_covered_address_is_proven_before_nothing_to_reissue() {
+        let code = include_str!("security_local.rs");
+        let body = crate::test_src::fn_body(code, "fn pki_push_node_prove(");
+        let prove = body.find("node_prove::prove_node_at(").expect("the dial-back");
+        let covered = body.find("if covered {").expect("the covered branch");
+        let confirm = body.find("confirm_destructive(").expect("the confirm");
+        let mint = body.find("issue_node_cert(").expect("the mint");
+        assert!(prove < covered, "the covered answer comes after the dial-back");
+        assert!(covered < confirm && confirm < mint, "the confirm comes after the covered answer and before the mint");
+        let branch = &body[covered..confirm];
+        assert!(branch.contains("\"proven\": true") && branch.contains("\"changed\": false"), "{branch}");
+        assert!(branch.contains("nothing to re-issue") && branch.contains("return Ok(0)"), "{branch}");
+        assert!(!body[..prove].contains("return Ok(0)"), "nothing returns success before the dial-back");
+        assert!(!body[prove..covered].contains("covered"), "a failed proof fails whether or not the leaf covers the address");
     }
 
     /// The seam with node-pin (#1518), agreed in both PR bodies: `--prove`
