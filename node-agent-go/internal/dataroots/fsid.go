@@ -6,7 +6,9 @@ package dataroots
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -52,10 +54,15 @@ import (
 // one that is present but not enabled do not count: neither is mounted at
 // boot.
 //
-// "Cannot tell" never refuses. When /proc/self/mountinfo, /etc/fstab or a
-// unit directory cannot be read or parsed, the part of the check that needs
-// it is "not checked": the reason is reported (data_roots.policy.filesystem.
-// not_checked, shown by verify) and nothing is refused for it. Only a
+// An ABSENT /etc/fstab or unit directory (a container, a host without
+// systemd) declares nothing: it is read as no entries, and the check runs on
+// what the rest declares.
+//
+// "Cannot tell" never refuses. When /proc/self/mountinfo cannot be read, or
+// /etc/fstab or a unit directory exists but cannot be read or parsed, the
+// part of the check that needs it is "not checked": the reason is reported
+// (data_roots.policy.filesystem.not_checked, shown by verify) and nothing is
+// refused for it. Only a
 // positive finding refuses: a covering boot mount that is not mounted, or a
 // filesystem that differs from the record. A failed read of the mount table
 // is not evidence of a different disk.
@@ -330,10 +337,14 @@ func isNetworkFS(fstype string) bool {
 }
 
 // fstabMounts are the /etc/fstab boot-time mounts (never "/", never swap,
-// never `noauto` unless it is also an automount). An unreadable or
-// unparsable fstab is an error: the caller cannot tell, and refuses nothing.
+// never `noauto` unless it is also an automount). An absent fstab declares
+// nothing (no entries, no error). An unreadable or unparsable one is an
+// error: the caller cannot tell, and refuses nothing.
 func fstabMounts() ([]bootMount, error) {
 	b, err := os.ReadFile(fstabPath)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, nil
+	}
 	if err != nil {
 		return nil, fmt.Errorf("cannot read %s: %w", fstabPath, err)
 	}
@@ -423,11 +434,15 @@ func unitMasked(file string) bool {
 
 // unitMounts are the ENABLED systemd mount units' boot-time mounts. A .mount
 // whose Options= has noauto does not count; an .automount names an
-// automount. A unit directory that cannot be read is an error.
+// automount. An absent unit directory holds no units (a host without
+// systemd); one that exists but cannot be read is an error.
 func unitMounts() ([]bootMount, error) {
 	var out []bootMount
 	for _, dir := range mountUnitDirs() {
 		entries, err := os.ReadDir(dir)
+		if errors.Is(err, fs.ErrNotExist) {
+			continue
+		}
 		if err != nil {
 			return nil, fmt.Errorf("cannot read the unit directory %s: %w", dir, err)
 		}
