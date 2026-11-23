@@ -317,7 +317,11 @@ TURN_PATHS = ("/api/inference", "/api/inference/chat", "/v1/chat/completions",
 INJECTED_FIELDS = ("dropped", "pre_dedup_chars", "post_dedup_chars")
 
 
-def turn_markers(ev: list[dict]) -> dict:
+# Lines that name their turn once the gateway carries conversation_id on them.
+ID_EVENTS = ("backend_call", "context_injected", "request_size")
+
+
+def turn_markers(ev: list[dict], cid: str | None = None) -> dict:
     ws = sum(e["event"] == "ws_coordinator connected" for e in ev)
     other = [f"chat stream {e.get('conversation_id', '?')}" for e in ev if e["event"] == "coordinator_chat_stream_start"]
     other += [f"{e.get('method', '')} {e.get('path')}" for e in ev
@@ -333,19 +337,37 @@ def turn_markers(ev: list[dict]) -> dict:
                 or (n == "heartbeat_loop_dispatched_parallel" and (e.get("spawned") or 0) > 0) \
                 or n in ("heartbeat_run_queued_pending_completion", "heartbeat_llm_waiting_for_slot"):
             hb.append({k: e.get(k) for k in ("event", "_ts", "task_id", "action", "due_count", "spawned") if e.get(k) is not None})
+    if cid:
+        others = sorted({str(e["conversation_id"]) for e in ev if e.get("conversation_id") not in (None, cid)
+                         and (e["event"] in ID_EVENTS or LOOP_EVENT.match(e["event"]))})
+        return {"by": "conversation_id", "conversation_id": cid, "other_conversations": others[:10],
+                "heartbeat": hb[:10], "overlapped": False}
     return {"by": "time window: backend_call, context_injected and loop lines name no conversation",
             "ws_connects": ws, "other_turn_starts": other[:10], "heartbeat": hb[:10],
             "overlapped": ws > 1 or bool(other) or bool(hb)}
 
 
-def log_facts(lines: list[str] | None) -> dict:
+def log_facts(lines: list[str] | None, cid: str | None = None) -> dict:
     """What a turn's gateway log says. `readable` False when the log could
-    not be read at all (every other figure is then unknown)."""
+    not be read at all (every other figure is then unknown). With the turn's
+    conversation id `cid`, and a gateway that puts conversation_id on its turn
+    lines, the turn's lines are those naming it (attribution by id); otherwise
+    the whole window, said so, with any overlap marked."""
     if lines is None:
         return {"readable": False, "request_size": [], "backend_calls": [], "cuts": 0, "too_small": 0,
                 "tiers": [], "has_tier": False, "prefill_s": None, "auth_failures": [], "loop": [],
                 "injected": [], "attribution": None}
     ev = [e for e in (parse_log_line(l) for l in lines) if e]
+    # By id only when some turn line names THIS id exactly: a gateway without
+    # the field, or one that coerces the id, keeps the window (said so).
+    by_id = bool(cid) and any(e.get("conversation_id") == cid for e in ev
+                              if e["event"] in ID_EVENTS or LOOP_EVENT.match(e["event"]))
+    window = ev
+    if by_id:
+        # The turn's own lines: every id-bearing line naming it; a line of the
+        # kinds that carry an id but names another turn is someone else's.
+        ev = [e for e in ev if e.get("conversation_id") == cid
+              or not (e["event"] in ID_EVENTS or LOOP_EVENT.match(e["event"]))]
     sizes = [e for e in ev if e["event"] == "request_size"]
     calls = [e for e in ev if e["event"] == "backend_call"]
     tiers = [str(e["tier"]) for e in sizes if e.get("tier") is not None]
@@ -358,7 +380,7 @@ def log_facts(lines: list[str] | None) -> dict:
             "auth_failures": auth_failure_reasons(lines), "loop": loop_lines(ev),
             "injected": [{k: v for k, v in e.items() if k.startswith("has_") or k in INJECTED_FIELDS}
                          for e in ev if e["event"] == "context_injected"],
-            "attribution": turn_markers(ev)}
+            "attribution": turn_markers(window, cid if by_id else None)}
 
 
 def pick_contexts(items: list[dict], model: str | None) -> list[dict]:
@@ -719,9 +741,11 @@ def ws_frame(text: str) -> bytes:
     return head + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
 
 
-def chat_turn(prompt: str, base: str, timeout: float = 300) -> dict:
-    """One turn on /ws/coordinator, a fresh conversation (no conversation_id),
-    as ws_chat.ask does, keeping the frames a judge needs."""
+def chat_turn(prompt: str, base: str, timeout: float = 300, conversation_id: str = "") -> dict:
+    """One turn on /ws/coordinator, a fresh conversation, keeping the frames a
+    judge needs. `conversation_id` (a new random id per turn) is the id the gateway
+    then uses for the turn (ws_coordinator: empty means it makes one), so the
+    turn's gateway lines can be attributed by id."""
     import ssl
     ws = _load("ws_chat")
     out = {"text": "", "calls": [], "approval": False, "done": None, "error": None}
@@ -740,7 +764,10 @@ def chat_turn(prompt: str, base: str, timeout: float = 300) -> dict:
             head += ws.read_exact(s, 1)
         if b" 101 " not in head.split(b"\r\n", 1)[0]:
             raise RuntimeError("handshake refused: " + head.split(b"\r\n", 1)[0].decode(errors="replace"))
-        s.sendall(ws_frame(json.dumps({"prompt": prompt})))
+        msg = {"prompt": prompt}
+        if conversation_id:
+            msg["conversation_id"] = conversation_id
+        s.sendall(ws_frame(json.dumps(msg)))
         s.settimeout(60)
         end = time.time() + timeout
         while time.time() < end:
@@ -802,10 +829,11 @@ def gateway_log(since: float, until: float) -> list[str] | None:
 
 def timed_turn(prompt: str, base: str, timeout: float) -> tuple[dict, dict, float]:
     t0 = time.time()
-    chat = chat_turn(prompt, base, timeout)
+    cid = "cf-" + os.urandom(16).hex()
+    chat = chat_turn(prompt, base, timeout, cid)
     t1 = time.time()
     time.sleep(1)  # the turn's last lines reach docker's log
-    facts = log_facts(gateway_log(t0 - 0.5, t1))
+    facts = log_facts(gateway_log(t0 - 0.5, t1), cid)
     chat["error"] = with_auth_reason(chat.get("error"), facts)
     return chat, facts, t1 - t0
 

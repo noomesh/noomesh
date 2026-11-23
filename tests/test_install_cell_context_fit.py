@@ -698,3 +698,45 @@ def test_a_turns_window_is_attributed_honestly_and_keeps_its_injected_context():
     idle = CF.log_facts(own + [json.dumps({"fields": {"message": "heartbeat_loop_tick", "due_count": 0}})])["attribution"]
     assert idle["overlapped"] is False and idle["heartbeat"] == []
     assert CF.log_facts(None)["attribution"] is None
+
+
+def test_a_turn_is_attributed_by_its_conversation_id_when_the_gateway_names_it():
+    """With conversation_id on the turn lines (fa's gateway change), a turn's
+    calls, injected context and loop lines are those naming its id; another
+    turn's lines in the same window are left out, not counted as overlap."""
+    mine, theirs = "conv-mine", "conv-theirs"
+    lines = [
+        json.dumps({"fields": {"message": "ws_coordinator connected"}}),
+        json.dumps({"fields": {"message": "context_injected", "has_rag": True, "conversation_id": mine}}),
+        json.dumps({"fields": {"message": "backend_call", "sent_estimate": 6500, "conversation_id": mine}}),
+        json.dumps({"fields": {"message": "backend_call", "sent_estimate": 15700, "conversation_id": theirs}}),
+        json.dumps({"fields": {"message": "loop.retrieval_nudge", "iteration": 2, "conversation_id": theirs}}),
+        json.dumps({"fields": {"message": "coordinator.kb_tool_deferred", "iteration": 1, "conversation_id": mine}}),
+    ]
+    f = CF.log_facts(lines, mine)
+    assert [c["sent_estimate"] for c in f["backend_calls"]] == [6500]
+    assert [e["event"] for e in f["loop"]] == ["coordinator.kb_tool_deferred"]
+    assert f["injected"] == [{"has_rag": True}]
+    a = f["attribution"]
+    assert a["by"] == "conversation_id" and a["conversation_id"] == mine and a["other_conversations"] == [theirs]
+    assert a["overlapped"] is False
+    # The same lines with no id known: the window, both calls, overlap unknown to the id.
+    w = CF.log_facts(lines)
+    assert len(w["backend_calls"]) == 2 and w["attribution"]["by"].startswith("time window")
+
+
+def test_an_id_the_gateway_does_not_name_keeps_the_window():
+    """A coerced or absent id (an older gateway, or a line that names another
+    form of it) must not attribute nothing: the turn keeps its window."""
+    lines = [json.dumps({"fields": {"message": "backend_call", "sent_estimate": 6500, "conversation_id": "cli-COERCED"}})]
+    f = CF.log_facts(lines, "cf-abc")
+    assert len(f["backend_calls"]) == 1 and f["attribution"]["by"].startswith("time window")
+
+
+def test_each_context_fit_turn_sends_its_own_conversation_id():
+    src = SCRIPT.read_text()
+    body = src[src.index("def timed_turn("):src.index("def cluster_show(")]
+    assert 'cid = "cf-" + os.urandom(16).hex()' in body and "chat_turn(prompt, base, timeout, cid)" in body
+    assert "log_facts(gateway_log(t0 - 0.5, t1), cid)" in body
+    chat = src[src.index("def chat_turn("):src.index("def gateway_log(")]
+    assert 'msg["conversation_id"] = conversation_id' in chat
