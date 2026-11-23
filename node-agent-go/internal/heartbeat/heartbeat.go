@@ -165,6 +165,12 @@ type Reporter struct {
 	// provider answering nil (nothing checked yet) omits the key.
 	ollamaVerify atomic.Pointer[func() any]
 
+	// ggufUnverified reports the GGUF backends started on a local file
+	// without the controller's manifest (docker/gguf_unvouched.go), sent as
+	// `gguf_unverified`: [{backend, model, reason, since}]. nil = not wired;
+	// a provider answering nil (none) omits the key.
+	ggufUnverified atomic.Pointer[func() any]
+
 	// nodeLocal reports the node's own declarations file (nodelocal): which
 	// keys it declares, which it refused and why, sent as `node_local`.
 	nodeLocal atomic.Pointer[func() any]
@@ -455,6 +461,18 @@ func (r *Reporter) SetLlamacppOffload(f func() any) { r.llamacppOffload.Store(&f
 
 func (r *Reporter) llamacppOffloadReport() any {
 	f := r.llamacppOffload.Load()
+	if f == nil || *f == nil {
+		return nil
+	}
+	return (*f)()
+}
+
+// SetGGUFUnverified installs the provider of `gguf_unverified`: [{backend,
+// model, reason, since}].
+func (r *Reporter) SetGGUFUnverified(f func() any) { r.ggufUnverified.Store(&f) }
+
+func (r *Reporter) ggufUnverifiedReport() any {
+	f := r.ggufUnverified.Load()
 	if f == nil || *f == nil {
 		return nil
 	}

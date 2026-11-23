@@ -444,6 +444,7 @@ func (a *Agent) Run() error {
 		a.hb.SetImageStoreFreeBytes(func() (int64, bool) { return a.docker.ImageStoreFreeBytes(a.lifeCtx()) })
 		a.hb.SetHeldImages(func() map[string]bool { return a.docker.HeldImages(a.lifeCtx()) })
 		a.hb.SetBackendCaps(dockerpkg.BackendCapsReport)
+		a.hb.SetGGUFUnverified(dockerpkg.UnvouchedGGUFReport)
 		a.hb.SetLlamacppOffload(dockerpkg.LlamacppOffloadReport)
 	}
 	a.hb.SetNodeFacts(rec.NodeFacts)

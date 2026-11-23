@@ -209,6 +209,7 @@ var heartbeatSections = []payloadSection{
 	secModelSets,
 	secImageStore,
 	secOllamaVerify,
+	secGGUFUnverified,
 	secNodeLocal,
 	secBackendCaps,
 	secLlamacppOffload,
@@ -269,6 +270,16 @@ var (
 		// claim "none placed".
 		if ov := r.ollamaVerifyReport(); ov != nil {
 			p["ollama_verify"] = ov
+		}
+	}}
+
+	secGGUFUnverified = payloadSection{name: "ggufUnverified", add: func(r *Reporter, p map[string]any) {
+		// The GGUF backends that started on a local file the controller has
+		// not vouched for: [{backend, model, reason, since}], until the node
+		// re-verifies the file against the controller's manifest. OMITTED
+		// when there are none.
+		if gu := r.ggufUnverifiedReport(); gu != nil {
+			p["gguf_unverified"] = gu
 		}
 	}}
 

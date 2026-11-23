@@ -1326,6 +1326,10 @@ func ggufManifestReason(model string, err error) string {
 	switch {
 	case errors.Is(err, ErrArtifactHashing) || errors.Is(err, ErrArtifactManifestTimeout):
 		return "the controller is still hashing " + model + "; retrying on the next reconcile pass"
+	case errors.Is(err, ErrArtifactUnreadable):
+		var un *ArtifactUnreadableError
+		errors.As(err, &un)
+		return unreadableReason(un)
 	case errors.Is(err, ErrArtifactRefused):
 		return "the controller refused to vouch for " + model + ": " + err.Error()
 	case errors.Is(err, ErrArtifactAbsent):
@@ -1333,6 +1337,25 @@ func ggufManifestReason(model string, err error) string {
 	default:
 		return "the controller's manifest request for " + model + " failed: " + err.Error()
 	}
+}
+
+// unreadableReason words the gateway's unreadable answer: the path, who owns
+// it and its mode (each when the gateway could stat it), and the fix it named.
+func unreadableReason(un *ArtifactUnreadableError) string {
+	who := ""
+	switch {
+	case un.Owner != "" && un.Mode != "":
+		who = " (owner " + un.Owner + ", mode " + un.Mode + ")"
+	case un.Owner != "":
+		who = " (owner " + un.Owner + ")"
+	case un.Mode != "":
+		who = " (mode " + un.Mode + ")"
+	}
+	fix := un.Fix
+	if fix == "" {
+		fix = "make it readable by the gateway (uid 65532)"
+	}
+	return "the controller cannot read " + un.Path + who + ": " + fix
 }
 
 // ggufStartGate runs the preseed and decides whether the start may go on. A
@@ -1344,6 +1367,7 @@ func ggufManifestReason(model string, err error) string {
 func (c *Client) ggufStartGate(ctx context.Context, backend, model, modelsDir string) error {
 	_, err := c.preseedGGUF(ctx, backend, model)
 	if err == nil {
+		clearUnvouchedGGUF(backend)
 		return nil
 	}
 	var un *GGUFUnavailableError
@@ -1357,6 +1381,7 @@ func (c *Client) ggufStartGate(ctx context.Context, backend, model, modelsDir st
 	if _, serr := os.Stat(filepath.Join(dir, model)); serr == nil {
 		slog.Warn("gguf preseed unavailable; the file is already on the node, starting with it",
 			"model", model, "dir", dir, "reason", un.Reason)
+		recordUnvouchedGGUF(backend, model, dir, un.Reason, time.Now())
 		return nil
 	}
 	return err
