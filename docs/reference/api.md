@@ -254,7 +254,10 @@ add-on service key with the `metrics` scope; at most 256 series per source,
 placed reranker (a GGUF cross-encoder on llama.cpp) serves it; with none
 placed, the cluster's chat model does (`noo.served_by: "llm"`,
 `noo.fallback: true`), and `GET /api/external/capabilities` says
-`rerank.available: false`. When the chat model ranks nothing (it scores
+`rerank.available: false`. `available` is true only when a reranker can answer
+now: while one is placed but its model is still loading, it is false with
+`state: loading` and a `reason` naming the node (`state` is `ready`,
+`loading` or `none`). When the chat model ranks nothing (it scores
 every document 0, or cannot be asked), the answer is the input order with
 every `score` **null**, and `noo` carries `degraded: "identity"` and
 `degraded_reason`. A caller that needs a ranking checks `degraded`, or
