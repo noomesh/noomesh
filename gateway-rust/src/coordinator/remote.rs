@@ -1163,7 +1163,9 @@ mod tests {
         events.iter().filter(|(k, v)| k == "tool_call" && v["name"] == "noo_rag_query").map(|(_, v)| v.clone()).collect()
     }
 
-    const KB_ANSWER: &str = "The launch window is Tuesday, zircon-4471.";
+    // Past the loop's 50-character floor for an answer after a tool result,
+    // or the loop nudges it once and makes one more model call.
+    const KB_ANSWER: &str = "The launch window is Tuesday, according to the knowledge base (zircon-4471).";
 
     fn answer_unless_rag_offered(_n: usize, offered: &[String], _last_tool: &str) -> Reply {
         if offered.iter().any(|t| t == "noo_rag_query") {
