@@ -192,7 +192,11 @@ def fetch_release_file(ver: str, name: str, cache: str) -> bytes | None:
     p = os.path.join(cache, name)
     if os.path.isfile(p) and os.path.getsize(p) > 0:
         return open(p, "rb").read()
-    repo = os.environ.get("NOO_CLI_REPO") or "noomesh/noomesh"
+    # Resolved, never typed: NOO_CLI_REPO, else the repository this workflow
+    # runs in (Actions sets it). Neither: nothing to fetch from.
+    repo = os.environ.get("NOO_CLI_REPO") or os.environ.get("GITHUB_REPOSITORY") or ""
+    if not repo:
+        return None
     url = f"https://github.com/{repo}/releases/download/noo-cli-v{ver}/{name}"
     try:
         with urllib.request.urlopen(url, timeout=300) as r:
