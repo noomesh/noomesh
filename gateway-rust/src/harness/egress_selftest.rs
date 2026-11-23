@@ -358,6 +358,28 @@ mod tests {
         assert!(serving(), "held and reached: the harness takes work");
     }
 
+    /// i1246, run only by tests/ci/harness-egress-systemd.sh inside a held
+    /// unit's cgroup and mount namespace on a host without systemd-resolved,
+    /// after the host rewrote its /etc/resolv.conf: the check reports the
+    /// private resolver file replaced, still finds the unit held (nothing
+    /// resolves, no allowed address answers DNS), and the harness keeps
+    /// taking work.
+    #[tokio::test]
+    #[ignore = "needs the real egress hold: tests/ci/harness-egress-systemd.sh runs it"]
+    async fn real_hold_resolv_replaced() {
+        assert_eq!(std::env::var("NOO_REAL_HOLD").as_deref(), Ok("1"), "runs under the real hold only");
+        assert_eq!(std::env::var(HOLD_ENV).as_deref(), Ok("1"), "the drop-in's hold flag");
+        let gw = std::env::var("NOO_GATEWAY_URL").expect("NOO_GATEWAY_URL");
+        let rec = check_once(now_secs(), &gw).await.expect("the unit's runtime directory");
+        println!("{rec}");
+        assert_eq!(rec["resolv_held"], json!(false), "{rec}");
+        assert_eq!(rec["enforced"], json!(true), "{rec}");
+        assert_eq!(rec["lookup"]["result"], json!("failed"), "{rec}");
+        assert_eq!(rec["dns_reachable"], json!([]), "{rec}");
+        assert_eq!(rec["gateway"]["result"], json!("ok"), "{rec}");
+        assert!(serving(), "held: the harness takes work");
+    }
+
     /// i1246: a check that is not held stops the harness taking work only
     /// where the hold is installed; elsewhere it serves as before.
     #[test]

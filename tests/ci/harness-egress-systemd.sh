@@ -47,6 +47,7 @@ cleanup() {
 }
 trap cleanup EXIT
 systemctl --version | head -1
+echo "resolv.conf at start: $(ls -l /etc/resolv.conf | awk '{print $1, $9, $10, $11}')"
 
 # ── a. the fake controller ──────────────────────────────────────────────────
 PRIV="$(ip -4 route get 1.1.1.1 | sed -n 's/.* src \([0-9.]*\).*/\1/p' | head -1)"
@@ -93,12 +94,17 @@ lk=failed
 if getent hosts example.com >/dev/null 2>&1; then echo "canary RESOLVED" >> "\$out"; lk=resolved; else echo "canary FAILED" >> "\$out"; fi
 if getent hosts noo-ci-controller >/dev/null 2>&1; then echo "rendered RESOLVED" >> "\$out"; else echo "rendered FAILED" >> "\$out"; fi
 enf=false; if [ "\$lk" = failed ] && [ "\$cr" = timeout ]; then enf=true; fi
-printf '{"version":1,"pid":%s,"started_at":%s,"lookup":{"name":"example.com","result":"%s"},"connect":{"addr":"127.0.0.2:9","result":"%s"},"enforced":%s}\n' \
-    "\$\$" "\$(date +%s)" "\$lk" "\$cr" "\$enf" > "\$R/egress.json"
-chmod 644 "\$R/egress.json"
+st=\$(date +%s)
+rec() {
+    rh=false; [ "\$(grep -m1 '^nameserver' /etc/resolv.conf 2>/dev/null)" = "nameserver 192.0.2.53" ] && rh=true
+    printf '{"version":1,"pid":%s,"started_at":%s,"checked_at":%s,"resolv_held":%s,"lookup":{"name":"example.com","result":"%s"},"connect":{"addr":"127.0.0.2:9","result":"%s"},"enforced":%s}\n' \
+        "\$\$" "\$st" "\$(date +%s)" "\$rh" "\$lk" "\$cr" "\$enf" > "\$R/egress.json.tmp" \
+        && chmod 644 "\$R/egress.json.tmp" && mv -f "\$R/egress.json.tmp" "\$R/egress.json"
+}
+rec
 echo done >> "\$out"
 mv "\$out" "$RESULT"
-sleep infinity
+while :; do sleep 2; rec; done
 PROBE_EOF
 chmod 755 "$PROBE"
 cat > "$UNIT" <<UNIT_EOF
@@ -215,7 +221,7 @@ echo "unprivileged_bpf_disabled=$(cat /proc/sys/kernel/unprivileged_bpf_disabled
 timeout 20 systemd-run --wait --collect -p IPAccounting=yes /bin/bash -c 'exec 3<>/dev/tcp/127.0.0.1/18443; echo hi >&3' 2>&1 | grep -iE 'IP traffic|Finished|Failed' || true
 journalctl -u noo-harness -b --no-pager -o cat 2>/dev/null | tail -15 || true
 grep -E 'CONFIG_CGROUP_BPF|CONFIG_BPF_SYSCALL' "/boot/config-$(uname -r)" 2>/dev/null || true
-timeout 15 systemd-run --wait --pipe --quiet --collect -p IPAccounting=yes -p 'IPAddressDeny=0.0.0.0/0 ::/0' -p 'IPAddressAllow=127.0.0.1/32' /bin/bash -c 'exec 3<>/dev/tcp/1.1.1.1/443' 2>&1 | head -3 || true
+timeout 15 systemd-run --wait --pipe --quiet --collect -p RuntimeMaxSec=10 -p IPAccounting=yes -p 'IPAddressDeny=0.0.0.0/0 ::/0' -p 'IPAddressAllow=127.0.0.1/32' /bin/bash -c 'exec 3<>/dev/tcp/1.1.1.1/443' 2>&1 | head -3 || true
 
 # ── e2. only loopback and the controller ────────────────────────────────────
 # The allow list names single hosts, and a DNS server at any other address,
@@ -261,14 +267,23 @@ echo "$INSIDE"
 check "control: the host gets an answer from the DNS servers" bash -c "/usr/local/libexec/noo-ci-dns-ask 10.66.0.53 | grep -q answered"
 N_ANSWERED="$(grep -c answered <<<"$INSIDE")"; N_NONE="$(grep -c "no answer" <<<"$INSIDE")"
 check "inside the hold: no DNS server at another address answers" test "$N_ANSWERED" = 0 -a "$N_NONE" = 2
-# A host rewrite of its resolver file (a rename, as resolvers do) leaves the
-# unit reading its own.
+# A systemd-resolved host (/etc/resolv.conf its symlink): the hold binds the
+# resolver directory, and a host rewrite of its resolver file (a rename, as
+# resolvers do) leaves the unit reading its own. A runner whose
+# /etc/resolv.conf is a plain file is judged on that branch in f3, which every
+# run also exercises.
 HP="$(systemctl show -p MainPID --value noo-harness)"
 RT="$(readlink -f /etc/resolv.conf)"
-cp -p "$RT" "$RT.noo-ci" && echo "# rewritten by the CI" >> "$RT.noo-ci" && mv -f "$RT.noo-ci" "$RT"
-sleep 1
-HELD_NS="$(nsenter -t "$HP" -m cat /etc/resolv.conf | grep -m1 nameserver)"
-check "after a host rewrite of $RT the unit still reads its own resolv.conf" test "$HELD_NS" = "nameserver 192.0.2.53"
+case "$RT" in /run/systemd/resolve/*) RESOLVED_HOST=yes ;; *) RESOLVED_HOST=no ;; esac
+echo "systemd-resolved host: $RESOLVED_HOST ($RT)"
+if [ "$RESOLVED_HOST" = yes ]; then
+    check "systemd-resolved host: the hold binds the resolver directory" grep -qx "BindReadOnlyPaths=/etc/noo/harness-net/resolvdir:/run/systemd/resolve" "$DROPIN"
+    cp -p "$RT" "$RT.noo-ci" && echo "# rewritten by the CI" >> "$RT.noo-ci" && mv -f "$RT.noo-ci" "$RT"
+    sleep 1
+    HELD_NS="$(nsenter -t "$HP" -m cat /etc/resolv.conf | grep -m1 nameserver)"
+    echo "after the host rewrite the unit reads: ${HELD_NS:-nothing}"
+    check "after a host rewrite of $RT the unit still reads its own resolv.conf" test "$HELD_NS" = "nameserver 192.0.2.53"
+fi
 
 # ── f. the node agent's real reader ─────────────────────────────────────────
 if (cd "$REPO/node-agent-go" && NOO_REAL_SYSTEMD=1 go test ./internal/hostsvc -run TestRealSystemdEgress -v -count=1); then
@@ -292,6 +307,60 @@ if [ -n "${NOO_CI_SELFTEST:-}" ] && [ -x "$NOO_CI_SELFTEST" ]; then
 else
     fail "the harness's own self-test: no binary (NOO_CI_SELFTEST unset or not executable)"
 fi
+
+# ── f3. a host without systemd-resolved: /etc/resolv.conf a plain file ────
+# What holds there after the host rewrites that file: the agent reports the
+# private resolver file replaced while the hold stays enforced, nothing
+# resolves from inside the unit, no resolver outside the allow list answers,
+# the harness's own check still finds itself held and keeps taking work, and
+# a restart of the harness restores its own file. "From inside" = in the
+# unit's own cgroup (its address filter) and mount namespace, as its user.
+RS_LINK=""; [ -L /etc/resolv.conf ] && RS_LINK="$(readlink /etc/resolv.conf)"
+[ -n "$RS_LINK" ] && cp --remove-destination "$(readlink -f /etc/resolv.conf)" /etc/resolv.conf
+OUT3="$(run_block 2>"$WORK/block3.err")"
+echo "$OUT3"; cat "$WORK/block3.err"
+sleep 3
+check "plain-file host: the hold binds its own resolver file onto /etc/resolv.conf" grep -qx "BindReadOnlyPaths=/etc/noo/harness-net/resolv.conf:/etc/resolv.conf" "$DROPIN"
+check "plain-file host: the applier restarted the harness under it" grep -q '^APPLIED=.*(harness restarted)' <<<"$OUT3"
+HP="$(systemctl show -p MainPID --value noo-harness)"; CG="$(systemctl show -p ControlGroup --value noo-harness)"
+inside() { sh -c 'cg=$1; hp=$2; shift 2; echo $$ > "/sys/fs/cgroup$cg/cgroup.procs" && exec nsenter -t "$hp" -m -- setpriv --reuid=65534 --regid=65534 --clear-groups "$@"' inside "$CG" "$HP" "$@"; }
+BEFORE="$(nsenter -t "$HP" -m cat /etc/resolv.conf | grep -m1 nameserver)"
+check "plain-file host: the unit reads its own resolver file" test "$BEFORE" = "nameserver 192.0.2.53"
+cp -p /etc/resolv.conf /etc/resolv.conf.noo-ci && echo "# rewritten by the CI" >> /etc/resolv.conf.noo-ci && mv -f /etc/resolv.conf.noo-ci /etc/resolv.conf
+sleep 4
+AFTER="$(nsenter -t "$HP" -m cat /etc/resolv.conf | grep -m1 nameserver)"
+echo "plain-file host: after the host rewrite the unit reads: ${AFTER:-nothing}"
+if (cd "$REPO/node-agent-go" && NOO_REAL_SYSTEMD_RESOLV_REPLACED=1 go test ./internal/hostsvc -run '^TestRealSystemdEgressResolvReplaced$' -v -count=1); then
+    pass "plain-file host, after a host rewrite: the node agent reports the private resolver file replaced and the hold enforced"
+else
+    fail "plain-file host, after a host rewrite: the node agent reports the private resolver file replaced and the hold enforced"
+fi
+check "control: the host itself resolves example.com" getent hosts example.com
+if inside getent hosts example.com >/dev/null 2>&1; then
+    fail "plain-file host, after a host rewrite: nothing resolves from inside the unit"
+else
+    pass "plain-file host, after a host rewrite: nothing resolves from inside the unit"
+fi
+IN3="$(inside /usr/local/libexec/noo-ci-dns-ask 10.66.0.53 100.64.0.53 127.0.0.53 2>&1)"
+echo "$IN3"
+check "plain-file host, after a host rewrite: no resolver outside the allow list answers from inside" \
+    test "$(grep -c answered <<<"$IN3")" = 0 -a "$(grep -c 'no answer' <<<"$IN3")" = 3
+if [ -n "${NOO_CI_SELFTEST:-}" ] && [ -x "$NOO_CI_SELFTEST" ]; then
+    ST3="$(inside env -i PATH=/usr/bin:/bin NOO_REAL_HOLD=1 NOO_HARNESS_EGRESS_HOLD=1 NOO_GATEWAY_URL="https://noo-ci-controller:$PORT_HTTP" \
+        "$NOO_CI_SELFTEST" --ignored --exact harness::egress_selftest::tests::real_hold_resolv_replaced --nocapture 2>&1)"; ST3_RC=$?
+    echo "$ST3"
+    check "plain-file host, after a host rewrite: the harness's own check still finds itself held and keeps taking work" \
+        bash -c "[ $ST3_RC = 0 ] && grep -q 'test result: ok. 1 passed' <<<\"\$1\"" _ "$ST3"
+else
+    fail "plain-file host: the harness's own check: no binary (NOO_CI_SELFTEST unset or not executable)"
+fi
+systemctl restart noo-harness
+sleep 2
+HP2="$(systemctl show -p MainPID --value noo-harness)"
+RESTORED="$(nsenter -t "$HP2" -m cat /etc/resolv.conf | grep -m1 nameserver)"
+check "plain-file host: a restart of the harness restores its own resolver file" test "$RESTORED" = "nameserver 192.0.2.53"
+# The runner as it was, for the fail-safe below.
+[ -n "$RS_LINK" ] && ln -sfn "$RS_LINK" /etc/resolv.conf
 
 # ── g. the fail-safe ────────────────────────────────────────────────────────
 sed -i '/ noo-ci-controller$/d' /etc/hosts
