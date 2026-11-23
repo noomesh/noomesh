@@ -641,3 +641,26 @@ def test_the_rag_evidence_keeps_kb_tool_deferred_which_names_no_conversation():
                                   "has_rag": True, "tool": "kb_search"}})
     got = RCE.view(line, cid)
     assert got and "kb_tool_deferred" in got and '"iteration": 1' in got
+
+
+def test_a_turns_loop_lines_are_kept_with_their_time_and_no_body_field():
+    """Each turn's record carries the gateway's loop.* / coordinator.* lines of
+    its window (i1332: a Windows turn stopped after a tool call and nothing
+    named the iteration), with whitelisted fields only: the evidence is uploaded."""
+    lines = [
+        json.dumps({"timestamp": "2026-11-23T14:00:01.5Z", "fields": {
+            "message": "coordinator.kb_tool_deferred", "iteration": 1, "has_rag": True, "tool": "kb_search"}}),
+        json.dumps({"timestamp": "2026-11-23T14:00:03.0Z", "fields": {
+            "message": "loop.retrieval_nudge", "iteration": 2, "reason": "no retrieval used",
+            "prompt": "KESTREL-SECRET", "content": "KESTREL-SECRET"}}),
+        json.dumps({"timestamp": "2026-11-23T14:00:04.0Z", "fields": {"message": "unrelated", "iteration": 9}}),
+        json.dumps({"fields": {"message": "backend_call", "backend": "ollama", "sent_estimate": 15700}}),
+    ]
+    facts = CF.log_facts(lines)
+    loop = facts["loop"]
+    assert [e["event"] for e in loop] == ["coordinator.kb_tool_deferred", "loop.retrieval_nudge"]
+    assert loop[0]["ts"] == "2026-11-23T14:00:01.5Z" and loop[1]["iteration"] == 2 and loop[1]["reason"] == "no retrieval used"
+    assert "KESTREL-SECRET" not in json.dumps(loop)
+    rec = CF.turn_record("first-answer", "PASS", "", 1.0, facts, {"text": "", "calls": []})
+    assert rec["loop"] == loop
+    assert CF.log_facts(None)["loop"] == []

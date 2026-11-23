@@ -228,6 +228,8 @@ def parse_log_line(line: str) -> dict | None:
             return None
         out = {k: _debug_value(v) for k, v in fields.items() if k != "message"}
         out["event"] = msg
+        if isinstance(obj.get("timestamp"), str):
+            out["_ts"] = obj["timestamp"]
         return out
     m = re.search(r":\s(%s)\b" % "|".join(EVENTS), line)
     if not m:
@@ -281,12 +283,36 @@ def with_auth_reason(error: str | None, facts: dict) -> str | None:
     return f"{error} [gateway reason: {'; '.join(why)}]"
 
 
+# The gateway's turn-loop lines (loop.*, coordinator.*), kept per turn so a
+# turn that stops can be placed (which iteration, after which tool, a nudge, a
+# stall). Only these fields: the evidence is uploaded, and a body field
+# (prompt, answer, tool output) never is.
+LOOP_EVENT = re.compile(r"^(loop|coordinator)\.")
+LOOP_FIELDS = ("iteration", "tool", "has_rag", "called", "reason", "kind", "attempt", "attempts", "elapsed_ms",
+               "ms", "phase", "stage", "model", "backend", "count", "tier", "nudge", "cause", "outcome", "status",
+               "stream", "stalled_s", "budget", "remaining", "max_iterations", "step")
+
+
+def loop_lines(ev: list[dict]) -> list[dict]:
+    out = []
+    for e in ev:
+        if not LOOP_EVENT.match(str(e.get("event", ""))):
+            continue
+        rec = {"event": e["event"], "ts": e.get("_ts")}
+        for k in LOOP_FIELDS:
+            if k in e:
+                v = e[k]
+                rec[k] = v if isinstance(v, (int, float, bool)) or v is None else str(v)[:120]
+        out.append(rec)
+    return out
+
+
 def log_facts(lines: list[str] | None) -> dict:
     """What a turn's gateway log says. `readable` False when the log could
     not be read at all (every other figure is then unknown)."""
     if lines is None:
         return {"readable": False, "request_size": [], "backend_calls": [], "cuts": 0, "too_small": 0,
-                "tiers": [], "has_tier": False, "prefill_s": None, "auth_failures": []}
+                "tiers": [], "has_tier": False, "prefill_s": None, "auth_failures": [], "loop": []}
     ev = [e for e in (parse_log_line(l) for l in lines) if e]
     sizes = [e for e in ev if e["event"] == "request_size"]
     calls = [e for e in ev if e["event"] == "backend_call"]
@@ -297,7 +323,7 @@ def log_facts(lines: list[str] | None) -> dict:
             "too_small": sum(e["event"] == "context_too_small_for_instructions" for e in ev),
             "tiers": tiers, "has_tier": bool(tiers),
             "prefill_s": round(sum(prefills) / 1000, 3) if prefills else None,
-            "auth_failures": auth_failure_reasons(lines)}
+            "auth_failures": auth_failure_reasons(lines), "loop": loop_lines(ev)}
 
 
 def pick_contexts(items: list[dict], model: str | None) -> list[dict]:
@@ -550,7 +576,7 @@ def turn_record(name: str, verdict, reason: str, elapsed_s: float, facts: dict, 
             "cached": bool(done.get("cached")), "tools": [c.get("name") for c in chat.get("calls", [])],
             "approval_request": bool(chat.get("approval")), "error": chat.get("error"),
             "answer": _excerpt(chat.get("text", ""), 800), "wire": turn_wires(facts),
-            **turn_tokens(facts)}
+            "loop": facts.get("loop", []), **turn_tokens(facts)}
 
 
 def turn_tokens(facts: dict) -> dict:
