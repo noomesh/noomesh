@@ -1963,13 +1963,13 @@ pub(crate) fn parse_unplace_with(a: &mut Args) -> Result<UnplaceArgs, ArgError> 
 /// DELETE /api/cluster/nodes/{node}/placements/{backend}. The agent stops
 /// managing the backend.
 ///
-/// A CONTAINER is left running: it stays visible in `docker ps`, and the
-/// operator can see what they left behind. The HARNESS is stopped (#355).
-/// The asymmetry is deliberate — the harness is a host service running as
-/// a dedicated user with node credentials and a bus subscription, and
-/// once the placement is gone nothing reports it and nothing converges
-/// it. A container nobody manages is visible; an unmanaged harness is
-/// not, which is why one is left and the other is not.
+/// The gateway records the unplace with the DELETE (an unplace tombstone,
+/// shipped to that node only, for 24 h). The node agent removes the
+/// backend's container once it has seen it in two consecutive reads and no
+/// placement wants the backend any more; it never removes a container just
+/// because a placement is absent (that one is reported by `noo cluster
+/// verify`, and removed by `noo cluster stop-backend`). The HARNESS is
+/// stopped as before.
 pub fn cluster_unplace(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     let parsed = parse_unplace_with(&mut Args::new(args))?;
     let (node, backend) = (&parsed.node, &parsed.backend);
@@ -2354,6 +2354,39 @@ pub fn cluster_restart_agent(g: &Globals, args: &[String]) -> Result<i32, Unhand
         return Ok(0);
     }
     ui::done(resp["message"].as_str().unwrap_or("agent restart triggered"));
+    Ok(0)
+}
+
+pub(crate) fn parse_stop_backend_with(a: &mut Args) -> Result<(String, String, bool), ArgError> {
+    let yes = a.flag(&["--yes", "-y"]);
+    let [node, backend]: [String; 2] = a.positionals()?.try_into().map_err(|_| ArgError::new("expected <node> <backend>"))?;
+    Ok((node, backend, yes))
+}
+
+/// The body `noo cluster stop-backend` posts to `/api/cluster/backends/stop`.
+pub(crate) fn stop_backend_body(node: &str, backend: &str) -> serde_json::Value {
+    serde_json::json!({"backend": backend, "node_id": node})
+}
+
+/// `noo cluster stop-backend NODE BACKEND [-y/--yes]` — POST
+/// /api/cluster/backends/stop for one node: the agent stops the backend's
+/// container (with its drain timeout) and removes it and its door. It
+/// changes no placement: the remedy for a container `noo cluster verify`
+/// reports running with no placement. A placed backend comes back on the
+/// agent's next pass; unplace it instead (`noo cluster unplace`).
+pub fn cluster_stop_backend(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
+    let (node, backend, yes) = parse_stop_backend_with(&mut Args::new(args))?;
+    super::confirm_destructive(g, yes, "stop backend", &format!("{backend} on {node}"));
+    let resp = post_json(g, "/api/cluster/backends/stop", &stop_backend_body(&node, &backend), true, 60);
+    if g.json {
+        println!("{resp}");
+        return Ok(0);
+    }
+    ui::done(&format!("stop {backend} on {node}: {}", ui::state(resp["status"].as_str().unwrap_or("unknown"))));
+    ui::guide(&[
+        (&format!("noo cluster verify {node}"), "the `unplaced backends` row reads clear once the node reports"),
+        (&format!("noo cluster place {node} {backend} <model>"), "declares it instead, if it should run"),
+    ]);
     Ok(0)
 }
 
@@ -4353,5 +4386,33 @@ mod logs_notice_tests {
     fn no_notice_says_nothing() {
         assert_eq!(logs_notice("node_a", &json!({"logs": ["a"]})), None);
         assert_eq!(logs_notice("node_a", &json!({"logs": [], "notice": ""})), None);
+    }
+}
+
+#[cfg(test)]
+mod stop_backend_tests {
+    use super::*;
+
+    fn argv(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// `noo cluster stop-backend <node> <backend> [-y]` parses to the node and
+    /// backend, and posts the stop route's body for that one node.
+    #[test]
+    fn stop_backend_parses_and_names_the_node_and_backend() {
+        let a = argv(&["node-a", "reranker", "-y"]);
+        let (node, backend, yes) = parse_stop_backend_with(&mut Args::new(&a)).expect("parses");
+        assert_eq!((node.as_str(), backend.as_str(), yes), ("node-a", "reranker", true));
+        let a = argv(&["node-a", "reranker"]);
+        assert!(!parse_stop_backend_with(&mut Args::new(&a)).expect("parses").2, "asks without -y");
+        let a = argv(&["node-a"]);
+        assert!(parse_stop_backend_with(&mut Args::new(&a)).is_err(), "a backend is required");
+        assert_eq!(stop_backend_body("node-a", "reranker"), serde_json::json!({"backend": "reranker", "node_id": "node-a"}));
+        let src = crate::test_src::own_code(include_str!("cluster.rs"));
+        let f = crate::test_src::fn_body(&src, "pub fn cluster_stop_backend(");
+        assert!(f.contains("post_json(g, \"/api/cluster/backends/stop\", &stop_backend_body(&node, &backend), true, 60)"), "the existing stop route");
+        assert!(f.contains("confirm_destructive(g, yes, "), "asks first");
+        assert!(crate::usage::lookup(&["cluster", "stop-backend"]).is_some(), "in the usage table");
     }
 }

@@ -39,6 +39,7 @@ an allow-list.
 | Preseed a model weight from the controller's store | Only against a **digest the controller states in its artifact manifest** |
 | Benchmark the running chat model (`POST /bench`) | Controller identity required, one bench at a time, 600 s in all — see [Harness profile](#harness-profile) |
 | Set the node's harness profile (desired-config `harness_profile`) | Numbers and enums the agent applies to its own bounds; the env on the box still wins — see [Harness profile](#harness-profile) |
+| Have a backend container removed after an explicit unplace (desired-config `unplaced`) | Only that node's own record, at most 24 h old, seen on two consecutive good reads, for a container the agent labelled and named, created before the unplace — see [Removing a backend after an unplace](#removing-a-backend-after-an-unplace) |
 
 ### The controller MAY NOT
 
@@ -793,6 +794,42 @@ there).
 `NOO_OLLAMA_TLS`, `NOO_RERANKER_TLS` select nothing (`NOO_TEI_TLS` went with the TEI engine, removed in 0.6.30, and is ignored).
 `provision` renders them empty; a `false`/`0`/`no`/`off` value **refuses
 the agent's start**, naming the line, like `NOO_MTLS_NODES`.
+
+### Removing a backend after an unplace
+
+The agent removes a backend container only after an explicit unplace, never
+because a placement is absent: a controller whose database came up empty or
+was restored from an older backup answers "nothing placed" as confidently as
+a real one. `noo cluster unplace` records the unplace (a `backend_unplaced:`
+record, written only by the unplace, in the same transaction as the placement
+removal; a place of the same backend and role deletes it in its own
+transaction), and desired-config ships the node its own records, at most 24 h
+old, in a separate `unplaced` array that is never part of `placements`. The
+agent stops a backend on one only when all of these hold:
+
+- the read is good: desired-config answered and decoded, it names the node,
+  and the controller is not away; and it is not the first good read since
+  the agent started;
+- the same record (backend, role, time) was in two consecutive good reads;
+- the controller lists `reap_unplaced_backends` in `gateway_features`;
+- no placement of the backend remains;
+- the container carries `noo.managed-by=node-agent-go` and
+  `noo.backend=<backend>` and is named exactly the backend's container (never
+  a native backend, the harness, a compose service, a node workload or an
+  add-on container);
+- Docker created the container before the unplace, so a record replayed from
+  an old backup can never remove a container placed again since.
+
+It then uses the normal stop (a timeout so a serving request drains, then the
+container and its door are removed), logs `reconcile.stopping_unplaced_backend`
+and reports the removal on its heartbeat for 24 h (`reaped_backends`; the
+controller then deletes the record). Model files, volumes, the PKI directory
+and images are not touched. A container the agent owns that no placement wants
+and no record names is reported (`orphan_backends`, the `unplaced backends`
+verify row) and left running; `noo cluster stop-backend <node> <backend>`
+removes it. The generic settings writes refuse the `backend_unplaced:` key
+namespace, so the authority to change a setting is not the authority to have a
+container removed.
 
 **Leftover TEI containers.** The TEI engine was removed in 0.6.30. On its first
 reconcile pass after an upgrade the agent stops and removes the TEI containers

@@ -434,8 +434,9 @@ type ollamaContainerDownError struct{ node string }
 
 func (e *ollamaContainerDownError) Error() string {
 	return fmt.Sprintf(
-		"the %s container is not running and the import goes only to it on this node — start it (`noo cluster start-backend %s ollama`), then re-run",
-		OllamaContainer, e.node)
+		"the %s container is not running and the import goes only to it on this node — start it: place it if nothing is placed "+
+			"(`noo cluster place %s ollama <model>`), or restart the placed one (`noo cluster restart-backends %s %s`), then re-run",
+		OllamaContainer, e.node, e.node, OllamaContainer)
 }
 
 func (e *ollamaContainerDownError) Unwrap() error { return errOllamaContainerDown }

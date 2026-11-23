@@ -544,6 +544,7 @@ pub(crate) fn node_checks(n: &Value, controller_tag: &str, cli_version: &str, no
     out.extend(docker_engine_check(n));
     out.extend(vllm_compute_check(n));
     out.extend(removed_engine_check(n));
+    out.extend(unplaced_backends_check(n));
     out.extend(hardened_images_check(n));
 
     // 6c''. Vendor telemetry (docs/security/telemetry.md): no running
@@ -1906,6 +1907,45 @@ pub(crate) fn removed_engine_check(n: &Value) -> Option<Check> {
     }
     remedies.dedup();
     Some(warn(NAME, lines.join("; "), Some(remedies.join("; "))))
+}
+
+/// The `unplaced backends` row, from the agent's `orphan_backends` and
+/// `reaped_backends` (node-agent-go internal/backendreap). The agent removes a
+/// backend container only after an explicit unplace; a container it owns that
+/// no placement wants and no unplace names is reported, never removed: WARN,
+/// "`<backend>` is running on `<node>` with no placement", with the stop (or
+/// the place). A container removed on an unplace in the last 24 h is a note.
+/// No row when the agent reports neither (an agent that predates them, or
+/// one that has not judged yet).
+pub(crate) fn unplaced_backends_check(n: &Value) -> Option<Check> {
+    const NAME: &str = "unplaced backends";
+    let id = n["id"].as_str().unwrap_or("?");
+    let orphans = n["orphan_backends"].as_array();
+    let reaped = n["reaped_backends"].as_array();
+    if orphans.is_none() && reaped.is_none() {
+        return None;
+    }
+    let notes: Vec<String> = reaped
+        .into_iter()
+        .flatten()
+        .map(|r| format!("stopped `{}` on `{id}`: unplaced at `{}`", r["backend"].as_str().unwrap_or("?"), r["unplaced_at"].as_str().unwrap_or("?")))
+        .collect();
+    let running: Vec<&str> = orphans.into_iter().flatten().filter_map(|o| o["backend"].as_str()).collect();
+    if running.is_empty() {
+        let mut detail = "no backend container runs without a placement".to_string();
+        if !notes.is_empty() {
+            detail = format!("{detail}; {}", notes.join("; "));
+        }
+        return Some(ok(NAME, detail));
+    }
+    let mut lines: Vec<String> = running.iter().map(|b| format!("`{b}` is running on `{id}` with no placement")).collect();
+    lines.extend(notes);
+    let remedy = running
+        .iter()
+        .map(|b| format!("noo cluster stop-backend {id} {b}   # or place it: noo cluster place {id} {b} <model>"))
+        .collect::<Vec<_>>()
+        .join("; ");
+    Some(warn(NAME, lines.join("; "), Some(remedy)))
 }
 
 /// The `unsupported engine space` row: an embedding space whose model no node
@@ -8744,6 +8784,7 @@ mod gateway_redis_tests {
                     restarts: 7,
                     last_error: Some("Fatal error: can't open the AOF manifest file appendonly.aof.manifest: Permission denied".into()),
                     crashed: None,
+                    agent_backend: None,
                 }]),
                 "noo",
             )
@@ -10049,7 +10090,7 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         checks.push(image_family::image_family_row());
         // A container docker keeps restarting reads "Up" between restarts;
         // judge RestartCount + recency instead (0.6.4 redis AOF, 2026-10-16).
-        checks.push(restart_loops::restart_loops_row());
+        checks.push(restart_loops::restart_loops_row(g));
         // A GPU service the launcher held because the GPU did not answer at
         // start (i277e): the core runs without it, this row keeps it named.
         checks.push(gpu_held::gpu_held_row());
@@ -14361,6 +14402,31 @@ mod tests {
         let inject = crate::test_src::fn_body(&own, "fn with_harness_wanted(");
         assert!(inject.contains("removed_engine_placements(&d[\"placements\"])"), "fed from desired-config");
         assert!(own.contains("out.extend(removed_engine_check(n));"), "the row is in the run");
+    }
+
+    /// A container the agent owns with no placement is a WARN naming the
+    /// stop (or the place); a removal on an unplace is a note; an agent that
+    /// reports neither gives no row.
+    #[test]
+    fn unplaced_backends_row_warns_on_an_orphan_and_notes_a_reap() {
+        use serde_json::json;
+        let n = json!({"id": "node-a", "orphan_backends": [{"backend": "reranker", "container": "noo-reranker", "since": "2026-11-20T10:00:00Z"}],
+            "reaped_backends": [{"backend": "vllm", "at": "2026-11-23T10:05:00Z", "unplaced_at": "2026-11-23T10:00:00.000Z"}]});
+        let c = unplaced_backends_check(&n).expect("a row");
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert_eq!(c.name, "unplaced backends");
+        assert!(c.detail.contains("`reranker` is running on `node-a` with no placement"), "{}", c.detail);
+        assert!(c.detail.contains("stopped `vllm` on `node-a`: unplaced at `2026-11-23T10:00:00.000Z`"), "{}", c.detail);
+        assert_eq!(c.remedy.as_deref(), Some("noo cluster stop-backend node-a reranker   # or place it: noo cluster place node-a reranker <model>"));
+        let c = unplaced_backends_check(&json!({"id": "node-a", "orphan_backends": [],
+            "reaped_backends": [{"backend": "vllm", "at": "t", "unplaced_at": "u"}]})).expect("a row");
+        assert_eq!(c.verdict, Verdict::Ok);
+        assert_eq!(c.detail, "no backend container runs without a placement; stopped `vllm` on `node-a`: unplaced at `u`");
+        let c = unplaced_backends_check(&json!({"id": "node-a", "orphan_backends": []})).expect("a row");
+        assert_eq!((c.verdict, c.detail.as_str()), (Verdict::Ok, "no backend container runs without a placement"));
+        assert!(unplaced_backends_check(&json!({"id": "node-a"})).is_none(), "not reported: no guess");
+        let own = crate::test_src::own_code(include_str!("cluster_verify.rs"));
+        assert!(own.contains("out.extend(unplaced_backends_check(n));"), "the row is in the run");
     }
 
     /// i1182a: a space bound to a Hugging Face model no node serves WARNs

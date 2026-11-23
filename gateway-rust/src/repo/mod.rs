@@ -66,7 +66,8 @@
 //! - `noo_security_audit` — [`audit`] (reads and the one INSERT). The writer's
 //!   policy stays in `audit.rs`/`audit_chain.rs`; partition management stays in
 //!   `audit_partition.rs` (`pg_catalog`, `tableoid`, dynamic partition names).
-//! - `noo_settings` — [`settings`].
+//! - `noo_settings` — [`settings`]; the `backend_unplaced:` key namespace
+//!   (unplace tombstones) — [`backend_unplaced`], its only writer.
 //! - `noo_tasks` — [`tasks`] (single-table statements; the `Task` read model
 //!   with its JOIN stays in `tasks.rs`).
 //!
@@ -85,6 +86,7 @@ pub mod agent_recipients;
 pub mod approval_requests;
 pub mod autonomy;
 pub mod audit;
+pub mod backend_unplaced;
 pub mod caller_verifiers;
 pub mod cluster;
 pub mod connections;
@@ -233,7 +235,7 @@ mod ratchet {
     ("routes/admin.rs", 10),
     ("routes/agents.rs", 5),
     ("routes/bootstrap.rs", 15),
-    ("routes/cluster.rs", 39),
+    ("routes/cluster.rs", 36),
     ("routes/communication.rs", 11),
     ("routes/core.rs", 3),
     ("routes/core/refresh_rotation_tests.rs", 8),

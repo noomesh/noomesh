@@ -1847,6 +1847,15 @@ fn flag_set_refusal(ctx: Option<&crate::auth::RequesterCtx>) -> Option<&'static 
     None
 }
 
+/// Why a generic settings write refuses `key`: the unplace-tombstone
+/// namespace (`backend_unplaced:`) is written only by `noo cluster unplace`
+/// (`placement_delete`), because a node acts on it by removing a container.
+pub(crate) fn reserved_key_refusal(key: &str) -> Option<String> {
+    crate::repo::backend_unplaced::is_reserved(key).then(|| {
+        format!("{key}: keys starting `backend_unplaced:` are written only by `noo cluster unplace`, never as a setting")
+    })
+}
+
 /// POST /api/settings/flags/set — body {key, value: bool}. Admin-only, audited.
 /// [ported from workers/settings.py::_settings_flags_set 2026-07-18]
 ///
@@ -1877,6 +1886,11 @@ async fn settings_flags_set(
         .unwrap_or("")
         .trim()
         .to_string();
+    // The unplace tombstones live in `noo_settings` too, and a node removes a
+    // backend's container on one: only an unplace writes them.
+    if let Some(why) = reserved_key_refusal(&key) {
+        return Err(AppError::BadRequest(why));
+    }
     // Settings that decide where results go (the reports folder) are a person's: a door that could set
     // one would redirect every report, and the scheduled-task guard treats the configured target as
     // already registered.
@@ -3219,6 +3233,21 @@ mod tests {
         let first_write = set.find("repo::settings::upsert(").unwrap();
         assert!(gate < first_write, "the person gate must come before the first write");
         assert!(set[gate..first_write].contains("AppError::Forbidden"), "a refused caller must get 403");
+    }
+
+    /// The unplace-tombstone namespace is refused by the generic setter, with
+    /// a 400, before any write: settings-write authority is never reap
+    /// authority.
+    #[test]
+    fn the_flag_setter_refuses_the_unplace_tombstone_namespace() {
+        let why = super::reserved_key_refusal("backend_unplaced:node-a:ollama:chat").expect("refused");
+        assert!(why.contains("noo cluster unplace"), "{why}");
+        assert!(super::reserved_key_refusal("CLOUD_PROVIDERS_ENABLED").is_none());
+        let src = include_str!("settings.rs");
+        let set = &src[src.find("async fn settings_flags_set(").unwrap()..];
+        let refuse = set.find("reserved_key_refusal(&key)").expect("the setter asks");
+        assert!(refuse < set.find("repo::settings::upsert(").unwrap(), "before the first write");
+        assert!(set[refuse..].starts_with("reserved_key_refusal(&key) {\n        return Err(AppError::BadRequest(why));"), "a 400");
     }
 }
 

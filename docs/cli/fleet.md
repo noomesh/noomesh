@@ -123,6 +123,22 @@ noo cluster desired gpu-2
 noo cluster unplace gpu-2 ollama
 ```
 
+**Remove what a node runs.** `noo cluster unplace` records the unplace with
+the placement's removal, and the node agent stops and removes the backend's
+container (and its door) once it has read that record on two consecutive
+passes and no placement of the backend remains; its model files are never
+touched. The record is shipped to that node only and only for 24 hours, so a
+placement made again after it always wins. The agent never removes a
+container because a placement is simply absent: a backend container it owns
+that no placement wants and no unplace names is reported by `noo cluster
+verify` (the `unplaced backends` row: "`<backend>` is running on `<node>`
+with no placement"), and stays running until you stop it or place it:
+
+```sh
+noo cluster stop-backend gpu-2 reranker     # stop and remove it (asks first; -y skips)
+noo cluster place gpu-2 reranker <file>.gguf # or declare it
+```
+
 An ollama unloads an idle model after its keep_alive (5 minutes by
 default) and loads it again, cold, on the next request. `--keep-warm`
 declares an ollama chat model warm on any ollama runtime (agent-run,
@@ -393,8 +409,9 @@ reads verified about a minute after `place`, plus the import and its first
 byte check); `--stopped` records it without starting, `--port`/`--tls`/`--image`
 pin the container. `desired` shows the node's config row (ip, tier, ssh
 user, data root, models dir, GPU override) and its placements
-(`backend | model | port | tls | desired`). `unplace` removes the record
-and leaves the container as-is. Node facts that the agent cannot detect
+(`backend | model | port | tls | desired`). `unplace` removes the record,
+and the node agent then stops and removes the backend's container (see
+"Remove what a node runs" above). Node facts that the agent cannot detect
 go in with `noo cluster set-config gpu-2 --tier 2 --gpu-model "RTX 4090"
 --vram-gb 24` (the GPU override is inactive until **both** fields are set).
 
@@ -937,12 +954,13 @@ drain_started, drained_at}`, plus `workload` for a reservation and
 | `noo cluster verify` | `[<node>...] [--controller] [--wait] [--timings] [--brief]` | Assert node and controller invariants; exit 1 with the remedy (--brief: failures first) |
 | `noo cluster invite` | — | Mint a tagged tailscale auth key and print the `noo enroll --via-tailnet <url>` line |
 | `noo cluster down` | `<backend> [--node <node>] [-y\|--yes]` | Stop a backend on one node or all nodes; destructive, asks for confirmation (-y) |
+| `noo cluster stop-backend` | `<node> <backend> [-y\|--yes]` | Stop a backend's container on a node, e.g. one running with no placement; asks first (-y) |
 | `noo cluster desired` | `<node>` | Alias of show: the node in full, with its desired config and every placement |
 | `noo cluster proposals` | `[--status <s>] [--limit <n>]` | List the enrollment proposals agents filed, with each host in full |
 | `noo cluster show` | `<node>` | Show one node in full: hardware, agent version, tier drift, bus principal, roles |
 | `noo cluster forget` | `<node> [--purge-tailscale] [-y\|--yes]` | Remove a dead node's row, KV entry and enrollments; --purge-tailscale drops its device |
 | `noo cluster place` | `<node> <backend\|harness> <model\|auto> [--on cpu\|gpu] [--keep-warm\|--no-keep-warm] [--env KEY=VALUE]... [--kind noo\|claude-code\|copilot\|codex] [--role chat\|embed\|rerank] [--port <port>] [--tls] [--image <image>] [--stopped] [--force] [--retune]` | Declare a backend and model on a node (cpu or gpu), auto-tuned; model auto: harness only |
-| `noo cluster unplace` | `<node> <backend> [--role chat\|embed\|rerank] [--model <model>]` | Remove a placement, or one embed model; a container keeps running, a harness is stopped |
+| `noo cluster unplace` | `<node> <backend> [--role chat\|embed\|rerank] [--model <model>]` | Remove a placement or one embed model; the agent then stops and removes what it ran |
 | `noo cluster fit` | `<node> [--with <backend> <model> [--on cpu\|gpu] [--role <role>] [--env KEY=VALUE]...]` | Show whether placements fit a node's GPU memory and RAM, with or without one more |
 | `noo cluster class list` | — | Show the model classes consumers may send as `model`, with candidate placement and health |
 | `noo cluster class set` | `<class> <node>/<backend>[=<model>]... [--degraded <node>/<backend>[=<model>]]... [--alias <name>]... [--pool]` | Declare a model class: failover order, or --pool to share the load; --degraded ones last |
