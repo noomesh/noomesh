@@ -5926,7 +5926,6 @@ pub(crate) const COMPOSE_BACKENDS: &[(&str, BackendFront)] = &[
     ("vllm-secondary", BackendFront::Stunnel("vllm-secondary")),
     ("llamacpp", BackendFront::Stunnel("llamacpp")),
     ("ollama", BackendFront::Stunnel("ollama")),
-    ("reranker", BackendFront::Stunnel("reranker")),
     ("ollama-embed", BackendFront::Stunnel("ollama-embed")),
     ("ollama-embed-cpu", BackendFront::Stunnel("ollama-embed-cpu")),
 ];
