@@ -118,8 +118,11 @@ run_block() { # [APPLY_FILE]: this tree's applier, or another release's
         echo 'set -eu'
         sed -n '/^# BEGIN config_unchanged$/,/^# END config_unchanged$/p' "$src"
         sed -n '/^# BEGIN harness_egress$/,/^# END harness_egress$/p' "$src"
-        echo 'applied=""; need_harness_restart=0'
+        echo 'applied=""; need_harness_restart=0; need_daemon_reload=0'
         echo 'harness_egress_apply'
+        # The applier's own restart of a running harness (absent from a
+        # release older than this block: the caller restarts for it).
+        sed -n '/^# BEGIN harness_restart/,/^# END harness_restart$/p' "$src"
         echo 'echo "APPLIED=$applied"; echo "RESTART=$need_harness_restart"'
     } > "$WORK/block.sh"
     bash "$WORK/block.sh"
@@ -161,14 +164,19 @@ check "the drop-in exists" test -f "$DROPIN"
 check "harness-net files exist" test -f /etc/noo/harness-net/resolv.conf -a -f /etc/noo/harness-net/hosts -a -f /etc/noo/harness-net/nsswitch.conf
 check "the hosts file names the controller" grep -q 'noo-ci-controller' /etc/noo/harness-net/hosts
 check "upgrade: the new block re-rendered the hold and asks for one harness restart" grep -qx 'RESTART=1' <<<"$OUT"
-systemctl daemon-reload
-systemctl restart noo-harness
+# The restart is the applier's own (its harness_restart block), not this script's.
+check "upgrade: the applier itself restarted the harness" grep -q '^APPLIED=.*(harness restarted)' <<<"$OUT"
 sleep 2
 NEW_PID="$(systemctl show -p MainPID --value noo-harness)"
 LIVE_ALLOW="$(systemctl show -p IPAddressAllow --value noo-harness)"
 LIVE_WIDE="$(for a in $LIVE_ALLOW; do case $a in */32|*/128) ;; *) echo "$a" ;; esac; done)"
 check "upgrade: after the restart a new harness process runs" test -n "$NEW_PID" -a "$NEW_PID" != 0 -a "$NEW_PID" != "$OLD_PID"
 check "upgrade: the running unit allows single hosts only" test -n "$LIVE_ALLOW" -a -z "$LIVE_WIDE"
+# Exactly loopback (v4 and v6) and the controller: no other address, single or not.
+WANT_ALLOW="$(printf '%s\n' 127.0.0.1/32 ::1/128 "$PRIV/32" | sort | tr '\n' ' ')"
+GOT_ALLOW="$(for a in $LIVE_ALLOW; do echo "$a"; done | sort | tr '\n' ' ')"
+echo "allow: want [$WANT_ALLOW] got [$GOT_ALLOW]"
+check "upgrade: the running unit allows exactly loopback and the controller" test -n "$LIVE_ALLOW" -a "$GOT_ALLOW" = "$WANT_ALLOW"
 check "upgrade: the running unit carries the hold flag" bash -c "systemctl show -p Environment --value noo-harness | tr ' ' '\\n' | grep -qx NOO_HARNESS_EGRESS_HOLD=1"
 
 # ── d/e. what the unit saw ──────────────────────────────────────────────────
@@ -269,6 +277,22 @@ else
     fail "node agent reads the live unit as enforced"
 fi
 
+# ── f2. the harness's own self-test, under the unit's own hold ─────────────
+# The gateway's real egress check (egress_selftest.rs check_once), run as a
+# transient unit with the drop-in's exact properties and the unit's env file:
+# it must find itself held, reach the controller, and keep taking work.
+# After f: it rewrites egress.json with its own pid.
+if [ -n "${NOO_CI_SELFTEST:-}" ] && [ -x "$NOO_CI_SELFTEST" ]; then
+    held=(); while IFS= read -r l; do case "$l" in IPAddress*|Environment=*|BindReadOnlyPaths=*|InaccessiblePaths=*) held+=(-p "$l");; esac; done < "$DROPIN"
+    ST="$(systemd-run --wait --pipe --quiet --collect -p User=nobody -p EnvironmentFile=/etc/noo-harness.env -E NOO_REAL_HOLD=1 "${held[@]}" \
+        "$NOO_CI_SELFTEST" --ignored --exact harness::egress_selftest::tests::real_hold_serves --nocapture 2>&1)"; ST_RC=$?
+    echo "$ST"
+    check "the harness's own self-test under the hold: held, controller reached, taking work" test "$ST_RC" = 0
+    check "the harness's own self-test ran (1 passed)" grep -q 'test result: ok. 1 passed' <<<"$ST"
+else
+    fail "the harness's own self-test: no binary (NOO_CI_SELFTEST unset or not executable)"
+fi
+
 # ── g. the fail-safe ────────────────────────────────────────────────────────
 sed -i '/ noo-ci-controller$/d' /etc/hosts
 echo "192.0.2.77 noo-ci-controller" >> /etc/hosts
@@ -288,6 +312,12 @@ sleep 2
 echo "--- systemctl show (fail-safe)"
 systemctl show noo-harness -p MainPID -p IPAddressDeny -p IPAddressAllow
 check "fail-safe: the unit runs without IPAddressDeny" bash -c '[ -z "$(systemctl show noo-harness -p IPAddressDeny --value)" ]'
+# The node agent's real reader on the live unheld unit, and the Codex gate on it.
+if (cd "$REPO/node-agent-go" && NOO_REAL_SYSTEMD_UNENFORCED=1 go test ./internal/reconcile -run '^TestRealSystemdUnenforcedRefusesCodex$' -v -count=1); then
+    pass "fail-safe: the node agent reads the live unit as unenforced and refuses a Codex harness"
+else
+    fail "fail-safe: the node agent reads the live unit as unenforced and refuses a Codex harness"
+fi
 
 echo
 if [ "$FAILS" = 0 ]; then echo "harness-egress-systemd: all assertions passed"; exit 0; fi
