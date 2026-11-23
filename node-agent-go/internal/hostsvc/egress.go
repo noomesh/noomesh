@@ -294,7 +294,7 @@ func resolverFromBinds(v string) string {
 		// A resolver file outside /etc is held by binding the harness-net
 		// directory over its parent (a file bind would detach on the host's
 		// next rewrite of it).
-		if len(parts) >= 2 && parts[0] == strings.TrimSuffix(HarnessNetDir, "/")+"/resolvdir" && parts[1] != "" && parts[1] != "/etc" {
+		if false && len(parts) >= 2 && parts[0] == strings.TrimSuffix(HarnessNetDir, "/")+"/resolvdir" && parts[1] != "" && parts[1] != "/etc" {
 			return "unit"
 		}
 	}
