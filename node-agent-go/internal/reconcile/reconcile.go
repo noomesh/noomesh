@@ -146,6 +146,10 @@ type desiredConfig struct {
 	// job executor) send the same value, so nothing reloads the model at
 	// another context. Absent on an older gateway or when nothing is decided.
 	ChatContexts map[string]int `json:"chat_contexts"`
+	// This node's explicit unplaces (reap_unplaced.go): the ONLY thing the
+	// agent removes a backend container on. Absent on a controller that
+	// predates it, which then never has a container removed.
+	Unplaced []unplacedTombstone `json:"unplaced"`
 }
 
 // Reconciler pulls desired config and converges the node toward it.
@@ -262,6 +266,9 @@ type Reconciler struct {
 	ggufExists  func(ctx context.Context, dir, file string) (bool, error)
 	// startBackendFn: nil = r.docker.StartBackend. A seam for tests only.
 	startBackendFn func(ctx context.Context, backend, model string, gpuCount int, o dockerpkg.StartOverrides) error
+	// reverifyFn: nil = dockerpkg.ReverifyUnvouchedGGUF. A seam for tests only
+	// (stopBackendFn, declared below with the reaper's seams, is shared).
+	reverifyFn func(ctx context.Context, backend, model string) *dockerpkg.GGUFReverifyMismatchError
 	// removeRetiredTEIFn: nil = r.docker.RemoveRetiredTEI. A seam for tests only.
 	removeRetiredTEIFn func(ctx context.Context) ([]dockerpkg.RetiredTEI, error)
 	// retiredTEIDone: the leftover-TEI check has run clean this agent run.
@@ -312,6 +319,17 @@ type Reconciler struct {
 	// envConflicts are the placement_env_conflict refusal targets recorded
 	// last pass, so ones that resolved are cleared.
 	envConflicts map[string]bool
+
+	// The unplace reaper (reap_unplaced.go). goodReads counts good reads
+	// since the agent started; unplacedPrev is the previous good read's
+	// tombstones (nil after a read that was not good). Tick goroutine only.
+	goodReads    int
+	unplacedPrev map[unplacedTombstone]bool
+	// listManagedFn: nil = r.docker.ManagedContainers; stopBackendFn: nil =
+	// r.docker.StopBackend; reapNow: nil = time.Now. Seams for tests only.
+	listManagedFn func(ctx context.Context) ([]dockerpkg.ManagedContainer, error)
+	stopBackendFn func(ctx context.Context, backend string) error
+	reapNow       func() time.Time
 }
 
 type ollamaPullState struct {
@@ -548,6 +566,9 @@ type tick struct {
 	effective []placement
 	// ollamaRows: every still-wanted ollama placement (all roles).
 	ollamaRows []placement
+	// reapConfirmed: the unplace tombstones this read may act on
+	// (observeUnplaced: two consecutive good reads, not the first).
+	reapConfirmed []unplacedTombstone
 }
 
 // phase is one step of a reconcile pass. It returns false to end the pass
@@ -564,7 +585,9 @@ type phase struct {
 // the models dir; what is running here; multi-role merge; the shared-GPU
 // yield's sizing; image prefetch; stop and remove the TEI containers an older
 // agent left; converge each placement; restart an
-// engine its door's restart left stranded; then reap what was removed.
+// engine its door's restart left stranded; then reap what was removed (the
+// harness; a backend container only on an explicit unplace, never on an
+// absent placement: reap_unplaced.go).
 var reconcilePhases = []phase{
 	{"fetchDesired", (*Reconciler).fetchDesired},
 	{"offerWorkloadApprovals", (*Reconciler).offerWorkloadApprovals},
@@ -583,6 +606,7 @@ var reconcilePhases = []phase{
 	{"convergePlacements", (*Reconciler).convergePlacements},
 	{"healDoorNamespaces", (*Reconciler).healDoorNamespaces},
 	{"reportAndCleanup", (*Reconciler).reportAndCleanup},
+	{"reapUnplacedBackends", (*Reconciler).reapUnplacedBackends},
 	{"writeImageKeep", (*Reconciler).writeImageKeep},
 }
 
@@ -600,6 +624,8 @@ func (r *Reconciler) Once(ctx context.Context) {
 func (r *Reconciler) fetchDesired(ctx context.Context, t *tick) bool {
 	desired, err := r.fetch(ctx)
 	if err != nil {
+		// A failed read breaks the unplace reaper's two consecutive reads.
+		r.forgetUnplaced()
 		// No controller, no pass: nothing is started, stopped or changed
 		// until it answers. Said ONCE per outage (ctrlreach, shared with the
 		// heartbeat); each tick's failure at debug. An answer that is an
@@ -614,6 +640,7 @@ func (r *Reconciler) fetchDesired(ctx context.Context, t *tick) bool {
 	}
 	ctrlreach.Answered("reconcile", time.Now())
 	t.desired = desired
+	t.reapConfirmed = r.observeUnplaced(desired)
 	return true
 }
 
@@ -983,6 +1010,9 @@ func (r *Reconciler) convergeContainer(ctx context.Context, t *tick, p placement
 			// left running on a refused start): re-check that one.
 			if r.ggufMissing[p.Backend] != "" {
 				r.ggufPresent(ctx, t, p)
+			}
+			if r.reverifyUnvouched(ctx, p) {
+				return
 			}
 			r.clearBackendStart(p.Backend)
 			if p.Backend == "ollama" {

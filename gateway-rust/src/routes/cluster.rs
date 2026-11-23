@@ -329,16 +329,28 @@ pub(crate) fn peer_refusal(offered: &str, peer: Option<&str>) -> Option<String> 
         .then(|| format!("the heartbeat came from tailnet address {peer}, not {offered}"))
 }
 
-/// A refused address is never stored. The stored one stays, unless it is
-/// itself another node's (or the controller's): then the record drops it,
-/// and the node is reached over its bus or tunnel until it reports one that
-/// is its own.
-pub(crate) fn hold_stored_address(data: &mut Value, node_id: &str, claims: &AddressClaims, leaf_ips: &[String]) {
-    let stored = data.get("ip_address").and_then(Value::as_str).unwrap_or("").to_string();
-    if !stored.is_empty() && address_refusal(node_id, &stored, claims, leaf_ips).is_some() {
-        if let Some(m) = data.as_object_mut() {
-            m.remove("ip_address");
-            m.remove("agent_url");
+/// The record (`data`) after the node's reported address was refused for
+/// `why`; the heartbeat and the registration both answer a refusal here.
+/// A refused address is never stored: the record keeps the address of the
+/// node's STORED record (`stored`, its last accepted one), unless that one is
+/// itself refused now (another node's, or the controller's): then the record
+/// drops it and its `agent_url`, and the node is reached over its bus or
+/// tunnel until it reports one that is its own. With no stored record (a
+/// first registration) the record has no address.
+pub(crate) fn keep_stored_address(data: &mut Value, stored: Option<&Value>, node_id: &str, claims: &AddressClaims, leaf_ips: &[String], why: &str) {
+    data["ip_address_refused"] = json!(why);
+    let kept = stored
+        .and_then(|s| s.get("ip_address"))
+        .and_then(Value::as_str)
+        .filter(|ip| !ip.is_empty() && address_refusal(node_id, ip, claims, leaf_ips).is_none())
+        .map(str::to_string);
+    match kept {
+        Some(ip) => data["ip_address"] = json!(ip),
+        None => {
+            if let Some(m) = data.as_object_mut() {
+                m.remove("ip_address");
+                m.remove("agent_url");
+            }
         }
     }
 }
@@ -601,6 +613,10 @@ const I300_BEAT_KEYS: &[(&str, BeatShape)] = &[
     // controller's store (`{model, state, anchor, model_layer, reason,
     // remedy?, checked_at}`), read by the `ollama models` verify row.
     ("ollama_verify", BeatShape::Objects(64)),
+    // Each GGUF backend started on a local file without the controller's
+    // manifest (`{backend, model, reason, since}`; node-agent-go
+    // docker/gguf_unvouched.go), read by the `gguf verification` verify row.
+    ("gguf_unverified", BeatShape::Objects(16)),
     // Per llamacpp started on the GPU, what llama-server's own startup lines
     // said (`{backend, model, target, state, offloaded?, total?,
     // cuda_devices?, device?, compute_cap?, failure?, cause?, checked_at}`;
@@ -608,10 +624,19 @@ const I300_BEAT_KEYS: &[(&str, BeatShape)] = &[
     // offload` verify row: 0 offloaded on a GPU start is a WARN.
     ("llamacpp_offload", BeatShape::Objects(8)),
     // i1058: the node's Docker Engine, `{state: ok, version, kind}` (kind
-    // dockerd | docker-desktop | podman), `{state: none}` (no Docker) or
-    // `{state: unreadable, error}`; read by the `docker engine` verify row.
-    // Absent is an agent that predates it.
-    ("docker_engine", BeatShape::StateObject(&["ok", "none", "unreadable"])),
+    // dockerd | docker-desktop | podman), `{state: none}` (Docker not
+    // installed), `{state: down, installed_by}` (installed, its daemon's
+    // socket gone) or `{state: unreadable, error}`; read by the `docker
+    // engine` verify row. Absent is an agent that predates it.
+    ("docker_engine", BeatShape::StateObject(&["ok", "none", "down", "unreadable"])),
+    // A backend container the agent owns that no placement wants and no
+    // unplace names: `{backend, container, since}`. Reported, never removed
+    // (absence never reaps); read by the `unplaced backends` verify row.
+    ("orphan_backends", BeatShape::Objects(16)),
+    // What the agent removed on an explicit unplace in the last 24 h:
+    // `{backend, at, unplaced_at}`. Read by the same row; each entry also
+    // acknowledges (deletes) the tombstone it acted on (`ack_reaped`).
+    ("reaped_backends", BeatShape::Objects(64)),
 ];
 
 fn beat_shape_ok(v: &Value, shape: BeatShape) -> bool {
@@ -647,6 +672,32 @@ pub(crate) fn carry_i300(data: &mut Value, body: &Value) {
                 }
             }
         }
+    }
+}
+
+/// A beat's `reaped_backends` acknowledges the unplace tombstones the agent
+/// acted on: each of THIS node's tombstones (the route is the node's own)
+/// whose backend and exact `unplaced_at` an entry names is deleted. Delete
+/// only: a node's report can remove a tombstone, never write one. Nothing is
+/// read when the beat reaped nothing; a failure is logged and the tombstone
+/// ages out at its 24 h.
+async fn ack_reaped(state: &AppState, node_id: &str, body: &Value) {
+    let Some(reaped) = body.get("reaped_backends").filter(|v| v.as_array().is_some_and(|a| !a.is_empty())) else {
+        return;
+    };
+    let acked = match crate::repo::backend_unplaced::for_node(&state.db, node_id).await {
+        Ok(t) => crate::repo::backend_unplaced::acked(&t, reaped),
+        Err(e) => {
+            tracing::warn!(node = %node_id, error = %e, "unplace_records_unreadable");
+            return;
+        }
+    };
+    if acked.is_empty() {
+        return;
+    }
+    match crate::repo::backend_unplaced::delete_keys(&state.db, &acked).await {
+        Ok(n) => tracing::info!(node = %node_id, removed = n, "unplace_records_acknowledged"),
+        Err(e) => tracing::warn!(node = %node_id, error = %e, "unplace_records_ack_failed"),
     }
 }
 
@@ -815,6 +866,7 @@ async fn node_heartbeat(
     data["running_backends"] = body.get("running_backends").cloned().unwrap_or(json!({}));
     carry_lanes(&mut data, &body);
     carry_i300(&mut data, &body);
+    ack_reaped(&state, &node_id, &body).await;
     // The node on the controller's own device says so (NOO_SELF_NODE);
     // fleet views and node verbs branch on it.
     if let Some(v) = body.get("self_node") { if !v.is_null() { data["self_node"] = v.clone(); } }
@@ -858,8 +910,10 @@ async fn node_heartbeat(
                     }
                     Some(why) => {
                         tracing::warn!(node = %node_id, offered = %ip, reason = %why, "ip_address_refused");
-                        data["ip_address_refused"] = json!(why);
-                        hold_stored_address(&mut data, &node_id, &claims, &leaf_ips);
+                        // `data` is still the stored record here: the
+                        // offered address was not written.
+                        let stored = data.clone();
+                        keep_stored_address(&mut data, Some(&stored), &node_id, &claims, &leaf_ips, &why);
                         crate::operator_alert::send_operator_alert_with(
                             &state,
                             crate::operator_alert::OperatorAlert::new(
@@ -1597,14 +1651,22 @@ async fn node_register_body(
     // tunnel). Written every beat; an agent that does not say is an older
     // one and reads as the HTTPS listener only.
     data[crate::node_link::TRANSPORTS_FIELD] = crate::node_link::reported_transports(&body);
+    // The node's stored record: a refused address keeps its last accepted
+    // one (below), and the write carries routing fields from it.
+    let kv = state.js.get_key_value("mesh_nodes").await.ok();
+    let stored = match &kv {
+        Some(kv) => kv.get(node_id).await.ok().flatten().and_then(|v| serde_json::from_slice::<Value>(&v).ok()),
+        None => None,
+    };
     // i1174: a registration cannot claim another node's address or the
     // controller's own either (no leaf override here: a registration
     // rebuilds the record, and the next heartbeat may take a vetted one).
+    // A refusal keeps the stored address, as a heartbeat's does.
     if let Some(ip) = data.get("ip_address").and_then(Value::as_str).map(str::to_string) {
-        if let Some(why) = address_refusal(node_id, &ip, &AddressClaims::current(node_id, body.get("self_node").and_then(Value::as_bool) == Some(true)), &[]) {
+        let claims = AddressClaims::current(node_id, body.get("self_node").and_then(Value::as_bool) == Some(true));
+        if let Some(why) = address_refusal(node_id, &ip, &claims, &[]) {
             tracing::warn!(node = %node_id, offered = %ip, reason = %why, "ip_address_refused");
-            data["ip_address"] = Value::Null;
-            data["ip_address_refused"] = json!(why);
+            keep_stored_address(&mut data, stored.as_ref(), node_id, &claims, &[], &why);
         }
     }
     carry_target_node(&mut data, &body);
@@ -1615,8 +1677,7 @@ async fn node_register_body(
     // node offered a second ago (`carry_stored`). A forgotten node's record
     // was purged (`node_forget`), so a re-enrolled one inherits nothing.
     let mut kept: Vec<&str> = Vec::new();
-    if let Ok(kv) = state.js.get_key_value("mesh_nodes").await {
-        let stored = kv.get(node_id).await.ok().flatten().and_then(|v| serde_json::from_slice::<Value>(&v).ok());
+    if let Some(kv) = &kv {
         let from = stored_for_carry(stored.as_ref(), node_id, now);
         for &key in REGISTER_KEEPS_FROM_STORED {
             carry_stored(&mut data, from, &body, key);
@@ -4621,9 +4682,15 @@ async fn desired_config_get(
     // Withheld (key absent) when the gateway cannot say right now: the agent
     // then touches nothing, never reads it as "remove them".
     let node_workloads = super::node_workload_placements::desired_for(&state, &node_id).await;
+    let unplaced = unplaced_for(&state, &node_id, &placement_json).await;
     let mut body = json!({
         "node": node_json,
         "placements": placement_json,
+        // This node's explicit unplaces (repo/backend_unplaced.rs), at most
+        // 24 h old, none whose (backend, role) is placed: the ONLY thing on
+        // which the agent removes a backend container. Its own array, never
+        // `placements`: an agent that predates it ignores the key.
+        "unplaced": unplaced,
         "mcp_servers": mcp_json,
         // The resolved harness profile (config/harness-profiles.json):
         // `{tier, first_byte_secs, stream_idle_secs, thinking,
@@ -4644,7 +4711,9 @@ async fn desired_config_get(
         // agent refuses new calls with `node_restarting` during its stop
         // drain only when its controller lists that here; otherwise new
         // calls behave as they did before the drain existed.
-        "gateway_features": [crate::node_restart::FEATURE],
+        // `reap_unplaced_backends`: this gateway ships `unplaced`; an agent
+        // acts on it only when this is listed.
+        "gateway_features": [crate::node_restart::FEATURE, crate::repo::backend_unplaced::FEATURE],
         // i802, for `noo cluster show`: per Ollama chat model, the context the
         // daemon runs now, the decided one, why, and the model's ceiling.
         "chat_context_detail": chat_context_detail,
@@ -4668,6 +4737,27 @@ async fn desired_config_get(
     // omits the field and the agent goes tolerant again.
     body[crate::node_pin::REQUIRE_TARGET_DESIRED] = json!(require_target_node(&record));
     Ok(Json(body))
+}
+
+/// desired-config's `unplaced` for `node_id` (`backend_unplaced::ship`
+/// over its tombstones), deleting the ones past their 24 h on the way. A
+/// read error ships none: no tombstone, nothing is removed (the safe
+/// direction), and the placements still go out.
+async fn unplaced_for(state: &AppState, node_id: &str, placements: &[Value]) -> Vec<Value> {
+    let tombstones = match crate::repo::backend_unplaced::for_node(&state.db, node_id).await {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!(node = %node_id, error = %e, "unplace_records_unreadable");
+            return Vec::new();
+        }
+    };
+    let (unplaced, expired) = crate::repo::backend_unplaced::ship(&tombstones, placements, chrono::Utc::now().timestamp());
+    if !expired.is_empty() {
+        if let Err(e) = crate::repo::backend_unplaced::delete_keys(&state.db, &expired).await {
+            tracing::warn!(node = %node_id, error = %e, "unplace_records_expiry_failed");
+        }
+    }
+    unplaced
 }
 
 /// Whether desired-config tells this node to refuse a header-less
@@ -6037,6 +6127,10 @@ async fn placement_put(
     // just the primary row of any other backend), so a second embed model on
     // TEI/llamacpp REPLACES the first, as it always did, instead of adding a
     // row the node could not serve.
+    // The replace, the upsert and the kill of this slot's unplace tombstone
+    // commit together: a place after an unplace can never be followed by a
+    // node removing the container (repo/backend_unplaced.rs).
+    let mut tx = state.db.begin().await.map_err(|e| AppError::Internal(format!("placement upsert: {e}")))?;
     if role == "embed" && desired == "running" && backend != "ollama" {
         sqlx::query(
             "DELETE FROM noo_backend_placements WHERE node_id = $1 AND backend = $2 AND role = 'embed' AND model IS DISTINCT FROM $3",
@@ -6044,7 +6138,7 @@ async fn placement_put(
         .bind(&node_id)
         .bind(&backend)
         .bind(&body.model)
-        .execute(&state.db)
+        .execute(&mut *tx)
         .await
         .map_err(|e| AppError::Internal(format!("placement replace: {e}")))?;
     }
@@ -6062,9 +6156,13 @@ async fn placement_put(
         .bind(target)
         .bind(memory_limit.as_ref().map(|(b, _)| *b as i64))
         .bind(body.keep_warm)
-        .execute(&state.db)
+        .execute(&mut *tx)
         .await
         .map_err(|e| AppError::Internal(format!("placement upsert: {e}")))?;
+    crate::repo::backend_unplaced::kill(&mut *tx, &node_id, &backend, &role)
+        .await
+        .map_err(|e| AppError::Internal(format!("placement upsert: unplace record: {e}")))?;
+    tx.commit().await.map_err(|e| AppError::Internal(format!("placement upsert: {e}")))?;
     crate::role_capability::invalidate();
 
     tracing::info!(node = %node_id, backend = %backend, role = %role, desired = %desired, "placement_updated");
@@ -6095,6 +6193,8 @@ struct PlacementRoleQuery {
 /// naming them.
 async fn placement_delete(
     State(state): State<Arc<AppState>>,
+    ctx: Option<axum::Extension<crate::auth::RequesterCtx>>,
+    caller: Option<axum::Extension<crate::auth::ClusterNode>>,
     Path((node_id, backend)): Path<(String, String)>,
     Query(q): Query<PlacementRoleQuery>,
 ) -> AppResult {
@@ -6131,21 +6231,47 @@ async fn placement_delete(
             )));
         }
     }
-    let res = match target.as_deref() {
-        Some("embed") if model.is_some() => sqlx::query(
-            "DELETE FROM noo_backend_placements WHERE node_id = $1 AND backend = $2 AND role = 'embed' AND model = $3",
-        )
-        .bind(&node_id).bind(&backend).bind(model).execute(&state.db).await,
-        Some(r) => sqlx::query("DELETE FROM noo_backend_placements WHERE node_id = $1 AND backend = $2 AND role = $3")
-            .bind(&node_id).bind(&backend).bind(r).execute(&state.db).await,
-        None => sqlx::query("DELETE FROM noo_backend_placements WHERE node_id = $1 AND backend = $2")
-            .bind(&node_id).bind(&backend).execute(&state.db).await,
+    // The DELETE and its unplace tombstones commit together: a node removes
+    // a backend's container only on an explicit tombstone for exactly
+    // (node, backend, role), never because a placement is absent
+    // (repo/backend_unplaced.rs). One per role a row was removed for; none
+    // when nothing was removed.
+    let by = unplace_principal(ctx.as_deref(), caller.as_deref());
+    let unplaced_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let mut tx = state.db.begin().await.map_err(|e| AppError::Internal(format!("placement delete: {e}")))?;
+    let removed = crate::repo::backend_unplaced::delete_placements(&mut *tx, &node_id, &backend, target.as_deref(), model)
+        .await
+        .map_err(|e| AppError::Internal(format!("placement delete: {e}")))?;
+    for role in tombstone_roles(&removed) {
+        crate::repo::backend_unplaced::write(&mut *tx, &node_id, &backend, &role, &unplaced_at, &by)
+            .await
+            .map_err(|e| AppError::Internal(format!("placement delete: unplace record: {e}")))?;
     }
-    .map_err(|e| AppError::Internal(format!("placement delete: {e}")))?;
+    tx.commit().await.map_err(|e| AppError::Internal(format!("placement delete: {e}")))?;
     crate::role_capability::invalidate();
+    if !removed.is_empty() {
+        tracing::info!(node = %node_id, backend = %backend, roles = ?tombstone_roles(&removed), unplaced_at = %unplaced_at, by = %by, "placement_unplaced");
+    }
 
     nudge_reconcile(state.clone(), node_id.clone());
-    Ok(Json(json!({"ok": true, "deleted": res.rows_affected()})))
+    Ok(Json(json!({"ok": true, "deleted": removed.len()})))
+}
+
+/// The roles an unplace writes a tombstone for: each role a row was removed
+/// for, once. Empty when nothing was removed (no tombstone without a DELETE).
+pub(crate) fn tombstone_roles(removed: &[String]) -> Vec<String> {
+    let mut roles: Vec<String> = removed.to_vec();
+    roles.sort();
+    roles.dedup();
+    roles
+}
+
+/// Who unplaced: the JWT subject, else the cluster caller's name (the
+/// operator CLI on the controller), else `cluster-cli`.
+fn unplace_principal(ctx: Option<&crate::auth::RequesterCtx>, caller: Option<&crate::auth::ClusterNode>) -> String {
+    ctx.map(|c| c.sub.clone())
+        .or_else(|| caller.map(|c| c.0.clone()))
+        .unwrap_or_else(|| "cluster-cli".to_string())
 }
 
 #[derive(Deserialize)]
@@ -10040,9 +10166,12 @@ mod i300_beat_tests {
             ],
             "node_workloads": [{"addon": "rhaddon", "name": "worker", "state": "provisioned", "ready": false, "door_port": 41001}],
             "ollama_verify": [{"model": "harrier", "state": "verified", "anchor": "gguf", "model_layer": "sha256:5f26", "reason": "", "checked_at": "t"}],
+            "gguf_unverified": [{"backend": "llamacpp", "model": "m.gguf", "reason": "the controller is still hashing m.gguf", "since": "2026-11-23T10:00:00Z"}],
             "llamacpp_offload": [{"backend": "llamacpp", "model": "m.gguf", "target": "gpu", "state": "gpu", "offloaded": 33, "total": 33,
                 "cuda_devices": 1, "device": "NVIDIA GeForce GTX 1080", "compute_cap": "6.1", "checked_at": "t"}],
             "docker_engine": {"state": "ok", "version": "27.5.1", "kind": "dockerd"},
+            "orphan_backends": [{"backend": "reranker", "container": "noo-reranker", "since": "2026-11-20T10:00:00Z"}],
+            "reaped_backends": [{"backend": "vllm", "at": "2026-11-23T10:00:00.000Z", "unplaced_at": "2026-11-23T09:59:00.000Z"}],
         })
     }
 
@@ -10055,6 +10184,7 @@ mod i300_beat_tests {
         for good in [
             json!({"state": "ok", "version": "26.1.4", "kind": "docker-desktop"}),
             json!({"state": "none"}),
+            json!({"state": "down", "installed_by": "dockerd at /usr/bin/dockerd"}),
             json!({"state": "unreadable", "error": "Cannot connect to the Docker daemon"}),
         ] {
             carry_i300(&mut data, &json!({"docker_engine": good.clone()}));
@@ -11444,12 +11574,64 @@ mod address_claim_tests {
 
     #[test]
     fn a_stored_address_another_node_holds_is_dropped_not_kept() {
-        let mut data = json!({"ip_address": "100.64.0.12", "agent_url": "https://100.64.0.12:8081"});
-        hold_stored_address(&mut data, "node_a", &claims(), &[]);
+        let stored = json!({"ip_address": "100.64.0.12", "agent_url": "https://100.64.0.12:8081"});
+        let mut data = stored.clone();
+        keep_stored_address(&mut data, Some(&stored), "node_a", &claims(), &[], "100.64.0.1 is the controller's own address");
         assert!(data.get("ip_address").is_none() && data.get("agent_url").is_none(), "{data}");
-        let mut good = json!({"ip_address": "100.64.0.11"});
-        hold_stored_address(&mut good, "node_a", &claims(), &[]);
-        assert_eq!(good["ip_address"], "100.64.0.11", "the last good address stays");
+        assert_eq!(data["ip_address_refused"], "100.64.0.1 is the controller's own address");
+        // A heartbeat: `data` is the stored record.
+        let good = json!({"ip_address": "100.64.0.11", "agent_url": "https://100.64.0.11:8081"});
+        let mut beat = good.clone();
+        keep_stored_address(&mut beat, Some(&good), "node_a", &claims(), &[], "100.64.0.12 is claimed by node_b");
+        assert_eq!(beat["ip_address"], "100.64.0.11", "the last good address stays");
+        assert_eq!(beat["agent_url"], "https://100.64.0.11:8081", "with its agent_url");
+        assert_eq!(beat["ip_address_refused"], "100.64.0.12 is claimed by node_b");
+    }
+
+    /// The rc.2 rehearsal: a restarted agent re-registered with an address
+    /// another node holds, and the registration wiped its good stored one.
+    /// A registration's refusal keeps the stored address, as a beat's does.
+    #[test]
+    fn a_reregistration_with_a_claimed_address_keeps_the_stored_one() {
+        let stored = json!({"id": "node_a", "ip_address": "100.64.0.11"});
+        // The registration rebuilt the record with the address it offered.
+        let mut data = json!({"id": "node_a", "ip_address": "100.64.0.12"});
+        let why = address_refusal("node_a", "100.64.0.12", &claims(), &[]).expect("refused");
+        keep_stored_address(&mut data, Some(&stored), "node_a", &claims(), &[], &why);
+        assert_eq!(data["ip_address"], "100.64.0.11", "{data}");
+        assert_eq!(data["ip_address_refused"], "100.64.0.12 is claimed by node_b");
+        assert!(!data.to_string().contains("100.64.0.12\""), "the offered address is never stored: {data}");
+    }
+
+    #[test]
+    fn a_first_registration_with_a_claimed_address_stores_none() {
+        let mut data = json!({"id": "node_a", "ip_address": "100.64.0.12"});
+        keep_stored_address(&mut data, None, "node_a", &claims(), &[], "100.64.0.12 is claimed by node_b");
+        assert!(data.get("ip_address").is_none(), "{data}");
+        assert_eq!(data["ip_address_refused"], "100.64.0.12 is claimed by node_b");
+    }
+
+    #[test]
+    fn a_reregistration_whose_stored_address_is_now_claimed_stores_none() {
+        let stored = json!({"id": "node_a", "ip_address": "100.64.0.12", "agent_url": "https://100.64.0.12:8081"});
+        let mut data = json!({"id": "node_a", "ip_address": "100.64.0.1"});
+        keep_stored_address(&mut data, Some(&stored), "node_a", &claims(), &[], "100.64.0.1 is the controller's own address");
+        assert!(data.get("ip_address").is_none() && data.get("agent_url").is_none(), "{data}");
+    }
+
+    /// Both paths answer a refusal with the one helper, so they cannot
+    /// drift: the beat with its stored record (`data` before the offered
+    /// address is written), the registration with the record it read from KV.
+    #[test]
+    fn the_heartbeat_and_the_registration_keep_the_stored_address_alike() {
+        let code = crate::test_src::own_code(include_str!("cluster.rs"));
+        let beat = crate::test_src::fn_body(&code, "async fn node_heartbeat(");
+        assert!(beat.contains("keep_stored_address(&mut data, Some(&stored), &node_id, &claims, &leaf_ips, &why);"), "{beat}");
+        let reg = crate::test_src::fn_body(&code, "async fn node_register_body(");
+        let read = reg.find("let stored = match &kv {").expect("the stored record is read");
+        let keep = reg.find("keep_stored_address(&mut data, stored.as_ref(), node_id, &claims, &[], &why);").expect("the refusal keeps it");
+        assert!(read < keep, "{reg}");
+        assert!(!reg.contains("data[\"ip_address\"] = Value::Null;"), "{reg}");
     }
 
     #[test]
@@ -11463,7 +11645,7 @@ mod address_claim_tests {
         assert!(beat.contains("crate::node_pin::note(&node_id, &data);"));
         assert!(beat.contains("carry_target_node(&mut data, &body);"));
         let reg = crate::test_src::fn_body(&code, "async fn node_register_body(");
-        assert!(reg.contains("address_refusal(node_id, &ip, &AddressClaims::current("), "{reg}");
+        assert!(reg.contains("address_refusal(node_id, &ip, &claims, &[])"), "{reg}");
         assert!(reg.contains("crate::node_pin::note(node_id, &data);"));
     }
 
@@ -11502,5 +11684,131 @@ mod address_claim_tests {
         assert!(list.contains("if let Some(m) = crate::node_pin::last_mismatch(&id) {"), "{list}");
         assert!(list.contains("n[crate::node_pin::MISMATCH_FIELD] = m;"), "{list}");
         assert_eq!(crate::node_pin::MISMATCH_FIELD, "node_identity_mismatch");
+    }
+}
+
+#[cfg(test)]
+mod unplace_tombstone_tests {
+    //! The unplace tombstone (repo/backend_unplaced.rs): written with the
+    //! DELETE, killed with the PUT, shipped beside `placements` and never in
+    //! it, acknowledged by the heartbeat, written by nothing else.
+    use super::*;
+
+    fn own() -> String {
+        crate::test_src::own_code(include_str!("cluster.rs"))
+    }
+
+    /// One tombstone per role a row was removed for; none without a DELETE.
+    #[test]
+    fn an_unplace_writes_one_tombstone_per_removed_role_and_none_without_a_delete() {
+        assert!(tombstone_roles(&[]).is_empty(), "nothing removed, nothing written");
+        let removed = vec!["embed".to_string(), "chat".to_string(), "embed".to_string()];
+        assert_eq!(tombstone_roles(&removed), vec!["chat".to_string(), "embed".to_string()]);
+    }
+
+    /// The DELETE and the tombstones are one transaction, committed after both.
+    #[test]
+    fn the_unplace_writes_its_tombstones_in_the_delete_transaction() {
+        let own = own();
+        let del = crate::test_src::fn_body(&own, "async fn placement_delete(");
+        let begin = del.find("let mut tx = state.db.begin()").expect("a transaction");
+        let delete = del.find("backend_unplaced::delete_placements(&mut *tx,").expect("the DELETE in it");
+        let write = del.find("crate::repo::backend_unplaced::write(&mut *tx, &node_id, &backend, &role, &unplaced_at, &by)").expect("the tombstone in it");
+        let commit = del.find("tx.commit()").expect("committed");
+        assert!(begin < delete && delete < write && write < commit);
+        assert!(del.contains("for role in tombstone_roles(&removed) {"), "only for removed rows");
+        assert!(!del[begin..commit].contains("&state.db)"), "no statement of the unplace outside its transaction");
+    }
+
+    /// A re-place deletes the slot's tombstone in the upsert's transaction.
+    #[test]
+    fn a_re_place_kills_the_tombstone_in_the_upsert_transaction() {
+        let own = own();
+        let put = crate::test_src::fn_body(&own, "async fn placement_put(");
+        let begin = put.find("let mut tx = state.db.begin()").expect("a transaction");
+        let upsert = put.find("(PLACEMENT_UPSERT)").expect("the upsert");
+        let kill = put.find("crate::repo::backend_unplaced::kill(&mut *tx, &node_id, &backend, &role)").expect("the kill");
+        let commit = put.find("tx.commit()").expect("committed");
+        assert!(begin < upsert && upsert < kill && kill < commit);
+        assert!(put[upsert..kill].contains(".execute(&mut *tx)"), "the upsert is in the transaction");
+    }
+
+    /// desired-config ships `unplaced` from the placements it sends (after the
+    /// harness policy), as its own key, and the feature beside it.
+    #[test]
+    fn desired_config_ships_unplaced_beside_placements_never_in_them() {
+        let own = own();
+        let dc = crate::test_src::fn_body(&own, "async fn desired_config_get(");
+        let policy = dc.find("let placement_json = apply_harness_policy(&harness_policy, placement_json);").expect("final placements");
+        let ship = dc.find("let unplaced = unplaced_for(&state, &node_id, &placement_json).await;").expect("computed");
+        assert!(policy < ship, "filtered against the placements actually sent");
+        assert!(dc.contains("\"placements\": placement_json,"));
+        assert!(dc.contains("\"unplaced\": unplaced,"));
+        assert!(!dc.contains("placement_json.push(") && !dc.contains("placement_json.extend("), "nothing is added to placements");
+        assert!(dc.contains("crate::repo::backend_unplaced::FEATURE]"), "the feature is advertised");
+        let f = crate::test_src::fn_body(&own, "async fn unplaced_for(");
+        assert!(f.contains("backend_unplaced::ship(&tombstones, placements, chrono::Utc::now().timestamp())"), "TTL on read");
+        assert!(f.contains("delete_keys(&state.db, &expired)"), "expired ones are deleted");
+        assert_eq!(crate::repo::backend_unplaced::FEATURE, "reap_unplaced_backends", "the agent reads this name");
+    }
+
+    /// The heartbeat acknowledges by deleting only; it never writes one.
+    #[test]
+    fn the_heartbeat_ack_only_deletes() {
+        let own = own();
+        let beat = crate::test_src::fn_body(&own, "async fn node_heartbeat(");
+        assert!(beat.contains("ack_reaped(&state, &node_id, &body).await;"));
+        let ack = crate::test_src::fn_body(&own, "async fn ack_reaped(");
+        assert!(ack.contains("backend_unplaced::acked(&t, reaped)") && ack.contains("backend_unplaced::delete_keys(&state.db, &acked)"));
+        assert!(!ack.contains("backend_unplaced::write(") && !ack.contains("settings::upsert("));
+        let mut data = json!({"id": "n1"});
+        carry_i300(&mut data, &json!({"reaped_backends": [{"backend": "vllm", "at": "t", "unplaced_at": "u"}], "orphan_backends": []}));
+        assert_eq!(data["reaped_backends"][0]["backend"], "vllm", "the report reaches the record");
+        assert_eq!(data["orphan_backends"], json!([]));
+    }
+
+    /// Removing a whole node writes no tombstone: its agent is going away.
+    #[test]
+    fn node_removal_writes_no_tombstone() {
+        let own = own();
+        let forget = crate::test_src::fn_body(&own, "async fn node_forget(");
+        assert!(forget.contains("DELETE FROM noo_backend_placements WHERE node_id = $1"), "it removes the placements");
+        assert!(!forget.contains("backend_unplaced"), "and writes no unplace record");
+    }
+
+    fn rs_files(dir: &std::path::Path, out: &mut Vec<(String, String)>) {
+        for e in std::fs::read_dir(dir).expect("src dir") {
+            let p = e.expect("entry").path();
+            if p.is_dir() {
+                rs_files(&p, out);
+            } else if p.extension().is_some_and(|x| x == "rs") {
+                let rel = p.strip_prefix(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src")).unwrap().to_string_lossy().replace('\\', "/");
+                out.push((rel, crate::test_src::own_code(&std::fs::read_to_string(&p).expect("read"))));
+            }
+        }
+    }
+
+    /// The unplace handler is the ONLY tombstone writer, and no route a node
+    /// may call (`auth::NODE_ROUTES`: register, heartbeat, desired-config...)
+    /// writes `noo_settings`: the generic setting writer is called from the
+    /// settings routes alone, which are not node routes.
+    #[test]
+    fn only_the_unplace_handler_writes_a_tombstone_and_no_node_route_writes_settings() {
+        let mut files = Vec::new();
+        rs_files(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"), &mut files);
+        let writers: Vec<&str> = files.iter().filter(|(_, c)| c.contains("backend_unplaced::write(")).map(|(f, _)| f.as_str()).collect();
+        assert_eq!(writers, vec!["routes/cluster.rs"], "{writers:?}");
+        let own = own();
+        assert_eq!(own.matches("backend_unplaced::write(").count(), 1);
+        assert!(crate::test_src::fn_body(&own, "async fn placement_delete(").contains("backend_unplaced::write("));
+        let upserters: Vec<&str> = files.iter().filter(|(f, c)| !f.starts_with("repo/") && c.contains("settings::upsert(")).map(|(f, _)| f.as_str()).collect();
+        assert_eq!(upserters, vec!["routes/settings.rs"], "{upserters:?}");
+        for (_, pattern) in crate::auth::NODE_ROUTES {
+            assert!(!pattern.starts_with("/api/settings") && !pattern.starts_with("/api/config"), "{pattern} is a node route");
+        }
+        for f in ["async fn node_heartbeat(", "async fn desired_config_get(", "async fn ack_reaped(", "async fn unplaced_for("] {
+            let b = crate::test_src::fn_body(&own, f);
+            assert!(!b.contains("settings::upsert(") && !b.contains("backend_unplaced::write("), "{f} writes no setting");
+        }
     }
 }

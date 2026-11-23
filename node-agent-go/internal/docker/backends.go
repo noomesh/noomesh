@@ -1326,6 +1326,10 @@ func ggufManifestReason(model string, err error) string {
 	switch {
 	case errors.Is(err, ErrArtifactHashing) || errors.Is(err, ErrArtifactManifestTimeout):
 		return "the controller is still hashing " + model + "; retrying on the next reconcile pass"
+	case errors.Is(err, ErrArtifactUnreadable):
+		var un *ArtifactUnreadableError
+		errors.As(err, &un)
+		return unreadableReason(model, un)
 	case errors.Is(err, ErrArtifactRefused):
 		return "the controller refused to vouch for " + model + ": " + err.Error()
 	case errors.Is(err, ErrArtifactAbsent):
@@ -1333,6 +1337,26 @@ func ggufManifestReason(model string, err error) string {
 	default:
 		return "the controller's manifest request for " + model + " failed: " + err.Error()
 	}
+}
+
+// unreadableReason words the gateway's unreadable answer: the model, who owns
+// the file and its mode (each when the gateway could stat it), the path the
+// gateway reported (its container's view, not a host path), and where the host
+// path and the fix are named.
+func unreadableReason(model string, un *ArtifactUnreadableError) string {
+	var facts []string
+	if un.Owner != "" {
+		facts = append(facts, "owner "+un.Owner)
+	}
+	if un.Mode != "" {
+		facts = append(facts, "mode "+un.Mode)
+	}
+	view := un.Path + " is the gateway container's view"
+	detail := view
+	if len(facts) > 0 {
+		detail = strings.Join(facts, ", ") + "; " + view
+	}
+	return "the controller cannot read " + model + " (" + detail + "): `noo cluster verify` on the controller names its host path and the fix (`model store readable`)"
 }
 
 // ggufStartGate runs the preseed and decides whether the start may go on. A
@@ -1344,6 +1368,7 @@ func ggufManifestReason(model string, err error) string {
 func (c *Client) ggufStartGate(ctx context.Context, backend, model, modelsDir string) error {
 	_, err := c.preseedGGUF(ctx, backend, model)
 	if err == nil {
+		clearUnvouchedGGUF(backend)
 		return nil
 	}
 	var un *GGUFUnavailableError
@@ -1357,6 +1382,7 @@ func (c *Client) ggufStartGate(ctx context.Context, backend, model, modelsDir st
 	if _, serr := os.Stat(filepath.Join(dir, model)); serr == nil {
 		slog.Warn("gguf preseed unavailable; the file is already on the node, starting with it",
 			"model", model, "dir", dir, "reason", un.Reason)
+		recordUnvouchedGGUF(backend, model, dir, un.Reason, time.Now())
 		return nil
 	}
 	return err

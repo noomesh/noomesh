@@ -625,6 +625,21 @@ pub(crate) fn rerank_order<T>(cands: Vec<(T, Option<String>)>, wanted: Option<&s
     first.into_iter().map(|(t, m)| (t, m, false)).chain(rest.into_iter().map(|(t, m)| (t, m, true))).collect()
 }
 
+/// `capabilities.rerank`: `available` only when a reranker is routable now.
+/// `state` is `ready`, `loading` (a node advertises the capability but no lane
+/// routes yet: its model is loading or its agent is not reachable) or `none`;
+/// `reason` says which nodes, when it is not ready.
+pub(crate) fn rerank_capability(advertising: &[String], routable: &[String]) -> Value {
+    if !routable.is_empty() {
+        return json!({"available": true, "models": ["default"], "state": "ready"});
+    }
+    if !advertising.is_empty() {
+        return json!({"available": false, "models": [], "state": "loading",
+            "reason": format!("placed on {}, loading: not serving yet (its model is loading or its agent is not reachable); a request now is answered by the chat model, labelled", advertising.join(", "))});
+    }
+    json!({"available": false, "models": [], "state": "none", "reason": "no reranker placed; a request is answered by the chat model, labelled"})
+}
+
 /// The `noo` block of a rerank answer.
 pub(crate) fn rerank_noo(served_by: &str, model: Option<&str>, requested: Option<&str>, fallback: bool) -> Value {
     let mut v = json!({
@@ -1256,8 +1271,19 @@ async fn capabilities(State(state): State<Arc<AppState>>) -> Response {
 
     // rerank is available iff some alive mesh node advertises the capability.
     // (The co-located NOO_RERANK_URL path is gone — see `rerank_target`.)
-    let rerank_ok = !state.gossip.find_peers_by_capability("rerank", 1).is_empty();
-    let rerank_models: Value = if rerank_ok { json!(["default"]) } else { json!([]) };
+    // rerank is available when a reranker is ROUTABLE now: the lanes
+    // `do_rerank` would try (`mesh_targets`: the node's agent reachable and
+    // the reranker's model loaded), not merely a node advertising the
+    // capability. A container that is up while its model still loads is
+    // "loading", with the nodes named, and a request then is the labelled
+    // chat-model fallback.
+    let advertising: Vec<String> = state.gossip.find_peers_by_capability("rerank", 8).into_iter().map(|p| p.node_id).collect();
+    let routable: Vec<String> = if advertising.is_empty() {
+        Vec::new()
+    } else {
+        mesh_targets(&state, "rerank", "rerank", 8).await.into_iter().map(|t| t.node_id).collect()
+    };
+    let rerank = rerank_capability(&advertising, &routable);
 
     Json(json!({
         "chat": {
@@ -1266,10 +1292,7 @@ async fn capabilities(State(state): State<Arc<AppState>>) -> Response {
             "models": chat_models
         },
         "embeddings": embeddings,
-        "rerank": {
-            "available": rerank_ok,
-            "models": rerank_models
-        },
+        "rerank": rerank,
         "classify": {
             "available": chat_ok,
             "models": chat_models,
@@ -1492,6 +1515,34 @@ mod rerank_preference_tests {
         assert_eq!((n["served_by"].as_str(), n["model"].as_str(), n["fallback"].as_bool()), (Some("llm"), Some("llm"), Some(true)));
         assert_eq!(n["requested_model"], "qwen3-reranker");
         assert!(rerank_noo("gpu-1", Some("bge"), None, false).get("requested_model").is_none());
+    }
+
+    /// `available` means routable now: during a reranker's load window (the
+    /// node advertises, no lane routes) it is false, `state: loading`, naming
+    /// the node; only a routable lane makes it true.
+    #[test]
+    fn rerank_is_available_only_when_a_lane_routes() {
+        use super::rerank_capability;
+        let loading = rerank_capability(&["node-a".into()], &[]);
+        assert_eq!((loading["available"].clone(), loading["state"].clone()), (serde_json::json!(false), serde_json::json!("loading")));
+        assert!(loading["reason"].as_str().unwrap().starts_with("placed on node-a, loading"), "{loading}");
+        assert_eq!(loading["models"], serde_json::json!([]));
+        let ready = rerank_capability(&["node-a".into()], &["node-a".into()]);
+        assert_eq!((ready["available"].clone(), ready["state"].clone(), ready["models"].clone()), (serde_json::json!(true), serde_json::json!("ready"), serde_json::json!(["default"])));
+        assert!(ready.get("reason").is_none());
+        let none = rerank_capability(&[], &[]);
+        assert_eq!((none["available"].clone(), none["state"].clone()), (serde_json::json!(false), serde_json::json!("none")));
+    }
+
+    /// The capabilities answer reads the same routing `do_rerank` uses, never
+    /// the advertisement alone.
+    #[test]
+    fn capabilities_reads_rerank_from_the_routing() {
+        let own = crate::test_src::own_code(include_str!("external.rs"));
+        let caps = crate::test_src::fn_body(&own, "async fn capabilities(");
+        assert!(caps.contains("mesh_targets(&state, \"rerank\", \"rerank\", 8).await"), "{caps}");
+        assert!(caps.contains("let rerank = rerank_capability(&advertising, &routable);"));
+        assert!(caps.contains("\"rerank\": rerank,"));
     }
 
     /// i1182a: an unranked answer says so; a ranked one carries no flag.

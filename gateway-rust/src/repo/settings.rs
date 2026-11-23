@@ -36,6 +36,12 @@ where
 }
 
 /// Set (or replace) one override, stamping who and when.
+///
+/// Refuses a key in the unplace-tombstone namespace (`backend_unplaced:`):
+/// only `placement_delete` writes those ([`super::backend_unplaced::write`]),
+/// so the authority to change a setting never becomes the authority to make
+/// a node remove a container. The routes refuse it first with a 400; this is
+/// the floor under any other caller.
 pub async fn upsert<'e, E>(
     db: E,
     key: &str,
@@ -46,6 +52,9 @@ pub async fn upsert<'e, E>(
 where
     E: sqlx::PgExecutor<'e>,
 {
+    if super::backend_unplaced::is_reserved(key) {
+        return Err(sqlx::Error::Protocol(format!("{key}: the backend_unplaced: namespace is written only by an unplace")));
+    }
     sqlx::query(
         "INSERT INTO noo_settings (key, value, category, updated_by, updated_at) \
          VALUES ($1, $2, $3, $4, NOW()) \
@@ -79,4 +88,22 @@ where
     .execute(db)
     .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    /// The floor under every caller: an upsert of an unplace-tombstone key
+    /// is refused before the database is touched (the pool here cannot
+    /// connect; reaching it would be a different error).
+    #[tokio::test]
+    async fn upsert_refuses_the_unplace_tombstone_namespace() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(std::time::Duration::from_millis(200))
+            .connect_lazy("postgres://nobody@127.0.0.1:1/nothing")
+            .expect("lazy pool");
+        let err = super::upsert(&pool, "backend_unplaced:node-a:ollama:chat", "{}", "unplace", "op").await.unwrap_err();
+        assert!(matches!(err, sqlx::Error::Protocol(ref m) if m.contains("written only by an unplace")), "{err}");
+        let other = super::upsert(&pool, "CLOUD_PROVIDERS_ENABLED", "1", "general", "op").await.unwrap_err();
+        assert!(!matches!(other, sqlx::Error::Protocol(_)), "any other key reaches the database: {other}");
+    }
 }

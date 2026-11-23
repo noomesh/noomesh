@@ -476,6 +476,7 @@ pub fn cluster_show(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         ("docker engine", match n["docker_engine"]["state"].as_str() {
             Some("ok") => format!("{} ({})", str_of(&n["docker_engine"]["version"]), str_of(&n["docker_engine"]["kind"])),
             Some("none") => "none (native backends only)".to_string(),
+            Some("down") => ui::warn(&format!("installed, daemon not answering ({})", str_of(&n["docker_engine"]["installed_by"]))).to_string(),
             Some("unreadable") => ui::warn(&format!("unreadable: {}", str_of(&n["docker_engine"]["error"]))).to_string(),
             _ => ui::muted("not reported (agent predates this release)").to_string(),
         }),
@@ -1963,13 +1964,13 @@ pub(crate) fn parse_unplace_with(a: &mut Args) -> Result<UnplaceArgs, ArgError> 
 /// DELETE /api/cluster/nodes/{node}/placements/{backend}. The agent stops
 /// managing the backend.
 ///
-/// A CONTAINER is left running: it stays visible in `docker ps`, and the
-/// operator can see what they left behind. The HARNESS is stopped (#355).
-/// The asymmetry is deliberate — the harness is a host service running as
-/// a dedicated user with node credentials and a bus subscription, and
-/// once the placement is gone nothing reports it and nothing converges
-/// it. A container nobody manages is visible; an unmanaged harness is
-/// not, which is why one is left and the other is not.
+/// The gateway records the unplace with the DELETE (an unplace tombstone,
+/// shipped to that node only, for 24 h). The node agent removes the
+/// backend's container once it has seen it in two consecutive reads and no
+/// placement wants the backend any more; it never removes a container just
+/// because a placement is absent (that one is reported by `noo cluster
+/// verify`, and removed by `noo cluster stop-backend`). The HARNESS is
+/// stopped as before.
 pub fn cluster_unplace(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     let parsed = parse_unplace_with(&mut Args::new(args))?;
     let (node, backend) = (&parsed.node, &parsed.backend);
@@ -1989,8 +1990,22 @@ pub fn cluster_unplace(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             path.push_str(&format!("&model={}", super::urlencode(m)));
         }
     }
-    let resp = delete_json(g, &path, true, 10);
+    let mut resp = delete_json(g, &path, true, 10);
+    // What happens to the container next depends on the controller: one
+    // that advertises `reap_unplaced_backends` has the agent remove it; an
+    // older one does not. Its desired-config says which, and whether another
+    // placement still wants the backend.
+    let deleted = resp["deleted"].as_u64().unwrap_or(0);
+    let desired = if deleted > 0 && backend != "harness" {
+        crate::http::get_json_opt(g, &format!("/api/cluster/nodes/{}/desired-config", super::urlencode(node)), true, 15)
+    } else {
+        None
+    };
+    let note = unplace_note(node, backend, deleted, desired.as_ref());
     if g.json {
+        if let (Some(n), Some(o)) = (&note, resp.as_object_mut()) {
+            o.insert("note".into(), serde_json::json!(n));
+        }
         println!("{resp}");
         return Ok(0);
     }
@@ -1999,7 +2014,36 @@ pub fn cluster_unplace(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         (Some(r), None) => ui::done(&format!("{node}: {backend} {r} placement removed")),
         _ => ui::done(&format!("{node}: {backend} placement removed")),
     }
+    if let Some(n) = note {
+        println!("{}", ui::note(&n));
+    }
     Ok(0)
+}
+
+/// The one line `noo cluster unplace` adds after a removal: when the agent
+/// stops the container (the controller advertises `reap_unplaced_backends`:
+/// two reconcile passes, about 10 minutes), or that this controller does
+/// not, with the command that stops it now. `desired` is the node's
+/// desired-config read after the DELETE (`None`: unreadable). Nothing for a
+/// removal that removed nothing, or for the harness (stopped as before).
+pub(crate) fn unplace_note(node: &str, backend: &str, deleted: u64, desired: Option<&serde_json::Value>) -> Option<String> {
+    if deleted == 0 || backend == "harness" {
+        return None;
+    }
+    let stop = format!("noo cluster stop-backend {node} {backend}");
+    let Some(d) = desired else {
+        return Some(format!("unplaced; to stop the container now: {stop}"));
+    };
+    let still = d["placements"].as_array().is_some_and(|ps| ps.iter().any(|p| p["backend"].as_str() == Some(backend)));
+    if still {
+        return Some(format!("unplaced; {backend} keeps running on {node}: another placement of it remains"));
+    }
+    let reaps = d["gateway_features"].as_array().is_some_and(|f| f.iter().any(|x| x.as_str() == Some("reap_unplaced_backends")));
+    Some(if reaps {
+        format!("unplaced: {node} stops {backend} within about 10 minutes (after two reconcile passes); to stop it now: {stop}")
+    } else {
+        format!("unplaced; this controller does not stop the container: {stop}")
+    })
 }
 
 /// `noo cluster fit NODE [--with BACKEND MODEL [--on cpu|gpu] [--role R] [--env K=V]...]` -
@@ -2354,6 +2398,39 @@ pub fn cluster_restart_agent(g: &Globals, args: &[String]) -> Result<i32, Unhand
         return Ok(0);
     }
     ui::done(resp["message"].as_str().unwrap_or("agent restart triggered"));
+    Ok(0)
+}
+
+pub(crate) fn parse_stop_backend_with(a: &mut Args) -> Result<(String, String, bool), ArgError> {
+    let yes = a.flag(&["--yes", "-y"]);
+    let [node, backend]: [String; 2] = a.positionals()?.try_into().map_err(|_| ArgError::new("expected <node> <backend>"))?;
+    Ok((node, backend, yes))
+}
+
+/// The body `noo cluster stop-backend` posts to `/api/cluster/backends/stop`.
+pub(crate) fn stop_backend_body(node: &str, backend: &str) -> serde_json::Value {
+    serde_json::json!({"backend": backend, "node_id": node})
+}
+
+/// `noo cluster stop-backend NODE BACKEND [-y/--yes]` — POST
+/// /api/cluster/backends/stop for one node: the agent stops the backend's
+/// container (with its drain timeout) and removes it and its door. It
+/// changes no placement: the remedy for a container `noo cluster verify`
+/// reports running with no placement. A placed backend comes back on the
+/// agent's next pass; unplace it instead (`noo cluster unplace`).
+pub fn cluster_stop_backend(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
+    let (node, backend, yes) = parse_stop_backend_with(&mut Args::new(args))?;
+    super::confirm_destructive(g, yes, "stop backend", &format!("{backend} on {node}"));
+    let resp = post_json(g, "/api/cluster/backends/stop", &stop_backend_body(&node, &backend), true, 60);
+    if g.json {
+        println!("{resp}");
+        return Ok(0);
+    }
+    ui::done(&format!("stop {backend} on {node}: {}", ui::state(resp["status"].as_str().unwrap_or("unknown"))));
+    ui::guide(&[
+        (&format!("noo cluster verify {node}"), "the `unplaced backends` row reads clear once the node reports"),
+        (&format!("noo cluster place {node} {backend} <model>"), "declares it instead, if it should run"),
+    ]);
     Ok(0)
 }
 
@@ -4353,5 +4430,61 @@ mod logs_notice_tests {
     fn no_notice_says_nothing() {
         assert_eq!(logs_notice("node_a", &json!({"logs": ["a"]})), None);
         assert_eq!(logs_notice("node_a", &json!({"logs": [], "notice": ""})), None);
+    }
+}
+
+#[cfg(test)]
+mod stop_backend_tests {
+    use super::*;
+
+    fn argv(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// `noo cluster stop-backend <node> <backend> [-y]` parses to the node and
+    /// backend, and posts the stop route's body for that one node.
+    #[test]
+    fn stop_backend_parses_and_names_the_node_and_backend() {
+        let a = argv(&["node-a", "reranker", "-y"]);
+        let (node, backend, yes) = parse_stop_backend_with(&mut Args::new(&a)).expect("parses");
+        assert_eq!((node.as_str(), backend.as_str(), yes), ("node-a", "reranker", true));
+        let a = argv(&["node-a", "reranker"]);
+        assert!(!parse_stop_backend_with(&mut Args::new(&a)).expect("parses").2, "asks without -y");
+        let a = argv(&["node-a"]);
+        assert!(parse_stop_backend_with(&mut Args::new(&a)).is_err(), "a backend is required");
+        assert_eq!(stop_backend_body("node-a", "reranker"), serde_json::json!({"backend": "reranker", "node_id": "node-a"}));
+        let src = crate::test_src::own_code(include_str!("cluster.rs"));
+        let f = crate::test_src::fn_body(&src, "pub fn cluster_stop_backend(");
+        assert!(f.contains("post_json(g, \"/api/cluster/backends/stop\", &stop_backend_body(&node, &backend), true, 60)"), "the existing stop route");
+        assert!(f.contains("confirm_destructive(g, yes, "), "asks first");
+        assert!(crate::usage::lookup(&["cluster", "stop-backend"]).is_some(), "in the usage table");
+    }
+}
+
+#[cfg(test)]
+mod unplace_note_tests {
+    use super::unplace_note;
+    use serde_json::json;
+
+    /// The line names the real node and backend, the bound and the stop
+    /// command when the controller reaps; the other wording when it does not.
+    #[test]
+    fn the_unplace_note_says_what_happens_to_the_container() {
+        let reaps = json!({"placements": [], "gateway_features": ["node_restarting", "reap_unplaced_backends"]});
+        assert_eq!(
+            unplace_note("gpu-2", "reranker", 1, Some(&reaps)).as_deref(),
+            Some("unplaced: gpu-2 stops reranker within about 10 minutes (after two reconcile passes); to stop it now: noo cluster stop-backend gpu-2 reranker")
+        );
+        let older = json!({"placements": [], "gateway_features": ["node_restarting"]});
+        assert_eq!(
+            unplace_note("gpu-2", "reranker", 1, Some(&older)).as_deref(),
+            Some("unplaced; this controller does not stop the container: noo cluster stop-backend gpu-2 reranker")
+        );
+        let still = json!({"placements": [{"backend": "ollama", "role": "embed"}], "gateway_features": ["reap_unplaced_backends"]});
+        assert_eq!(unplace_note("gpu-2", "ollama", 1, Some(&still)).as_deref(), Some("unplaced; ollama keeps running on gpu-2: another placement of it remains"));
+        assert_eq!(unplace_note("gpu-2", "reranker", 1, None).as_deref(), Some("unplaced; to stop the container now: noo cluster stop-backend gpu-2 reranker"));
+        assert_eq!(unplace_note("gpu-2", "reranker", 0, Some(&reaps)), None, "nothing removed, nothing to say");
+        assert_eq!(unplace_note("gpu-2", "harness", 1, Some(&reaps)), None, "the harness is stopped as before");
+        assert!(!unplace_note("gpu-2", "reranker", 1, Some(&reaps)).unwrap().contains('\n'), "one line");
     }
 }

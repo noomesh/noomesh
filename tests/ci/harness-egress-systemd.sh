@@ -44,8 +44,28 @@ WORK="$(mktemp -d /tmp/noo-egress-ci.XXXXXX)" || exit 2
 cleanup() {
     for p in $PIDS; do kill "$p" 2>/dev/null || true; done
     systemctl stop noo-harness 2>/dev/null || true
+    # The runner's own resolver file, as it started.
+    if [ -n "${RS_ORIG_LINK:-}" ]; then ln -sfn "$RS_ORIG_LINK" /etc/resolv.conf
+    elif [ -s "${RS_ORIG_FILE:-}" ]; then rm -f /etc/resolv.conf; cp "$RS_ORIG_FILE" /etc/resolv.conf; fi
 }
 trap cleanup EXIT
+RS_ORIG_LINK=""; RS_ORIG_FILE=""
+if [ -L /etc/resolv.conf ]; then RS_ORIG_LINK="$(readlink /etc/resolv.conf)"; else RS_ORIG_FILE="$WORK/resolv.conf.orig"; cp /etc/resolv.conf "$RS_ORIG_FILE"; fi
+# The workflow's start=plain jobs: a runner that starts with a plain-file
+# /etc/resolv.conf, as some hosted runners do, made here so that path runs on
+# every run, not by luck. The runner's own layout is restored at exit.
+if [ "${NOO_CI_START_PLAIN:-}" = 1 ] && [ -L /etc/resolv.conf ]; then
+    cp --remove-destination "$(readlink -f /etc/resolv.conf)" /etc/resolv.conf
+fi
+echo "resolv.conf at start: $(ls -l /etc/resolv.conf | awk '{print $1, $9, $10, $11}')"
+case "$(readlink -f /etc/resolv.conf)" in
+    /run/systemd/resolve/*) echo "runner started with: the systemd-resolved layout (/etc/resolv.conf its symlink)" ;;
+    *)
+        echo "runner started with: a plain-file /etc/resolv.conf; the systemd-resolved layout is made for the first part, f3 makes the plain-file one"
+        systemctl start systemd-resolved 2>/dev/null || true
+        for _ in $(seq 1 10); do [ -s /run/systemd/resolve/stub-resolv.conf ] && break; sleep 1; done
+        [ -s /run/systemd/resolve/stub-resolv.conf ] && ln -sfn ../run/systemd/resolve/stub-resolv.conf /etc/resolv.conf ;;
+esac
 systemctl --version | head -1
 
 # ── a. the fake controller ──────────────────────────────────────────────────
@@ -93,12 +113,17 @@ lk=failed
 if getent hosts example.com >/dev/null 2>&1; then echo "canary RESOLVED" >> "\$out"; lk=resolved; else echo "canary FAILED" >> "\$out"; fi
 if getent hosts noo-ci-controller >/dev/null 2>&1; then echo "rendered RESOLVED" >> "\$out"; else echo "rendered FAILED" >> "\$out"; fi
 enf=false; if [ "\$lk" = failed ] && [ "\$cr" = timeout ]; then enf=true; fi
-printf '{"version":1,"pid":%s,"started_at":%s,"lookup":{"name":"example.com","result":"%s"},"connect":{"addr":"127.0.0.2:9","result":"%s"},"enforced":%s}\n' \
-    "\$\$" "\$(date +%s)" "\$lk" "\$cr" "\$enf" > "\$R/egress.json"
-chmod 644 "\$R/egress.json"
+st=\$(date +%s)
+rec() {
+    rh=false; [ "\$(grep -m1 '^nameserver' /etc/resolv.conf 2>/dev/null)" = "nameserver 192.0.2.53" ] && rh=true
+    printf '{"version":1,"pid":%s,"started_at":%s,"checked_at":%s,"resolv_held":%s,"lookup":{"name":"example.com","result":"%s"},"connect":{"addr":"127.0.0.2:9","result":"%s"},"enforced":%s}\n' \
+        "\$\$" "\$st" "\$(date +%s)" "\$rh" "\$lk" "\$cr" "\$enf" > "\$R/egress.json.tmp" \
+        && chmod 644 "\$R/egress.json.tmp" && mv -f "\$R/egress.json.tmp" "\$R/egress.json"
+}
+rec
 echo done >> "\$out"
 mv "\$out" "$RESULT"
-sleep infinity
+while :; do sleep 2; rec; done
 PROBE_EOF
 chmod 755 "$PROBE"
 cat > "$UNIT" <<UNIT_EOF
@@ -118,8 +143,11 @@ run_block() { # [APPLY_FILE]: this tree's applier, or another release's
         echo 'set -eu'
         sed -n '/^# BEGIN config_unchanged$/,/^# END config_unchanged$/p' "$src"
         sed -n '/^# BEGIN harness_egress$/,/^# END harness_egress$/p' "$src"
-        echo 'applied=""; need_harness_restart=0'
+        echo 'applied=""; need_harness_restart=0; need_daemon_reload=0'
         echo 'harness_egress_apply'
+        # The applier's own restart of a running harness (absent from a
+        # release older than this block: the caller restarts for it).
+        sed -n '/^# BEGIN harness_restart/,/^# END harness_restart$/p' "$src"
         echo 'echo "APPLIED=$applied"; echo "RESTART=$need_harness_restart"'
     } > "$WORK/block.sh"
     bash "$WORK/block.sh"
@@ -161,14 +189,19 @@ check "the drop-in exists" test -f "$DROPIN"
 check "harness-net files exist" test -f /etc/noo/harness-net/resolv.conf -a -f /etc/noo/harness-net/hosts -a -f /etc/noo/harness-net/nsswitch.conf
 check "the hosts file names the controller" grep -q 'noo-ci-controller' /etc/noo/harness-net/hosts
 check "upgrade: the new block re-rendered the hold and asks for one harness restart" grep -qx 'RESTART=1' <<<"$OUT"
-systemctl daemon-reload
-systemctl restart noo-harness
+# The restart is the applier's own (its harness_restart block), not this script's.
+check "upgrade: the applier itself restarted the harness" grep -q '^APPLIED=.*(harness restarted)' <<<"$OUT"
 sleep 2
 NEW_PID="$(systemctl show -p MainPID --value noo-harness)"
 LIVE_ALLOW="$(systemctl show -p IPAddressAllow --value noo-harness)"
 LIVE_WIDE="$(for a in $LIVE_ALLOW; do case $a in */32|*/128) ;; *) echo "$a" ;; esac; done)"
 check "upgrade: after the restart a new harness process runs" test -n "$NEW_PID" -a "$NEW_PID" != 0 -a "$NEW_PID" != "$OLD_PID"
 check "upgrade: the running unit allows single hosts only" test -n "$LIVE_ALLOW" -a -z "$LIVE_WIDE"
+# Exactly loopback (v4 and v6) and the controller: no other address, single or not.
+WANT_ALLOW="$(printf '%s\n' 127.0.0.1/32 ::1/128 "$PRIV/32" | sort | tr '\n' ' ')"
+GOT_ALLOW="$(for a in $LIVE_ALLOW; do echo "$a"; done | sort | tr '\n' ' ')"
+echo "allow: want [$WANT_ALLOW] got [$GOT_ALLOW]"
+check "upgrade: the running unit allows exactly loopback and the controller" test -n "$LIVE_ALLOW" -a "$GOT_ALLOW" = "$WANT_ALLOW"
 check "upgrade: the running unit carries the hold flag" bash -c "systemctl show -p Environment --value noo-harness | tr ' ' '\\n' | grep -qx NOO_HARNESS_EGRESS_HOLD=1"
 
 # ── d/e. what the unit saw ──────────────────────────────────────────────────
@@ -207,7 +240,7 @@ echo "unprivileged_bpf_disabled=$(cat /proc/sys/kernel/unprivileged_bpf_disabled
 timeout 20 systemd-run --wait --collect -p IPAccounting=yes /bin/bash -c 'exec 3<>/dev/tcp/127.0.0.1/18443; echo hi >&3' 2>&1 | grep -iE 'IP traffic|Finished|Failed' || true
 journalctl -u noo-harness -b --no-pager -o cat 2>/dev/null | tail -15 || true
 grep -E 'CONFIG_CGROUP_BPF|CONFIG_BPF_SYSCALL' "/boot/config-$(uname -r)" 2>/dev/null || true
-timeout 15 systemd-run --wait --pipe --quiet --collect -p IPAccounting=yes -p 'IPAddressDeny=0.0.0.0/0 ::/0' -p 'IPAddressAllow=127.0.0.1/32' /bin/bash -c 'exec 3<>/dev/tcp/1.1.1.1/443' 2>&1 | head -3 || true
+timeout 15 systemd-run --wait --pipe --quiet --collect -p RuntimeMaxSec=10 -p IPAccounting=yes -p 'IPAddressDeny=0.0.0.0/0 ::/0' -p 'IPAddressAllow=127.0.0.1/32' /bin/bash -c 'exec 3<>/dev/tcp/1.1.1.1/443' 2>&1 | head -3 || true
 
 # ── e2. only loopback and the controller ────────────────────────────────────
 # The allow list names single hosts, and a DNS server at any other address,
@@ -253,14 +286,24 @@ echo "$INSIDE"
 check "control: the host gets an answer from the DNS servers" bash -c "/usr/local/libexec/noo-ci-dns-ask 10.66.0.53 | grep -q answered"
 N_ANSWERED="$(grep -c answered <<<"$INSIDE")"; N_NONE="$(grep -c "no answer" <<<"$INSIDE")"
 check "inside the hold: no DNS server at another address answers" test "$N_ANSWERED" = 0 -a "$N_NONE" = 2
-# A host rewrite of its resolver file (a rename, as resolvers do) leaves the
-# unit reading its own.
+# A systemd-resolved host (/etc/resolv.conf its symlink): the hold binds the
+# resolver directory, and a host rewrite of its resolver file (a rename, as
+# resolvers do) leaves the unit reading its own. A runner whose
+# /etc/resolv.conf is a plain file is judged on that branch in f3, which every
+# run also exercises.
 HP="$(systemctl show -p MainPID --value noo-harness)"
 RT="$(readlink -f /etc/resolv.conf)"
-cp -p "$RT" "$RT.noo-ci" && echo "# rewritten by the CI" >> "$RT.noo-ci" && mv -f "$RT.noo-ci" "$RT"
-sleep 1
-HELD_NS="$(nsenter -t "$HP" -m cat /etc/resolv.conf | grep -m1 nameserver)"
-check "after a host rewrite of $RT the unit still reads its own resolv.conf" test "$HELD_NS" = "nameserver 192.0.2.53"
+case "$RT" in /run/systemd/resolve/*) RESOLVED_HOST=yes ;; *) RESOLVED_HOST=no ;; esac
+echo "systemd-resolved host: $RESOLVED_HOST ($RT)"
+check "the systemd-resolved layout is in place for the first part" test "$RESOLVED_HOST" = yes
+if [ "$RESOLVED_HOST" = yes ]; then
+    check "systemd-resolved host: the hold binds the resolver directory" grep -qx "BindReadOnlyPaths=/etc/noo/harness-net/resolvdir:/run/systemd/resolve" "$DROPIN"
+    cp -p "$RT" "$RT.noo-ci" && echo "# rewritten by the CI" >> "$RT.noo-ci" && mv -f "$RT.noo-ci" "$RT"
+    sleep 1
+    HELD_NS="$(nsenter -t "$HP" -m cat /etc/resolv.conf | grep -m1 '^nameserver')"
+    echo "after the host rewrite the unit reads: ${HELD_NS:-nothing}"
+    check "after a host rewrite of $RT the unit still reads its own resolv.conf" test "$HELD_NS" = "nameserver 192.0.2.53"
+fi
 
 # ── f. the node agent's real reader ─────────────────────────────────────────
 if (cd "$REPO/node-agent-go" && NOO_REAL_SYSTEMD=1 go test ./internal/hostsvc -run TestRealSystemdEgress -v -count=1); then
@@ -268,6 +311,89 @@ if (cd "$REPO/node-agent-go" && NOO_REAL_SYSTEMD=1 go test ./internal/hostsvc -r
 else
     fail "node agent reads the live unit as enforced"
 fi
+
+# ── f2. the harness's own self-test, under the unit's own hold ─────────────
+# The gateway's real egress check (egress_selftest.rs check_once), run as a
+# transient unit with the drop-in's exact properties and the unit's env file:
+# it must find itself held, reach the controller, and keep taking work.
+# After f: it rewrites egress.json with its own pid.
+if [ -n "${NOO_CI_SELFTEST:-}" ] && [ -x "$NOO_CI_SELFTEST" ]; then
+    held=(); while IFS= read -r l; do case "$l" in IPAddress*|Environment=*|BindReadOnlyPaths=*|InaccessiblePaths=*) held+=(-p "$l");; esac; done < "$DROPIN"
+    ST="$(systemd-run --wait --pipe --quiet --collect -p User=nobody -p EnvironmentFile=/etc/noo-harness.env -E NOO_REAL_HOLD=1 "${held[@]}" \
+        "$NOO_CI_SELFTEST" --ignored --exact harness::egress_selftest::tests::real_hold_serves --nocapture 2>&1)"; ST_RC=$?
+    echo "$ST"
+    check "the harness's own self-test under the hold: held, controller reached, taking work" test "$ST_RC" = 0
+    check "the harness's own self-test ran (1 passed)" grep -q 'test result: ok. 1 passed' <<<"$ST"
+else
+    fail "the harness's own self-test: no binary (NOO_CI_SELFTEST unset or not executable)"
+fi
+
+# ── f3. a host without systemd-resolved: /etc/resolv.conf a plain file ────
+# What holds there after the host rewrites that file: the agent reports the
+# private resolver file replaced while the hold stays enforced, nothing
+# resolves from inside the unit, no resolver outside the allow list answers,
+# the harness's own check still finds itself held and keeps taking work, and
+# a restart of the harness restores its own file. "From inside" = in the
+# unit's own cgroup (its address filter) and mount namespace, as its user.
+RS_LINK=""; [ -L /etc/resolv.conf ] && RS_LINK="$(readlink /etc/resolv.conf)"
+[ -n "$RS_LINK" ] && cp --remove-destination "$(readlink -f /etc/resolv.conf)" /etc/resolv.conf
+OUT3="$(run_block 2>"$WORK/block3.err")"
+echo "$OUT3"; cat "$WORK/block3.err"
+sleep 3
+check "plain-file host: the hold binds its own resolver file onto /etc/resolv.conf" grep -qx "BindReadOnlyPaths=/etc/noo/harness-net/resolv.conf:/etc/resolv.conf" "$DROPIN"
+check "plain-file host: the applier restarted the harness under it" grep -q '^APPLIED=.*(harness restarted)' <<<"$OUT3"
+HP="$(systemctl show -p MainPID --value noo-harness)"; CG="$(systemctl show -p ControlGroup --value noo-harness)"
+# The restarted stand-in writes its first record after its own probes (up to
+# ~30 s): wait for one that names this process before judging anything.
+rec_of() { python3 -c 'import json,sys; d=json.load(open("/run/noo-harness/egress.json")); print(d.get("pid"), d.get("resolv_held"))' 2>/dev/null; }
+for _ in $(seq 1 60); do [ "$(rec_of | cut -d' ' -f1)" = "$HP" ] && break; sleep 1; done
+echo "plain-file host: the unit's record before the rewrite: $(rec_of || echo none)"
+inside() { sh -c 'cg=$1; hp=$2; shift 2; echo $$ > "/sys/fs/cgroup$cg/cgroup.procs" && exec nsenter -t "$hp" -m -- setpriv --reuid=65534 --regid=65534 --clear-groups "$@"' inside "$CG" "$HP" "$@"; }
+BEFORE="$(nsenter -t "$HP" -m cat /etc/resolv.conf | grep -m1 '^nameserver')"
+check "plain-file host: the unit reads its own resolver file" test "$BEFORE" = "nameserver 192.0.2.53"
+cp -p /etc/resolv.conf /etc/resolv.conf.noo-ci && echo "# rewritten by the CI" >> /etc/resolv.conf.noo-ci && mv -f /etc/resolv.conf.noo-ci /etc/resolv.conf
+# The stand-in re-checks every 2 s: wait (bounded) for a record written after the rewrite.
+for _ in $(seq 1 15); do [ "$(rec_of)" = "$HP False" ] && break; sleep 1; done
+echo "plain-file host: the unit's record after the rewrite: $(rec_of || echo none)"
+AFTER="$(nsenter -t "$HP" -m cat /etc/resolv.conf | grep -m1 '^nameserver')"
+echo "plain-file host: after the host rewrite the unit reads: ${AFTER:-nothing}"
+if (cd "$REPO/node-agent-go" && NOO_REAL_SYSTEMD_RESOLV_REPLACED=1 go test ./internal/hostsvc -run '^TestRealSystemdEgressResolvReplaced$' -v -count=1); then
+    pass "plain-file host, after a host rewrite: the node agent reports the private resolver file replaced and the hold enforced"
+else
+    fail "plain-file host, after a host rewrite: the node agent reports the private resolver file replaced and the hold enforced"
+fi
+check "control: the host itself resolves example.com" getent hosts example.com
+# Nothing resolves: not through the system resolver, and not for a client that
+# reads resolv.conf itself and asks the nameserver it names (as c-ares does).
+NS_NOW="$(awk '{print $2}' <<<"$AFTER")"
+case "$NS_NOW" in *.*.*.*|*:*) ;; *) NS_NOW="" ;; esac
+DIRECT="$(inside /usr/local/libexec/noo-ci-dns-ask "${NS_NOW:-0.0.0.0}" 2>&1)"
+echo "plain-file host: asking ${NS_NOW:-no nameserver} directly from inside: $DIRECT"
+if [ -z "$NS_NOW" ] || inside getent hosts example.com >/dev/null 2>&1 || ! grep -q "no answer" <<<"$DIRECT"; then
+    fail "plain-file host, after a host rewrite: nothing resolves from inside the unit"
+else
+    pass "plain-file host, after a host rewrite: nothing resolves from inside the unit"
+fi
+IN3="$(inside /usr/local/libexec/noo-ci-dns-ask 10.66.0.53 100.64.0.53 127.0.0.53 2>&1)"
+echo "$IN3"
+check "plain-file host, after a host rewrite: no resolver outside the allow list answers from inside" \
+    test "$(grep -c answered <<<"$IN3")" = 0 -a "$(grep -c 'no answer' <<<"$IN3")" = 3
+if [ -n "${NOO_CI_SELFTEST:-}" ] && [ -x "$NOO_CI_SELFTEST" ]; then
+    ST3="$(inside env -i PATH=/usr/bin:/bin NOO_REAL_HOLD=1 NOO_HARNESS_EGRESS_HOLD=1 NOO_GATEWAY_URL="https://noo-ci-controller:$PORT_HTTP" \
+        "$NOO_CI_SELFTEST" --ignored --exact harness::egress_selftest::tests::real_hold_resolv_replaced --nocapture 2>&1)"; ST3_RC=$?
+    echo "$ST3"
+    check "plain-file host, after a host rewrite: the harness's own check still finds itself held and keeps taking work" \
+        bash -c "[ $ST3_RC = 0 ] && grep -q 'test result: ok. 1 passed' <<<\"\$1\"" _ "$ST3"
+else
+    fail "plain-file host: the harness's own check: no binary (NOO_CI_SELFTEST unset or not executable)"
+fi
+systemctl restart noo-harness
+sleep 2
+HP2="$(systemctl show -p MainPID --value noo-harness)"
+RESTORED="$(nsenter -t "$HP2" -m cat /etc/resolv.conf | grep -m1 '^nameserver')"
+check "plain-file host: a restart of the harness restores its own resolver file" test "$RESTORED" = "nameserver 192.0.2.53"
+# The runner as it was, for the fail-safe below.
+[ -n "$RS_LINK" ] && ln -sfn "$RS_LINK" /etc/resolv.conf
 
 # ── g. the fail-safe ────────────────────────────────────────────────────────
 sed -i '/ noo-ci-controller$/d' /etc/hosts
@@ -288,6 +414,12 @@ sleep 2
 echo "--- systemctl show (fail-safe)"
 systemctl show noo-harness -p MainPID -p IPAddressDeny -p IPAddressAllow
 check "fail-safe: the unit runs without IPAddressDeny" bash -c '[ -z "$(systemctl show noo-harness -p IPAddressDeny --value)" ]'
+# The node agent's real reader on the live unheld unit, and the Codex gate on it.
+if (cd "$REPO/node-agent-go" && NOO_REAL_SYSTEMD_UNENFORCED=1 go test ./internal/reconcile -run '^TestRealSystemdUnenforcedRefusesCodex$' -v -count=1); then
+    pass "fail-safe: the node agent reads the live unit as unenforced and refuses a Codex harness"
+else
+    fail "fail-safe: the node agent reads the live unit as unenforced and refuses a Codex harness"
+fi
 
 echo
 if [ "$FAILS" = 0 ]; then echo "harness-egress-systemd: all assertions passed"; exit 0; fi

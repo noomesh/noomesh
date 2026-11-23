@@ -294,6 +294,7 @@ const NATIVE: &[(&[&str], Handler)] = &[
     (&["migrate", "export"], commands::migrate_export),
     (&["migrate", "import"], commands::migrate_import),
     (&["cluster", "down"], commands::cluster_down),
+    (&["cluster", "stop-backend"], commands::cluster_stop_backend),
     (&["cluster", "scale"], commands::cluster_scale),
     (&["cluster", "desired"], commands::cluster_desired),
     (&["cluster", "proposals"], commands::cluster_proposals),

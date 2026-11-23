@@ -40,6 +40,7 @@ mod image_family;
 mod off_by_choice;
 mod pg_memory;
 mod tempo;
+mod gguf_vouch;
 mod warmup;
 pub(crate) mod restart_loops;
 mod gpu_held;
@@ -544,6 +545,7 @@ pub(crate) fn node_checks(n: &Value, controller_tag: &str, cli_version: &str, no
     out.extend(docker_engine_check(n));
     out.extend(vllm_compute_check(n));
     out.extend(removed_engine_check(n));
+    out.extend(unplaced_backends_check(n));
     out.extend(hardened_images_check(n));
 
     // 6c''. Vendor telemetry (docs/security/telemetry.md): no running
@@ -643,6 +645,7 @@ pub(crate) fn node_checks(n: &Value, controller_tag: &str, cli_version: &str, no
     out.extend(backend_caps_check(id, n));
     out.extend(agent_address_check(id, n));
     out.extend(ollama_models_check(id, n));
+    out.extend(gguf_vouch::gguf_verification_check(id, n));
     out.extend(harness_tasks_check(n));
     out.extend(harness_egress_check(id, n));
     settle_after_roll(n, &mut out);
@@ -733,12 +736,13 @@ pub(crate) fn agent_address_check(id: &str, n: &Value) -> Option<Check> {
 /// The `agent address` row for an address the gateway did not store
 /// (`ip_address_refused`, i1174): another node holds it, it is the
 /// controller's own, or the heartbeat came from a different tailnet
-/// address. The record keeps its last accepted address (or none). The next
+/// address. The record keeps its last accepted address (or none: a first
+/// registration, or a stored address that is itself refused now). The next
 /// command follows the reason.
 fn ip_address_refused_check(id: &str, n: &Value, why: &str) -> Check {
-    let dials = match n["ip_address"].as_str().filter(|s| !s.is_empty()) {
-        Some(ip) => format!("the controller keeps dialling it at {ip}"),
-        None => "the controller reaches it over its bus or tunnel only".to_string(),
+    let detail = match n["ip_address"].as_str().filter(|s| !s.is_empty()) {
+        Some(ip) => format!("{id}: the controller refused the address it reported ({why}) and keeps its previous address {ip}"),
+        None => format!("{id}: the controller did not store the address it reported ({why}); the controller reaches it over its bus or tunnel only"),
     };
     let next = if let Some((_, other)) = why.split_once(" is claimed by ") {
         let other = other.trim();
@@ -750,7 +754,7 @@ fn ip_address_refused_check(id: &str, n: &Value, why: &str) -> Check {
     } else {
         format!("noo cluster logs {id}")
     };
-    fail("agent address", format!("{id}: the controller did not store the address it reported ({why}); {dials}"), next)
+    fail("agent address", detail, next)
 }
 
 /// The `backend caps` row (#1283): the capability set a node's backend
@@ -1637,10 +1641,14 @@ pub(crate) const MIN_DOCKER_ENGINE_MAJOR: u64 = 28;
 
 /// The `docker engine` row (i1058), from the node's `docker_engine` fact.
 /// No row from an agent that predates the fact (a fleet mid-roll stays
-/// quiet). `none` (no Docker, a native-only node) is OK. `unreadable` is a
-/// WARN: the engine is there and could not be checked. A known Docker Engine
-/// below [`MIN_DOCKER_ENGINE_MAJOR`] is a WARN naming the upgrade; at or above
-/// it, OK. Podman's compat API is reported, not compared: its version is
+/// quiet). `none` (Docker not installed, a native-only node) is OK. `down`
+/// (installed, its daemon's socket gone: a clean stop deletes it) is a WARN
+/// naming what showed it installed, a FAIL when the node has a container-lane
+/// backend placed or running ([`container_lane_backends`]: containers cannot
+/// run without the daemon), and OK on darwin, whose backends are native.
+/// `unreadable` is a WARN: the engine is there and could not be checked. A
+/// known Docker Engine below [`MIN_DOCKER_ENGINE_MAJOR`] is a WARN naming the
+/// upgrade; at or above it, OK. Podman's compat API is reported, not compared: its version is
 /// Podman's, not a Docker Engine's.
 pub(crate) fn docker_engine_check(n: &Value) -> Option<Check> {
     const NAME: &str = "docker engine";
@@ -1655,6 +1663,21 @@ pub(crate) fn docker_engine_check(n: &Value) -> Option<Check> {
     };
     match state {
         "none" => Some(ok(NAME, "no Docker on this node (native backends only)")),
+        "down" => {
+            let os = n["os"].as_str().or_else(|| n["hostd"]["host"]["os"].as_str());
+            if os == Some("darwin") {
+                return Some(ok(NAME, format!("Docker Desktop is installed on {id} but not running (not needed: its backends are native)")));
+            }
+            let by = e.get("installed_by").and_then(Value::as_str).unwrap_or("what showed it was not given");
+            let detail = format!("Docker is installed on {id} but its daemon is not answering ({by})");
+            let remedy = format!("on {id} (run on that machine, with sudo): sudo systemctl start docker   # then, from the controller: noo cluster verify {id}");
+            let containers = container_lane_backends(n);
+            if containers.is_empty() {
+                Some(warn(NAME, detail, Some(remedy)))
+            } else {
+                Some(fail(NAME, format!("{detail}; its container-lane backend(s) {} cannot run without it", containers.join(", ")), remedy))
+            }
+        }
         "unreadable" => Some(cannot(e.get("error").and_then(Value::as_str).unwrap_or("no error given").to_string())),
         "ok" if kind == "podman" => Some(ok(NAME, format!("Podman {version} (Docker-compatible API; not compared with the Docker Engine minimum {MIN_DOCKER_ENGINE_MAJOR})"))),
         "ok" => {
@@ -1670,6 +1693,31 @@ pub(crate) fn docker_engine_check(n: &Value) -> Option<Check> {
         }
         other => Some(cannot(format!("unknown state {other:?}"))),
     }
+}
+
+/// The container-lane backends a node has placed (the agent's `lanes`) or
+/// running (`running_backends`): every one whose `backend_runtimes` entry is
+/// not `native`. Sorted, each once. The `docker engine` row FAILs a node whose
+/// daemon is down while this is not empty.
+pub(crate) fn container_lane_backends(n: &Value) -> Vec<String> {
+    let mut names: Vec<&str> = Vec::new();
+    if let Some(lanes) = n["lanes"].as_array() {
+        names.extend(lanes.iter().filter_map(|l| l["backend"].as_str()));
+    }
+    match &n["running_backends"] {
+        Value::Object(m) => names.extend(m.keys().map(String::as_str)),
+        Value::Array(a) => names.extend(a.iter().filter_map(Value::as_str)),
+        _ => {}
+    }
+    let mut out: Vec<String> = names
+        .into_iter()
+        .map(str::trim)
+        .filter(|b| !b.is_empty() && n["backend_runtimes"][*b].as_str() != Some("native"))
+        .map(str::to_string)
+        .collect();
+    out.sort();
+    out.dedup();
+    out
 }
 
 /// What to run on a node whose Docker Engine is below
@@ -1906,6 +1954,45 @@ pub(crate) fn removed_engine_check(n: &Value) -> Option<Check> {
     }
     remedies.dedup();
     Some(warn(NAME, lines.join("; "), Some(remedies.join("; "))))
+}
+
+/// The `unplaced backends` row, from the agent's `orphan_backends` and
+/// `reaped_backends` (node-agent-go internal/backendreap). The agent removes a
+/// backend container only after an explicit unplace; a container it owns that
+/// no placement wants and no unplace names is reported, never removed: WARN,
+/// "`<backend>` is running on `<node>` with no placement", with the stop (or
+/// the place). A container removed on an unplace in the last 24 h is a note.
+/// No row when the agent reports neither (an agent that predates them, or
+/// one that has not judged yet).
+pub(crate) fn unplaced_backends_check(n: &Value) -> Option<Check> {
+    const NAME: &str = "unplaced backends";
+    let id = n["id"].as_str().unwrap_or("?");
+    let orphans = n["orphan_backends"].as_array();
+    let reaped = n["reaped_backends"].as_array();
+    if orphans.is_none() && reaped.is_none() {
+        return None;
+    }
+    let notes: Vec<String> = reaped
+        .into_iter()
+        .flatten()
+        .map(|r| format!("stopped `{}` on `{id}`: unplaced at `{}`", r["backend"].as_str().unwrap_or("?"), r["unplaced_at"].as_str().unwrap_or("?")))
+        .collect();
+    let running: Vec<&str> = orphans.into_iter().flatten().filter_map(|o| o["backend"].as_str()).collect();
+    if running.is_empty() {
+        let mut detail = "no backend container runs without a placement".to_string();
+        if !notes.is_empty() {
+            detail = format!("{detail}; {}", notes.join("; "));
+        }
+        return Some(ok(NAME, detail));
+    }
+    let mut lines: Vec<String> = running.iter().map(|b| format!("`{b}` is running on `{id}` with no placement")).collect();
+    lines.extend(notes);
+    let remedy = running
+        .iter()
+        .map(|b| format!("noo cluster stop-backend {id} {b}   # or place it: noo cluster place {id} {b} <model>"))
+        .collect::<Vec<_>>()
+        .join("; ");
+    Some(warn(NAME, lines.join("; "), Some(remedy)))
 }
 
 /// The `unsupported engine space` row: an embedding space whose model no node
@@ -3705,10 +3792,19 @@ pub(crate) fn reranker_check(caps: Option<&Value>) -> Check {
     };
     match caps["rerank"]["available"].as_bool() {
         Some(true) => ok(NAME, "a reranker node serves /api/external/rerank"),
-        Some(false) => warn(
+        // Placed, but no lane routes yet (its model loading, or its agent not
+        // reachable): the gateway names the nodes.
+        Some(false) if caps["rerank"]["state"].as_str() == Some("loading") => warn(
             NAME,
-            "no reranker placed; rerank requests are served by the chat model, and when it ranks nothing the answer is the input order with no scores (noo.degraded: identity)",
-            Some(PLACE.into()),
+            caps["rerank"]["reason"].as_str().unwrap_or("a reranker is placed but not serving yet").to_string(),
+            None,
+        ),
+        // Reranking is optional: none placed is not a fault, so it is OK and
+        // says what answers instead and how to place one. (A gateway older
+        // than `state` reports false only when no node advertises at all.)
+        Some(false) => ok(
+            NAME,
+            format!("no reranker placed (optional): /api/external/rerank answers with the labelled chat-model fallback; place one with `{PLACE}`"),
         ),
         None => warn(NAME, "the gateway's capabilities carry no rerank.available", None),
     }
@@ -8744,6 +8840,7 @@ mod gateway_redis_tests {
                     restarts: 7,
                     last_error: Some("Fatal error: can't open the AOF manifest file appendonly.aof.manifest: Permission denied".into()),
                     crashed: None,
+                    agent_backend: None,
                 }]),
                 "noo",
             )
@@ -9649,6 +9746,7 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         // i1096: the keys that act as an admin, or mint agent tokens.
         checks.push(key_bindings::row((kc, &keys, &ke), (uc, &users, &ue)));
         checks.push(system_credentials_check(crate::commands::systems::store_missing_credentials()));
+        checks.extend(gguf_vouch::model_store_readable_row());
         // Is there a recent backup, and is it anywhere but this machine? 2026-10-24:
         // the 03:30 run never happened and nothing said so; every dump sat on the
         // disk next to the data.
@@ -10049,7 +10147,7 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         checks.push(image_family::image_family_row());
         // A container docker keeps restarting reads "Up" between restarts;
         // judge RestartCount + recency instead (0.6.4 redis AOF, 2026-10-16).
-        checks.push(restart_loops::restart_loops_row());
+        checks.push(restart_loops::restart_loops_row(g));
         // A GPU service the launcher held because the GPU did not answer at
         // start (i277e): the core runs without it, this row keeps it named.
         checks.push(gpu_held::gpu_held_row());
@@ -14361,6 +14459,31 @@ mod tests {
         let inject = crate::test_src::fn_body(&own, "fn with_harness_wanted(");
         assert!(inject.contains("removed_engine_placements(&d[\"placements\"])"), "fed from desired-config");
         assert!(own.contains("out.extend(removed_engine_check(n));"), "the row is in the run");
+    }
+
+    /// A container the agent owns with no placement is a WARN naming the
+    /// stop (or the place); a removal on an unplace is a note; an agent that
+    /// reports neither gives no row.
+    #[test]
+    fn unplaced_backends_row_warns_on_an_orphan_and_notes_a_reap() {
+        use serde_json::json;
+        let n = json!({"id": "node-a", "orphan_backends": [{"backend": "reranker", "container": "noo-reranker", "since": "2026-11-20T10:00:00Z"}],
+            "reaped_backends": [{"backend": "vllm", "at": "2026-11-23T10:05:00Z", "unplaced_at": "2026-11-23T10:00:00.000Z"}]});
+        let c = unplaced_backends_check(&n).expect("a row");
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert_eq!(c.name, "unplaced backends");
+        assert!(c.detail.contains("`reranker` is running on `node-a` with no placement"), "{}", c.detail);
+        assert!(c.detail.contains("stopped `vllm` on `node-a`: unplaced at `2026-11-23T10:00:00.000Z`"), "{}", c.detail);
+        assert_eq!(c.remedy.as_deref(), Some("noo cluster stop-backend node-a reranker   # or place it: noo cluster place node-a reranker <model>"));
+        let c = unplaced_backends_check(&json!({"id": "node-a", "orphan_backends": [],
+            "reaped_backends": [{"backend": "vllm", "at": "t", "unplaced_at": "u"}]})).expect("a row");
+        assert_eq!(c.verdict, Verdict::Ok);
+        assert_eq!(c.detail, "no backend container runs without a placement; stopped `vllm` on `node-a`: unplaced at `u`");
+        let c = unplaced_backends_check(&json!({"id": "node-a", "orphan_backends": []})).expect("a row");
+        assert_eq!((c.verdict, c.detail.as_str()), (Verdict::Ok, "no backend container runs without a placement"));
+        assert!(unplaced_backends_check(&json!({"id": "node-a"})).is_none(), "not reported: no guess");
+        let own = crate::test_src::own_code(include_str!("cluster_verify.rs"));
+        assert!(own.contains("out.extend(unplaced_backends_check(n));"), "the row is in the run");
     }
 
     /// i1182a: a space bound to a Hugging Face model no node serves WARNs
@@ -19137,6 +19260,71 @@ mod docker_engine_tests {
         assert_eq!(podman.verdict, Verdict::Ok, "Podman's version is not a Docker Engine's: {podman:?}");
     }
 
+    const DOWN_REMEDY: &str = "on node_a (run on that machine, with sudo): sudo systemctl start docker   # then, from the controller: noo cluster verify node_a";
+
+    /// rc.2 rehearsal: a Linux node whose dockerd was stopped read OK "no
+    /// Docker on this node". The agent now says `down`: a WARN naming what
+    /// showed Docker installed, with the start command run on that node.
+    #[test]
+    fn a_down_daemon_on_linux_warns_with_the_start_remedy() {
+        let mut n = node(json!({"state": "down", "installed_by": "dockerd at /usr/bin/dockerd"}));
+        n["os"] = "linux".into();
+        let c = docker_engine_check(&n).expect("a row");
+        assert_eq!(c.verdict, Verdict::Warn, "{c:?}");
+        assert_eq!(c.detail, "Docker is installed on node_a but its daemon is not answering (dockerd at /usr/bin/dockerd)");
+        assert_eq!(c.remedy.as_deref(), Some(DOWN_REMEDY));
+        // An agent that does not report `os` is judged as Linux.
+        let bare = docker_engine_check(&node(json!({"state": "down", "installed_by": "unit file /lib/systemd/system/docker.service"}))).expect("a row");
+        assert_eq!(bare.verdict, Verdict::Warn, "{bare:?}");
+    }
+
+    /// A down daemon on a node with a container-lane backend placed or
+    /// running FAILs: those containers cannot run. A native one does not count.
+    #[test]
+    fn a_down_daemon_under_a_container_backend_fails() {
+        let mut placed = node(json!({"state": "down", "installed_by": "dockerd at /usr/bin/dockerd"}));
+        placed["os"] = "linux".into();
+        placed["lanes"] = json!([{"backend": "vllm", "model": "m", "role": "chat", "state": "down", "reason": ""}]);
+        let c = docker_engine_check(&placed).expect("a row");
+        assert_eq!(c.verdict, Verdict::Fail, "{c:?}");
+        assert_eq!(c.detail, "Docker is installed on node_a but its daemon is not answering (dockerd at /usr/bin/dockerd); its container-lane backend(s) vllm cannot run without it");
+        assert_eq!(c.remedy.as_deref(), Some(DOWN_REMEDY));
+
+        let mut running = node(json!({"state": "down", "installed_by": "dockerd at /usr/bin/dockerd"}));
+        running["running_backends"] = json!({"llamacpp": "m.gguf", "ollama": "gemma"});
+        running["backend_runtimes"] = json!({"ollama": "native"});
+        let c = docker_engine_check(&running).expect("a row");
+        assert_eq!(c.verdict, Verdict::Fail, "{c:?}");
+        assert!(c.detail.ends_with("backend(s) llamacpp cannot run without it"), "{}", c.detail);
+
+        let mut native = node(json!({"state": "down", "installed_by": "dockerd at /usr/bin/dockerd"}));
+        native["running_backends"] = json!({"ollama": "gemma"});
+        native["backend_runtimes"] = json!({"ollama": "native"});
+        assert_eq!(docker_engine_check(&native).expect("a row").verdict, Verdict::Warn, "a native backend needs no daemon");
+    }
+
+    /// On a Mac the backends are native: Docker Desktop not running is fine.
+    #[test]
+    fn a_down_docker_desktop_on_darwin_is_ok() {
+        let mut n = node(json!({"state": "down", "installed_by": "Docker Desktop at /Applications/Docker.app"}));
+        n["os"] = "darwin".into();
+        n["running_backends"] = json!({"ollama": "gemma"});
+        let c = docker_engine_check(&n).expect("a row");
+        assert_eq!(c.verdict, Verdict::Ok, "{c:?}");
+        assert_eq!(c.detail, "Docker Desktop is installed on node_a but not running (not needed: its backends are native)");
+        let mut h = node(json!({"state": "down", "installed_by": "Docker Desktop at /Applications/Docker.app"}));
+        h["hostd"] = json!({"host": {"os": "darwin"}});
+        assert_eq!(docker_engine_check(&h).expect("a row").verdict, Verdict::Ok, "hostd's os when the beat's is absent");
+    }
+
+    /// An older agent's `none` keeps today's text.
+    #[test]
+    fn an_older_agents_none_keeps_its_text() {
+        let c = docker_engine_check(&node(json!({"state": "none"}))).expect("a row");
+        assert_eq!(c.verdict, Verdict::Ok, "{c:?}");
+        assert_eq!(c.detail, "no Docker on this node (native backends only)");
+    }
+
     #[test]
     fn node_checks_carry_the_docker_engine_row() {
         let c = node_checks(&node(json!({"state": "ok", "version": "24.0.7", "kind": "dockerd"})), "", "", 0, None);
@@ -19339,8 +19527,16 @@ mod target_node_row_tests {
         assert_eq!((claimed.name, claimed.verdict), ("agent address", Verdict::Fail));
         assert_eq!(
             claimed.detail,
-            "node-b: the controller did not store the address it reported (192.0.2.42 is claimed by node-c); the controller keeps dialling it at 192.0.2.41"
+            "node-b: the controller refused the address it reported (192.0.2.42 is claimed by node-c) and keeps its previous address 192.0.2.41"
         );
+        // A first registration (or a stored address itself refused): none kept.
+        let none = agent_address_check("node-b", &serde_json::json!({"ip_address_refused": "192.0.2.42 is claimed by node-c"})).expect("a row");
+        assert_eq!((none.name, none.verdict), ("agent address", Verdict::Fail));
+        assert_eq!(
+            none.detail,
+            "node-b: the controller did not store the address it reported (192.0.2.42 is claimed by node-c); the controller reaches it over its bus or tunnel only"
+        );
+        assert!(none.remedy.as_deref().unwrap().starts_with("noo cluster verify node-c"), "{:?}", none.remedy);
         assert!(claimed.remedy.as_deref().unwrap().starts_with("noo cluster verify node-c"), "{:?}", claimed.remedy);
         let own = row("192.0.2.1 is the controller's own address");
         assert!(own.remedy.as_deref().unwrap().starts_with("on node-b, set NODE_IP"), "{:?}", own.remedy);
@@ -19870,16 +20066,24 @@ mod reranker_row_tests {
     /// i1182a: no reranker placed WARNs with the place command; a placed one
     /// is OK; an unread or shapeless answer is not judged as either.
     #[test]
-    fn no_reranker_placed_warns_with_the_place_command() {
-        let c = reranker_check(Some(&json!({"rerank": {"available": false, "models": []}})));
-        assert_eq!(c.verdict, Verdict::Warn);
-        assert!(c.detail.contains("no reranker placed; rerank requests are served by the chat model"), "{}", c.detail);
-        assert_eq!(c.remedy.as_deref(), Some("noo cluster place <node> reranker <file>.gguf --on cpu"));
+    fn no_reranker_placed_is_ok_and_a_loading_one_warns() {
+        // None placed is not a fault (reranking is optional): OK, saying what
+        // answers instead and how to place one. A fresh install reads OK here.
+        let c = reranker_check(Some(&json!({"rerank": {"available": false, "models": [], "state": "none"}})));
+        assert_eq!(c.verdict, Verdict::Ok);
+        assert_eq!(c.detail, "no reranker placed (optional): /api/external/rerank answers with the labelled chat-model fallback; place one with `noo cluster place <node> reranker <file>.gguf --on cpu`");
+        let older = reranker_check(Some(&json!({"rerank": {"available": false, "models": []}})));
+        assert_eq!(older.verdict, Verdict::Ok, "a gateway older than `state` says false only with none placed");
         let ok = reranker_check(Some(&json!({"rerank": {"available": true, "models": ["default"]}})));
         assert_eq!(ok.verdict, Verdict::Ok);
         let unread = reranker_check(None);
         assert_eq!(unread.verdict, Verdict::Warn);
         assert!(unread.detail.starts_with("not read") && unread.remedy.is_none(), "{}", unread.detail);
+        let loading = reranker_check(Some(&json!({"rerank": {"available": false, "models": [], "state": "loading",
+            "reason": "placed on node-a, loading: not serving yet (its model is loading or its agent is not reachable); a request now is answered by the chat model, labelled"}})));
+        assert_eq!(loading.verdict, Verdict::Warn);
+        assert!(loading.detail.starts_with("placed on node-a, loading") && loading.remedy.is_none(), "{}", loading.detail);
+        assert!(!loading.detail.contains("no reranker placed"), "a placed reranker is never called absent");
         let odd = reranker_check(Some(&json!({"chat": {}})));
         assert!(odd.remedy.is_none() && !odd.detail.contains("no reranker placed"), "{}", odd.detail);
     }

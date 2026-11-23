@@ -489,8 +489,13 @@ information" when the knowledge base already holds the fact
   model call and attached to the user's message as the
   `<<<NOOMESH-RETRIEVED-DATA-BEGIN>>>` block. When that block carries a
   knowledge-base layer, the persona says the material is already shown first
-  and to call `noo_rag_query` only if it is not enough (`mark_kb_shown` in
+  and that a retrieval tool is offered from the next step on if it is not enough (`mark_kb_shown` in
   `context.rs`). With no knowledge-base layer the persona is unchanged.
+  When this turn's context already carries the knowledge-base results, the
+  first iteration is offered every tool except `noo_rag_query` and answers
+  from them; the tool is offered from the next iteration on, so a different
+  query can still run (`offered_tools` in `agent_loop.rs`, logged as
+  `coordinator.kb_tool_deferred`).
 - **A post-tool answer that ignores the result is a stall.** After a turn that
   ran a retrieval tool (`noo_rag_query`, `noo_memory_search`,
   `noo_recall_search`, `noo_graph_semantic_search`), the loop re-nudges ONCE

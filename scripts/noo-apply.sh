@@ -3494,6 +3494,7 @@ addons_unit_bounds_apply
 
 
 # ── 4. Orchestrate — the agent must LOAD what changed ─────
+# BEGIN harness_restart (tests/ci/harness-egress-systemd.sh runs this block)
 [ "$need_daemon_reload" = 1 ] && systemctl daemon-reload
 # The harness is restarted only if it is RUNNING: a placement the agent has
 # not made (or has withdrawn) must not be started by a config refresh.
@@ -3501,6 +3502,7 @@ if [ "${need_harness_restart:-0}" = 1 ] && systemctl is-active --quiet noo-harne
     systemctl restart noo-harness
     applied="$applied (harness restarted)"
 fi
+# END harness_restart
 if [ "$fresh_unit" = 1 ]; then
     # First install on this host: the old containerised agent may still hold
     # :8081, and a unit that cannot bind restarts forever while the container
