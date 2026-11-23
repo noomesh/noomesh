@@ -1255,6 +1255,22 @@ fn request_size(messages: &[Value], tools: &[Value], data_frame: Option<&str>, w
     }
 }
 
+/// The longest conversation id a log line carries.
+const LOG_CONVERSATION_ID_MAX: usize = 64;
+
+/// A caller's conversation id as the coordinator's log lines carry it:
+/// at most `LOG_CONVERSATION_ID_MAX` characters, and only `[A-Za-z0-9._:-]`
+/// (anything else becomes `_`). The id repeats on every loop line of a turn,
+/// so a caller cannot grow log volume or put control characters into a line
+/// through it. What the coordinator ACCEPTS is unchanged: this is the logged
+/// form only. A UUID or a `cf-<hex>` id is logged as sent.
+fn log_conversation_id(raw: &str) -> String {
+    raw.chars()
+        .take(LOG_CONVERSATION_ID_MAX)
+        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '-') { c } else { '_' })
+        .collect()
+}
+
 /// The line also carries the backend's calibration (i802 PR-2): the ratio
 /// learned so far (1.0 before any sample) and how many samples taught it.
 /// Token counts only, never content.
@@ -2363,11 +2379,11 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
     // and runs this same loop — tools, context, session, usage, hooks.
 
     let start = Instant::now();
-    // The turn's id exactly as the caller sent it (the same value
-    // `coordinator_chat_stream_start` logs), so a log reader can match every
-    // loop line to its turn. The session store keys the coerced form
-    // (`session::coerce_conversation_id`, a UUIDv5 of this for a non-UUID id).
-    let turn_conv = conversation_id.to_string();
+    // The turn's id as the caller sent it, bounded for logging
+    // (`log_conversation_id`), so a log reader can match every loop line to
+    // its turn. The session store keys the coerced form
+    // (`session::coerce_conversation_id`, a UUIDv5 of the raw id).
+    let turn_conv = log_conversation_id(conversation_id);
     let mut usage = UsageStats::default();
 
     // 1. Resolve backend — pass user's model preference for targeted routing
@@ -3696,11 +3712,11 @@ async fn run_inner_bound<R: HarnessRuntime>(
     // and runs this same loop — tools, context, session, usage, hooks.
 
     let start = Instant::now();
-    // The turn's id exactly as the caller sent it (the same value
-    // `coordinator_chat_stream_start` logs), so a log reader can match every
-    // loop line to its turn. The session store keys the coerced form
-    // (`session::coerce_conversation_id`, a UUIDv5 of this for a non-UUID id).
-    let turn_conv = conversation_id.to_string();
+    // The turn's id as the caller sent it, bounded for logging
+    // (`log_conversation_id`), so a log reader can match every loop line to
+    // its turn. The session store keys the coerced form
+    // (`session::coerce_conversation_id`, a UUIDv5 of the raw id).
+    let turn_conv = log_conversation_id(conversation_id);
     let mut usage = UsageStats::default();
 
     // Resolve backend — pass user's model preference for targeted routing
@@ -5258,6 +5274,19 @@ mod window_tests {
         let judge = crate::test_src::fn_body(&own, "async fn judge_call<");
         assert!(judge.contains("CallRead::Cut if ollama =>") && judge.contains("note_backend_cut("), "only an Ollama is judged: {judge}");
         assert!(judge.contains("CallRead::Whole =>") && judge.contains("crate::chat_context::learn("), "{judge}");
+    }
+
+    #[test]
+    fn the_logged_conversation_id_is_bounded_and_plain() {
+        // Ids a turn really sends are logged as sent.
+        assert_eq!(log_conversation_id("cf-0123456789abcdef0123456789abcdef"), "cf-0123456789abcdef0123456789abcdef");
+        assert_eq!(log_conversation_id("3f2504e0-4f89-11d3-9a0c-0305e82c3301"), "3f2504e0-4f89-11d3-9a0c-0305e82c3301");
+        // Over-long: cut at the bound.
+        let long = "a".repeat(10_000);
+        assert_eq!(log_conversation_id(&long).chars().count(), LOG_CONVERSATION_ID_MAX);
+        // Control characters, quotes, spaces and `=`: never reach the line.
+        assert_eq!(log_conversation_id("x\n\r\t\"y\" z=1\u{1b}[0m"), "x____y__z_1__0m");
+        assert!(log_conversation_id("é✓\0").chars().all(|c| c == '_'));
     }
 
     /// A log reader attributes a turn's lines to one chat by the turn's
