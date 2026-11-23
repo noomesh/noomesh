@@ -7,9 +7,11 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/noomesh/noomesh/node-agent-go/internal/config"
+	dockerpkg "github.com/noomesh/noomesh/node-agent-go/internal/docker"
 	"github.com/noomesh/noomesh/node-agent-go/internal/refusals"
 )
 
@@ -161,5 +163,56 @@ func TestMissingGGUFOnDefaultModelsDirWithoutQuarantineGoesOnToPreseed(t *testin
 	}
 	if got := ggufStartRefusals()["llamacpp"]; got != "" {
 		t.Fatalf("refusal recorded for a fetchable first placement: %q", got)
+	}
+}
+
+// A re-verify that finds the file does not match the controller's manifest
+// stops the backend and records a backend_start refusal naming the model and
+// both digests.
+func TestAReverifyMismatchStopsTheBackendAndRecordsTheRefusal(t *testing.T) {
+	refusals.Reset()
+	t.Cleanup(refusals.Reset)
+	var stopped []string
+	r := &Reconciler{
+		cfg:         &config.Config{NodeID: "node-a"},
+		ggufMissing: map[string]string{},
+		reverifyFn: func(context.Context, string, string) *dockerpkg.GGUFReverifyMismatchError {
+			return &dockerpkg.GGUFReverifyMismatchError{Backend: "llamacpp", Model: ggufModel, Path: "/m/" + ggufModel, Expected: "aaaa", Actual: "bbbb"}
+		},
+		stopBackendFn: func(_ context.Context, b string) error { stopped = append(stopped, b); return nil },
+	}
+	if !r.reverifyUnvouched(context.Background(), ggufPlacement) {
+		t.Fatal("a mismatch must end the pass for this backend")
+	}
+	if len(stopped) != 1 || stopped[0] != "llamacpp" {
+		t.Fatalf("stopped = %v, want the backend stopped", stopped)
+	}
+	got := ggufStartRefusals()["llamacpp"]
+	for _, want := range []string{ggufModel, "aaaa", "bbbb", "gguf_mismatch"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("refusal %q lacks %q", got, want)
+		}
+	}
+	// The refusal stands while the backend is converged-checked again.
+	r.clearBackendStart("llamacpp")
+	if ggufStartRefusals()["llamacpp"] == "" {
+		t.Fatal("the refusal was cleared before the next start")
+	}
+}
+
+// A re-verify that matches (or has nothing to do) leaves the pass alone.
+func TestAReverifyThatMatchesStopsNothing(t *testing.T) {
+	refusals.Reset()
+	t.Cleanup(refusals.Reset)
+	r := &Reconciler{
+		cfg:           &config.Config{NodeID: "node-a"},
+		reverifyFn:    func(context.Context, string, string) *dockerpkg.GGUFReverifyMismatchError { return nil },
+		stopBackendFn: func(context.Context, string) error { t.Fatal("stopped a verified backend"); return nil },
+	}
+	if r.reverifyUnvouched(context.Background(), ggufPlacement) {
+		t.Fatal("a match must not end the pass")
+	}
+	if got := ggufStartRefusals()["llamacpp"]; got != "" {
+		t.Fatalf("unexpected refusal %q", got)
 	}
 }

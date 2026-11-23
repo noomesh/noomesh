@@ -40,6 +40,7 @@ mod image_family;
 mod off_by_choice;
 mod pg_memory;
 mod tempo;
+mod gguf_vouch;
 mod warmup;
 pub(crate) mod restart_loops;
 mod gpu_held;
@@ -644,6 +645,7 @@ pub(crate) fn node_checks(n: &Value, controller_tag: &str, cli_version: &str, no
     out.extend(backend_caps_check(id, n));
     out.extend(agent_address_check(id, n));
     out.extend(ollama_models_check(id, n));
+    out.extend(gguf_vouch::gguf_verification_check(id, n));
     out.extend(harness_tasks_check(n));
     out.extend(harness_egress_check(id, n));
     settle_after_roll(n, &mut out);
@@ -9690,6 +9692,7 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         // i1096: the keys that act as an admin, or mint agent tokens.
         checks.push(key_bindings::row((kc, &keys, &ke), (uc, &users, &ue)));
         checks.push(system_credentials_check(crate::commands::systems::store_missing_credentials()));
+        checks.extend(gguf_vouch::model_store_readable_row());
         // Is there a recent backup, and is it anywhere but this machine? 2026-10-24:
         // the 03:30 run never happened and nothing said so; every dump sat on the
         // disk next to the data.

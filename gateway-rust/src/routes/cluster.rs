@@ -601,6 +601,10 @@ const I300_BEAT_KEYS: &[(&str, BeatShape)] = &[
     // controller's store (`{model, state, anchor, model_layer, reason,
     // remedy?, checked_at}`), read by the `ollama models` verify row.
     ("ollama_verify", BeatShape::Objects(64)),
+    // Each GGUF backend started on a local file without the controller's
+    // manifest (`{backend, model, reason, since}`; node-agent-go
+    // docker/gguf_unvouched.go), read by the `gguf verification` verify row.
+    ("gguf_unverified", BeatShape::Objects(16)),
     // Per llamacpp started on the GPU, what llama-server's own startup lines
     // said (`{backend, model, target, state, offloaded?, total?,
     // cuda_devices?, device?, compute_cap?, failure?, cause?, checked_at}`;
@@ -10140,6 +10144,7 @@ mod i300_beat_tests {
             ],
             "node_workloads": [{"addon": "rhaddon", "name": "worker", "state": "provisioned", "ready": false, "door_port": 41001}],
             "ollama_verify": [{"model": "harrier", "state": "verified", "anchor": "gguf", "model_layer": "sha256:5f26", "reason": "", "checked_at": "t"}],
+            "gguf_unverified": [{"backend": "llamacpp", "model": "m.gguf", "reason": "the controller is still hashing m.gguf", "since": "2026-11-23T10:00:00Z"}],
             "llamacpp_offload": [{"backend": "llamacpp", "model": "m.gguf", "target": "gpu", "state": "gpu", "offloaded": 33, "total": 33,
                 "cuda_devices": 1, "device": "NVIDIA GeForce GTX 1080", "compute_cap": "6.1", "checked_at": "t"}],
             "docker_engine": {"state": "ok", "version": "27.5.1", "kind": "dockerd"},

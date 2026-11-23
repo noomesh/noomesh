@@ -11,6 +11,7 @@
 package docker
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -175,6 +176,40 @@ func doArtifactManifest(httpClient *http.Client, req *http.Request) (*artifactMa
 // a fallback.
 var ErrArtifactRefused = errors.New("the controller refused to vouch for it")
 
+// ErrArtifactUnreadable is the gateway's typed 409 `{"status":"unreadable"}`:
+// the file is in the controller's store but the gateway cannot read it, so it
+// cannot hash it. Matched with errors.Is; the *ArtifactUnreadableError carries
+// the path, owner and mode the gateway reported.
+var ErrArtifactUnreadable = errors.New("the controller cannot read the file")
+
+// ArtifactUnreadableError is the body of the gateway's `unreadable` answer.
+type ArtifactUnreadableError struct {
+	Path, Owner, Mode, Fix, Detail string
+}
+
+func (e *ArtifactUnreadableError) Error() string {
+	return ErrArtifactUnreadable.Error() + ": " + e.Path + ": " + e.Detail
+}
+
+func (e *ArtifactUnreadableError) Is(target error) bool { return target == ErrArtifactUnreadable }
+
+// parseUnreadable decodes the gateway's unreadable body; nil when the body is
+// any other 409 (a refusal to vouch).
+func parseUnreadable(raw []byte) *ArtifactUnreadableError {
+	var b struct {
+		Status string `json:"status"`
+		Path   string `json:"path"`
+		Owner  string `json:"owner"`
+		Mode   string `json:"mode"`
+		Error  string `json:"error"`
+		Fix    string `json:"fix"`
+	}
+	if json.Unmarshal(raw, &b) != nil || b.Status != "unreadable" {
+		return nil
+	}
+	return &ArtifactUnreadableError{Path: b.Path, Owner: b.Owner, Mode: b.Mode, Fix: b.Fix, Detail: b.Error}
+}
+
 // doArtifactRequest runs the request and returns a 200's body, or the
 // classified failure: ErrArtifactKindUnknown / ErrArtifactAbsent (400/404),
 // a hashingError (202), ErrArtifactRefused (409), a timeout, or an error
@@ -205,7 +240,11 @@ func doArtifactRequest(httpClient *http.Client, req *http.Request) ([]byte, erro
 		}
 		return nil, &hashingError{retryAfter: min(wait, maxManifestRetryAfter)}
 	case resp.StatusCode == http.StatusConflict:
-		return nil, fmt.Errorf("%w: %s", ErrArtifactRefused, gatewayErrorText(resp.Body))
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		if un := parseUnreadable(raw); un != nil {
+			return nil, un
+		}
+		return nil, fmt.Errorf("%w: %s", ErrArtifactRefused, gatewayErrorText(bytes.NewReader(raw)))
 	case resp.StatusCode != http.StatusOK:
 		if msg := gatewayErrorText(resp.Body); msg != "" {
 			return nil, fmt.Errorf("manifest request answered HTTP %d: %s", resp.StatusCode, msg)

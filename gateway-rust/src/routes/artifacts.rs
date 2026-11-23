@@ -494,6 +494,43 @@ fn hashing_response(kind: &str, name: &str, size: u64) -> Response {
         .into_response()
 }
 
+/// True when a hash failure is the file not being readable (`sha256_file`
+/// words an open or read error "open: ..." / "read: ..."), as opposed to the
+/// hash task itself failing.
+fn hash_error_is_unreadable(e: &str) -> bool {
+    e.starts_with("open: ") || e.starts_with("read: ")
+}
+
+/// The body of the 409 a node gets when the store holds the file and this
+/// process cannot read it. `stat` is the file's (uid, gid, mode) when it could
+/// be read; `owner` and `mode` are left out when it could not.
+fn unreadable_body(kind: &str, name: &str, path: &Path, stat: Option<(u32, u32, u32)>, error: &str) -> serde_json::Value {
+    let mut body = json!({
+        "status": "unreadable",
+        "kind": kind,
+        "name": name,
+        "path": path.display().to_string(),
+        "error": error,
+        "fix": format!(
+            "make it readable by the gateway (uid 65532), e.g. chmod 0644 {}",
+            path.display()
+        ),
+    });
+    if let Some((uid, gid, mode)) = stat {
+        body["owner"] = json!(format!("{uid}:{gid}"));
+        body["mode"] = json!(format!("{:04o}", mode & 0o7777));
+    }
+    body
+}
+
+/// The 409 for an unreadable store file.
+fn unreadable_response(kind: &str, name: &str, path: &Path, error: &str) -> Response {
+    use std::os::unix::fs::MetadataExt;
+    let stat = std::fs::metadata(path).ok().map(|m| (m.uid(), m.gid(), m.mode()));
+    tracing::warn!(artifact = %format!("{kind}/{name}"), path = %path.display(), error = %error, "artifacts.manifest.unreadable");
+    (StatusCode::CONFLICT, Json(unreadable_body(kind, name, path, stat, error))).into_response()
+}
+
 /// The refusal for the retired `binary` kind. It was the
 /// gateway half of the agent swap: this process signed the binary's manifest
 /// with its own TLS key and a root daemon on every node installed what that
@@ -1004,6 +1041,9 @@ async fn manifest(
             let rx = hash_in_background(&key, path.clone(), stamp);
             match await_hash(rx, std::time::Duration::from_secs(HASH_WAIT_SECS)).await {
                 Some(Ok(sha256)) => DigestEntry::new(stamp, sha256),
+                Some(Err(e)) if hash_error_is_unreadable(&e) => {
+                    return Ok(unreadable_response(&kind, &name, &path, &e));
+                }
                 Some(Err(e)) => return Err(AppError::Internal(format!("hashing {name}: {e}"))),
                 None => return Ok(hashing_response(&kind, &name, size)),
             }
@@ -1595,6 +1635,35 @@ mod tests {
             }
         }
         assert!(matches!(manifest_target("nope", "x.gguf"), Err(AppError::BadRequest(_))));
+    }
+
+    #[test]
+    fn an_unreadable_store_file_is_a_typed_409_body_naming_owner_and_mode() {
+        let p = Path::new("/artifacts/models/m.gguf");
+        let b = unreadable_body("gguf", "m.gguf", p, Some((1000, 1000, 0o100600)), "open: Permission denied (os error 13)");
+        assert_eq!(b["status"], "unreadable");
+        assert_eq!(b["kind"], "gguf");
+        assert_eq!(b["name"], "m.gguf");
+        assert_eq!(b["path"], "/artifacts/models/m.gguf");
+        assert_eq!(b["owner"], "1000:1000");
+        assert_eq!(b["mode"], "0600");
+        assert_eq!(b["error"], "open: Permission denied (os error 13)");
+        assert_eq!(b["fix"], "make it readable by the gateway (uid 65532), e.g. chmod 0644 /artifacts/models/m.gguf");
+        // A file that could not be stat'ed omits owner and mode.
+        let b = unreadable_body("gguf", "m.gguf", p, None, "open: x");
+        assert!(b.get("owner").is_none() && b.get("mode").is_none(), "{b}");
+        assert!(hash_error_is_unreadable("open: Permission denied (os error 13)"));
+        assert!(hash_error_is_unreadable("read: Input/output error"));
+        assert!(!hash_error_is_unreadable("hash task ended without a result"));
+    }
+
+    #[test]
+    fn the_manifest_handler_answers_an_unreadable_file_with_409_not_500() {
+        let code = crate::test_src::own_code(include_str!("artifacts.rs"));
+        let body = crate::test_src::fn_body(&code, "async fn manifest(");
+        assert!(body.contains("unreadable_response(&kind, &name, &path, &e)"), "{body}");
+        let resp = unreadable_response("gguf", "no-such.gguf", Path::new("/nonexistent/no-such.gguf"), "open: Permission denied");
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
     }
 
     #[test]

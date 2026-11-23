@@ -266,6 +266,9 @@ type Reconciler struct {
 	ggufExists  func(ctx context.Context, dir, file string) (bool, error)
 	// startBackendFn: nil = r.docker.StartBackend. A seam for tests only.
 	startBackendFn func(ctx context.Context, backend, model string, gpuCount int, o dockerpkg.StartOverrides) error
+	// reverifyFn: nil = dockerpkg.ReverifyUnvouchedGGUF. A seam for tests only
+	// (stopBackendFn, declared below with the reaper's seams, is shared).
+	reverifyFn func(ctx context.Context, backend, model string) *dockerpkg.GGUFReverifyMismatchError
 	// removeRetiredTEIFn: nil = r.docker.RemoveRetiredTEI. A seam for tests only.
 	removeRetiredTEIFn func(ctx context.Context) ([]dockerpkg.RetiredTEI, error)
 	// retiredTEIDone: the leftover-TEI check has run clean this agent run.
@@ -1007,6 +1010,9 @@ func (r *Reconciler) convergeContainer(ctx context.Context, t *tick, p placement
 			// left running on a refused start): re-check that one.
 			if r.ggufMissing[p.Backend] != "" {
 				r.ggufPresent(ctx, t, p)
+			}
+			if r.reverifyUnvouched(ctx, p) {
+				return
 			}
 			r.clearBackendStart(p.Backend)
 			if p.Backend == "ollama" {
