@@ -201,6 +201,16 @@ func (l *ollamaVerifyLoop) runPass(ctx context.Context, models []string, lane st
 		vctx, cancel := context.WithTimeout(ctx, 3*time.Hour)
 		res := l.verify(vctx, m, lane)
 		cancel()
+		if res.State == dockerpkg.OllamaDeferred {
+			// The repair needs a container that is not up yet (a recreate
+			// is under way). No result, no lastRun, no refusal: the model
+			// stays due, and backendStarted's markAllDue plus the ready
+			// nudge check it the moment the backend answers. Presence is
+			// left as ensureOllamaModels read it.
+			slog.Info("reconcile.ollama_verify_deferred", "model", m,
+				"detail", "the backend is not running; will verify once the backend is up")
+			continue
+		}
 		l.mu.Lock()
 		prev, had := l.results[m]
 		l.results[m] = res
@@ -223,6 +233,18 @@ func logVerifyResult(res dockerpkg.OllamaVerifyResult) {
 	default:
 		slog.Warn("reconcile.ollama_verify", attrs...)
 	}
+}
+
+// markAllDue forgets when each model was last checked, so the next schedule
+// treats every one as due. A backend start calls it: a check deferred, or
+// run against the old container, is repeated as soon as the ready nudge ticks.
+func (l *ollamaVerifyLoop) markAllDue() {
+	if l == nil {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.lastRun = map[string]time.Time{}
 }
 
 // publishRefusal records or clears the backend_start refusal when the set of

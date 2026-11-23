@@ -83,6 +83,11 @@ const (
 	// never left out, so the row's model set does not change with the
 	// agent's memory (i1067). Not a verdict: no anchor, no remedy.
 	OllamaPending = "pending"
+	// OllamaDeferred: the repair could not run because noo-ollama is not
+	// running (a recreate is under way). Not a verdict and never stored or
+	// reported: the verify loop records nothing for it and checks the model
+	// again once the backend has started.
+	OllamaDeferred = "deferred"
 )
 
 // OllamaPendingReason is a pending row's reason.
@@ -611,6 +616,12 @@ func (v *OllamaVerifier) Verify(ctx context.Context, model string) OllamaVerifyR
 		return v.refuse(res, model, f, verb, errors.New("no repair path on this agent"))
 	}
 	if rerr := v.repair(ctx, model, a.kind, f.bad); rerr != nil {
+		if errors.Is(rerr, errOllamaContainerDown) {
+			// Only the container's absence stopped the repair: say nothing
+			// about the bytes, and let the caller wait for the start.
+			res.State, res.Reason = OllamaDeferred, "the repair needs "+OllamaContainer+", which is not running"
+			return res
+		}
 		return v.refuse(res, model, f, verb, rerr)
 	}
 	g, err := v.check(ctx, a, mpath)

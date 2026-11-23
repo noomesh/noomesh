@@ -341,3 +341,141 @@ func TestOllamaVerifyTheReadErrorIsBounded(t *testing.T) {
 		t.Fatalf("reason is %d bytes, want %d: %q", len(r.Reason), len(want), r.Reason)
 	}
 }
+
+// A model whose repair needs a container that is not up yet (a recreate) is
+// deferred: no result, no lastRun, no refusal, no ERROR, presence untouched.
+func TestOllamaVerifyContainerDownRecordsNothing(t *testing.T) {
+	refusals.Reset()
+	modelpresence.Reset()
+	t.Cleanup(func() { refusals.Reset(); modelpresence.Reset() })
+	logs := captureLog(t)
+	l := newOllamaVerifyLoop(func(_ context.Context, model string, _ string) dockerpkg.OllamaVerifyResult {
+		return dockerpkg.OllamaVerifyResult{Model: model, State: dockerpkg.OllamaDeferred}
+	}, nil)
+	r := &Reconciler{ollamaVerify: l}
+	rows := []placement{{Backend: "ollama", Model: "harrier", Role: "chat", DesiredState: "running"}}
+	modelpresence.Set("ollama", modelpresence.Entry{Model: "harrier", Role: "chat", Present: true})
+
+	l.runPass(context.Background(), []string{"harrier"}, dockerpkg.OllamaLaneContainer)
+	r.verifyOllamaModels(context.Background(), rows, dockerpkg.OllamaLaneContainer)
+	// verifyOllamaModels scheduled a pass of its own; wait for it to end.
+	waitIdle(t, l)
+
+	l.mu.Lock()
+	_, hasResult := l.results["harrier"]
+	_, hasLastRun := l.lastRun["harrier"]
+	l.mu.Unlock()
+	if hasResult || hasLastRun {
+		t.Errorf("a deferred model stored result=%v lastRun=%v", hasResult, hasLastRun)
+	}
+	if got := backendStartRefusals(); len(got) != 0 || l.standingRefusal() != "" {
+		t.Errorf("a deferred model was refused: %+v", got)
+	}
+	if !modelpresence.Report()["ollama"].Present {
+		t.Errorf("presence flipped false on a deferred model")
+	}
+	out := logs.String()
+	if strings.Contains(out, "level=ERROR") {
+		t.Errorf("an ERROR was logged: %s", out)
+	}
+	if !strings.Contains(out, "reconcile.ollama_verify_deferred") {
+		t.Errorf("no deferred INFO line: %s", out)
+	}
+	if len(l.dueLocked([]string{"harrier"})) != 1 {
+		t.Errorf("the deferred model is not due")
+	}
+}
+
+// After the backend start the model is due at once (even right after a
+// stored result), and a successful verify then sets presence true.
+func TestOllamaVerifyBackendStartMakesModelsDueAtOnce(t *testing.T) {
+	refusals.Reset()
+	modelpresence.Reset()
+	t.Cleanup(func() { refusals.Reset(); modelpresence.Reset() })
+	state := dockerpkg.OllamaRefused
+	l := newOllamaVerifyLoop(func(_ context.Context, model string, _ string) dockerpkg.OllamaVerifyResult {
+		return dockerpkg.OllamaVerifyResult{Model: model, State: state, Reason: "refused"}
+	}, nil)
+	r := &Reconciler{ollamaVerify: l, hashWaits: map[string]int{}}
+	rows := []placement{{Backend: "ollama", Model: "harrier", Role: "chat", DesiredState: "running"}}
+
+	// A check ran a moment ago (and refused): not due, and presence false.
+	modelpresence.Set("ollama", modelpresence.Entry{Model: "harrier", Role: "chat", Present: true})
+	l.runPass(context.Background(), []string{"harrier"}, dockerpkg.OllamaLaneContainer)
+	r.verifyOllamaModels(context.Background(), rows, dockerpkg.OllamaLaneContainer)
+	waitIdle(t, l)
+	if modelpresence.Report()["ollama"].Present {
+		t.Fatalf("setup: the refused model is still present")
+	}
+	if len(l.dueLocked([]string{"harrier"})) != 0 {
+		t.Fatalf("setup: a model checked just now is due")
+	}
+
+	r.backendStarted(context.Background(), "ollama", "harrier")
+	if len(l.dueLocked([]string{"harrier"})) != 1 {
+		t.Fatalf("a backend start did not make the model due")
+	}
+
+	// The ready nudge's tick: ensure reads it present, verify now passes.
+	state = dockerpkg.OllamaVerified
+	modelpresence.Set("ollama", modelpresence.Entry{Model: "harrier", Role: "chat", Present: true})
+	r.verifyOllamaModels(context.Background(), rows, dockerpkg.OllamaLaneContainer)
+	waitIdle(t, l)
+	l.mu.Lock()
+	got := l.results["harrier"].State
+	l.mu.Unlock()
+	if got != dockerpkg.OllamaVerified {
+		t.Fatalf("the model was not re-verified at once: %q", got)
+	}
+	// The next tick: ensure reads the model present again, and with a
+	// verified result standing verify no longer flips it false.
+	modelpresence.Set("ollama", modelpresence.Entry{Model: "harrier", Role: "chat", Present: true})
+	r.verifyOllamaModels(context.Background(), rows, dockerpkg.OllamaLaneContainer)
+	if !modelpresence.Report()["ollama"].Present {
+		t.Errorf("presence is not true after a successful verify")
+	}
+}
+
+// Regression guard: a real mismatch (a refused result, not a deferral) is
+// stored, recorded as a backend_start refusal, logged ERROR and not due again.
+func TestOllamaVerifyRealRefusalStillRecorded(t *testing.T) {
+	refusals.Reset()
+	t.Cleanup(refusals.Reset)
+	logs := captureLog(t)
+	l := newOllamaVerifyLoop(func(_ context.Context, model string, _ string) dockerpkg.OllamaVerifyResult {
+		return dockerpkg.OllamaVerifyResult{Model: model, State: dockerpkg.OllamaRefused, Reason: "blob mismatch"}
+	}, nil)
+	l.runPass(context.Background(), []string{"harrier"}, dockerpkg.OllamaLaneContainer)
+	l.mu.Lock()
+	_, hasResult := l.results["harrier"]
+	_, hasLastRun := l.lastRun["harrier"]
+	l.mu.Unlock()
+	if !hasResult || !hasLastRun {
+		t.Errorf("a real refusal was not stored: result=%v lastRun=%v", hasResult, hasLastRun)
+	}
+	if len(backendStartRefusals()) != 1 || l.standingRefusal() == "" {
+		t.Errorf("no backend_start refusal for a real mismatch")
+	}
+	if !strings.Contains(logs.String(), "level=ERROR") {
+		t.Errorf("no ERROR for a real mismatch: %s", logs.String())
+	}
+	if len(l.dueLocked([]string{"harrier"})) != 0 {
+		t.Errorf("a refused model is due at once")
+	}
+}
+
+// waitIdle waits for the loop's in-flight pass (if any) to end.
+func waitIdle(t *testing.T, l *ollamaVerifyLoop) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		l.mu.Lock()
+		busy := l.busy
+		l.mu.Unlock()
+		if !busy {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("the verify pass did not end")
+}

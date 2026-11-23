@@ -513,6 +513,7 @@ func (r *Reconciler) backendStarted(ctx context.Context, backend, model string) 
 	r.clearBackendStart(backend)
 	delete(r.hashWaits, backend)
 	if backend == "ollama" {
+		r.ollamaVerify.markAllDue()
 		go r.nudgeWhenReady(ctx, backend, model, startReadyWithin, startReadyEvery)
 	}
 }
