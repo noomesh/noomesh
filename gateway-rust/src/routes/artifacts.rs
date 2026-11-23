@@ -510,11 +510,9 @@ fn unreadable_body(kind: &str, name: &str, path: &Path, stat: Option<(u32, u32, 
         "kind": kind,
         "name": name,
         "path": path.display().to_string(),
+        "path_is": "the gateway container's view (/artifacts/models)",
         "error": error,
-        "fix": format!(
-            "make it readable by the gateway (uid 65532), e.g. chmod 0644 {}",
-            path.display()
-        ),
+        "fix": "run `noo cluster verify` on the controller: the `model store readable` row names this file's host path and the command to make it readable",
     });
     if let Some((uid, gid, mode)) = stat {
         body["owner"] = json!(format!("{uid}:{gid}"));
@@ -1648,7 +1646,9 @@ mod tests {
         assert_eq!(b["owner"], "1000:1000");
         assert_eq!(b["mode"], "0600");
         assert_eq!(b["error"], "open: Permission denied (os error 13)");
-        assert_eq!(b["fix"], "make it readable by the gateway (uid 65532), e.g. chmod 0644 /artifacts/models/m.gguf");
+        assert_eq!(b["path_is"], "the gateway container's view (/artifacts/models)");
+        assert_eq!(b["fix"], "run `noo cluster verify` on the controller: the `model store readable` row names this file's host path and the command to make it readable");
+        assert!(!b.to_string().contains("chmod"), "no host command is printed from the container's path: {b}");
         // A file that could not be stat'ed omits owner and mode.
         let b = unreadable_body("gguf", "m.gguf", p, None, "open: x");
         assert!(b.get("owner").is_none() && b.get("mode").is_none(), "{b}");

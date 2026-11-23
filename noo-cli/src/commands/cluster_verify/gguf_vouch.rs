@@ -33,11 +33,16 @@ pub(crate) fn gguf_verification_check(id: &str, n: &Value) -> Option<Check> {
     let parts: Vec<String> = rows
         .iter()
         .map(|r| {
+            // While the node hashes the file, that is the state to read; the
+            // reason it started unvouched stays with the row's remedy.
+            let why = match (r["state"].as_str(), r["verifying_since"].as_str()) {
+                (Some("verifying"), Some(t)) => format!("verifying against the controller's manifest since {t}"),
+                _ => r["reason"].as_str().unwrap_or("no reason reported").to_string(),
+            };
             format!(
-                "{} {} started without the controller's verification: {}",
+                "{} {} started without the controller's verification: {why}",
                 r["backend"].as_str().unwrap_or("?"),
                 r["model"].as_str().unwrap_or("?"),
-                r["reason"].as_str().unwrap_or("no reason reported"),
             )
         })
         .collect();
@@ -171,6 +176,15 @@ mod tests {
         let r = c.remedy.unwrap();
         assert!(r.contains("confirm the file is in the controller's model store and readable"), "{r}");
         assert!(r.contains("node-a re-verifies on its own once the controller answers"), "{r}");
+    }
+
+    #[test]
+    fn a_backend_being_hashed_reads_verifying_since_the_time() {
+        let n = json!({"gguf_unverified": [{"backend": "llamacpp", "model": "m.gguf", "reason": "r",
+            "state": "verifying", "verifying_since": "2026-11-23T10:00:00Z", "since": "t"}]});
+        let c = gguf_verification_check("node-a", &n).unwrap();
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert_eq!(c.detail, "llamacpp m.gguf started without the controller's verification: verifying against the controller's manifest since 2026-11-23T10:00:00Z");
     }
 
     #[test]

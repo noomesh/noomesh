@@ -471,6 +471,36 @@ func (e *PresentMismatchError) Unwrap() error { return e.Fetch }
 // themselves (the ollama store check, docker/ollama_verify.go).
 func HashFile(path string) (string, error) { return hashFile(path, nil) }
 
+// HashFileCtx is HashFile that stops when ctx ends: the read loop checks ctx
+// at each chunk and returns its error, so a hash of a multi-GB file does not
+// outlive a node that is shutting down.
+func HashFileCtx(ctx context.Context, path string) (string, error) {
+	hashCalls.Add(1)
+	return hashNiced(func() (string, error) {
+		f, err := os.Open(path)
+		if err != nil {
+			return "", err
+		}
+		defer f.Close()
+		h := sha256.New()
+		buf := make([]byte, 1<<20)
+		for {
+			if err := ctx.Err(); err != nil {
+				return "", err
+			}
+			n, rerr := f.Read(buf)
+			h.Write(buf[:n])
+			if rerr == io.EOF {
+				break
+			}
+			if rerr != nil {
+				return "", rerr
+			}
+		}
+		return hex.EncodeToString(h.Sum(nil)), nil
+	})
+}
+
 // hashCalls counts hashFile calls: the tests' view of "re-hashed or not".
 var hashCalls atomic.Int64
 

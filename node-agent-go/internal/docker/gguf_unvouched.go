@@ -25,7 +25,12 @@ type UnvouchedGGUF struct {
 	Model   string `json:"model"`
 	Reason  string `json:"reason"`
 	Since   string `json:"since"`
-	dir     string
+	// State is "unverified", or "verifying" while the local file is being
+	// hashed against the controller's manifest (VerifyingSince is when it
+	// began).
+	State          string `json:"state"`
+	VerifyingSince string `json:"verifying_since,omitempty"`
+	dir            string
 }
 
 var (
@@ -40,9 +45,10 @@ func recordUnvouchedGGUF(backend, model, dir, reason string, now time.Time) {
 	unvouchedMu.Lock()
 	defer unvouchedMu.Unlock()
 	rec := UnvouchedGGUF{Backend: backend, Model: model, Reason: reason, dir: dir,
-		Since: now.UTC().Format(time.RFC3339)}
+		Since: now.UTC().Format(time.RFC3339), State: "unverified"}
 	if prev, ok := unvouchedLive[backend]; ok && prev.Model == model {
 		rec.Since = prev.Since
+		rec.State, rec.VerifyingSince = prev.State, prev.VerifyingSince
 	}
 	unvouchedLive[backend] = rec
 }
@@ -75,6 +81,7 @@ func ResetUnvouchedGGUF() {
 	unvouchedMu.Lock()
 	defer unvouchedMu.Unlock()
 	unvouchedLive = map[string]UnvouchedGGUF{}
+	currentHash = nil
 }
 
 // GGUFReverifyMismatchError: the local file a backend started with does not
@@ -92,7 +99,8 @@ func (e *GGUFReverifyMismatchError) Error() string {
 }
 
 // reverifyManifestFn and reverifyHashFn are the controller's answer and the
-// file hash; variables so a test supplies both.
+// file hash; variables so a test supplies both. reverifyHashTimeout bounds one
+// hash (a test shortens it).
 var (
 	reverifyManifestFn = func(ctx context.Context, model string) (string, error) {
 		m, err := lookupArtifactManifestWithin(ctx, "gguf", model, awaitManifestRequestTimeout)
@@ -101,25 +109,74 @@ var (
 		}
 		return m.SHA256, nil
 	}
-	reverifyHashFn = preseed.HashFile
+	reverifyHashFn      = preseed.HashFileCtx
+	reverifyHashTimeout = 30 * time.Minute
 )
 
-// ReverifyUnvouchedGGUF asks the controller's manifest once for the backend's
-// unvouched GGUF (a 202 or any failure leaves it recorded for the next pass).
-// On a manifest it hashes the local file: a match clears the record; a
-// mismatch clears it and returns a *GGUFReverifyMismatchError for the caller
-// to stop the backend and refuse. Nothing recorded for backend/model: (nil).
+// hashRun is the one background hash a node runs at a time. It is owned by
+// the registry (guarded by unvouchedMu); finished is closed when the
+// goroutine has ended.
+type hashRun struct {
+	backend, model, path, want string
+	done                       bool // sum is ready to be picked up
+	sum                        string
+	finished                   chan struct{}
+}
+
+var currentHash *hashRun
+
+// unvouchedHashFinished is the running hash's end signal, nil when none. Tests.
+func unvouchedHashFinished() <-chan struct{} {
+	unvouchedMu.Lock()
+	defer unvouchedMu.Unlock()
+	if currentHash == nil {
+		return nil
+	}
+	return currentHash.finished
+}
+
+// ReverifyUnvouchedGGUF is one reconcile pass's step for the backend's
+// unvouched GGUF. It never waits on a hash:
+//   - a finished hash is picked up: a match clears the record, a mismatch
+//     clears it and returns a *GGUFReverifyMismatchError for the caller to
+//     stop the backend and refuse;
+//   - a running hash is left alone (the record reads "verifying");
+//   - otherwise the controller's manifest is asked once (a 202 or a failure
+//     keeps the record, with the reason), and when it answers a background
+//     hash of the local file starts, at most one at a time on the node. The
+//     hash's context derives from ctx (the agent's lifetime) and is bounded by
+//     reverifyHashTimeout; an errored or cancelled hash returns the record to
+//     "unverified" with the reason and a later pass tries again.
 func ReverifyUnvouchedGGUF(ctx context.Context, backend, model string) *GGUFReverifyMismatchError {
 	unvouchedMu.Lock()
 	rec, ok := unvouchedLive[backend]
-	unvouchedMu.Unlock()
 	if !ok {
+		unvouchedMu.Unlock()
 		return nil
 	}
 	if rec.Model != model {
-		clearUnvouchedGGUF(backend) // the placement moved on; the next start decides afresh
+		delete(unvouchedLive, backend) // the placement moved on; the next start decides afresh
+		unvouchedMu.Unlock()
 		return nil
 	}
+	if h := currentHash; h != nil {
+		if h.backend != backend || !h.done {
+			unvouchedMu.Unlock()
+			return nil
+		}
+		currentHash = nil
+		delete(unvouchedLive, backend)
+		unvouchedMu.Unlock()
+		if h.sum == h.want {
+			slog.Info("verified against the controller's manifest", "backend", backend, "model", model, "sha256", h.want[:12]+"…")
+			return nil
+		}
+		slog.Error("gguf refused: the file a backend started with does not match the controller's manifest",
+			"backend", backend, "model", model, "path", h.path, "expected", h.want, "actual", h.sum)
+		return &GGUFReverifyMismatchError{Backend: backend, Model: model, Path: h.path, Expected: h.want, Actual: h.sum}
+	}
+	unvouchedMu.Unlock()
+
 	want, err := reverifyManifestFn(ctx, model)
 	if err != nil {
 		var h *hashingError
@@ -129,17 +186,46 @@ func ReverifyUnvouchedGGUF(ctx context.Context, backend, model string) *GGUFReve
 		return nil
 	}
 	path := filepath.Join(rec.dir, model)
-	got, herr := reverifyHashFn(path)
-	if herr != nil {
-		slog.Warn("gguf re-verify could not hash the local file", "backend", backend, "model", model, "path", path, "error", herr)
+	unvouchedMu.Lock()
+	defer unvouchedMu.Unlock()
+	if currentHash != nil { // another pass or backend started one meanwhile
 		return nil
 	}
-	clearUnvouchedGGUF(backend)
-	if got == want {
-		slog.Info("verified against the controller's manifest", "backend", backend, "model", model, "sha256", want[:12]+"…")
-		return nil
-	}
-	slog.Error("gguf refused: the file a backend started with does not match the controller's manifest",
-		"backend", backend, "model", model, "path", path, "expected", want, "actual", got)
-	return &GGUFReverifyMismatchError{Backend: backend, Model: model, Path: path, Expected: want, Actual: got}
+	run := &hashRun{backend: backend, model: model, path: path, want: want, finished: make(chan struct{})}
+	currentHash = run
+	rec = unvouchedLive[backend]
+	rec.State, rec.VerifyingSince = "verifying", time.Now().UTC().Format(time.RFC3339)
+	unvouchedLive[backend] = rec
+	hashFn := reverifyHashFn
+	hctx, cancel := context.WithTimeout(ctx, reverifyHashTimeout)
+	go func() {
+		defer cancel()
+		sum, herr := hashFn(hctx, path)
+		unvouchedMu.Lock()
+		defer unvouchedMu.Unlock()
+		defer close(run.finished)
+		if herr != nil {
+			slog.Warn("gguf re-verify could not hash the local file; it stays unverified and is retried",
+				"backend", backend, "model", model, "path", path, "error", herr)
+			if currentHash == run {
+				currentHash = nil
+			}
+			if r, ok := unvouchedLive[backend]; ok && r.Model == model {
+				r.State, r.VerifyingSince = "unverified", ""
+				r.Reason = "hashing the local file for verification did not finish: " + herr.Error()
+				unvouchedLive[backend] = r
+			}
+			return
+		}
+		if r, ok := unvouchedLive[backend]; !ok || r.Model != model {
+			// Cleared meanwhile (a verified start, or the placement moved on):
+			// nothing waits for this result.
+			if currentHash == run {
+				currentHash = nil
+			}
+			return
+		}
+		run.sum, run.done = sum, true
+	}()
+	return nil
 }
