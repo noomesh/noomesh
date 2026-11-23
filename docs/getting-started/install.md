@@ -22,8 +22,8 @@ The wizard leaves the stack running. Check it with `noo health`, then
 `noo cluster verify`: no FAIL means ready; `!` rows are notes.
 
 You need Linux x86_64 (or WSL2), about 25 GB of free disk, 16 GB of RAM, and
-Docker with the Compose v2 plugin, 2.24.6 or newer (the oldest our CI tests;
-on Ubuntu/Debian the wizard offers to install it). The details of each step are in the agent part below.
+Docker Engine 28 or newer with the Compose v2 plugin, 2.33.0 or newer (the
+oldest noomesh supports; on Ubuntu/Debian the wizard offers to install it). The details of each step are in the agent part below.
 
 **Next:**
 
@@ -35,7 +35,7 @@ on Ubuntu/Debian the wizard offers to install it). The details of each step are 
 
 ## For agents
 
-**What a person provides first:** Docker with the Compose v2 plugin, 2.24.6 or newer (`noo onboard --ci` will not install it and stops at the prerequisites step), passwordless sudo (or a person runs each `sudo` line the wizard prints), and outbound HTTPS (the hosts in the minimums table below).
+**What a person provides first:** Docker Engine 28 or newer with the Compose v2 plugin, 2.33.0 or newer (`noo onboard --ci` will not install it and stops at the prerequisites step), passwordless sudo (or a person runs each `sudo` line the wizard prints), and outbound HTTPS (the hosts in the minimums table below).
 
 **Steps, with their exit codes:**
 
@@ -54,7 +54,7 @@ This is the primary path; [standalone-controller.md](standalone-controller.md)
 is the no-checkout variant of the same step, and
 `noo --help` lists every command.
 
-Requirements: Linux (or WSL2), Docker Compose v2, 2.24.6 or newer (the oldest our CI tests; on Ubuntu/Debian
+Requirements: Linux (or WSL2), Docker Engine 28 or newer, Docker Compose v2, 2.33.0 or newer (the oldest noomesh supports; on Ubuntu/Debian
 the wizard offers to install it: get.docker.com, uses sudo)
 (`docker compose version` must work — Ubuntu's `docker.io` ships without
 it, add `docker-compose-v2` from Ubuntu, or `docker-compose-plugin` from Docker's
@@ -70,13 +70,17 @@ folders). `git` only for a contributor checkout.
 
 Compose runs only on the controller (workers use the node agent's Docker
 API). Its minimum is `MIN_COMPOSE` in `noo-cli/src/commands/cluster_verify.rs`,
-the oldest Compose CI's `start-inputs` job runs (Ubuntu 24.04's
-`docker-compose-v2`); changing it is the operator's decision. `noo onboard`
-warns below it and goes on, and `noo cluster verify --controller` has a
-`docker compose` row: below 2.24.6 WARN (upgrade the package or Docker
-Desktop; noomesh does not install it), `cannot be checked` WARN when the
+2.33.0, the Compose that Docker Engine 28 bundles; CI's `start-inputs` job
+runs the launcher on it, and on 2.24.6 (Ubuntu 24.04's release-pocket
+`docker-compose-v2`) as a canary below it. Changing it is the operator's
+decision. `noo onboard` warns below it and goes on, and `noo cluster verify
+--controller` has a `docker compose` row: below 2.33.0 WARN (the remedy names
+the `apt-get` command for this machine's package, or Docker Desktop; noomesh
+does not install it), `cannot be checked` WARN when the
 version does not read, FAIL with the package to install when there is no
-Compose v2, ok otherwise.
+Compose v2, ok otherwise. An existing install below either minimum (Engine
+28, Compose 2.33.0) is never refused by an upgrade, a start or a roll: verify
+WARNs, with the command to run.
 
 **On WSL2, keep the VM from idling out.** WSL2 shuts its virtual machine
 down after a period with no open Windows terminal into it, and that stops
@@ -220,7 +224,7 @@ Enter accepts the default at every prompt. These are the ones to read:
 
 | The prompt | What to type |
 |---|---|
-| `Install the missing prerequisites now? (uses sudo)` | Enter (yes): installs Docker (get.docker.com) and the listed packages; asks your sudo password. |
+| `Install the missing prerequisites now? (uses sudo)` | Enter (yes): installs Docker (get.docker.com) and the listed packages; asks your sudo password. It then holds the Docker packages it installed (`apt-mark hold`), so an unattended upgrade cannot restart every container; a Docker you already had is not held. To take a Docker update: [Host updates](../operating/runbooks/host-updates.md#taking-a-docker-security-update). |
 | `Admin password`, then `Confirm password` | a password of your choice, twice: at least 12 characters, not a common one, not containing the username. Enter alone is refused. |
 | `Stored both in a password manager OFF this machine` | `y`, once you have copied the two backup passphrases it just printed somewhere off this machine. Without them an encrypted backup cannot be restored, so the default (N) asks again. |
 | `Tailscale is not installed. Install it now` | `n` on a single machine with no tailnet: the dashboard is then on `https://localhost:8080`. `y` puts this machine on your tailnet (it may ask for sudo, then shows a login link). There is no default: Enter asks again. |

@@ -19,7 +19,7 @@ import (
 // The HF preseed used to walk the controller's nginx JSON listing and keep
 // any local file whose length matched the served one (fetchFile's size
 // shortcut), copying a miss with no hash at all. The node's HF cache is
-// mounted READ-WRITE into vllm, TEI and the reranker, so a model container
+// mounted READ-WRITE into vllm, so a model container
 // could rewrite a weight at the same size and every later start would load
 // it. Now the controller's gateway states each file of the snapshot with the
 // sha256 of its resolved blob (GET /api/artifacts/manifest/hf/<models--org--

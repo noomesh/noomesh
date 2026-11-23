@@ -38,7 +38,7 @@ import (
 var hostRootEnvs = []string{
 	"MODELS_DIR",          // the model store (llamacpp/reranker /models source)
 	"NOO_DATA_ROOT",       // the node's data tree (models, caches, ollama)
-	"HF_CACHE_DIR",        // the HuggingFace cache (vllm, TEI)
+	"HF_CACHE_DIR",        // the HuggingFace cache (vllm)
 	"OLLAMA_DATA_DIR",     // ollama's blob store
 	"NOO_SKILLS_HOST_DIR", // the skills tree (shared with skillBindRoots)
 }
@@ -139,7 +139,7 @@ func canonicalHostPathAllowMissing(p string) (string, error) {
 // never a "warn and continue": a mount the node would not have chosen is a
 // placement that must not start.
 func ValidateHostPathUnderRoots(p string) (string, error) {
-	if err := dataroots.Refusal(dataroots.Current()); err != nil {
+	if err := dataroots.Gate(); err != nil {
 		return "", fmt.Errorf("refusing host path %q: %w", p, err)
 	}
 	clean, err := canonicalHostPathAllowMissing(p)

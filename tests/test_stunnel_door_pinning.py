@@ -8,9 +8,9 @@ grafana's, a backend's. Every door therefore pins the peer by the DNS name in
 its leaf's SANs (`checkHost`, any one match accepts), mirroring what the
 model-cache nginx door does with O=.
 
-Two kinds of door:
+One kind of door (the TEI doors and the compose reranker door were static-only
+and are gone, i1182a; the agent builds the reranker door itself):
 
-* tei, tei-gpu, reranker: only containers call them; the pins are static.
 * ollama, ollama-embed, ollama-embed-cpu, llamacpp (i132): the same static
   pins for the service leaves, PLUS the controller's own HOST node-agent,
   which dials them with its node leaf. stunnel cannot match O=, and a node
@@ -33,7 +33,6 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 DOCK = ROOT / "docker"
 
-STATIC_ONLY = {"tei", "tei-gpu", "reranker"}
 SELF_PINNED = {"ollama", "ollama-embed", "ollama-embed-cpu", "llamacpp", "vllm", "vllm-secondary"}
 # The leaves that dial the doors (SAN names, from noo-cli/src/pki.rs).
 CALLERS = {"gateway", "worker", "trellion", "trellion-intel", "evolve"}
@@ -61,22 +60,15 @@ def _all() -> dict[str, Path]:
 
 
 def test_every_door_is_classified():
-    assert set(_all()) == STATIC_ONLY | SELF_PINNED, (
-        "a new docker/stunnel-*.conf must be added to STATIC_ONLY or SELF_PINNED"
+    assert set(_all()) == SELF_PINNED, (
+        "a new docker/stunnel-*.conf must be added to SELF_PINNED, and a door with no compose service has no conf"
     )
 
 
-@pytest.mark.parametrize("name", sorted(STATIC_ONLY | SELF_PINNED))
+@pytest.mark.parametrize("name", sorted(SELF_PINNED))
 def test_every_door_requires_a_client_certificate(name):
     d = dict(_directives(_all()[name]))
     assert d.get("verify") == "2", f"{name}: verify is {d.get('verify')!r}"
-
-
-@pytest.mark.parametrize("name", sorted(STATIC_ONLY))
-def test_static_doors_name_their_callers(name):
-    hosts = {v for k, v in _directives(_all()[name]) if k == "checkHost"}
-    assert hosts == CALLERS, f"{name}: checkHost set is {sorted(hosts)}, want {sorted(CALLERS)}"
-    assert not (hosts & EVERY_LEAF), f"{name} pins on a name every leaf carries"
 
 
 @pytest.mark.parametrize("name", sorted(SELF_PINNED))
@@ -138,13 +130,6 @@ def test_the_self_pin_entrypoint_refuses_an_unusable_node_id(tmp_path, bad):
     assert r.returncode == 78, (r.returncode, r.stdout, r.stderr)
     assert "NODE_ID" in r.stderr and "noo stack restart --force" in r.stderr, "the refusal names the fix"
     assert r.stdout == "", "stunnel must not have run"
-
-
-@pytest.mark.parametrize("name", sorted(STATIC_ONLY))
-def test_static_doors_have_no_self_pin_entrypoint(name):
-    """tei/reranker have no host-agent caller: they must not start refusing
-    on a missing NODE_ID."""
-    assert "entrypoint" not in _services()[f"stunnel-{name}"]
 
 
 def test_pinned_callers_exist_as_leaf_names():

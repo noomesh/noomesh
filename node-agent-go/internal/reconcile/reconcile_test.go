@@ -87,12 +87,10 @@ func TestSpecHash_ReasoningParserTriggersDrift(t *testing.T) {
 	}
 }
 
-// A TEI placement's model change is a spec change, so the reconciler
-// recreates the container; the agent resolves the new one's --model-id from
-// the placed model (docker.resolveCommand), so the hashed model is the
-// command's input.
-func TestSpecHash_TEIModelChangeTriggersDrift(t *testing.T) {
-	for _, backend := range []string{"embedding", "reranker"} {
+// A reranker placement's model change is a spec change, so the reconciler
+// recreates the container; the hashed model is the container's MODEL_PATH.
+func TestSpecHash_RerankerModelChangeTriggersDrift(t *testing.T) {
+	for _, backend := range []string{"reranker"} {
 		before := basePlacement()
 		before.Backend = backend
 		before.Model = "org/model-a"

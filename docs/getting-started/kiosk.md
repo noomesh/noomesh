@@ -34,6 +34,13 @@ and starts whether the box boots to the desktop or to a console. Setup turns
 off the desktop login (gdm3, lightdm, sddm) by its real name, and
 `noo kiosk teardown` turns that same one back on.
 
+A seat enrolled before 0.6.30 keeps its older unit, which waits on the boot
+splash and can leave the display black after a reboot. Its own sync cannot
+replace a root-owned unit. After upgrading to 0.6.30, `noo cluster verify`
+shows a `kiosk unit` warning for each such seat with the one command to run
+once on that seat, for example
+`sudo /home/alex/.local/libexec/noo-seat/noo kiosk seat-sync --migrate`.
+
 If the display is still not up, `noo kiosk status` says why. A start that is
 waiting on another unit shows as
 `inactive: a start job is queued behind <unit>`, and `systemctl list-jobs`
@@ -247,7 +254,11 @@ any bundle staged for the old one.
   `kiosk_job_blocked_by`. A dedicated unit never orders after
   `plymouth-quit-wait.service`, and it is `WantedBy=` both
   `graphical.target` and `multi-user.target`. Setup never changes the box's
-  default target.
+  default target. A dedicated seat reports `kiosk_unit` in its heartbeat
+  (`current`, `needs_migrate`, `shared`, `absent` or `unreadable`); verify's
+  `kiosk unit` row warns on `needs_migrate` and its remedy is the person's
+  one `sudo <seat user's home>/.local/libexec/noo-seat/noo kiosk seat-sync --migrate`.
+  A seat whose `noo` does not report its kiosk unit yet shows the row as OK, "not reported".
 - **Updates reach the displays:** `noo upgrade --seats` (and `--all`,
   `--nodes` unless `--no-seats`) stages a bundle every seat applies on its
   next sync tick (the timer runs once a minute), which may restart the

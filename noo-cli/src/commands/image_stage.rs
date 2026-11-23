@@ -70,7 +70,7 @@ pub(crate) const CONTROLLER_ONLY: &[&str] = &[
 /// for every architecture would slow every roll. A node that needs one is
 /// staged by name (`noo cluster sync-images <node> -i <image>`).
 pub(crate) const THIRD_PARTY_LOCK_ROWS: &[&str] = &[
-    "nats", "nginx", "redis", "loki", "tempo", "prometheus", "alertmanager", "grafana", "node-exporter", "tei", "tei-cpu", "vllm",
+    "nats", "nginx", "redis", "loki", "tempo", "prometheus", "alertmanager", "grafana", "node-exporter", "vllm",
 ];
 
 /// Lock rows that pin an ARTIFACT image: files the CLI unpacks with `docker

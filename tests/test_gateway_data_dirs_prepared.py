@@ -32,7 +32,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS = REPO_ROOT / "scripts"
 LIB_INSTANCE = SCRIPTS / "lib-instance.sh"
 
-GATEWAY_DIRS = ("ingest/working", "ingest/archive", "audit-archive")
+GATEWAY_DIRS = ("ingest/working", "ingest/archive", "audit-archive", "cache")
 
 
 def _fake_bin(tmp_path: Path) -> Path:
@@ -96,6 +96,8 @@ def test_prep_creates_every_gateway_dir_and_hands_it_to_65532(tmp_path: Path) ->
         top = d.split("/")[0]
         assert d in owned or (top in owned and any("-R" in c.split() for c in calls)), f"/data/{d} is not handed to 65532: {calls}"
     assert "audit-archive" in owned, calls
+    # The artifact digest cache's home (gateway-rust routes/artifacts.rs).
+    assert "cache" in owned, calls
 
 
 def _uncommented(text: str) -> str:

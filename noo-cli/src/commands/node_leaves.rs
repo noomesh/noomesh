@@ -62,7 +62,7 @@ pub struct NodeDoorLeaf {
 /// The node door table. Mirrors node-agent-go `internal/docker/client.go`
 /// `backendDoors` (pinned by `tests/test_node_backend_leaves_on_the_rail.py`
 /// once that table is on the base): vLLM (and vllm-secondary, which shares
-/// its leaf and mount) serves natively; llama.cpp, ollama, TEI (`embedding`)
+/// its leaf and mount) serves natively; llama.cpp, ollama
 /// and the reranker sit behind a stunnel sidecar. airllm is plaintext by
 /// named exception and has no row.
 pub const NODE_DOOR_LEAVES: &[NodeDoorLeaf] = &[
@@ -86,13 +86,6 @@ pub const NODE_DOOR_LEAVES: &[NodeDoorLeaf] = &[
         doors: &["noo-stunnel-ollama"],
         crt_kind: "svc-ollama.crt",
         key_kind: "svc-ollama.key",
-    },
-    NodeDoorLeaf {
-        service: "tei",
-        backends: &["embedding"],
-        doors: &["noo-stunnel-tei"],
-        crt_kind: "svc-tei.crt",
-        key_kind: "svc-tei.key",
     },
     NodeDoorLeaf {
         service: "reranker",
@@ -622,6 +615,22 @@ mod tests {
         let _ = std::fs::remove_dir_all(&ca.dir);
     }
 
+    /// i1182a: 0.6.30 stops issuing and packing the `tei` leaf. The kind is
+    /// still ACCEPTED by the appliers (node_fetch.rs / noo-apply.sh KNOWN_KINDS)
+    /// for one release, so a 0.6.29 node verifying this bundle never fails.
+    #[test]
+    fn a_fresh_node_is_issued_and_packed_no_tei_leaf() {
+        let ca = scratch("no-tei");
+        let issued = ensure_node_leaves(&ca, "n", 90).unwrap();
+        assert!(issued.iter().all(|(svc, _)| *svc != "tei"), "{issued:?}");
+        assert!(!ca.node_service_dir("n", "tei").exists());
+        assert!(door_leaf("tei").is_none() && door_leaf_for_backend("embedding").is_none());
+        let (p, skipped) = leaf_payloads(&ca, "n").unwrap();
+        assert!(!p.iter().any(|(k, _)| k.starts_with("svc-tei")), "{:?}", p.iter().map(|(k, _)| *k).collect::<Vec<_>>());
+        assert!(!skipped.contains(&"tei"));
+        let _ = std::fs::remove_dir_all(&ca.dir);
+    }
+
     #[test]
     fn a_node_leaf_key_is_owner_only_and_read_by_the_cli() {
         let ca = scratch("modes");
@@ -645,8 +654,8 @@ mod tests {
         let ca = scratch("separate");
         ensure_node_leaves(&ca, "a", 90).unwrap();
         ensure_node_leaves(&ca, "b", 90).unwrap();
-        let ka = std::fs::read(ca.node_service_dir("a", "tei").join("service.key")).unwrap();
-        let kb = std::fs::read(ca.node_service_dir("b", "tei").join("service.key")).unwrap();
+        let ka = std::fs::read(ca.node_service_dir("a", "ollama").join("service.key")).unwrap();
+        let kb = std::fs::read(ca.node_service_dir("b", "ollama").join("service.key")).unwrap();
         assert_ne!(ka, kb);
         let _ = std::fs::remove_dir_all(&ca.dir);
     }
@@ -667,7 +676,7 @@ mod tests {
         assert_eq!(got.len(), 1);
         assert!(got[0].1.contains("noo-stunnel-ollama"), "{got:?}");
         // Expiring inside the renewal window.
-        ca.issue_node_service_cert("n", "tei", &door_sans("tei"), 10).unwrap();
+        ca.issue_node_service_cert("n", "llamacpp", &door_sans("llamacpp"), 10).unwrap();
         let got = ensure_node_leaves(&ca, "n", 90).unwrap();
         assert_eq!(got.len(), 1);
         assert!(got[0].1.contains("expires"), "{got:?}");
@@ -702,7 +711,7 @@ mod tests {
 
     #[test]
     fn every_backend_key_maps_to_one_leaf_and_kinds_are_flat() {
-        for b in ["vllm", "vllm-secondary", "llamacpp", "ollama", "embedding", "reranker"] {
+        for b in ["vllm", "vllm-secondary", "llamacpp", "ollama", "reranker"] {
             assert!(door_leaf_for_backend(b).is_some(), "{b}");
         }
         assert!(door_leaf_for_backend("airllm").is_none(), "airllm is plaintext by named exception");

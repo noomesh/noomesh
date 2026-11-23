@@ -262,6 +262,10 @@ type Reconciler struct {
 	ggufExists  func(ctx context.Context, dir, file string) (bool, error)
 	// startBackendFn: nil = r.docker.StartBackend. A seam for tests only.
 	startBackendFn func(ctx context.Context, backend, model string, gpuCount int, o dockerpkg.StartOverrides) error
+	// removeRetiredTEIFn: nil = r.docker.RemoveRetiredTEI. A seam for tests only.
+	removeRetiredTEIFn func(ctx context.Context) ([]dockerpkg.RetiredTEI, error)
+	// retiredTEIDone: the leftover-TEI check has run clean this agent run.
+	retiredTEIDone bool
 
 	// ollamaPulls tracks the registry pull an ollama placement needs, per
 	// model: one in flight at a time, and a failed pull waits before it is
@@ -509,6 +513,7 @@ func (r *Reconciler) backendStarted(ctx context.Context, backend, model string) 
 	r.clearBackendStart(backend)
 	delete(r.hashWaits, backend)
 	if backend == "ollama" {
+		r.ollamaVerify.markAllDue()
 		go r.nudgeWhenReady(ctx, backend, model, startReadyWithin, startReadyEvery)
 	}
 }
@@ -557,7 +562,8 @@ type phase struct {
 // the node advertises from it; stop early when nothing is desired; MCP
 // servers (before backends — a discovery report is small, a pull is not);
 // the models dir; what is running here; multi-role merge; the shared-GPU
-// yield's sizing; image prefetch; converge each placement; restart an
+// yield's sizing; image prefetch; stop and remove the TEI containers an older
+// agent left; converge each placement; restart an
 // engine its door's restart left stranded; then reap what was removed.
 var reconcilePhases = []phase{
 	{"fetchDesired", (*Reconciler).fetchDesired},
@@ -573,6 +579,7 @@ var reconcilePhases = []phase{
 	{"planEffective", (*Reconciler).planEffective},
 	{"sizeGpuYield", (*Reconciler).sizeGpuYield},
 	{"prefetch", (*Reconciler).prefetch},
+	{"removeRetiredTEI", (*Reconciler).removeRetiredTEI},
 	{"convergePlacements", (*Reconciler).convergePlacements},
 	{"healDoorNamespaces", (*Reconciler).healDoorNamespaces},
 	{"reportAndCleanup", (*Reconciler).reportAndCleanup},
@@ -867,6 +874,13 @@ func (r *Reconciler) convergeContainer(ctx context.Context, t *tick, p placement
 			}
 		}
 	case "running":
+		// A placement of a removed engine is refused with its replacement,
+		// not skipped: `noo cluster show` says why nothing runs.
+		if why := retiredBackendRefusal(p.Backend, r.cfg.NodeID); why != "" {
+			slog.Error("reconcile.backend_refused", "backend", p.Backend, "reason", why)
+			refusals.Record("backend_start", p.Backend, why)
+			return
+		}
 		if model, ok := t.native[p.Backend]; ok {
 			slog.Info("reconcile.native_backend_unmanaged",
 				"backend", p.Backend, "running_model", model,
@@ -1014,8 +1028,7 @@ func (r *Reconciler) convergeContainer(ctx context.Context, t *tick, p placement
 		// Guard: a gguf-only engine given a NON-gguf model can never
 		// start. This is the case the check below misses, because it
 		// keys on the model ENDING in .gguf — so a HuggingFace repo id
-		// (which is what an operator naturally types, and what the TEI
-		// reranker legitimately takes) slips straight through to a
+		// (which is what an operator naturally types) slips straight through to a
 		// permanent restart loop:
 		//
 		//   gguf_init_from_file: failed to open GGUF file
@@ -1029,7 +1042,13 @@ func (r *Reconciler) convergeContainer(ctx context.Context, t *tick, p placement
 				"backend", p.Backend, "model", p.Model,
 				"detail", "this engine loads a gguf FILE from the models dir, not a HuggingFace repo id",
 				"fix", "set the placement model to a .gguf filename (noo cluster place "+
-					r.cfg.NodeID+" "+p.Backend+" <file>.gguf), or set RERANK_ENGINE=tei for a repo id")
+					r.cfg.NodeID+" "+p.Backend+" <file>.gguf)")
+			if p.Backend == "reranker" {
+				// The upgrade case: a reranker placed with a repo id ran on
+				// TEI, which is gone. Say so in the refusal `noo cluster
+				// show` prints, not only in this log.
+				refusals.Record("backend_start", p.Backend, retiredRerankerRefusal(r.cfg.NodeID, p.Model))
+			}
 			// Skipping the start is not enough. If the container already
 			// exists it carries a restart policy and Docker keeps cycling
 			// it independently of this loop — which is exactly what
@@ -1153,6 +1172,7 @@ func (r *Reconciler) reportAndCleanup(ctx context.Context, t *tick) bool {
 	// Nor does a vLLM backend no longer placed keep its start refusal: the
 	// compute-floor refusal's remedy IS the unplace.
 	clearUnplacedVllmRefusals(t.desired.Placements)
+	clearUnplacedRetiredRefusals(t.desired.Placements)
 	// A placement that was removed or stopped must stop reporting a model
 	// presence; only still-wanted ollama placements keep one.
 	// Keys of every still-wanted ollama placement survive, including the
@@ -1509,7 +1529,6 @@ var placementEnvExact = map[string]struct{}{
 var placementEnvPrefixes = []string{
 	"VLLM_",      // vLLM tuning (parsers, max-model-len, quantization, V2 runner…)
 	"LLAMA_ARG_", // llama-server's own argument environment
-	"TEI_",       // text-embeddings-inference
 	"RERANK_",    // reranker engine/model/ctx/threads
 }
 
@@ -1768,9 +1787,8 @@ func (r *Reconciler) fetch(ctx context.Context) (*desiredConfig, error) {
 // time (dockerpkg.BackendDialURL) so a pre-door container and a sidecar-
 // fronted one are both reached as they run.
 var embedBackends = map[string]bool{
-	"embedding": true, // TEI
-	"ollama":    true, // ollama's OpenAI-compatible /v1/embeddings
-	"llamacpp":  true, // llama-server --embedding
+	"ollama":   true, // ollama's OpenAI-compatible /v1/embeddings
+	"llamacpp": true, // llama-server --embedding
 }
 
 // resolveEmbedTarget picks the backend this node is DECLARED to serve
@@ -1786,6 +1804,11 @@ var embedBackends = map[string]bool{
 func resolveEmbedTarget(placements []placement) embedtarget.Target {
 	for _, p := range placements {
 		if p.Role != "embed" || p.DesiredState == "stopped" {
+			continue
+		}
+		if p.Backend == retiredBackendEmbedding {
+			// Refused in convergeContainer, with the replacement; it is not
+			// an unmapped backend to add to the table.
 			continue
 		}
 		if !embedBackends[p.Backend] {

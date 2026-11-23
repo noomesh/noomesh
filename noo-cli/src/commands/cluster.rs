@@ -1129,6 +1129,31 @@ pub(crate) fn auto_model_refusal(backend: &str, model: &str) -> Option<&'static 
         .then_some("auto picks a model only for harness: name a model, see `noo models recommended`")
 }
 
+/// The TEI engine was removed in 0.6.30 (i1182a): a new `embedding` placement,
+/// or a `reranker` whose model is not a `.gguf` file (an HF repo id) or whose
+/// image is the TEI one, is refused with the replacement. Not an auto-map: an
+/// HF id is not an Ollama model name, and the embedding model is an
+/// embedding-space decision. The gateway refuses the same (authoritative: the
+/// API and MCP reach it too); this is the early, offline copy with the same
+/// text. Pure.
+pub(crate) fn removed_engine_refusal(node: &str, backend: &str, model: &str, image: Option<&str>) -> Option<String> {
+    match backend {
+        "embedding" => Some(format!(
+            "the TEI embedding engine was removed in 0.6.30: new placements are refused; place an Ollama embedder instead: `noo cluster place {node} ollama <model> --role embed`"
+        )),
+        "reranker" => {
+            let tei_image = image.is_some_and(|i| i.to_ascii_lowercase().contains("text-embeddings-inference"));
+            let m = model.trim();
+            let not_gguf = !m.is_empty() && !m.to_ascii_lowercase().ends_with(".gguf");
+            (tei_image || not_gguf).then(|| format!(
+                "the TEI reranker was removed in 0.6.30: new placements are refused; place a GGUF cross-encoder: `noo cluster place {node} reranker <file>.gguf` \
+                 (e.g. bge-reranker-v2-m3-Q8_0.gguf; ship it with `noo cluster sync-model-files {node} -m <file>`)"
+            ))
+        }
+        _ => None,
+    }
+}
+
 /// `noo cluster place NODE BACKEND MODEL [--on cpu|gpu] [--env KEY=VALUE]... [--port P] [--tls]
 /// [--image IMG] [--stopped]` — PUT /api/cluster/nodes/{node}/placements/{backend}.
 /// Declares that NODE should run BACKEND with MODEL; the node-agent
@@ -1144,6 +1169,12 @@ pub fn cluster_place(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     let (node, backend, model) = (&node, &backend, &model);
     if let Some(why) = auto_model_refusal(backend, model) {
         crate::output::fail(g.json, crate::output::ExitCode::Usage, "bad_model", why, Some("noo models recommended"));
+    }
+    // A `--stopped` place goes through: it winds an old placement down.
+    if !stopped {
+        if let Some(why) = removed_engine_refusal(node, backend, model, image.as_deref()) {
+            crate::output::fail(g.json, crate::output::ExitCode::Usage, "removed_engine", &why, None);
+        }
     }
     if let Some(k) = &kind {
         if backend != "harness" {
@@ -1708,8 +1739,30 @@ mod placement_env_tests {
         assert_eq!(other_role_for_same_model(&legacy, "ollama", "harrier"), None);
     }
 
-    use super::{capabilities_cell, chat_context_line, current_env_for, merge_placement_env, other_role_for_same_model, parse_env_change, render_fit, role_capabilities_section, role_capabilities_section_with, target_cell, usage_cell, memory_limit_line, mem_cell, harness_cell, harness_show_cell, vendor_kinds_row};
+    use super::{capabilities_cell, chat_context_line, current_env_for, merge_placement_env, other_role_for_same_model, parse_env_change, removed_engine_refusal, render_fit, role_capabilities_section, role_capabilities_section_with, target_cell, usage_cell, memory_limit_line, mem_cell, harness_cell, harness_show_cell, vendor_kinds_row};
     use serde_json::json;
+
+    /// i1182a: the TEI engine was removed in 0.6.30; the CLI refuses early with the
+    /// gateway's text, naming the Ollama embedder or the GGUF reranker.
+    #[test]
+    fn place_refuses_the_unsupported_tei_engine_with_the_replacement() {
+        let e = removed_engine_refusal("n1", "embedding", "BAAI/bge-small-en-v1.5", None).expect("refused");
+        assert_eq!(
+            e,
+            "the TEI embedding engine was removed in 0.6.30: new placements are refused; place an Ollama embedder instead: `noo cluster place n1 ollama <model> --role embed`"
+        );
+        let r = removed_engine_refusal("n1", "reranker", "BAAI/bge-reranker-v2-m3", None).expect("an HF id is refused");
+        assert!(r.starts_with("the TEI reranker was removed in 0.6.30: new placements are refused; place a GGUF cross-encoder: `noo cluster place n1 reranker <file>.gguf`"), "{r}");
+        assert!(r.contains("bge-reranker-v2-m3-Q8_0.gguf") && r.contains("`noo cluster sync-model-files n1 -m <file>`"), "{r}");
+        assert!(removed_engine_refusal("n1", "reranker", "x.gguf", Some("ghcr.io/huggingface/text-embeddings-inference:cpu-1.9.4")).is_some(), "a TEI image");
+        assert!(removed_engine_refusal("n1", "reranker", "bge-reranker-v2-m3-Q8_0.gguf", None).is_none(), "a GGUF reranker is unchanged");
+        assert!(removed_engine_refusal("n1", "ollama", "harrier", None).is_none());
+        let own = crate::test_src::own_code(include_str!("cluster.rs"));
+        let place = crate::test_src::fn_body(&own, "pub fn cluster_place(");
+        let at = place.find("removed_engine_refusal(").expect("cluster_place asks");
+        assert!(place[..at].contains("if !stopped"), "a --stopped place still goes through");
+        assert!(at < place.find("get_json(").unwrap(), "before any request");
+    }
 
     #[test]
     fn place_merges_env_only_from_the_same_role_and_model() {

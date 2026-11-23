@@ -117,7 +117,7 @@ func TestProfileOllamaContextJoinsTheSpecOnlyWhenThePlacementDoesNotSetIt(t *tes
 	own := placement{Backend: "ollama", Model: "gemma4:12b", DesiredState: "running", Env: map[string]string{"OLLAMA_CONTEXT_LENGTH": "8192"}}
 	// an engine with no window key stays untouched (vLLM now gets one: see
 	// TestTheProfileContextReachesEveryChatEngineThatDoesNotSetItsOwn)
-	other := placement{Backend: "tei", Model: "m", DesiredState: "running"}
+	other := placement{Backend: "reranker", Model: "m", DesiredState: "running"}
 
 	p32 := &harnessprofile.Profile{Context: 32768}
 	out := withProfileContext([]placement{bare, own, other}, p32)
@@ -164,7 +164,7 @@ func TestTheProfileContextReachesEveryChatEngineThatDoesNotSetItsOwn(t *testing.
 	secondary := placement{Backend: "vllm-secondary", Model: "m2", DesiredState: "running"}
 	llama := placement{Backend: "llamacpp", Model: "x.gguf", DesiredState: "running"}
 	llamaArg := placement{Backend: "llamacpp", Model: "y.gguf", DesiredState: "running", Env: map[string]string{"LLAMA_ARG_CTX_SIZE": "4096"}}
-	embed := placement{Backend: "tei", Model: "e", DesiredState: "running"}
+	embed := placement{Backend: "reranker", Model: "e", DesiredState: "running"}
 	out := withProfileContext([]placement{vllm, vllmOwn, secondary, llama, llamaArg, embed}, p32)
 	if out[0].Env["VLLM_MAX_MODEL_LEN"] != "32768" || out[0].Env["VLLM_MAX_NUM_SEQS"] != "8" {
 		t.Errorf("vllm: %v", out[0].Env)

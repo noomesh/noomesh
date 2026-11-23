@@ -1116,8 +1116,6 @@ pub const CORE_REGISTRY: &[SecretSpec] = &[
         consumers: &[
             "noo-vllm",
             "noo-vllm-secondary",
-            "noo-tei",
-            "noo-tei-gpu",
             "noo-whisper",
             "noo-reranker",
             "noo-node-agent",

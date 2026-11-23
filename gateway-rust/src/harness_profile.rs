@@ -666,9 +666,9 @@ mod tests {
 
     #[test]
     fn the_chat_model_is_the_placement_model_or_the_served_name() {
-        let rec = json!({"running_backends": {"ollama": "gemma4:12b-it-qat", "tei": "harrier"}});
+        let rec = json!({"running_backends": {"ollama": "gemma4:12b-it-qat", "llamacpp": "harrier"}});
         let placements = vec![
-            json!({"backend": "tei", "role": "embed", "desired_state": "running", "model": "harrier"}),
+            json!({"backend": "llamacpp", "role": "embed", "desired_state": "running", "model": "harrier"}),
             json!({"backend": "ollama", "role": "chat", "desired_state": "running", "model": "gemma4:12b"}),
         ];
         // The placement's model as written comes first (what the agent benches).

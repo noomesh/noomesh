@@ -125,6 +125,7 @@ class Node:
             "HE_NET_DIR": str(self.net), "HE_DROPIN_DIR": str(self.dropin_dir), "HE_UNIT": str(self.unit),
             "HE_ENV": str(self.env), "HE_NSSWITCH_SRC": str(self.nss),
             "HE_OWNER_ARGS": "", "HE_STAT_OWNER": owner, "HE_STAGE_PARENT": str(self.tmp), "HE_RESOLV_PATH": str(self.resolv),
+            "HE_ETC_DIR": str(self.root),
         }
         return subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=env)
 
@@ -146,7 +147,12 @@ def allow_line(node: Node) -> str:
     return re.search(r"^IPAddressAllow=(.*)$", node.dropin.read_text(), re.M).group(1)
 
 
-BASE_ALLOW = sorted("127.0.0.1/32 ::1/128 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 fe80::/10 100.64.0.0/10 fd7a:115c:a1e0::/48".split())
+LOOPBACK = ["127.0.0.1/32", "::1/128"]
+
+
+def exact(*addrs: str) -> list[str]:
+    """The allowlist the hold must render: loopback plus each controller address."""
+    return sorted(LOOPBACK + list(addrs))
 
 
 # ── the rendered files, exactly ─────────────────────────────────────────────
@@ -155,11 +161,12 @@ def test_the_drop_in_is_exactly_the_contract(node: Node) -> None:
     node.hosts_db.write_text("ctl.example.net 203.0.113.9\nnats.example.net 100.64.0.100\n")
     applied_of(node.run())
     assert node.dropin.read_text() == (
-        "# Rendered by noo-apply: the harness and every CLI it launches reach only local and tailnet\n"
-        "# addresses and cannot resolve internet names (docs/security/telemetry.md).\n"
+        "# Rendered by noo-apply: the harness and every CLI it launches reach only loopback and\n"
+        "# the controller's addresses, and cannot resolve internet names (docs/security/telemetry.md).\n"
         "[Service]\n"
         "IPAddressDeny=0.0.0.0/0 ::/0\n"
-        f"IPAddressAllow={' '.join(sorted(BASE_ALLOW + ['203.0.113.9/32']))}\n"
+        f"IPAddressAllow={' '.join(exact('100.64.0.100/32', '203.0.113.9/32'))}\n"
+        "Environment=NOO_HARNESS_EGRESS_HOLD=1\n"
         f"BindReadOnlyPaths={node.net}/resolv.conf:{node.resolv}\n"
         f"BindReadOnlyPaths={node.net}/hosts:/etc/hosts\n"
         f"BindReadOnlyPaths={node.net}/nsswitch.conf:/etc/nsswitch.conf\n"
@@ -206,20 +213,20 @@ def test_literal_ips_and_localhost_are_not_names(node: Node) -> None:
     node.env.write_text("NODE_ID=h\nNOO_GATEWAY_URL=https://10.1.2.3:8000\nNATS_URL=nats://localhost:4222,tls://[fd00::1]:4222\n")
     applied_of(node.run())
     assert (node.net / "hosts").read_text().splitlines()[1].strip() == "# names:"
-    assert allow_line(node).split() == sorted(BASE_ALLOW)
+    assert allow_line(node).split() == exact("10.1.2.3/32")
 
 
 # ── the allowlist ───────────────────────────────────────────────────────────
 
-def test_allowlist_without_a_public_controller_address_is_the_base_only(node: Node) -> None:
+def test_every_controller_address_is_its_own_entry_and_nothing_else(node: Node) -> None:
     node.hosts_db.write_text("ctl.example.net 192.168.1.5\nnats.example.net 100.64.0.100\n")
     applied_of(node.run())
-    assert allow_line(node).split() == sorted(BASE_ALLOW)
+    assert allow_line(node).split() == exact("100.64.0.100/32", "192.168.1.5/32")
 
 
-def test_a_public_controller_address_is_the_one_public_entry(node: Node) -> None:
+def test_a_public_controller_address_is_allowed_like_any_other(node: Node) -> None:
     applied_of(node.run())
-    assert allow_line(node).split() == sorted(BASE_ALLOW + ["203.0.113.9/32"])
+    assert allow_line(node).split() == exact("100.64.0.100/32", "203.0.113.9/32")
 
 
 def test_a_public_v6_controller_address_is_a_slash_128(node: Node) -> None:
@@ -228,34 +235,37 @@ def test_a_public_v6_controller_address_is_a_slash_128(node: Node) -> None:
     assert "2001:db8::9/128" in allow_line(node).split()
 
 
-def test_ipv4_mapped_addresses_from_getent_are_judged_as_ipv4(node: Node) -> None:
+def test_ipv4_mapped_addresses_from_getent_are_allowed_as_ipv4(node: Node) -> None:
     node.hosts_db.write_text("ctl.example.net ::ffff:10.9.8.7\nnats.example.net ::ffff:203.0.113.77\n")
     applied_of(node.run())
     hosts = (node.net / "hosts").read_text()
     assert "10.9.8.7 ctl.example.net" in hosts and "203.0.113.77 nats.example.net" in hosts
-    assert allow_line(node).split() == sorted(BASE_ALLOW + ["203.0.113.77/32"])
+    assert allow_line(node).split() == exact("10.9.8.7/32", "203.0.113.77/32")
 
 
-def test_172_just_outside_the_private_range_is_public(node: Node) -> None:
-    node.hosts_db.write_text("ctl.example.net 172.32.0.1\nnats.example.net 172.31.255.255\n")
-    applied_of(node.run())
-    assert allow_line(node).split() == sorted(BASE_ALLOW + ["172.32.0.1/32"])
-
-
-def test_fc00_7_only_with_a_global_ula_on_this_host(node: Node) -> None:
-    applied_of(node.run())
-    assert "fc00::/7" not in allow_line(node).split()
+def test_no_range_is_ever_allowed(node: Node) -> None:
+    # Every entry is one host: a /32 or a /128. No private, tailnet, link-local
+    # or ULA range, so no resolver, router or bridge address in one is reachable.
+    node.hosts_db.write_text("ctl.example.net 100.64.0.7\nctl.example.net fd7a:115c:a1e0::7\nnats.example.net 10.0.0.9\n")
     node.ip_out.write_text("2: eth0    inet6 fd12:3456:789a::5/64 scope global \n")
     applied_of(node.run())
-    assert "fc00::/7" in allow_line(node).split()
+    allow = allow_line(node).split()
+    assert all(e.endswith("/32") or e.endswith("/128") for e in allow), allow
+    for resolver in ("100.100.100.100", "fd7a:115c:a1e0::53", "10.255.255.254"):
+        assert not any(e.split("/")[0] == resolver for e in allow), (resolver, allow)
+    assert allow == exact("100.64.0.7/32", "fd7a:115c:a1e0::7/128", "10.0.0.9/32")
 
 
-def test_the_tailnet_own_ula_address_does_not_open_fc00_7(node: Node) -> None:
-    node.ip_out.write_text("3: tailscale0    inet6 fd7a:115c:a1e0::1234/128 scope global \n"
-                           "2: eth0    inet6 2001:db8::5/64 scope global \n"
-                           "2: eth0    inet6 fd12::5/64 scope link \n")
+def test_the_allow_file_lists_the_same_addresses_for_the_self_test(node: Node) -> None:
     applied_of(node.run())
-    assert "fc00::/7" not in allow_line(node).split()
+    allow = sorted(e.split("/")[0] for e in allow_line(node).split())
+    assert sorted((node.net / "allow").read_text().split()) == allow
+    assert (node.net / "allow").stat().st_mode & 0o777 == 0o644
+
+
+def test_the_drop_in_tells_the_harness_its_hold_is_installed(node: Node) -> None:
+    applied_of(node.run())
+    assert "Environment=NOO_HARNESS_EGRESS_HOLD=1" in node.dropin.read_text().splitlines()
 
 
 def test_nothing_in_test_net_1_is_ever_allowed(node: Node) -> None:
@@ -419,8 +429,8 @@ def test_the_precheck_properties_are_the_drop_in_lines(node: Node) -> None:
     props = [x.replace(stage, str(node.net)) for x in props]
     assert props[0] == "DynamicUser=yes"
     dropin = [l for l in node.dropin.read_text().splitlines()
-              if l.split("=")[0] in {"IPAddressDeny", "IPAddressAllow", "BindReadOnlyPaths", "InaccessiblePaths"}]
-    assert props[1:] == dropin and len(dropin) == 6
+              if l.split("=")[0] in {"IPAddressDeny", "IPAddressAllow", "Environment", "BindReadOnlyPaths", "InaccessiblePaths"}]
+    assert props[1:] == dropin and len(dropin) == 7
     assert "--collect" in argv and "--wait" in argv
 
 
@@ -451,6 +461,8 @@ def test_a_failing_precheck_installs_nothing_removes_the_old_hold_and_restarts(n
     assert "RESTART=1" in r.stdout and "systemctl daemon-reload" in node.calls()
     assert "the hold was NOT applied" in r.stderr and "codex placements are refused" in r.stderr
     assert "runs unrestricted" in r.stderr
+    # Which address failed, and what the hold allowed, so the reason is never missing.
+    assert "ctl.example.net at 203.0.113.10" in r.stderr and "127.0.0.1/32" in r.stderr, r.stderr
 
 
 def test_a_failing_precheck_on_a_node_with_no_hold_installs_nothing_and_asks_no_restart(node: Node) -> None:
@@ -499,13 +511,13 @@ def test_the_precheck_looks_up_names_but_not_a_literal_ip(tmp_path: Path) -> Non
     assert "FAIL ctl.example.net 443 lookup" in r.stdout, r.stdout
 
 
-def test_a_literal_controller_ip_is_allowed_only_when_the_base_list_misses_it(node: Node) -> None:
+def test_a_literal_controller_ip_is_allowed_as_itself(node: Node) -> None:
     node.env.write_text("NODE_ID=h\nNOO_GATEWAY_URL=https://203.0.113.10:8443\nNATS_URL=tls://203.0.113.10:4222\n")
     applied_of(node.run())
-    assert "203.0.113.10/32" in allow_line(node).split()
+    assert allow_line(node).split() == exact("203.0.113.10/32")
     node.env.write_text("NODE_ID=h\nNOO_GATEWAY_URL=https://192.168.1.10:8443\nNATS_URL=tls://192.168.1.10:4222\n")
     applied_of(node.run())
-    assert sorted(allow_line(node).split()) == BASE_ALLOW, "a LAN address is already in the base list"
+    assert allow_line(node).split() == exact("192.168.1.10/32"), "a LAN address is one host too, never its range"
 
 
 def test_a_precheck_that_says_nothing_is_not_a_pass(node: Node) -> None:
@@ -545,6 +557,25 @@ def test_the_resolver_bind_lands_on_the_file_a_resolver_actually_reads(node: Nod
     node.resolv.symlink_to(target)
     applied_of(node.run())
     assert f"BindReadOnlyPaths={node.net}/resolv.conf:{target}\n" in node.dropin.read_text()
+
+
+def test_a_resolver_file_outside_etc_is_held_by_its_directory(node: Node) -> None:
+    # A host's resolver rewrites its file by renaming a new one into place,
+    # which detaches a bind over the FILE in the unit's namespace; a bind over
+    # its directory stays. Every name a resolver reads there is held.
+    rdir = node.root / "run" / "systemd" / "resolve"
+    rdir.mkdir(parents=True)
+    target = rdir / "stub-resolv.conf"
+    target.write_text("nameserver 127.0.0.53\n")
+    node.resolv.unlink()
+    node.resolv.symlink_to(target)
+    applied_of(node.run())
+    lines = node.dropin.read_text().splitlines()
+    assert f"BindReadOnlyPaths={node.net}/resolvdir:{rdir}" in lines, lines
+    assert not any(l.startswith(f"BindReadOnlyPaths={node.net}/resolv.conf:") for l in lines)
+    held = (node.net / "resolv.conf").read_text()
+    for name in ("resolv.conf", "stub-resolv.conf"):
+        assert (node.net / "resolvdir" / name).read_text() == held
 
 
 def test_loopback_is_only_127_0_0_1_and_nss_never_asks_dns(node: Node) -> None:

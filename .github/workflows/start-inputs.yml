@@ -7,10 +7,11 @@
 # project (scripts/test-start-inputs/run.sh). Unit tests cannot show what
 # compose does with a label change, a dependent, or --force-recreate.
 #
-# Two legs: the runner's compose, and v2.24.6, the oldest compose v2 the
-# documented install route lands on (Ubuntu 24.04's docker-compose-v2 in the
-# release pocket; the docs ask only for "the Compose v2 plugin"). That one is
-# a pinned release binary, checked against its sha256 before use.
+# Three legs: the runner's compose; v2.33.0, the supported floor
+# (MIN_COMPOSE in noo-cli/src/commands/cluster_verify.rs, the Compose Docker
+# Engine 28 bundles); and v2.24.6, a CANARY below that floor (Ubuntu 24.04's
+# docker-compose-v2 in the release pocket, the floor until 0.6.30). The pinned
+# legs are release binaries, each checked against its sha256 before use.
 # GitHub-hosted only (no secrets, read-only token).
 name: start-inputs
 
@@ -45,7 +46,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        compose: [ runner, v2.24.6 ]
+        compose: [ runner, v2.33.0, v2.24.6 ]
+        include:
+          # docker/compose releases, docker-compose-linux-x86_64.sha256
+          - compose: v2.33.0
+            sha256: 6395dbb256db6ea28d5c6695bc9bc33866c07ad1c93792f8d85857f1c21c34ee
+          - compose: v2.24.6
+            sha256: eca30ae32dc451f9e6d6c8ddce078a76f23b355c3ca0ab391d58f59e87c0d310
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
@@ -68,8 +75,7 @@ jobs:
         if: matrix.compose != 'runner'
         env:
           COMPOSE_VERSION: ${{ matrix.compose }}
-          # docker/compose release v2.24.6, docker-compose-linux-x86_64.sha256
-          COMPOSE_SHA256: eca30ae32dc451f9e6d6c8ddce078a76f23b355c3ca0ab391d58f59e87c0d310
+          COMPOSE_SHA256: ${{ matrix.sha256 }}
         run: |
           mkdir -p "$DOCKER_CONFIG/cli-plugins"
           f="$DOCKER_CONFIG/cli-plugins/docker-compose"

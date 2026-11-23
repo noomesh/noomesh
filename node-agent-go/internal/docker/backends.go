@@ -156,8 +156,8 @@ fi
 type BackendSpec struct {
 	Image string
 	// CPUImage, when set, is used instead of Image on nodes WITHOUT an
-	// NVIDIA GPU. Lets a single backend type (e.g. embedding/reranker, which
-	// ship distinct CUDA `:1.6` and `:cpu-1.9.4` TEI images) auto-select the
+	// NVIDIA GPU. Lets a single backend type (e.g. llamacpp, which
+	// ships distinct CUDA and CPU images) auto-select the
 	// right image per node — GPU where available, CPU otherwise. The GPU
 	// device reservation is independently guarded by hasNvidiaGPU(), so the
 	// two stay in sync. Empty → Image is used on every node (LLM backends).
@@ -176,7 +176,7 @@ type BackendSpec struct {
 	// tmpfs /tmp (rootFloor). Set only for an image whose write set was
 	// measured empty outside its mounts (`docker diff` on a running
 	// container): llama-server (node-a, 2026-10-28, a day of serving: no
-	// write). vLLM, ollama and TEI write caches into their image paths and
+	// write). vLLM and ollama write caches into their image paths and
 	// are not set until measured with a writable cache mount (i301).
 	ReadOnlyRoot bool
 
@@ -447,52 +447,12 @@ var backendSpecs = map[string]BackendSpec{
 		Network:     "noo-cluster",
 		MemoryLimit: 16 * 1024 * 1024 * 1024, // 16GB
 	},
-	// Embedding — TEI serving a sentence embedder (POST /embed). GPU where
-	// available (CUDA :1.6), CPU otherwise (:cpu-1.9.4) — chosen by the
-	// placement's target and teiGPUUsable (image_choice.go): cpu = CPU image,
-	// gpu without a usable NVIDIA runtime = refused, unset = GPU only when
-	// usable. GPUCount "1" is a no-op on CPU (the reservation is GPU-guarded). Start with:
-	//   noo cluster up embedding BAAI/bge-base-en-v1.5 --node <node>
-	"embedding": {
-		// held at 1.6: TEI 1.9.4's CUDA image requires cuda>=12.9 with no GeForce
-		// exemption (driver >= ~575, inferred from the image config); move after a
-		// GPU node proves it (#1444)
-		Image:         "${TEI_GPU_IMAGE:-ghcr.io/huggingface/text-embeddings-inference:1.6}",
-		CPUImage:      "${TEI_CPU_IMAGE:-ghcr.io/huggingface/text-embeddings-inference:cpu-1.9.4}",
-		ContainerName: "noo-tei",
-		Env: map[string]string{
-			"HUGGING_FACE_HUB_TOKEN": "${HF_TOKEN:-}",
-			"MODEL_ID":               "${TEI_MODEL:-BAAI/bge-base-en-v1.5}",
-			// TEI sends no usage report (its only exporter is OTLP, and only
-			// to an endpoint we never configure); these keep its hf-hub
-			// model fetch from reporting (docs/security/telemetry.md).
-			"HF_HUB_DISABLE_TELEMETRY": "1",
-			"DO_NOT_TRACK":             "1",
-			// Where TEI looks for the model: the node's VERIFIED snapshot
-			// (teiHubCache, below). Not overridable (buildEnvList).
-			"HUGGINGFACE_HUB_CACHE": teiHubCache,
-		},
-		// Persist + share the TEI model cache at /data — the node's
-		// HF_CACHE_DIR, whose hub/ holds the snapshots stageHFModel verified.
-		Volumes: []VolumeMount{
-			{Source: hfCacheSource, Target: "/data"},
-		},
-		GPUCount: "1",
-		Network:  "noo-cluster",
-		// TEI's --model-id beats its MODEL_ID env, so the flag must name the
-		// model the container env names: ${MODEL_ID} is resolved against the
-		// CONTAINER env (resolveCommand) — the placement's model when one is
-		// placed, else TEI_MODEL, else bge-base (the MODEL_ID default above).
-		Command: []string{"--model-id", "${MODEL_ID}"},
-	},
-	// Reranker — engine-selectable via RERANK_ENGINE, spec built by
-	// rerankerSpec() below. Default: hardened llama.cpp (llama-server
-	// --reranking on a gguf cross-encoder); RERANK_ENGINE=tei restores the
-	// TEI cross-encoder image. Either way ContainerName stays noo-reranker —
-	// the "rerank" in the name is what makes the capability detector
-	// advertise `rerank` to the gateway, and the node-agent /rerank proxy
-	// translates the wire shape so gateway callers never see the engine.
-	"reranker": rerankerSpec(),
+	// Reranker — hardened llama.cpp (llama-server --reranking on a gguf
+	// cross-encoder), always. ContainerName stays noo-reranker: the "rerank"
+	// in the name is what makes the capability detector advertise `rerank` to
+	// the gateway, and the node-agent /rerank proxy translates the wire shape
+	// so gateway callers never see the engine.
+	"reranker": rerankerSpecLlamacpp(),
 }
 
 // rerankEntrypointScript translates the hardened llamacpp image's stable env
@@ -510,59 +470,14 @@ exec "$BIN" --model "$MODEL_PATH" --reranking \
   --host "$HOST" --port "$PORT"
 `
 
-// rerankerSpec picks the reranker backend spec by RERANK_ENGINE
-// ("llamacpp" default, "tei" fallback). Evaluated once at package init,
-// like LLAMACPP_IMAGE. Note the spec only takes effect when the container
-// is (re)created by the reconciler / `noo cluster up reranker` — a live
-// TEI noo-reranker keeps running (and keeps working: the /rerank proxy
-// autodetects the engine) until then.
-func rerankerSpec() BackendSpec {
-	if strings.EqualFold(strings.TrimSpace(os.Getenv("RERANK_ENGINE")), "tei") {
-		return rerankerSpecTEI()
-	}
-	return rerankerSpecLlamacpp()
-}
-
-// rerankerSpecTEI is the legacy TEI cross-encoder spec (POST /rerank on :80).
-// Same image family + CPU/GPU auto-select as the embedding backend. Start:
-//
-//	RERANK_ENGINE=tei; noo cluster up reranker BAAI/bge-reranker-base --node <node>
-func rerankerSpecTEI() BackendSpec {
-	return BackendSpec{
-		// held at 1.6: TEI 1.9.4's CUDA image requires cuda>=12.9 with no GeForce
-		// exemption (driver >= ~575, inferred from the image config); move after a
-		// GPU node proves it (#1444)
-		Image:         "${TEI_GPU_IMAGE:-ghcr.io/huggingface/text-embeddings-inference:1.6}",
-		CPUImage:      "${TEI_CPU_IMAGE:-ghcr.io/huggingface/text-embeddings-inference:cpu-1.9.4}",
-		ContainerName: "noo-reranker",
-		Env: map[string]string{
-			"HUGGING_FACE_HUB_TOKEN": "${HF_TOKEN:-}",
-			"MODEL_ID":               "${RERANK_MODEL:-BAAI/bge-reranker-base}",
-			// Same as the embedding backend (docs/security/telemetry.md).
-			"HF_HUB_DISABLE_TELEMETRY": "1",
-			"DO_NOT_TRACK":             "1",
-			// The verified snapshot, as for the embedding backend.
-			"HUGGINGFACE_HUB_CACHE": teiHubCache,
-		},
-		// Shared TEI model cache — see embedding backend.
-		Volumes: []VolumeMount{
-			{Source: hfCacheSource, Target: "/data"},
-		},
-		GPUCount: "1",
-		Network:  "noo-cluster",
-		// The placed model, as for the embedding backend (resolveCommand).
-		Command: []string{"--model-id", "${MODEL_ID}"},
-	}
-}
-
 // rerankerSpecLlamacpp runs llama-server --reranking from the hardened
 // llamacpp image (same image/default-resolution story as the llamacpp LLM
 // backend: our release llamacpp on every arch, a refusal when not staged and
 // never upstream; RERANK_IMAGE overrides). Serves Jina-style POST /v1/rerank on :8085; the
-// node-agent /rerank proxy translates to/from the TEI wire contract.
+// node-agent /rerank proxy translates to/from the gateway's rerank wire contract.
 //
 // RERANK_MODEL is a bare GGUF FILENAME under /models (default
-// bge-reranker-v2-m3-Q8_0.gguf) — unlike TEI it is NOT auto-downloaded
+// bge-reranker-v2-m3-Q8_0.gguf) — it is NOT auto-downloaded
 // from HF; the gguf must be shipped to the node first:
 //
 //  1. On the controller, place the file in the model store:
@@ -759,19 +674,11 @@ func llamacppCPULimit(specLimit float64, threads string, cores int) float64 {
 	return float64(n)
 }
 
-// embedRerankModelEnv puts a placed embedding/reranker model into the
-// container env overrides. A TEI spec (the embedding backend, the reranker
-// with RERANK_ENGINE=tei: both carry MODEL_ID) takes the HF repo id as
-// MODEL_ID, which its Command passes on as --model-id (resolveCommand). The
-// llama.cpp reranker takes a gguf filename under the /models mount (same
-// bare-filename handling as the llamacpp backend). No model: the spec's own
-// default stands.
-func embedRerankModelEnv(spec BackendSpec, model string, envOverrides map[string]string) {
+// rerankerModelEnv puts a placed reranker model into the container env
+// overrides: a gguf filename under the /models mount (same bare-filename
+// handling as the llamacpp backend). No model: the spec's own default stands.
+func rerankerModelEnv(model string, envOverrides map[string]string) {
 	if model == "" {
-		return
-	}
-	if spec.Env["MODEL_ID"] != "" {
-		envOverrides["MODEL_ID"] = model
 		return
 	}
 	mp := model
@@ -808,8 +715,8 @@ func (c *Client) StartBackendSDK(ctx context.Context, backend, model string, gpu
 	defer cancel()
 
 	// ONE image choice (image_choice.go, shared with BackendImageRef):
-	// CPU/GPU choice (an embedding/reranker CPUImage by the placement's target
-	// and teiGPUUsable; the GPU device reservation is independently gated by
+	// CPU/GPU choice (llamacpp's CPUImage by the placement's target
+	// and nvidiaGPUUsable; the GPU device reservation is independently gated by
 	// hasNvidiaGPU() below), then the controller's override, else
 	// ${VLLM_IMAGE:-default} env substitution - and the policy that refuses a
 	// floating or digest-less third-party ref.
@@ -823,26 +730,6 @@ func (c *Client) StartBackendSDK(ctx context.Context, backend, model string, gpu
 	spec.Image = choice.Ref
 	if choice.Why != "" {
 		slog.Info("backend image: CPU chosen", "backend", backend, "why", choice.Why)
-	}
-
-	// Reranker engine correction: a placement/RERANK_IMAGE override can point
-	// at the other engine's image than RERANK_ENGINE selected (e.g. desired
-	// state pins the TEI image while the node defaults to llamacpp). When the
-	// resolved image clearly identifies an engine that contradicts the chosen
-	// spec, re-derive the spec so env/entrypoint match what actually runs.
-	// Ambiguous custom images keep the RERANK_ENGINE-selected spec.
-	if backend == "reranker" {
-		img := spec.Image
-		teiSpec := spec.Env["MODEL_ID"] != ""
-		teiImage := strings.Contains(img, "text-embeddings-inference")
-		llamaImage := strings.Contains(img, "llamacpp") || strings.Contains(img, "llama.cpp")
-		if teiImage && !teiSpec {
-			spec = rerankerSpecTEI()
-			spec.Image = img
-		} else if llamaImage && teiSpec {
-			spec = rerankerSpecLlamacpp()
-			spec.Image = img
-		}
 	}
 
 	// Override model in env
@@ -898,8 +785,8 @@ func (c *Client) StartBackendSDK(ctx context.Context, backend, model string, gpu
 		if model != "" {
 			envOverrides["MODEL_PATH"] = model
 		}
-	case "embedding", "reranker":
-		embedRerankModelEnv(spec, model, envOverrides)
+	case "reranker":
+		rerankerModelEnv(model, envOverrides)
 	}
 
 	// GPU count override
@@ -1034,8 +921,10 @@ func (c *Client) StartBackendSDK(ctx context.Context, backend, model string, gpu
 		return err
 	}
 	// Enforcing nodes refuse to mount anything until their data root passes
-	// the policy (dataroots/policy.go); warn mode only reports.
-	if err := dataroots.Refusal(dataroots.Current()); err != nil {
+	// the policy (dataroots/policy.go); warn mode only reports, except a root
+	// not on its recorded filesystem or not answering, refused in both modes.
+	// Bounded: a hung mount answers "not answering" within the probe bound.
+	if err := dataroots.Gate(); err != nil {
 		return fmt.Errorf("backend %s: %w", backend, err)
 	}
 	if err := requireMountSources(backend, mounts); err != nil {
@@ -1053,7 +942,7 @@ func (c *Client) StartBackendSDK(ctx context.Context, backend, model string, gpu
 	}
 
 	// Build command: resolved against the container env just built, so a
-	// ${VAR} in it follows the placement (TEI's --model-id ${MODEL_ID}).
+	// ${VAR} in it follows the placement.
 	cmd := resolveCommand(spec.Command, env)
 	entrypoint := spec.Entrypoint
 
@@ -1323,8 +1212,8 @@ func (c *Client) preseedGGUF(ctx context.Context, backend, model string) (bool, 
 	// because it holds the reconcile tick; past it the start is refused and
 	// the next tick asks again. That converges: the gateway hashes in the
 	// BACKGROUND, single-flight, and caches the digest in memory and in
-	// /data/artifact-digests.json (gateway-rust/src/routes/artifacts.rs:31-49,
-	// HASH_WAIT_SECS :294, in_flight() :308, mem_cache() :301), so each tick
+	// /data/cache/artifact-digests.json (gateway-rust/src/routes/artifacts.rs:
+	// DEFAULT_DIGEST_CACHE, HASH_WAIT_SECS, in_flight(), mem_cache()), so each tick
 	// re-joins the one running hash and the first tick after it ends gets 200.
 	man, merr := awaitArtifactManifestWithin(ctx, "gguf", model, ggufStartManifestBudget)
 	if merr != nil {
@@ -1582,8 +1471,7 @@ func resolveEnv(s string) string {
 // KEY=value list buildEnvList rendered: spec env, then the placement's
 // overrides, then the pinned keys), falling back to the agent's own env for
 // a name the container env does not carry. A Command ${VAR} resolved from
-// the agent's env alone ignored the placement: TEI's --model-id (which beats
-// its MODEL_ID env) named the node default whatever model was placed.
+// the agent's env alone ignored the placement.
 func resolveCommand(cmd []string, containerEnv []string) []string {
 	have := parseEnv(containerEnv)
 	lookup := func(name string) string {
@@ -1655,20 +1543,6 @@ func findMatchingBrace(s string, pos int) int {
 	}
 	return -1
 }
-
-// teiHubCache is the TEI images' hub cache, pointed at the hub/ level of the
-// node's HF_CACHE_DIR (mounted at /data).
-//
-// The TEI images (ghcr.io/huggingface/text-embeddings-inference:1.6 and
-// :cpu-1.9.4, the digests docker-compose.cluster.yml pins) set
-// HUGGINGFACE_HUB_CACHE=/data in their config, and TEI (1.6 and 1.9.4 alike) hands that
-// straight to hf-hub (router/src/lib.rs: ApiBuilder::with_cache_dir), whose
-// layout is <cache>/models--org--name. The agent stages and VERIFIES a placed
-// model at HF_CACHE_DIR/hub/models--org--name (stageHFModel, i675 F13), the
-// huggingface_hub layout vLLM and the model cache use. With the image default
-// TEI read /data/models--org--name — a tree nothing verifies — and never the
-// verified snapshot. This puts both on the same tree.
-const teiHubCache = "/data/hub"
 
 // pinnedSpecEnv are spec env keys a placement or node override cannot
 // change: where a backend reads its weights must stay the tree the agent
@@ -2141,7 +2015,7 @@ func ContainerNameFor(backend string) string {
 // OWN release (NOO_IMAGE_PREFIX/<name>:NOO_IMAGE_TAG) when the placement names
 // no image: the hardened llama-server for llamacpp and for the llama.cpp
 // reranker engine, and the hardened Ollama. "" when the backend's default is not release-derived (an
-// upstream pin such as vLLM's or TEI's, which the controller sends in the
+// upstream pin such as vLLM's, which the controller sends in the
 // placement from the signed stack lock), when an override names an image
 // that is not this release's, or on a node with no release pin.
 //
@@ -2168,9 +2042,6 @@ func ReleaseBackendImage(backend, target string) string {
 			img = envOr("LLAMACPP_IMAGE", llamacppDefaultImage())
 		}
 	case "reranker":
-		if strings.EqualFold(strings.TrimSpace(os.Getenv("RERANK_ENGINE")), "tei") {
-			return ""
-		}
 		img = envOr("RERANK_IMAGE", llamacppDefaultImage())
 	case "ollama":
 		img = envOr("OLLAMA_IMAGE", ollamaDefaultImage())
@@ -2250,9 +2121,6 @@ func hardenedDefault(backend string, cpuImage bool) string {
 			envVar, name = "LLAMACPP_IMAGE", "llamacpp"
 		}
 	case "reranker":
-		if strings.EqualFold(strings.TrimSpace(os.Getenv("RERANK_ENGINE")), "tei") {
-			return ""
-		}
 		envVar, name = "RERANK_IMAGE", "llamacpp"
 	case "ollama":
 		envVar, name = "OLLAMA_IMAGE", "ollama"
@@ -2278,14 +2146,11 @@ func hardenedDefault(backend string, cpuImage bool) string {
 // restart loop — the placement carried `BAAI/bge-reranker-base` while the
 // llamacpp engine wanted a bare filename like bge-reranker-v2-m3-Q8_0.gguf.
 //
-// `reranker` is engine-dependent: RERANK_ENGINE=tei restores the TEI
-// cross-encoder, which DOES take a repo id.
+// The reranker is always llama.cpp (a GGUF cross-encoder).
 func ExpectsGGUFModel(backend string) bool {
 	switch backend {
-	case "llamacpp":
+	case "llamacpp", "reranker":
 		return true
-	case "reranker":
-		return !strings.EqualFold(strings.TrimSpace(os.Getenv("RERANK_ENGINE")), "tei")
 	default:
 		return false
 	}
@@ -2294,7 +2159,7 @@ func ExpectsGGUFModel(backend string) bool {
 // hfBackend: backends that load an HF repo id (vs a flat GGUF / ollama tag).
 func hfBackend(backend string) bool {
 	switch backend {
-	case "vllm", "embedding", "reranker":
+	case "vllm":
 		return true
 	}
 	return false

@@ -524,7 +524,7 @@ pub(crate) fn node_checks(n: &Value, controller_tag: &str, cli_version: &str, no
 
     // 6b. What the node's NEXT BOOT will do, from
     //     the facts noo-hostd reports as root.
-    out.extend(host_checks(id, &hostd["host"], hostd["alive"].as_bool() == Some(true)));
+    out.extend(host_checks_with(id, &hostd["host"], hostd["alive"].as_bool() == Some(true), onboard_holds_of(n).as_deref()));
 
     // 6c. Backend doors: every door-backed backend on
     //     the node has a leaf that names its door, and the agent records no
@@ -543,6 +543,7 @@ pub(crate) fn node_checks(n: &Value, controller_tag: &str, cli_version: &str, no
     out.extend(llamacpp_offload_check(n));
     out.extend(docker_engine_check(n));
     out.extend(vllm_compute_check(n));
+    out.extend(removed_engine_check(n));
     out.extend(hardened_images_check(n));
 
     // 6c''. Vendor telemetry (docs/security/telemetry.md): no running
@@ -1102,10 +1103,13 @@ pub(crate) fn harness_egress_check(id: &str, n: &Value) -> Option<Check> {
     }
     let h = &n["host_services"]["harness"];
     let e = &h["egress"];
+    // No harness running here, no row: a stopped harness is right on a node
+    // that serves no chat model (policy `auto`), and the agent reports an
+    // egress object for any installed unit, running or not.
+    if h["state"].as_str() != Some("running") {
+        return None;
+    }
     if !e.is_object() {
-        if h["state"].as_str() != Some("running") {
-            return None;
-        }
         return Some(match h["runtime"].as_str() {
             Some(rt) if rt != "systemd" => warn(NAME, format!(
                 "no egress hold on {rt}: the hold is systemd-only, so this node's harness runs with nothing holding it off the internet"), None),
@@ -1115,10 +1119,16 @@ pub(crate) fn harness_egress_check(id: &str, n: &Value) -> Option<Check> {
     }
     let reason = e["reason"].as_str().unwrap_or("");
     let stale: Vec<&str> = e["stale_hosts"].as_array().map(|a| a.iter().filter_map(|v| v.as_str()).collect()).unwrap_or_default();
+    // From a harness that re-checks every minute: how old its latest check is.
+    let age = e["checked_age_secs"].as_i64().map(|a| format!(" (checked {a}s ago)")).unwrap_or_default();
     Some(match e["state"].as_str() {
+        Some("enforced") if stale.is_empty() && e["resolv_held"].as_bool() == Some(false) => warn(NAME, format!(
+            "held off the internet{age}, but the harness's private resolv.conf was replaced by the host's (a host resolver rewrote its file); its allow list still denies every resolver, so nothing leaks; a restart of the harness restores the file"), None),
         Some("enforced") if stale.is_empty() => ok(NAME, format!(
-            "held off the internet: deny {}, unit resolver; the harness's own check from inside the unit: lookup {}, connect {}",
+            "held off the internet{age}: deny {}, unit resolver; the harness's own check from inside the unit: lookup {}, connect {}",
             e["ip_deny"].as_str().unwrap_or("?"), e["lookup"].as_str().unwrap_or("?"), e["connect"].as_str().unwrap_or("?"))),
+        Some("stale") => fail(NAME, format!("{reason}; the harness takes no work it cannot reach the gateway for"),
+            format!("noo cluster provision {id}   # re-renders the hosts file and the allow list from the controller's current address")),
         Some("enforced") => fail(NAME, format!(
             "held off the internet, but {} changed address since the harness's hosts file was rendered: the harness cannot reach its controller (it never falls back to real DNS)",
             stale.join(", ")), format!("noo cluster provision {id}   # re-renders the hosts file and the allowlist")),
@@ -1617,11 +1627,13 @@ pub(crate) fn llamacpp_offload_check(n: &Value) -> Option<Check> {
     (!good.is_empty()).then(|| ok(NAME, good.join(", ")))
 }
 
-/// The oldest Docker Engine (major version) the project tests: CI's
-/// copy-owner job runs docker:27-dind. The one declared minimum: the
-/// `docker engine` verify row reads it, and docs/cli/fleet.md names it. The
-/// operator decides it (i1058); raise it here and nowhere else.
-pub(crate) const MIN_DOCKER_ENGINE_MAJOR: u64 = 27;
+/// The oldest Docker Engine (major version) noomesh supports: 28, the
+/// operator's decision of 2026-11-21 (was 27, i1058). CI's copy-owner job
+/// still runs docker:27-dind, as a canary BELOW this floor for the
+/// copy-owner bug of Engine 24-27 (#1387). The one declared minimum: the
+/// `docker engine` verify row reads it, and docs/cli/fleet.md names it.
+/// Below it is a verify WARN, never a refusal. Raise it here and nowhere else.
+pub(crate) const MIN_DOCKER_ENGINE_MAJOR: u64 = 28;
 
 /// The `docker engine` row (i1058), from the node's `docker_engine` fact.
 /// No row from an agent that predates the fact (a fleet mid-roll stays
@@ -1652,7 +1664,7 @@ pub(crate) fn docker_engine_check(n: &Value) -> Option<Check> {
                 Some(m) if m >= MIN_DOCKER_ENGINE_MAJOR => Some(ok(NAME, format!("{label} (minimum {MIN_DOCKER_ENGINE_MAJOR})"))),
                 Some(_) => Some(warn(NAME,
                     format!("{label} on {id} is below {MIN_DOCKER_ENGINE_MAJOR}, the oldest Docker Engine noomesh tests; known: a container-lane Ollama import fails on an engine below 28 with an agent before 0.6.28"),
-                    Some(format!("upgrade Docker Engine on {id} to {MIN_DOCKER_ENGINE_MAJOR} or newer (https://docs.docker.com/engine/install/), then: noo cluster verify {id}")))),
+                    Some(docker_engine_upgrade_remedy(id, kind)))),
                 None => Some(cannot(format!("version {version:?} does not parse"))),
             }
         }
@@ -1660,15 +1672,29 @@ pub(crate) fn docker_engine_check(n: &Value) -> Option<Check> {
     }
 }
 
-/// The oldest Docker Compose the project tests: CI's `start-inputs` job
+/// What to run on a node whose Docker Engine is below
+/// [`MIN_DOCKER_ENGINE_MAJOR`]. The heartbeat names the engine's kind, not the
+/// distro, so a Linux `dockerd` gets both supported routes: Docker's apt
+/// repository (docker-ce) and Docker's convenience script, as a file first
+/// (src/vendor.rs: never `curl … | sh`).
+pub(crate) fn docker_engine_upgrade_remedy(id: &str, kind: &str) -> String {
+    let min = MIN_DOCKER_ENGINE_MAJOR;
+    if kind == "docker-desktop" {
+        return format!("update Docker Desktop on {id} until its engine is {min} or newer, then: noo cluster verify {id}");
+    }
+    format!("upgrade Docker Engine on {id} to {min} or newer with the package manager, from the package that installed it: Docker's apt repository, sudo apt-get update && sudo apt-get install --only-upgrade docker-ce docker-ce-cli containerd.io docker-compose-plugin; or the distribution's own package, sudo apt-get update && sudo apt-get install --only-upgrade docker.io (only if the release ships {min} or newer); otherwise Docker's convenience script, downloaded then run (never piped): curl -fsSL --proto '=https' --tlsv1.2 https://get.docker.com -o get-docker.sh && sudo sh get-docker.sh (https://docs.docker.com/engine/install/); then: noo cluster verify {id}")
+}
+
+/// The oldest Docker Compose noomesh supports: 2.33.0, the Compose that Docker
+/// Engine 28 bundles (the operator's decision of 2026-11-21, with
+/// [`MIN_DOCKER_ENGINE_MAJOR`]; was 2.24.6). CI's `start-inputs` job
 /// (`.github/workflows/start-inputs.yml`) runs the launcher's real `up` path
-/// on the runner's Compose and on 2.24.6, Ubuntu 24.04's `docker-compose-v2`
-/// and the oldest Compose the documented install route gives (green on both
-/// in run 44668278238). The twin of [`MIN_DOCKER_ENGINE_MAJOR`], and the one
-/// declared minimum: the controller's `docker compose` verify row and `noo
-/// onboard`'s Docker probe read it, and docs/getting-started/install.md names
-/// it. The operator decides it; raise it here and nowhere else.
-pub(crate) const MIN_COMPOSE: (u32, u32, u32) = (2, 24, 6);
+/// on the runner's Compose, on this floor, and on 2.24.6 (Ubuntu 24.04's
+/// release-pocket `docker-compose-v2`) as a canary below it. The one declared
+/// minimum: the controller's `docker compose` verify row and `noo onboard`'s
+/// Docker probe read it, and docs/getting-started/install.md names it. Below
+/// it is a WARN, never a refusal. Raise it here and nowhere else.
+pub(crate) const MIN_COMPOSE: (u32, u32, u32) = (2, 33, 0);
 
 /// What `docker compose version --short` said on this machine. Compose runs
 /// only on the controller (the stack launcher); workers use the node agent's
@@ -1683,10 +1709,13 @@ pub(crate) enum ComposeVersion {
     Unreadable(String),
 }
 
-/// `2.24.6`, `v2.38.2`, `2.29.1-desktop.1` -> the three numbers. Anything
-/// else (empty, garbage, two parts) is `None`.
+/// `2.24.6`, `v2.38.2`, `v5.0.2`, `2.29.1-desktop.1`,
+/// `2.40.3+ds1-0ubuntu1~22.04.1` (Ubuntu's package), or the whole line
+/// `Docker Compose version v5.0.2` -> the three numbers: the last word, a
+/// leading `v` dropped, everything from the first `-` or `+` ignored.
+/// Anything else (empty, garbage, two parts) is `None`.
 pub(crate) fn parse_compose_version(text: &str) -> Option<(u32, u32, u32)> {
-    let t = text.trim();
+    let t = text.split_whitespace().next_back().unwrap_or("");
     let t = t.strip_prefix('v').unwrap_or(t);
     let core = t.split(['-', '+']).next().unwrap_or("");
     let mut parts = core.split('.').map(|p| p.parse::<u32>().ok());
@@ -1732,31 +1761,39 @@ pub(crate) fn read_compose_version(docker: &str) -> ComposeVersion {
     }
 }
 
-/// The plain-sentence remedy for a Compose below [`MIN_COMPOSE`]: noomesh
-/// cannot install it for the operator.
-pub(crate) fn compose_upgrade_remedy() -> String {
-    "upgrade the docker-compose-v2 package (or docker-compose-plugin from Docker's apt repository, or Docker Desktop), then: docker compose version".to_string()
+/// The remedy for a Compose below [`MIN_COMPOSE`], for this machine's package
+/// (onboard's `compose_package`: `docker-compose-plugin` from Docker's apt
+/// repository, `docker-compose-v2` from the distro, `None` off the Debian
+/// family). noomesh cannot install it for the operator.
+pub(crate) fn compose_upgrade_remedy(pkg: Option<&str>) -> String {
+    let min = min_compose_text();
+    match pkg {
+        Some("docker-compose-plugin") => format!("upgrade the docker-compose-plugin package to {min} or newer: sudo apt-get update && sudo apt-get install --only-upgrade docker-compose-plugin, then: docker compose version"),
+        Some(p) => format!("upgrade the {p} package to {min} or newer: sudo apt-get update && sudo apt-get install --only-upgrade {p}; if the distro's stays below {min}, install docker-compose-plugin from Docker's apt repository (https://docs.docker.com/engine/install/), then: docker compose version"),
+        None => format!("upgrade the Docker Compose v2 plugin (or Docker Desktop) to {min} or newer (https://docs.docker.com/compose/install/linux/), then: docker compose version"),
+    }
 }
 
-/// `"2.24.6"` from [`MIN_COMPOSE`].
+/// `"2.33.0"` from [`MIN_COMPOSE`].
 pub(crate) fn min_compose_text() -> String {
     format!("{}.{}.{}", MIN_COMPOSE.0, MIN_COMPOSE.1, MIN_COMPOSE.2)
 }
 
-/// The controller's `docker compose` row. Below [`MIN_COMPOSE`]: WARN, a
-/// declared floor and not a known failure (2.24.x does run the launcher; it
-/// recreates more dependents on a secret change). `Unreadable`: WARN,
-/// `cannot be checked`. `Missing` (no Compose v2): FAIL, as onboard's probe and
-/// the launcher's `require_compose_v2` refuse, with `none_remedy` (the
-/// package to install, from onboard). At or above: OK.
-pub(crate) fn docker_compose_check(v: &ComposeVersion, none_remedy: &str) -> Check {
+/// The controller's `docker compose` row. Below [`MIN_COMPOSE`]: WARN with
+/// `upgrade_remedy` ([`compose_upgrade_remedy`] for this machine), a declared
+/// floor and not a known failure (2.24.x does run the launcher; it recreates
+/// more dependents on a secret change). `Unreadable`: WARN, `cannot be
+/// checked`. `Missing` (no Compose v2): FAIL, as onboard's probe and the
+/// launcher's `require_compose_v2` refuse, with `none_remedy` (the package to
+/// install, from onboard). At or above: OK.
+pub(crate) fn docker_compose_check(v: &ComposeVersion, none_remedy: &str, upgrade_remedy: &str) -> Check {
     const NAME: &str = "docker compose";
     let min = min_compose_text();
     match v {
         ComposeVersion::Known(ver, text) if *ver >= MIN_COMPOSE => ok(NAME, format!("Docker Compose {text} (minimum {min})")),
         ComposeVersion::Known(_, text) => warn(NAME,
             format!("Docker Compose {text} is older than the oldest version noomesh tests ({min})"),
-            Some(compose_upgrade_remedy())),
+            Some(upgrade_remedy.to_string())),
         ComposeVersion::Unreadable(why) => warn(NAME,
             format!("cannot be checked: the Docker Compose version could not be read ({why})"),
             Some("docker compose version   # does the Compose v2 plugin answer?".to_string())),
@@ -1814,6 +1851,94 @@ pub(crate) fn vllm_compute_check(n: &Value) -> Option<Check> {
         format!("{id}: {} placed, but {}; its GPU is compute {c}", placed.join(", "), crate::vllm_floor::needs()),
         format!("noo cluster unplace {id} {backend}   # then: noo cluster place {id} ollama <model> (Ollama runs this GPU), or llamacpp"),
     ))
+}
+
+/// The placements of a node's desired config that use the TEI engine, which
+/// 0.6.30 no longer supports (i1182a): every `embedding` placement, and every `reranker`
+/// whose model is not a `.gguf` file or whose image is the TEI one. Each is
+/// `{"backend", "model"}`. The same rule as the gateway's refusal.
+pub(crate) fn removed_engine_placements(placements: &Value) -> Vec<Value> {
+    placements
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter(|p| {
+                    let model = p["model"].as_str().unwrap_or("").trim();
+                    let tei_image = p["image"].as_str().is_some_and(|i| i.to_ascii_lowercase().contains("text-embeddings-inference"));
+                    match p["backend"].as_str() {
+                        Some("embedding") => true,
+                        Some("reranker") => tei_image || (!model.is_empty() && !model.to_ascii_lowercase().ends_with(".gguf")),
+                        _ => false,
+                    }
+                })
+                .map(|p| serde_json::json!({"backend": p["backend"], "model": p["model"].as_str().unwrap_or("")}))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The `unsupported engine` row: the node's desired state holds a placement that
+/// uses the TEI engine (`removed_engine_placements`, injected by
+/// `with_harness_wanted` from desired-config). WARN for each, naming the
+/// replacement (an Ollama embedder, or the GGUF reranker) and the unplace of
+/// the old one; OK when none. No row when desired-config could not be read:
+/// "none" would then be a guess.
+pub(crate) fn removed_engine_check(n: &Value) -> Option<Check> {
+    const NAME: &str = "unsupported engine";
+    let id = n["id"].as_str().unwrap_or("?");
+    let found = n["removed_engine_placements"].as_array()?;
+    if found.is_empty() {
+        return Some(ok(NAME, "no placement uses an unsupported engine"));
+    }
+    let mut lines: Vec<String> = Vec::new();
+    let mut remedies: Vec<String> = Vec::new();
+    for p in found {
+        let backend = p["backend"].as_str().unwrap_or("?");
+        let model = p["model"].as_str().unwrap_or("");
+        let replace = if backend == "embedding" {
+            format!("noo cluster place {id} ollama <model> --role embed")
+        } else {
+            format!("noo cluster place {id} reranker <file>.gguf")
+        };
+        let who = if model.is_empty() { format!("{id} {backend}") } else { format!("{id} {backend} {model}") };
+        lines.push(format!("{who}: uses the TEI engine, which was removed in 0.6.30; nothing runs for this placement; replace it, then unplace it: {replace} && `noo cluster unplace {id} {backend}`"));
+        remedies.push(format!("{replace} && noo cluster unplace {id} {backend}"));
+    }
+    remedies.dedup();
+    Some(warn(NAME, lines.join("; "), Some(remedies.join("; "))))
+}
+
+/// The `unsupported engine space` row: an embedding space whose model no node
+/// serves and that names a Hugging Face repo id (`org/name`), the shape a
+/// TEI-served model has and an Ollama tag does not. Searches over its existing
+/// vectors still work; embed writes are refused until a node serves the model
+/// or the space is migrated. WARN naming the migrate command. `body` is
+/// `/api/cluster/embedding-spaces`; unreadable (None) gives no row, as that
+/// is already the `embedding spaces` row's WARN. This is a heuristic on the
+/// recorded model name: the gateway does not record which engine served it.
+pub(crate) fn removed_engine_space_check(body: Option<&Value>) -> Option<Check> {
+    const NAME: &str = "unsupported engine space";
+    let spaces = body?["spaces"].as_array()?;
+    let stale: Vec<(&str, &str)> = spaces
+        .iter()
+        .filter(|s| s["live"].as_u64().unwrap_or(0) + s["static_live"].as_u64().unwrap_or(0) == 0)
+        .filter_map(|s| Some((s["space"].as_str()?, s["model"].as_str()?)))
+        .filter(|(_, m)| m.contains('/') && !m.starts_with("hf.co/"))
+        .collect();
+    if stale.is_empty() {
+        return Some(ok(NAME, "no embedding space is bound to a model only an unsupported engine served"));
+    }
+    let detail = stale
+        .iter()
+        .map(|(sp, m)| format!("space {sp} model {m}: no node serves this model, and it is a Hugging Face id (the kind only the TEI engine, since removed, served); embed writes are refused until a node serves it or the space is migrated: `noo cluster embedding-space migrate {sp} <model>`"))
+        .collect::<Vec<_>>()
+        .join("; ");
+    let remedy = stale
+        .iter()
+        .map(|(sp, _)| format!("noo cluster embedding-space migrate {sp} <model>"))
+        .collect::<Vec<_>>()
+        .join("; ");
+    Some(warn(NAME, detail, Some(remedy)))
 }
 
 /// The hardened image of ours that replaces an upstream backend image
@@ -2521,8 +2646,22 @@ pub(crate) fn data_root_policy_row(n: &Value) -> Option<Check> {
     let pol = n.get("data_roots")?.get("policy")?;
     let id = n["id"].as_str().unwrap_or("?");
     let root = n["data_roots"]["noo_data_root"].as_str().unwrap_or("<root>");
+    // What the agent reads the root as (i1160): a boot-time mount (fstab or a
+    // systemd mount unit), a disk recorded at a known-good start, or a plain
+    // directory. Older agents do not say; then nothing is shown.
+    let kind = data_root_kind(&pol["filesystem"]);
+    // A disk that arrived over a root the node had already written to: those
+    // entries are under the mount now (the agent's count at its first look).
+    let hidden = data_root_hidden_note(&pol["filesystem"]);
+    // "Cannot tell" (an unreadable mount table, fstab or unit directory): the
+    // agent refuses nothing for it and says why; so does the row.
+    let hidden = match pol["filesystem"]["not_checked"].as_str() {
+        Some(why) if !why.is_empty() => format!("{hidden}; not checked: {why}"),
+        _ => hidden,
+    };
     if pol["ok"].as_bool() == Some(true) {
-        return Some(ok(NAME, format!("{root}: dedicated, conventional and owned by the agent")));
+        let k = kind.as_deref().map(|k| format!("; {k}")).unwrap_or_default();
+        return Some(ok(NAME, format!("{root}: dedicated, conventional and owned by the agent{k}{hidden}")));
     }
     let probs: Vec<&Value> = pol["problems"].as_array().map(|a| a.iter().collect()).unwrap_or_default();
     let codes: Vec<&str> = probs.iter().filter_map(|p| p["code"].as_str()).collect();
@@ -2543,6 +2682,8 @@ pub(crate) fn data_root_policy_row(n: &Value) -> Option<Check> {
     } else if self_owned_by_operator {
         "noo onboard --only services (declares your data root to the agent in /etc/noo/data-root-owner; asks for sudo once)"
             .to_string()
+    } else if only_ownership && codes.contains(&"missing") {
+        data_root_missing_remedy(id, root, pol["filesystem"]["meant"].as_str())
     } else if only_ownership {
         format!("on {id}: sudo install -d -o noo-agent -g noo-agent {root} && sudo chmod go-w {root}")
     } else {
@@ -2554,8 +2695,84 @@ pub(crate) fn data_root_policy_row(n: &Value) -> Option<Check> {
         };
         format!("noo cluster set-config {id} --data-root {target} && noo cluster provision {id} --move-data --wait")
     };
-    let msg = format!("{root}: {detail}");
+    let msg = match &kind {
+        Some(k) => format!("{root} [{k}]: {detail}{hidden}"),
+        None => format!("{root}: {detail}{hidden}"),
+    };
+    // Refused in warn mode too (the agent's safety problems, i1160): a root
+    // that does not answer, or whose mount is not there.
+    if codes.contains(&"not_answering") {
+        // The agent's detail already leads with the phrase; say it once.
+        let lead = format!("data root {root} not answering: ");
+        let rest = detail.strip_prefix(lead.as_str()).unwrap_or(detail.as_str());
+        return Some(fail(NAME, format!("{lead}{rest}"), data_root_hung_remedy(id, root)));
+    }
+    if codes.iter().any(|c| matches!(*c, "not_on_recorded_fs" | "mount_missing")) {
+        let mut r = data_root_mount_remedy(id, root);
+        // Only a DIFFERENT disk can have been replaced on purpose; a root back
+        // on the root filesystem is a missing mount, never re-recorded.
+        if codes.contains(&"not_on_recorded_fs") && detail.contains("on a different filesystem") {
+            r.push_str(&format!("; only if the disk was replaced or the root moved ON PURPOSE: on {id}: sudo rm {DATA_ROOT_FS_RECORD} (the agent records the new filesystem at its next check)"));
+        }
+        return Some(fail(NAME, msg, r));
+    }
     Some(if pol["mode"] == "enforce" { fail(NAME, msg, remedy) } else { warn(NAME, msg, Some(remedy)) })
+}
+
+/// `data_roots.policy.filesystem` as the row shows it: "mount (fstab)",
+/// "mount (systemd unit)", "mount (recorded)", "directory"; None when the
+/// agent does not say (older agents, or not Linux).
+fn data_root_kind(fs: &Value) -> Option<String> {
+    match (fs["meant"].as_str()?, fs["by"].as_str().unwrap_or("")) {
+        ("mount", "") => Some("mount".to_string()),
+        ("mount", by) => Some(format!("mount ({by})")),
+        ("directory", _) => Some("directory".to_string()),
+        _ => None,
+    }
+}
+
+/// `data_roots.policy.filesystem.hidden_note` (the agent's own sentence,
+/// node-agent-go dataroots.HiddenNote: how many entries a disk that arrived
+/// hides, since when, and the day the note clears) as "; <note>", or "".
+/// The agent stops sending it 7 days after the disk arrived.
+fn data_root_hidden_note(fs: &Value) -> String {
+    match fs["hidden_note"].as_str() {
+        Some(note) if !note.is_empty() => format!("; {note}"),
+        _ => String::new(),
+    }
+}
+
+/// The agent's record of each data root's filesystem
+/// (node-agent-go/internal/dataroots/fsid.go RecordFileName, in its state dir).
+const DATA_ROOT_FS_RECORD: &str = "/var/lib/noo-node-agent/data-root-fs.json";
+
+/// The remedy for a root whose mount is not there. It never creates the
+/// directory: `install -d` on an unmounted root makes an agent-owned
+/// directory on the ROOT disk, which the agent then fills and the mount
+/// later hides (i1160).
+pub(crate) fn data_root_mount_remedy(id: &str, root: &str) -> String {
+    format!("on {id}: the mount for {root} is not there: mount it (check `findmnt {root}`, your fstab or systemd mount unit) — do NOT create the directory, a mount would hide it; \
+             the agent clears this by itself once the mount is back")
+}
+
+/// The remedy for a root that does not answer (a hung mount, a failing disk).
+fn data_root_hung_remedy(id: &str, root: &str) -> String {
+    format!("on {id}: the disk under {root} does not answer (a hung NFS mount or a failing disk): check `findmnt {root}` and \
+             `dmesg | grep -iE 'I/O error|nfs|usb|nvme'`; the agent keeps beating and refuses backend starts and fetches into it until it answers")
+}
+
+/// The remedy for a MISSING root: create it only when it is meant to be a
+/// plain directory (`data_roots.policy.filesystem.meant`, sent by agents
+/// since 0.6.30); a mount, or a root an older agent cannot say, gets the
+/// mount remedy first.
+pub(crate) fn data_root_missing_remedy(id: &str, root: &str, meant: Option<&str>) -> String {
+    let create = format!("sudo install -d -o noo-agent -g noo-agent {root} && sudo chmod go-w {root}");
+    match meant {
+        Some("directory") => format!("on {id}: {create}"),
+        Some("mount") => data_root_mount_remedy(id, root),
+        _ => format!("{}; only if {root} is meant to be a plain directory on this disk (no mount): on {id}: {create}",
+            data_root_mount_remedy(id, root)),
+    }
 }
 
 /// The node record plus the gateway's answer on the harness (and the
@@ -2598,6 +2815,8 @@ fn with_harness_wanted(g: &Globals, n: &Value) -> Value {
     // The `vllm compute` row: the vLLM placements, judged against the node's
     // gpu_compute_cap.
     let vllm_placed = desired.as_ref().map(|d| vllm_placements(&d["placements"])).unwrap_or_default();
+    // The `unsupported engine` row: placements on the TEI engine (i1182a).
+    let removed_engines = desired.as_ref().map(|d| removed_engine_placements(&d["placements"]));
     // Control over the bus: a node that advertises it gets one health round
     // trip over NATS, run by the gateway (the only principal that may send).
     // Nothing is asked of a node that does not advertise, so its row reads
@@ -2639,11 +2858,19 @@ fn with_harness_wanted(g: &Globals, n: &Value) -> Value {
         if !vllm_placed.is_empty() {
             obj.insert("vllm_placements".into(), serde_json::json!(vllm_placed));
         }
+        if let Some(r) = removed_engines {
+            obj.insert("removed_engine_placements".into(), serde_json::json!(r));
+        }
         if let Some(w) = wanted {
             obj.insert("harness_wanted".into(), Value::Bool(w));
         }
         if let Some(d) = declared {
             obj.insert("declared_data_root".into(), Value::String(d));
+        }
+        // The `holds` row: what onboard held on THIS machine, for its own
+        // node only (another machine's record is not readable from here).
+        if crate::role::is_self_node(&id) {
+            obj.insert("onboard_docker_holds".into(), serde_json::json!(crate::docker_hold::recorded_here()));
         }
     }
     n
@@ -2701,7 +2928,23 @@ pub(crate) fn gpu_driver_remedy(host: &Value, next: &str, running: &str, runbook
     }
 }
 
+/// What onboard held on this machine (`docker_hold::RECORD_PATH`), as
+/// [`with_harness_wanted`] injects it for the self node only. `None` for any
+/// other node: this box cannot read another machine's record. Pure.
+pub(crate) fn onboard_holds_of(n: &Value) -> Option<Vec<String>> {
+    n["onboard_docker_holds"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+}
+
+/// [`host_checks_with`] for a node whose onboard record is not known here.
+#[cfg(test)]
 pub(crate) fn host_checks(id: &str, host: &Value, hostd_alive: bool) -> Vec<Check> {
+    host_checks_with(id, host, hostd_alive, None)
+}
+
+/// [`host_checks`], with what onboard held on this node when it is this
+/// machine (`onboard`: `None` = not known here, `Some(&[])` = onboard held
+/// nothing). The `holds` row then says whether onboard placed the hold.
+pub(crate) fn host_checks_with(id: &str, host: &Value, hostd_alive: bool, onboard: Option<&[String]>) -> Vec<Check> {
     let mut out = Vec::new();
     if host.is_null() {
         if hostd_alive {
@@ -2771,10 +3014,10 @@ pub(crate) fn host_checks(id: &str, host: &Value, hostd_alive: bool) -> Vec<Chec
         let mut unheld: Vec<&str> = platform.keys().map(String::as_str).filter(|p| !held.contains(p)).collect();
         unheld.sort_unstable();
         if unheld.is_empty() {
-            out.push(ok("holds", format!("{} platform package(s) held", platform.len())));
+            out.push(ok("holds", holds_ok_detail(platform.len(), onboard)));
         } else {
             out.push(warn("holds",
-                holds_detail(&unheld),
+                holds_detail_with(&unheld, onboard),
                 Some(format!("on {id}: sudo apt-mark hold {}", unheld.join(" ")))));
         }
     }
@@ -2836,6 +3079,38 @@ pub(crate) fn holds_detail(unheld: &[&str]) -> String {
     }
     let also = if other.is_empty() { String::new() } else { format!(" (also not pinned: {})", other.join(", ")) };
     format!("Docker isn't pinned ({}): a routine `apt upgrade` can restart every container. Hold it when you want control.{also}", docker.join(", "))
+}
+
+/// The `holds` row when every platform package is held, saying which holds
+/// onboard placed (i1098 row 12) when this is the machine onboard ran on, so
+/// months later the reason apt will not upgrade Docker is on the row. Pure.
+pub(crate) fn holds_ok_detail(count: usize, onboard: Option<&[String]>) -> String {
+    match onboard {
+        None => format!("{count} platform package(s) held"),
+        Some([]) => format!("{count} platform package(s) held; onboard placed none of these holds (it holds only a Docker it installed)"),
+        Some(held) => format!(
+            "{count} platform package(s) held; onboard held {} when it installed Docker, so an unattended upgrade cannot restart dockerd. To take an update: {}",
+            held.join(", "), crate::docker_hold::update_path(held)),
+    }
+}
+
+/// [`holds_detail`], plus whether onboard placed a hold on the Docker that is
+/// not held now, when this is the machine onboard ran on. Pure.
+pub(crate) fn holds_detail_with(unheld: &[&str], onboard: Option<&[String]>) -> String {
+    let base = holds_detail(unheld);
+    let Some(held) = onboard else { return base };
+    let docker_unheld: Vec<&str> = unheld.iter().copied().filter(|p| crate::docker_hold::CANDIDATES.contains(p)).collect();
+    if docker_unheld.is_empty() {
+        return base;
+    }
+    let released: Vec<&str> = docker_unheld.iter().copied().filter(|p| held.iter().any(|h| h == p)).collect();
+    if held.is_empty() {
+        format!("{base} Onboard placed no hold here: it holds only a Docker it installed itself.")
+    } else if released.is_empty() {
+        format!("{base} Onboard holds {} (it installed them); it did not install these.", held.join(", "))
+    } else {
+        format!("{base} Onboard held {} when it installed Docker, and the hold is gone (released for an update? hold it again).", released.join(", "))
+    }
 }
 
 /// The `host telemetry` row (docs/security/telemetry.md, "Host software").
@@ -3416,6 +3691,27 @@ pub(crate) fn default_chat_check(classes: Option<&Value>, has_gpu: Option<bool>,
         return ok(NAME, detail);
     }
     ok(NAME, format!("{detail} — {}", later.join("; ")))
+}
+
+/// The `reranker` row (i1182a): the gateway's own `capabilities.rerank`
+/// (a live node advertises rerank). Without one, `/api/external/rerank` is
+/// served by the chat model, which may answer the input order unranked.
+/// A warning: callers still get an answer, marked for what it is.
+pub(crate) fn reranker_check(caps: Option<&Value>) -> Check {
+    const NAME: &str = "reranker";
+    const PLACE: &str = "noo cluster place <node> reranker <file>.gguf --on cpu";
+    let Some(caps) = caps else {
+        return warn(NAME, "not read (GET /api/external/capabilities)", None);
+    };
+    match caps["rerank"]["available"].as_bool() {
+        Some(true) => ok(NAME, "a reranker node serves /api/external/rerank"),
+        Some(false) => warn(
+            NAME,
+            "no reranker placed; rerank requests are served by the chat model, and when it ranks nothing the answer is the input order with no scores (noo.degraded: identity)",
+            Some(PLACE.into()),
+        ),
+        None => warn(NAME, "the gateway's capabilities carry no rerank.available", None),
+    }
 }
 
 /// The `embedding spaces` row (i145): each space, its one model and how many
@@ -4645,6 +4941,14 @@ fn grafana_mounts_sso_pub() -> Option<bool> {
     }))
 }
 
+fn retired_text(v: &[&crate::pki::KeyIssue]) -> String {
+    format!(
+        "{} leftover private key(s) of the TEI engine removed in 0.6.30 — nothing reads them; delete it by hand: {}",
+        v.len(),
+        v.iter().map(|i| format!("{} {:04o}", i.rel, i.mode)).collect::<Vec<_>>().join(", ")
+    )
+}
+
 /// The "pki key modes" row. Every private key under the PKI dir has one
 /// reader (`pki::KeyReader`). A key readable beyond it (0644, a group
 /// that is not its reader's) is a FAIL: that is a private key someone
@@ -4656,7 +4960,7 @@ fn grafana_mounts_sso_pub() -> Option<bool> {
 /// readable beyond its owner is a WARN that `fix-modes` closes (i277a). Issuance, `noo upgrade --stack`, provision and
 /// onboard set every mode they can, so a FAIL here that needs no sudo
 /// line means one of them has not run since the key changed.
-pub(crate) fn pki_key_modes_check(issues: &[crate::pki::KeyIssue], grant_lines: &[String], total_keys: usize) -> Check {
+pub(crate) fn pki_key_modes_check(issues: &[crate::pki::KeyIssue], grant_lines: &[String], total_keys: usize, pki_dir: &std::path::Path) -> Check {
     use crate::pki::KeyIssueKind as K;
     let names = |kind: K| -> Vec<String> {
         issues.iter().filter(|i| i.kind == kind).map(|i| format!("{} {:04o}", i.rel, i.mode)).collect()
@@ -4681,6 +4985,14 @@ pub(crate) fn pki_key_modes_check(issues: &[crate::pki::KeyIssue], grant_lines: 
             if grant_lines.is_empty() { "noo security pki fix-modes --dry-run".to_string() } else { grant_lines.join(" && ") },
         );
     }
+    let retired_open: Vec<&crate::pki::KeyIssue> = issues.iter().filter(|i| i.kind == K::RetiredLeaf && i.mode & 0o077 != 0).collect();
+    if !retired_open.is_empty() {
+        return fail(
+            "pki key modes",
+            retired_text(&retired_open),
+            retired_open.iter().map(|i| crate::pki::retired_leaf_rm_line(pki_dir, &i.rel)).collect::<Vec<_>>().join(" && "),
+        );
+    }
     let unreadable = names(K::Unreadable);
     if !unreadable.is_empty() {
         return warn(
@@ -4697,6 +5009,17 @@ pub(crate) fn pki_key_modes_check(issues: &[crate::pki::KeyIssue], grant_lines: 
             // A key with no reader entry is a third-party add-on's: its only
             // consumers are the provision copies, so fix-modes makes it 0600.
             Some("noo security pki fix-modes".to_string()),
+        );
+    }
+    // Retired TEI leaves: nothing reads them, so any other-account access is
+    // pure exposure. Group/world-readable (mode & 0o077) is a FAIL (above the
+    // WARN-only kinds); owner-only is a WARN. Both name `rm <path>`.
+    let retired_warn: Vec<&crate::pki::KeyIssue> = issues.iter().filter(|i| i.kind == K::RetiredLeaf).collect();
+    if !retired_warn.is_empty() {
+        return warn(
+            "pki key modes",
+            retired_text(&retired_warn),
+            Some(retired_warn.iter().map(|i| crate::pki::retired_leaf_rm_line(pki_dir, &i.rel)).collect::<Vec<_>>().join(" && ")),
         );
     }
     ok("pki key modes", format!("{total_keys} private key(s), each readable only by its reader"))
@@ -5690,9 +6013,6 @@ pub(crate) const COMPOSE_BACKENDS: &[(&str, BackendFront)] = &[
     ("vllm-secondary", BackendFront::Stunnel("vllm-secondary")),
     ("llamacpp", BackendFront::Stunnel("llamacpp")),
     ("ollama", BackendFront::Stunnel("ollama")),
-    ("tei", BackendFront::Stunnel("tei")),
-    ("tei-gpu", BackendFront::Stunnel("tei-gpu")),
-    ("reranker", BackendFront::Stunnel("reranker")),
     ("ollama-embed", BackendFront::Stunnel("ollama-embed")),
     ("ollama-embed-cpu", BackendFront::Stunnel("ollama-embed-cpu")),
 ];
@@ -9471,6 +9791,9 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         checks.push(default_chat_check(model_classes.as_ref(), fleet_has_gpu(&fleet), fleet_node_count(&fleet)));
         let spaces = get_json_opt(g, "/api/cluster/embedding-spaces", true, 15);
         checks.push(embedding_spaces_check(spaces.as_ref()));
+        // i1182a: with no reranker placed, rerank is the chat model's.
+        checks.push(reranker_check(get_json_opt(g, "/api/external/capabilities", true, 15).as_ref()));
+        checks.extend(removed_engine_space_check(spaces.as_ref()));
         // Finding 126: a loaded model measured over its estimate or pool.
         let fit_ids: Vec<&str> = fleet.iter().filter_map(|n| n["id"].as_str()).collect();
         let fits: Vec<(String, Option<Value>)> = par_map(&fit_ids, |id| {
@@ -9549,10 +9872,14 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             .iter()
             .filter_map(|k| sso.key_grant_command(k))
             .collect();
-        checks.push(pki_key_modes_check(&key_issues, &grant_lines, sso.list_keys().len()));
+        checks.push(pki_key_modes_check(&key_issues, &grant_lines, sso.list_keys().len(), &sso.dir));
         checks.push(docker_userns_check(read_daemon_json()));
         // Compose runs only here (the stack launcher); nodes never run it.
-        checks.push(docker_compose_check(&read_compose_version("docker"), &crate::onboard::steps::compose_remedy_here()));
+        checks.push(docker_compose_check(
+            &read_compose_version("docker"),
+            &crate::onboard::steps::compose_remedy_here(),
+            &crate::onboard::steps::compose_upgrade_remedy_here(),
+        ));
         checks.push(tailscale_ssh_check(tailscale_status));
         let gw_mounts = std::fs::read_to_string(crate::envfile::repo_root().join("docker-compose.cluster.yml"))
             .ok()
@@ -11955,7 +12282,7 @@ mod tests {
     }
 
     /// Every shape of the `backend doors` row, one plant at a time, on a
-    /// node running vLLM and TEI in Docker and a NATIVE ollama (no door —
+    /// node running vLLM and a reranker in Docker and a NATIVE ollama (no door —
     /// the operator's loopback process, never judged here).
     #[test]
     fn the_backend_doors_row_judges_each_shape() {
@@ -11964,24 +12291,24 @@ mod tests {
         let far = now + 80 * 86_400;
         let base = || {
             let mut n = healthy(now);
-            n["running_backends"] = serde_json::json!({"vllm": "m", "embedding": "harrier", "ollama": "gemma"});
-            n["backend_runtimes"] = serde_json::json!({"vllm": "docker", "embedding": "docker", "ollama": "native"});
+            n["running_backends"] = serde_json::json!({"vllm": "m", "reranker": "bge-reranker-v2-m3-Q8_0.gguf", "ollama": "gemma"});
+            n["backend_runtimes"] = serde_json::json!({"vllm": "docker", "reranker": "docker", "ollama": "native"});
             n["backend_leaves"] = serde_json::json!({
                 "vllm": {"dns": ["vllm", "noo-vllm", "noo-vllm-secondary"], "not_after": far},
-                "tei": {"dns": ["tei", "noo-stunnel-tei"], "not_after": far},
+                "reranker": {"dns": ["reranker", "noo-stunnel-reranker"], "not_after": far},
             });
             n
         };
         let good = |svc: &str| match svc {
             "vllm" => door_leaf(&["vllm", "localhost", "noo-vllm", "noo-vllm-secondary"], far),
-            "tei" => door_leaf(&["tei", "localhost", "noo-stunnel-tei"], far),
+            "reranker" => door_leaf(&["reranker", "localhost", "noo-stunnel-reranker"], far),
             other => panic!("read a leaf for {other}, which has no docker backend here"),
         };
         let judge = |n: &Value, leaf: &dyn Fn(&str) -> LeafState| backend_doors_check(n, leaf, now);
 
         let c = judge(&base(), &good);
         assert_eq!(c.verdict, Verdict::Ok, "{}", c.detail);
-        assert!(c.detail.contains("embedding") && c.detail.contains("vllm") && !c.detail.contains("ollama"), "{}", c.detail);
+        assert!(c.detail.contains("reranker") && c.detail.contains("vllm") && !c.detail.contains("ollama"), "{}", c.detail);
 
         // Agent predates the report: WARN, never OK, never FAIL on that alone.
         let mut n = base();
@@ -11993,10 +12320,10 @@ mod tests {
         // Refusals: backend_door (plaintext) and backend_tls (refused start).
         for scope in ["backend_door", "backend_tls"] {
             let mut n = base();
-            n["reconcile_refusals"] = serde_json::json!([{ "scope": scope, "target": "embedding", "reason": "r" }]);
+            n["reconcile_refusals"] = serde_json::json!([{ "scope": scope, "target": "reranker", "reason": "r" }]);
             let c = judge(&n, &good);
             assert_eq!(c.verdict, Verdict::Fail, "{scope}");
-            assert!(c.detail.contains("embedding") && c.detail.contains(scope), "{}", c.detail);
+            assert!(c.detail.contains("reranker") && c.detail.contains(scope), "{}", c.detail);
             assert!(c.remedy.as_deref().unwrap().starts_with("noo cluster provision host3"));
         }
 
@@ -12006,21 +12333,21 @@ mod tests {
             assert_eq!(c.verdict, Verdict::Fail, "{needle}: {}", c.detail);
             assert!(c.detail.contains(needle), "{needle}: {}", c.detail);
         };
-        fails(&|s: &str| if s == "tei" { LeafState::Missing } else { good(s) }, "holds no tei leaf");
-        fails(&|s: &str| if s == "tei" { door_leaf(&["tei", "noo-tei"], far) } else { good(s) }, "does not name noo-stunnel-tei");
+        fails(&|s: &str| if s == "reranker" { LeafState::Missing } else { good(s) }, "holds no reranker leaf");
+        fails(&|s: &str| if s == "reranker" { door_leaf(&["reranker", "noo-reranker"], far) } else { good(s) }, "does not name noo-stunnel-reranker");
         fails(&|s: &str| if s == "vllm" { door_leaf(&["noo-vllm"], now + 3 * 86_400) } else { good(s) }, "expires in 3 days");
 
         // Node-side report: missing, not naming the door, expiring.
         let mut n = base();
-        n["backend_leaves"].as_object_mut().unwrap().remove("tei");
+        n["backend_leaves"].as_object_mut().unwrap().remove("reranker");
         let c = judge(&n, &good);
         assert_eq!(c.verdict, Verdict::Fail);
-        assert!(c.detail.contains("node holds no services/tei leaf"), "{}", c.detail);
+        assert!(c.detail.contains("node holds no services/reranker leaf"), "{}", c.detail);
         let mut n = base();
         n["backend_leaves"]["vllm"]["dns"] = serde_json::json!(["vllm"]);
         assert!(judge(&n, &good).detail.contains("node's services/vllm leaf does not name noo-vllm"));
         let mut n = base();
-        n["backend_leaves"]["tei"]["not_after"] = serde_json::json!(now + 86_400);
+        n["backend_leaves"]["reranker"]["not_after"] = serde_json::json!(now + 86_400);
         assert_eq!(judge(&n, &good).verdict, Verdict::Fail);
 
         // vllm-secondary shares the vllm leaf and is dialled by its own name.
@@ -12031,13 +12358,13 @@ mod tests {
     }
 
     /// A node record whose `backend doors` fails only because the node has
-    /// no tei leaf YET, with the node's `backend_containers` report as given
+    /// no reranker leaf YET, with the node's `backend_containers` report as given
     /// `far`-dated leaves otherwise.
     fn door_warmup_case(now: i64, containers: Option<Value>) -> (Value, impl Fn(&str) -> crate::commands::node_leaves::LeafState) {
         let far = now + 80 * 86_400;
         let mut n = healthy(now);
-        n["running_backends"] = serde_json::json!({"vllm": "m", "embedding": "harrier"});
-        n["backend_runtimes"] = serde_json::json!({"vllm": "docker", "embedding": "docker"});
+        n["running_backends"] = serde_json::json!({"vllm": "m", "reranker": "bge-reranker-v2-m3-Q8_0.gguf"});
+        n["backend_runtimes"] = serde_json::json!({"vllm": "docker", "reranker": "docker"});
         n["backend_leaves"] = serde_json::json!({
             "vllm": {"dns": ["vllm", "noo-vllm", "noo-vllm-secondary"], "not_after": far},
         });
@@ -12046,7 +12373,7 @@ mod tests {
         }
         let good = move |svc: &str| match svc {
             "vllm" => door_leaf(&["vllm", "localhost", "noo-vllm", "noo-vllm-secondary"], far),
-            "tei" => door_leaf(&["tei", "localhost", "noo-stunnel-tei"], far),
+            "reranker" => door_leaf(&["reranker", "localhost", "noo-stunnel-reranker"], far),
             other => panic!("read a leaf for {other}"),
         };
         (n, good)
@@ -12059,7 +12386,7 @@ mod tests {
         e
     }
 
-    /// The first verify after a bundle apply. The node's tei
+    /// The first verify after a bundle apply. The node's reranker
     /// door has no leaf yet and its container started 5s ago, health
     /// starting: `starting`, not FAIL, no remedy. Past the window the same
     /// record FAILs and names the backend.
@@ -12067,42 +12394,42 @@ mod tests {
     fn a_node_backend_five_seconds_old_and_starting_reads_starting() {
         let now = 1_800_000_000;
         let (n, leaf) = door_warmup_case(now, Some(serde_json::json!({
-            "vllm": life(now, 4000, Some("healthy")), "embedding": life(now, 5, Some("starting")) })));
+            "vllm": life(now, 4000, Some("healthy")), "reranker": life(now, 5, Some("starting")) })));
         let c = backend_doors_check(&n, &leaf, now);
         assert_eq!(c.verdict, Verdict::Starting, "{}", c.detail);
-        assert!(c.detail.starts_with("starting (embedding 5s since start, health=starting"), "{}", c.detail);
-        assert!(c.detail.contains("node holds no services/tei leaf"), "the unproven problem stays visible: {}", c.detail);
+        assert!(c.detail.starts_with("starting (reranker 5s since start, health=starting"), "{}", c.detail);
+        assert!(c.detail.contains("node holds no services/reranker leaf"), "the unproven problem stays visible: {}", c.detail);
         assert!(c.remedy.is_none(), "{:?}", c.remedy);
         assert_eq!(checks_json(&[c])[0]["verdict"], "starting");
 
         // The agent's own refusal for that missing leaf (the reason text
         // node-agent-go writes) is warm-up too.
-        let (mut n, leaf) = door_warmup_case(now, Some(serde_json::json!({ "embedding": life(now, 5, Some("starting")) })));
-        n["backend_leaves"]["tei"] = serde_json::json!({"dns": ["tei", "noo-stunnel-tei"], "not_after": now + 80 * 86_400});
-        n["reconcile_refusals"] = serde_json::json!([{ "scope": "backend_tls", "target": "embedding",
-            "reason": "this node's PKI dir has no services/tei leaf (/etc/noo/pki/services/tei/service.crt: no such file or directory); ..." }]);
+        let (mut n, leaf) = door_warmup_case(now, Some(serde_json::json!({ "reranker": life(now, 5, Some("starting")) })));
+        n["backend_leaves"]["reranker"] = serde_json::json!({"dns": ["reranker", "noo-stunnel-reranker"], "not_after": now + 80 * 86_400});
+        n["reconcile_refusals"] = serde_json::json!([{ "scope": "backend_tls", "target": "reranker",
+            "reason": "this node's PKI dir has no services/reranker leaf (/etc/noo/pki/services/reranker/service.crt: no such file or directory); ..." }]);
         n["backend_containers"]["vllm"] = life(now, 4000, Some("healthy"));
         let c = backend_doors_check(&n, &leaf, now);
         assert_eq!(c.verdict, Verdict::Starting, "{}", c.detail);
 
         // Past the window: FAIL, remedy kept, the backend named.
         let (n, leaf) = door_warmup_case(now, Some(serde_json::json!({
-            "embedding": life(now, warmup::WARMUP_WINDOW_SECS, Some("starting")) })));
+            "reranker": life(now, warmup::WARMUP_WINDOW_SECS, Some("starting")) })));
         let c = backend_doors_check(&n, &leaf, now);
         assert_eq!(c.verdict, Verdict::Fail, "{}", c.detail);
-        assert!(c.detail.contains("the embedding container has been up 180s, past the 180s warm-up"), "{}", c.detail);
+        assert!(c.detail.contains("the reranker container has been up 180s, past the 180s warm-up"), "{}", c.detail);
         assert!(c.remedy.is_some());
 
         // Inside the window but not warming: unhealthy, healthy, stopped.
         for e in [life(now, 5, Some("unhealthy")), life(now, 5, Some("healthy")),
             serde_json::json!({"running": false, "started_at": now - 5})] {
-            let (n, leaf) = door_warmup_case(now, Some(serde_json::json!({ "embedding": e.clone() })));
+            let (n, leaf) = door_warmup_case(now, Some(serde_json::json!({ "reranker": e.clone() })));
             let c = backend_doors_check(&n, &leaf, now);
             assert_eq!(c.verdict, Verdict::Fail, "{e}: {}", c.detail);
-            assert!(c.detail.contains("the embedding container"), "{}", c.detail);
+            assert!(c.detail.contains("the reranker container"), "{}", c.detail);
         }
         // No healthcheck declared: uptime alone explains it, as for Loki.
-        let (n, leaf) = door_warmup_case(now, Some(serde_json::json!({ "embedding": life(now, 40, None) })));
+        let (n, leaf) = door_warmup_case(now, Some(serde_json::json!({ "reranker": life(now, 40, None) })));
         assert_eq!(backend_doors_check(&n, &leaf, now).verdict, Verdict::Starting);
     }
 
@@ -12119,8 +12446,8 @@ mod tests {
         for report in [
             serde_json::json!({}),
             serde_json::json!({ "vllm": life(now, 5, Some("starting")) }),
-            serde_json::json!({ "embedding": {"running": true, "health": "starting"} }),
-            serde_json::json!({ "embedding": {"started_at": now - 5, "health": "starting"} }),
+            serde_json::json!({ "reranker": {"running": true, "health": "starting"} }),
+            serde_json::json!({ "reranker": {"started_at": now - 5, "health": "starting"} }),
             Value::Null,
         ] {
             let (n, leaf) = door_warmup_case(now, Some(report.clone()));
@@ -12134,7 +12461,7 @@ mod tests {
     #[test]
     fn backend_doors_security_faults_never_soften() {
         let now = 1_800_000_000;
-        let fresh = serde_json::json!({ "vllm": life(now, 5, Some("starting")), "embedding": life(now, 5, Some("starting")) });
+        let fresh = serde_json::json!({ "vllm": life(now, 5, Some("starting")), "reranker": life(now, 5, Some("starting")) });
         type Plant = Box<dyn Fn(&mut Value)>;
         let plants: Vec<(&str, Plant)> = vec![
             ("node leaf not naming its door", Box::new(|n: &mut Value| n["backend_leaves"]["vllm"]["dns"] = serde_json::json!(["vllm"]))),
@@ -12244,6 +12571,41 @@ mod tests {
         let mut ctl = with_egress(now, serde_json::json!({"state": "unknown"}));
         ctl["self_node"] = true.into();
         assert!(node_checks(&ctl, "v0.2.70", "0.5.57", now, Some(true)).iter().all(|c| c.name != "harness egress"));
+    }
+
+    /// i1246: the row reads the harness's CURRENT check. A stopped harness has
+    /// no row (robopi: policy auto, no chat model), the age is shown, a
+    /// replaced private resolv.conf alone is a WARN (the allow list still
+    /// holds), and a gateway the hold cuts off is its own FAIL with re-apply.
+    #[test]
+    fn the_harness_egress_row_reads_the_current_check() {
+        let now = 1_800_000_000;
+        let held = serde_json::json!({"state": "enforced", "reason": "", "ip_deny": "0.0.0.0/0 ::/0", "ip_allow": "127.0.0.1/32 ::1/128 10.0.0.5/32",
+            "resolver": "unit", "pid_match": true, "lookup": "failed", "connect": "timeout", "stale_hosts": [], "checked_age_secs": 40, "resolv_held": true});
+        let row = |e: serde_json::Value| node_checks(&with_egress(now, e), "v0.2.70", "0.5.57", now, Some(true)).into_iter().find(|c| c.name == "harness egress");
+
+        let ok = row(held.clone()).unwrap();
+        assert_eq!(ok.verdict, Verdict::Ok);
+        assert!(ok.detail.starts_with("held off the internet (checked 40s ago):"), "{}", ok.detail);
+
+        let mut lost = held.clone();
+        lost["resolv_held"] = false.into();
+        let w = row(lost).unwrap();
+        assert_eq!(w.verdict, Verdict::Warn);
+        assert!(w.detail.contains("private resolv.conf was replaced") && w.detail.contains("nothing leaks"), "{}", w.detail);
+
+        let mut stale = held.clone();
+        stale["state"] = "stale".into();
+        stale["reason"] = "held, but the harness cannot reach the gateway at 10.0.0.5:8443 from inside its hold (the allow list may be stale): re-apply".into();
+        let f = row(stale).unwrap();
+        assert_eq!(f.verdict, Verdict::Fail);
+        assert!(f.detail.contains("cannot reach the gateway at 10.0.0.5:8443"), "{}", f.detail);
+        assert!(f.remedy.as_deref().unwrap().starts_with("noo cluster provision host6"), "{:?}", f.remedy);
+
+        let mut stopped = with_egress(now, serde_json::json!({"state": "unknown", "reason": "the harness unit is not running"}));
+        stopped["host_services"]["harness"]["state"] = "stopped".into();
+        assert!(node_checks(&stopped, "v0.2.70", "0.5.57", now, Some(true)).iter().all(|c| c.name != "harness egress"),
+            "a stopped harness (and its egress object) gives no row");
     }
 
     /// A harness under a runtime with no hold (node-mac, a Mac node: launchd)
@@ -12987,36 +13349,36 @@ mod tests {
     fn the_pki_key_modes_row_names_the_file_and_the_fix() {
         use crate::pki::{KeyIssue, KeyIssueKind, KeyReader};
         let exposed = KeyIssue { rel: "nodes/host3/node.key".into(), mode: 0o644, reader: KeyReader::Cli, kind: KeyIssueKind::Exposed };
-        let c = pki_key_modes_check(std::slice::from_ref(&exposed), &[], 5);
+        let c = pki_key_modes_check(std::slice::from_ref(&exposed), &[], 5, std::path::Path::new("/p"));
         assert_eq!(c.verdict, Verdict::Fail, "a world-readable private key is a failure, not a warning");
         assert!(c.detail.contains("nodes/host3/node.key 0644"), "{}", c.detail);
         assert!(c.remedy.as_deref().unwrap().starts_with("noo security pki fix-modes"), "{:?}", c.remedy);
         // Owned by another uid and unreadable here: only the sudo line helps.
         let foreign = KeyIssue { rel: "services/nats/service.key".into(), mode: 0o600, reader: KeyReader::ContainerRoot, kind: KeyIssueKind::WrongOwner };
         let chown = "sudo chown 1000:1000 /p/services/nats/service.key && sudo chmod 600 /p/services/nats/service.key".to_string();
-        let c = pki_key_modes_check(std::slice::from_ref(&foreign), std::slice::from_ref(&chown), 5);
+        let c = pki_key_modes_check(std::slice::from_ref(&foreign), std::slice::from_ref(&chown), 5, std::path::Path::new("/p"));
         assert_eq!(c.verdict, Verdict::Fail);
         assert!(c.detail.contains("services/nats/service.key 0600") && c.detail.contains("another uid"), "{}", c.detail);
         assert_eq!(c.remedy.as_deref(), Some(chown.as_str()));
         let unreadable = KeyIssue { rel: "services/loki/service.key".into(), mode: 0o640, reader: KeyReader::ContainerUid(65532), kind: KeyIssueKind::Unreadable };
         let line = "sudo chgrp 65532 /p/services/loki/service.key && sudo chmod 640 /p/services/loki/service.key".to_string();
-        let c = pki_key_modes_check(&[unreadable], std::slice::from_ref(&line), 5);
+        let c = pki_key_modes_check(&[unreadable], std::slice::from_ref(&line), 5, std::path::Path::new("/p"));
         assert_eq!(c.verdict, Verdict::Warn);
         assert!(c.detail.contains("services/loki/service.key"), "{}", c.detail);
         assert_eq!(c.remedy.as_deref(), Some(line.as_str()));
         let unknown = KeyIssue { rel: "services/mystery/service.key".into(), mode: 0o644, reader: KeyReader::Unknown, kind: KeyIssueKind::UnknownReader };
-        let c = pki_key_modes_check(&[unknown], &[], 5);
+        let c = pki_key_modes_check(&[unknown], &[], 5, std::path::Path::new("/p"));
         assert_eq!(c.verdict, Verdict::Warn);
         let r = c.remedy.unwrap();
         assert_eq!(r, "noo security pki fix-modes", "fix-modes makes a no-reader key 0600 (i277a)");
         assert!(c.detail.contains("services/mystery/service.key 0644"), "{}", c.detail);
         // Exposure outranks an unreadable key: the fix for both is the same verb,
         // and the sudo line rides along when the verb alone cannot finish it.
-        let c = pki_key_modes_check(&[exposed, KeyIssue { rel: "x".into(), mode: 0o640, reader: KeyReader::ContainerUid(70), kind: KeyIssueKind::Unreadable }], std::slice::from_ref(&line), 5);
+        let c = pki_key_modes_check(&[exposed, KeyIssue { rel: "x".into(), mode: 0o640, reader: KeyReader::ContainerUid(70), kind: KeyIssueKind::Unreadable }], std::slice::from_ref(&line), 5, std::path::Path::new("/p"));
         assert!(c.detail.contains("beyond their reader"));
         let remedy = c.remedy.unwrap();
         assert!(remedy.starts_with("noo security pki fix-modes") && remedy.contains(&line), "{remedy}");
-        let c = pki_key_modes_check(&[], &[], 19);
+        let c = pki_key_modes_check(&[], &[], 19, std::path::Path::new("/p"));
         assert_eq!(c.verdict, Verdict::Ok);
         assert!(c.detail.contains("19 private key(s)"));
     }
@@ -13038,7 +13400,7 @@ mod tests {
                 .map(|kind| KeyIssue { rel: rel.into(), mode: acc.mode, reader, kind })
                 .into_iter()
                 .collect();
-            pki_key_modes_check(&issues, &[], 1)
+            pki_key_modes_check(&issues, &[], 1, std::path::Path::new("/p"))
         };
         let granted = |uid: u32| Access {
             mode: 0o640,
@@ -13964,6 +14326,63 @@ mod tests {
         let inject = crate::test_src::fn_body(&own, "fn with_harness_wanted(");
         assert!(inject.contains("gpu_targets_on_cpu_builds(&d[\"placements\"], &n)"), "fed from desired-config and the node's GPU facts");
         assert!(own.contains("out.extend(gpu_target_cpu_build_check(n));"), "the row is in the run");
+    }
+
+    /// i1182a: the `unsupported engine` row WARNs for every `embedding` placement
+    /// and every non-GGUF or TEI-image reranker, naming the replacement; a
+    /// GGUF reranker and an empty desired state are OK.
+    #[test]
+    fn unsupported_engine_row_warns_on_a_tei_placement_and_is_ok_otherwise() {
+        use serde_json::json;
+        let found = removed_engine_placements(&json!([
+            {"backend": "embedding", "model": "BAAI/bge-small-en-v1.5", "desired_state": "running"},
+            {"backend": "reranker", "model": "BAAI/bge-reranker-v2-m3", "desired_state": "running"},
+            {"backend": "reranker", "model": "x.gguf", "image": "ghcr.io/huggingface/text-embeddings-inference:cpu-1.9.4"},
+            {"backend": "reranker", "model": "bge-reranker-v2-m3-Q8_0.gguf", "desired_state": "running"},
+            {"backend": "ollama", "model": "harrier", "role": "embed", "desired_state": "running"},
+        ]));
+        assert_eq!(found.len(), 3, "{found:?}");
+        let n = json!({"id": "node-a", "removed_engine_placements": found});
+        let c = removed_engine_check(&n).expect("a row");
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.contains("node-a embedding BAAI/bge-small-en-v1.5: uses the TEI engine, which was removed in 0.6.30; nothing runs for this placement; replace it, then unplace it: noo cluster place node-a ollama <model> --role embed && `noo cluster unplace node-a embedding`"), "{}", c.detail);
+        assert!(c.detail.contains("noo cluster place node-a reranker <file>.gguf"), "{}", c.detail);
+        assert!(c.remedy.as_deref().unwrap().contains("noo cluster unplace node-a embedding"), "{:?}", c.remedy);
+        assert!(c.remedy.as_deref().unwrap().contains("noo cluster unplace node-a reranker"), "{:?}", c.remedy);
+
+        let gguf = removed_engine_placements(&json!([{"backend": "reranker", "model": "bge-reranker-v2-m3-Q8_0.gguf"}]));
+        let c = removed_engine_check(&json!({"id": "node-a", "removed_engine_placements": gguf})).expect("a row");
+        assert_eq!(c.verdict, Verdict::Ok);
+        assert_eq!(c.detail, "no placement uses an unsupported engine");
+        let c = removed_engine_check(&json!({"id": "node-a", "removed_engine_placements": []})).expect("a row");
+        assert_eq!(c.verdict, Verdict::Ok);
+        assert!(removed_engine_check(&json!({"id": "node-a"})).is_none(), "desired-config unread: no guess");
+        let own = crate::test_src::own_code(include_str!("cluster_verify.rs"));
+        let inject = crate::test_src::fn_body(&own, "fn with_harness_wanted(");
+        assert!(inject.contains("removed_engine_placements(&d[\"placements\"])"), "fed from desired-config");
+        assert!(own.contains("out.extend(removed_engine_check(n));"), "the row is in the run");
+    }
+
+    /// i1182a: a space bound to a Hugging Face model no node serves WARNs
+    /// naming `embedding-space migrate`; a served space, an Ollama tag and an
+    /// unread list do not.
+    #[test]
+    fn unsupported_engine_space_row_names_the_migrate_command() {
+        use serde_json::json;
+        let body = json!({"spaces": [
+            {"space": "knowledge", "model": "harrier", "default": true, "live": 2},
+            {"space": "old", "model": "BAAI/bge-small-en-v1.5", "default": false, "live": 0},
+            {"space": "served", "model": "org/served", "default": false, "live": 1},
+        ]});
+        let c = removed_engine_space_check(Some(&body)).expect("a row");
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.contains("space old model BAAI/bge-small-en-v1.5") && !c.detail.contains("org/served"), "{}", c.detail);
+        assert_eq!(c.remedy.as_deref(), Some("noo cluster embedding-space migrate old <model>"));
+        let fine = json!({"spaces": [{"space": "knowledge", "model": "harrier", "default": true, "live": 0}]});
+        assert_eq!(removed_engine_space_check(Some(&fine)).expect("a row").verdict, Verdict::Ok);
+        assert!(removed_engine_space_check(None).is_none());
+        let own = crate::test_src::own_code(include_str!("cluster_verify.rs"));
+        assert!(own.contains("checks.extend(removed_engine_space_check(spaces.as_ref()));"), "the row is in the run");
     }
 
     /// The `vllm compute` row FAILs when a vLLM placement sits on a node below
@@ -15958,6 +16377,85 @@ mod config_mount_tests {
         assert!(!super::data_root_policy_row(&both).unwrap().remedy.unwrap().starts_with("noo onboard"));
     }
 
+    /// i1160: a root that does not answer is a FAIL, in warn mode too,
+    /// named "data root <path> not answering".
+    #[test]
+    fn a_data_root_not_answering_fails() {
+        use serde_json::json;
+        let n = json!({"id": "node_a", "data_roots": {"noo_data_root": "/data/noo", "probe_error": "x",
+            "policy": {"mode": "warn", "ok": false, "problems": [{"code": "not_answering",
+                "detail": "data root /data/noo not answering: no reply within 5s"}]}}});
+        let c = super::data_root_policy_row(&n).unwrap();
+        assert_eq!(c.verdict, super::Verdict::Fail);
+        assert!(c.detail.starts_with("data root /data/noo not answering: no reply"), "{}", c.detail);
+        let r = c.remedy.unwrap();
+        assert!(r.contains("findmnt /data/noo") && !r.contains("install -d"), "{r}");
+    }
+
+    /// i1160: a missing root whose mount is not there is never fixed by
+    /// creating the directory: the remedy says to mount it, first.
+    #[test]
+    fn a_missing_mount_is_mounted_not_created() {
+        use serde_json::json;
+        let missing = |meant: Option<&str>| {
+            let mut pol = json!({"mode": "warn", "ok": false, "problems": [{"code": "missing", "detail": "/data/noo does not exist"}]});
+            if let Some(m) = meant {
+                pol["filesystem"] = json!({"meant": m});
+            }
+            json!({"id": "node_a", "data_roots": {"noo_data_root": "/data/noo", "policy": pol}})
+        };
+        let mount = super::data_root_policy_row(&missing(Some("mount"))).unwrap().remedy.unwrap();
+        assert!(mount.starts_with("on node_a: the mount for /data/noo is not there: mount it (check `findmnt /data/noo`, your fstab or systemd mount unit)"), "{mount}");
+        assert!(mount.contains("do NOT create the directory") && !mount.contains("install -d"), "{mount}");
+        // An agent that cannot say (older, or nothing recorded): the mount first.
+        let unknown = super::data_root_policy_row(&missing(None)).unwrap().remedy.unwrap();
+        assert!(unknown.starts_with("on node_a: the mount for /data/noo is not there"), "{unknown}");
+        assert!(unknown.find("findmnt").unwrap() < unknown.find("install -d").unwrap(), "{unknown}");
+        // A plain directory: creating it is the remedy.
+        let dir = super::data_root_policy_row(&missing(Some("directory"))).unwrap().remedy.unwrap();
+        assert_eq!(dir, "on node_a: sudo install -d -o noo-agent -g noo-agent /data/noo && sudo chmod go-w /data/noo");
+        // Not on its recorded filesystem: FAIL in warn mode, mount it, never create.
+        let moved = |detail: &str| json!({"id": "node_a", "data_roots": {"noo_data_root": "/data/noo",
+            "policy": {"mode": "warn", "ok": false, "problems": [{"code": "not_on_recorded_fs", "detail": detail}]}}});
+        let c = super::data_root_policy_row(&moved("/data/noo is on /dev/sda1 at / (ext4): the ROOT filesystem")).unwrap();
+        assert_eq!(c.verdict, super::Verdict::Fail);
+        let r = c.remedy.unwrap();
+        assert!(r.starts_with("on node_a: the mount for /data/noo is not there") && !r.contains("install -d"), "{r}");
+        assert!(!r.contains("data-root-fs.json"), "back on the root fs: never re-record: {r}");
+        // A different disk: the record may be replaced, on purpose only.
+        let r = super::data_root_policy_row(&moved("/data/noo is on a different filesystem, /dev/sdc1")).unwrap().remedy.unwrap();
+        assert!(r.contains("data-root-fs.json"), "{r}");
+    }
+
+    /// i1160: the row says what the agent reads the root as, from what the
+    /// machine declares (fstab, a systemd mount unit) or its record.
+    #[test]
+    fn the_data_root_row_shows_mount_or_directory() {
+        use serde_json::json;
+        let row = |fs: serde_json::Value, ok: bool| {
+            let probs = if ok { json!([]) } else { json!([{"code": "mount_missing", "detail": "not mounted"}]) };
+            let n = json!({"id": "node_a", "data_roots": {"noo_data_root": "/data/noo",
+                "policy": {"mode": "warn", "ok": ok, "problems": probs, "filesystem": fs}}});
+            super::data_root_policy_row(&n).unwrap().detail
+        };
+        assert_eq!(row(json!({"meant": "mount", "by": "fstab"}), true),
+            "/data/noo: dedicated, conventional and owned by the agent; mount (fstab)");
+        // Cannot tell: said, never a refusal.
+        assert_eq!(row(json!({"meant": "unknown", "by": "", "not_checked": "cannot read /etc/fstab: permission denied"}), true),
+            "/data/noo: dedicated, conventional and owned by the agent; not checked: cannot read /etc/fstab: permission denied");
+        assert_eq!(row(json!({"meant": "directory", "by": ""}), true),
+            "/data/noo: dedicated, conventional and owned by the agent; directory");
+        assert_eq!(row(json!({"meant": "mount", "by": "systemd unit"}), false), "/data/noo [mount (systemd unit)]: not mounted");
+        assert_eq!(row(json!({"meant": "unknown", "by": ""}), true), "/data/noo: dedicated, conventional and owned by the agent");
+        // A disk that arrived over 3 entries: the row carries the agent's note.
+        let note = "the disk is now mounted at /data/noo since 2026-11-22: 3 files written before it was mounted are hidden under the mount point \
+                    on the root filesystem: unmount to recover or remove them; this note clears by itself on 2026-11-29";
+        assert_eq!(row(json!({"meant": "mount", "by": "fstab", "hidden_entries": 3, "hidden_note": note}), true),
+            format!("/data/noo: dedicated, conventional and owned by the agent; mount (fstab); {note}"));
+        assert_eq!(row(json!({"meant": "mount", "by": "fstab"}), true),
+            "/data/noo: dedicated, conventional and owned by the agent; mount (fstab)");
+    }
+
     #[test]
     fn an_undeclared_legacy_root_is_declared_where_it_is_not_moved() {
         use serde_json::json;
@@ -16649,7 +17147,7 @@ mod digest_tests {
             rel: "services/mystery/service.key".into(), mode: 0o644,
             reader: crate::pki::KeyReader::Unknown, kind: crate::pki::KeyIssueKind::UnknownReader,
         };
-        let c = pki_key_modes_check(&[unknown], &[], 5);
+        let c = pki_key_modes_check(&[unknown], &[], 5, std::path::Path::new("/p"));
         let r = c.remedy.unwrap();
         // fix-modes tightens a key with no reader row to 0600 (i277a).
         assert_eq!(r, "noo security pki fix-modes", "{r}");
@@ -18579,19 +19077,47 @@ mod docker_engine_tests {
     fn an_engine_below_the_minimum_warns_with_the_upgrade() {
         let c = docker_engine_check(&node(json!({"state": "ok", "version": "26.1.4", "kind": "dockerd"}))).expect("a row");
         assert_eq!(c.verdict, Verdict::Warn, "{c:?}");
-        assert!(c.detail.contains("Docker Engine 26.1.4 on node_a is below 27"), "{}", c.detail);
+        assert!(c.detail.contains("Docker Engine 26.1.4 on node_a is below 28"), "{}", c.detail);
         assert!(c.detail.contains("container-lane Ollama import fails on an engine below 28"), "{}", c.detail);
-        assert!(c.remedy.as_deref().unwrap_or("").starts_with("upgrade Docker Engine on node_a to 27 or newer"), "{:?}", c.remedy);
+        assert!(c.remedy.as_deref().unwrap_or("").starts_with("upgrade Docker Engine on node_a to 28 or newer"), "{:?}", c.remedy);
+    }
+
+    /// The operator's floor of 2026-11-21: Engine 28. 27.5.1 (the CI canary's
+    /// dind) WARNs with the whole message and both upgrade routes.
+    #[test]
+    fn engine_27_5_1_is_below_the_floor_of_28() {
+        let c = docker_engine_check(&node(json!({"state": "ok", "version": "27.5.1", "kind": "dockerd"}))).expect("a row");
+        assert_eq!(c.verdict, Verdict::Warn, "{c:?}");
+        assert_eq!(
+            c.detail,
+            "Docker Engine 27.5.1 on node_a is below 28, the oldest Docker Engine noomesh tests; known: a container-lane Ollama import fails on an engine below 28 with an agent before 0.6.28"
+        );
+        assert_eq!(
+            c.remedy.as_deref(),
+            Some("upgrade Docker Engine on node_a to 28 or newer with the package manager, from the package that installed it: Docker's apt repository, sudo apt-get update && sudo apt-get install --only-upgrade docker-ce docker-ce-cli containerd.io docker-compose-plugin; or the distribution's own package, sudo apt-get update && sudo apt-get install --only-upgrade docker.io (only if the release ships 28 or newer); otherwise Docker's convenience script, downloaded then run (never piped): curl -fsSL --proto '=https' --tlsv1.2 https://get.docker.com -o get-docker.sh && sudo sh get-docker.sh (https://docs.docker.com/engine/install/); then: noo cluster verify node_a")
+        );
+        let d = docker_engine_check(&node(json!({"state": "ok", "version": "27.5.1", "kind": "docker-desktop"}))).expect("a row");
+        assert_eq!(d.verdict, Verdict::Warn, "{d:?}");
+        assert_eq!(d.remedy.as_deref(), Some("update Docker Desktop on node_a until its engine is 28 or newer, then: noo cluster verify node_a"));
+    }
+
+    #[test]
+    fn engines_28_0_0_and_29_2_1_pass() {
+        for v in ["28.0.0", "29.2.1"] {
+            let c = docker_engine_check(&node(json!({"state": "ok", "version": v, "kind": "dockerd"}))).expect("a row");
+            assert_eq!(c.verdict, Verdict::Ok, "{v}: {c:?}");
+            assert_eq!(c.detail, format!("Docker Engine {v} (minimum 28)"));
+        }
     }
 
     #[test]
     fn an_engine_at_or_above_the_minimum_is_ok() {
-        for (v, kind) in [("27.0.1", "dockerd"), ("28.5.1", "docker-desktop"), ("29.0.0-rc.1", "dockerd")] {
+        for (v, kind) in [("28.0.1", "dockerd"), ("28.5.1", "docker-desktop"), ("29.0.0-rc.1", "dockerd")] {
             let c = docker_engine_check(&node(json!({"state": "ok", "version": v, "kind": kind}))).expect("a row");
             assert_eq!(c.verdict, Verdict::Ok, "{v}: {c:?}");
             assert!(c.detail.contains(v), "{}", c.detail);
         }
-        assert_eq!(MIN_DOCKER_ENGINE_MAJOR, 27, "the declared minimum is the operator's (i1058)");
+        assert_eq!(MIN_DOCKER_ENGINE_MAJOR, 28, "the declared minimum is the operator's (2026-11-21; was 27, i1058)");
     }
 
     #[test]
@@ -18626,6 +19152,58 @@ mod docker_compose_tests {
         compose_version_from(true, &format!("{text}\n"), "")
     }
 
+    const UPGRADE: &str = "upgrade it";
+
+    /// The operator's floor of 2026-11-21: Compose 2.33.0. The fleet runs
+    /// Compose 5.x (`docker compose version` prints `Docker Compose version
+    /// v5.0.2`); Ubuntu's package prints `2.40.3+ds1-0ubuntu1~22.04.1`.
+    /// Each string goes through the real parse and the real row.
+    #[test]
+    fn compose_5_and_ubuntu_suffixes_parse_and_meet_the_floor_of_2_33_0() {
+        for (v, want) in [
+            ("5.0.2", (5, 0, 2)),
+            ("v5.0.2", (5, 0, 2)),
+            ("2.33.0", (2, 33, 0)),
+            ("2.33.1", (2, 33, 1)),
+            ("2.40.3", (2, 40, 3)),
+            ("2.40.3+ds1-0ubuntu1~22.04.1", (2, 40, 3)),
+        ] {
+            assert_eq!(parse_compose_version(v), Some(want), "{v:?}");
+            let c = docker_compose_check(&known(v), "install it", UPGRADE);
+            assert_eq!(c.verdict, Verdict::Ok, "{v}: {c:?}");
+            assert_eq!(c.detail, format!("Docker Compose {v} (minimum 2.33.0)"));
+        }
+        // The whole `docker compose version` line reads as its last word.
+        assert_eq!(parse_compose_version("Docker Compose version v5.0.2"), Some((5, 0, 2)));
+        assert_eq!(
+            known("Docker Compose version v5.0.2"),
+            ComposeVersion::Known((5, 0, 2), "Docker Compose version v5.0.2".into())
+        );
+        for (v, want) in [("2.32.9", (2, 32, 9)), ("2.24.6", (2, 24, 6)), ("2.24.6+ds1-0ubuntu1~22.04.1", (2, 24, 6))] {
+            assert_eq!(parse_compose_version(v), Some(want), "{v:?}");
+            let c = docker_compose_check(&known(v), "install it", UPGRADE);
+            assert_eq!(c.verdict, Verdict::Warn, "{v}: {c:?}");
+            assert_eq!(c.detail, format!("Docker Compose {v} is older than the oldest version noomesh tests (2.33.0)"));
+            assert_eq!(c.remedy.as_deref(), Some(UPGRADE));
+        }
+    }
+
+    #[test]
+    fn the_compose_upgrade_remedy_names_this_machines_package() {
+        assert_eq!(
+            compose_upgrade_remedy(Some("docker-compose-plugin")),
+            "upgrade the docker-compose-plugin package to 2.33.0 or newer: sudo apt-get update && sudo apt-get install --only-upgrade docker-compose-plugin, then: docker compose version"
+        );
+        assert_eq!(
+            compose_upgrade_remedy(Some("docker-compose-v2")),
+            "upgrade the docker-compose-v2 package to 2.33.0 or newer: sudo apt-get update && sudo apt-get install --only-upgrade docker-compose-v2; if the distro's stays below 2.33.0, install docker-compose-plugin from Docker's apt repository (https://docs.docker.com/engine/install/), then: docker compose version"
+        );
+        assert_eq!(
+            compose_upgrade_remedy(None),
+            "upgrade the Docker Compose v2 plugin (or Docker Desktop) to 2.33.0 or newer (https://docs.docker.com/compose/install/linux/), then: docker compose version"
+        );
+    }
+
     #[test]
     fn compose_versions_parse_with_a_prefix_or_a_suffix() {
         assert_eq!(parse_compose_version("2.24.6"), Some((2, 24, 6)));
@@ -18651,29 +19229,29 @@ mod docker_compose_tests {
     #[test]
     fn a_compose_below_the_minimum_warns_with_the_upgrade() {
         for v in ["2.24.5", "v2.20.2", "1.29.2"] {
-            let c = docker_compose_check(&known(v), "install it");
+            let c = docker_compose_check(&known(v), "install it", &compose_upgrade_remedy(Some("docker-compose-v2")));
             assert_eq!(c.verdict, Verdict::Warn, "{v}: {c:?}");
-            assert_eq!(c.detail, format!("Docker Compose {v} is older than the oldest version noomesh tests (2.24.6)"));
-            assert!(c.remedy.as_deref().unwrap_or("").starts_with("upgrade the docker-compose-v2 package"), "{:?}", c.remedy);
+            assert_eq!(c.detail, format!("Docker Compose {v} is older than the oldest version noomesh tests (2.33.0)"));
+            assert!(c.remedy.as_deref().unwrap_or("").starts_with("upgrade the docker-compose-v2 package to 2.33.0 or newer"), "{:?}", c.remedy);
         }
     }
 
     #[test]
     fn a_compose_at_or_above_the_minimum_is_ok() {
-        for v in ["2.24.6", "v2.38.2", "2.29.1-desktop.1", "2.25.0", "3.0.0"] {
-            let c = docker_compose_check(&known(v), "install it");
+        for v in ["2.33.0", "v2.38.2", "2.35.1-desktop.1", "2.34.0", "3.0.0"] {
+            let c = docker_compose_check(&known(v), "install it", UPGRADE);
             assert_eq!(c.verdict, Verdict::Ok, "{v}: {c:?}");
             assert!(c.detail.contains(v), "{}", c.detail);
         }
-        assert_eq!(MIN_COMPOSE, (2, 24, 6), "the declared minimum is the operator's: the start-inputs job's oldest Compose");
+        assert_eq!(MIN_COMPOSE, (2, 33, 0), "the declared minimum is the operator's (2026-11-21): Docker 28's bundled Compose");
     }
 
     #[test]
     fn an_unreadable_compose_warns_and_a_missing_one_fails_with_the_package() {
-        let c = docker_compose_check(&ComposeVersion::Unreadable("exit 1".into()), "install it");
+        let c = docker_compose_check(&ComposeVersion::Unreadable("exit 1".into()), "install it", UPGRADE);
         assert_eq!(c.verdict, Verdict::Warn, "{c:?}");
         assert!(c.detail.starts_with("cannot be checked: the Docker Compose version could not be read (exit 1)"), "{}", c.detail);
-        let m = docker_compose_check(&ComposeVersion::Missing("not a docker command".into()), "install it with: sudo apt install docker-compose-v2");
+        let m = docker_compose_check(&ComposeVersion::Missing("not a docker command".into()), "install it with: sudo apt install docker-compose-v2", UPGRADE);
         assert_eq!(m.verdict, Verdict::Fail, "{m:?}");
         assert_eq!(m.remedy.as_deref(), Some("install it with: sudo apt install docker-compose-v2"));
     }
@@ -18971,6 +19549,69 @@ mod remedy_command_tests {
         assert_eq!(super::holds_detail(&["tailscale"]), "tailscale not pinned: a routine `apt upgrade` can move them. Hold them when you want control.");
     }
 
+    /// i1098 row 12 (operator 2026-11-21): on the machine onboard ran on, the
+    /// `holds` row shows the set onboard held and says onboard placed it, with
+    /// the way to take an update; it says so when onboard placed none, and
+    /// when a hold onboard placed is gone. Another node's row is unchanged.
+    #[test]
+    fn the_holds_row_shows_what_onboard_held() {
+        let docker = ["containerd.io", "docker-buildx-plugin", "docker-ce", "docker-ce-cli", "docker-compose-plugin"];
+        let platform: serde_json::Map<String, Value> = docker.iter().chain(["tailscale"].iter()).map(|p| (p.to_string(), json!("1"))).collect();
+        let host = |held: &[&str]| json!({
+            "os": "linux", "running_kernel": "7.0.11", "default_kernel": "7.0.11",
+            "platform": platform, "held": held,
+            "tailscale_state": "Running", "tailscale_online": true,
+        });
+        let rec: Vec<String> = docker.iter().map(|p| p.to_string()).collect();
+        let nothing: &[String] = &[];
+        let row = |h: &Value, onboard: Option<&[String]>| host_checks_with("node_a", h, true, onboard).into_iter().find(|c| c.name == "holds").expect("a holds row");
+        let mut all: Vec<&str> = docker.to_vec();
+        all.push("tailscale");
+
+        let held = row(&host(&all), Some(rec.as_slice()));
+        assert_eq!(held.verdict, Verdict::Ok);
+        assert_eq!(held.detail, "6 platform package(s) held; onboard held containerd.io, docker-buildx-plugin, docker-ce, docker-ce-cli, docker-compose-plugin \
+            when it installed Docker, so an unattended upgrade cannot restart dockerd. To take an update: sudo apt-mark unhold containerd.io docker-buildx-plugin docker-ce docker-ce-cli docker-compose-plugin \
+            && sudo apt-get update && sudo apt-get install --only-upgrade containerd.io docker-buildx-plugin docker-ce docker-ce-cli docker-compose-plugin, \
+            then noo cluster verify, then sudo apt-mark hold containerd.io docker-buildx-plugin docker-ce docker-ce-cli docker-compose-plugin");
+        assert_eq!(row(&host(&all), Some(nothing)).detail,
+            "6 platform package(s) held; onboard placed none of these holds (it holds only a Docker it installed)");
+        assert_eq!(row(&host(&all), None).detail, "6 platform package(s) held", "another node: unchanged");
+
+        // Docker present before onboard: not held, and the row says onboard placed nothing.
+        let before = row(&host(&["tailscale"]), Some(nothing));
+        assert_eq!(before.verdict, Verdict::Warn);
+        assert!(before.detail.starts_with("Docker isn't pinned (containerd.io, docker-buildx-plugin, docker-ce, docker-ce-cli, docker-compose-plugin)"), "{}", before.detail);
+        assert!(before.detail.ends_with(" Onboard placed no hold here: it holds only a Docker it installed itself."), "{}", before.detail);
+        assert_eq!(before.remedy.as_deref(), Some("on node_a: sudo apt-mark hold containerd.io docker-buildx-plugin docker-ce docker-ce-cli docker-compose-plugin"));
+
+        // Onboard held docker-ce; the person unheld it for an update.
+        let gone = row(&host(&["containerd.io", "docker-buildx-plugin", "docker-ce-cli", "docker-compose-plugin", "tailscale"]), Some(rec.as_slice()));
+        assert_eq!(gone.detail, "Docker isn't pinned (docker-ce): a routine `apt upgrade` can restart every container. Hold it when you want control. \
+            Onboard held docker-ce when it installed Docker, and the hold is gone (released for an update? hold it again).");
+        // A Docker package onboard did not install, unheld: named as not onboard's.
+        let other = row(&host(&["containerd.io", "docker-ce", "tailscale"]), Some(&rec[..1]));
+        assert!(other.detail.ends_with(" Onboard holds containerd.io (it installed them); it did not install these."), "{}", other.detail);
+        // Only Docker is onboard's business: an unheld tailscale alone reads as before.
+        assert_eq!(row(&host(&docker), Some(rec.as_slice())).detail, super::holds_detail(&["tailscale"]));
+    }
+
+    /// The record reaches the row for the self node only: with_harness_wanted
+    /// injects it under that test, and node_checks hands it to the row.
+    #[test]
+    fn the_onboard_record_is_read_for_the_self_node_only() {
+        assert_eq!(onboard_holds_of(&json!({"id": "n"})), None);
+        assert_eq!(onboard_holds_of(&json!({"onboard_docker_holds": []})), Some(Vec::new()));
+        assert_eq!(onboard_holds_of(&json!({"onboard_docker_holds": ["docker-ce"]})), Some(vec!["docker-ce".to_string()]));
+        let own = crate::test_src::own_code(include_str!("cluster_verify.rs"));
+        let inject = crate::test_src::fn_body(&own, "fn with_harness_wanted(");
+        let gate = inject.find("if crate::role::is_self_node(&id) {").expect("gated on the self node");
+        let put = inject.find("obj.insert(\"onboard_docker_holds\".into(), serde_json::json!(crate::docker_hold::recorded_here()));").expect("the record");
+        assert!(gate < put, "{inject}");
+        let node = crate::test_src::fn_body(&own, "pub(crate) fn node_checks(");
+        assert!(node.contains("host_checks_with(id, &hostd[\"host\"], hostd[\"alive\"].as_bool() == Some(true), onboard_holds_of(n).as_deref())"), "{node}");
+    }
+
     /// The at-rest rows say what is planned without an internal id.
     #[test]
     fn the_at_rest_remedies_carry_no_internal_id() {
@@ -19218,5 +19859,35 @@ mod controller_address_tests {
         let row = src.find("if let Some(c) = controller_address_row_here() {").expect("called");
         let svc = src.find("checks.push(service_cert_names_check(").expect("anchor");
         assert!(row < svc);
+    }
+}
+
+#[cfg(test)]
+mod reranker_row_tests {
+    use super::{reranker_check, Verdict};
+    use serde_json::json;
+
+    /// i1182a: no reranker placed WARNs with the place command; a placed one
+    /// is OK; an unread or shapeless answer is not judged as either.
+    #[test]
+    fn no_reranker_placed_warns_with_the_place_command() {
+        let c = reranker_check(Some(&json!({"rerank": {"available": false, "models": []}})));
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.contains("no reranker placed; rerank requests are served by the chat model"), "{}", c.detail);
+        assert_eq!(c.remedy.as_deref(), Some("noo cluster place <node> reranker <file>.gguf --on cpu"));
+        let ok = reranker_check(Some(&json!({"rerank": {"available": true, "models": ["default"]}})));
+        assert_eq!(ok.verdict, Verdict::Ok);
+        let unread = reranker_check(None);
+        assert_eq!(unread.verdict, Verdict::Warn);
+        assert!(unread.detail.starts_with("not read") && unread.remedy.is_none(), "{}", unread.detail);
+        let odd = reranker_check(Some(&json!({"chat": {}})));
+        assert!(odd.remedy.is_none() && !odd.detail.contains("no reranker placed"), "{}", odd.detail);
+    }
+
+    /// The row runs on the controller, from the gateway's own capabilities.
+    #[test]
+    fn the_controller_checks_read_the_gateways_capabilities() {
+        let own = crate::test_src::own_code(include_str!("cluster_verify.rs"));
+        assert!(own.contains(r#"checks.push(reranker_check(get_json_opt(g, "/api/external/capabilities", true, 15).as_ref()));"#));
     }
 }

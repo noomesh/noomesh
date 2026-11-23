@@ -43,7 +43,7 @@ def test_inference_set_matches_legacy():
 
 def test_provisionable_matches_node_agent_specs():
     assert set(bk.provisionable_backends()) == {
-        "vllm", "llamacpp", "ollama", "airllm", "embedding", "reranker",
+        "vllm", "llamacpp", "ollama", "airllm", "reranker",
     }
 
 

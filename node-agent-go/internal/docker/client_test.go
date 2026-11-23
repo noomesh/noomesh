@@ -145,10 +145,10 @@ func TestBackendURLHonoursOllamaURL(t *testing.T) {
 // flags say (a false value refuses the agent's START in config; here it
 // is simply not read). airllm is the one named plaintext exception.
 func TestSchemeFor_HTTPSByDefault(t *testing.T) {
-	for _, env := range []string{"NOO_VLLM_TLS", "NOO_LLAMACPP_TLS", "NOO_OLLAMA_TLS", "NOO_TEI_TLS", "NOO_RERANKER_TLS"} {
+	for _, env := range []string{"NOO_VLLM_TLS", "NOO_LLAMACPP_TLS", "NOO_OLLAMA_TLS", "NOO_RERANKER_TLS"} {
 		t.Setenv(env, "")
 	}
-	for _, b := range []string{"vllm", "llamacpp", "ollama", "embedding", "reranker"} {
+	for _, b := range []string{"vllm", "llamacpp", "ollama", "reranker"} {
 		if got := SchemeFor(b); got != "https" {
 			t.Errorf("SchemeFor(%s) = %q with no flag set; the door is TLS by default", b, got)
 		}
@@ -161,7 +161,7 @@ func TestSchemeFor_HTTPSByDefault(t *testing.T) {
 		t.Errorf("airllm is plain by named exception: %q", got)
 	}
 	// The flag table is config's — one declaration.
-	if len(backendTLSEnvVars) != 5 || backendTLSEnvVars["embedding"] != "NOO_TEI_TLS" {
+	if len(backendTLSEnvVars) != 4 || backendTLSEnvVars["reranker"] != "NOO_RERANKER_TLS" {
 		t.Errorf("backendTLSEnvVars must be config.BackendTLSFlags: %v", backendTLSEnvVars)
 	}
 }
@@ -196,19 +196,16 @@ func TestBackendDialURL_FollowsTheContainersDeclaration(t *testing.T) {
 		{"no declaration: vllm's TLS door", "vllm", nil, "https://noo-vllm:8000"},
 		{"no declaration: llama.cpp's sidecar door", "llamacpp", nil, "https://noo-stunnel-llamacpp:8085"},
 		{"no declaration: reranker's sidecar door", "reranker", nil, "https://noo-stunnel-reranker:443"},
-		{"no declaration: embedding's sidecar door", "embedding", nil, "https://noo-stunnel-tei:443"},
 		{"no declaration: ollama's sidecar door", "ollama", nil, "https://noo-stunnel-ollama:11434"},
 		{"no declaration: airllm plain by exception", "airllm", nil, "http://noo-airllm:8000"},
 		{"vllm declares the flag", "vllm", decl([]string{"vllm"}, nil, nil), "https://noo-vllm:8000"},
 		{"secondary declares the flag", "vllm-secondary", decl([]string{"vllm-secondary"}, nil, nil), "https://noo-vllm-secondary:8000"},
 		{"sidecar running: dial it", "llamacpp", decl(nil, []string{"llamacpp"}, nil), "https://noo-stunnel-llamacpp:8085"},
 		{"vllm's door running: dialled by its alias", "vllm", decl(nil, []string{"vllm"}, nil), "https://noo-vllm:8000"},
-		{"tei sidecar running (compose or agent)", "embedding", decl(nil, []string{"embedding"}, nil), "https://noo-stunnel-tei:443"},
 		{"ollama sidecar running", "ollama", decl(nil, []string{"ollama"}, nil), "https://noo-stunnel-ollama:11434"},
 		{"pre-door vllm: plain, what runs", "vllm", decl(nil, nil, []string{"vllm"}), "http://noo-vllm:8000"},
 		{"pre-door secondary: plain", "vllm-secondary", decl(nil, nil, []string{"vllm-secondary"}), "http://noo-vllm-secondary:8000"},
 		{"pre-door llama.cpp: plain", "llamacpp", decl(nil, nil, []string{"llamacpp"}), "http://noo-llamacpp:8085"},
-		{"pre-door tei: plain on 80", "embedding", decl(nil, nil, []string{"embedding"}), "http://noo-tei:80"},
 		{"declaration read, backend not running: the door", "llamacpp", decl(nil, nil, nil), "https://noo-stunnel-llamacpp:8085"},
 	}
 	for _, tc := range cases {
@@ -228,9 +225,6 @@ func TestBackendDialURL_FollowsTheContainersDeclaration(t *testing.T) {
 		t.Fatalf("nil client: %q", got)
 	}
 	// The compose-alias form for a containerised agent stays.
-	if got := BackendURL("embedding", ""); got != "https://stunnel-tei:443" {
-		t.Fatalf("BackendURL(embedding): %q", got)
-	}
 	if got := BackendURL("llamacpp", ""); got != "https://noo-stunnel-llamacpp:8085" {
 		t.Fatalf("BackendURL(llamacpp): %q", got)
 	}

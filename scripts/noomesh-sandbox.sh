@@ -42,7 +42,10 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 . "$REPO_ROOT/scripts/lib-dist.sh"
 NAME="noomesh-sandbox"
 VOL="noomesh-sandbox-docker"
-DIND_IMAGE="${NOO_SANDBOX_DIND_IMAGE:-docker:27-dind}"
+# Engine 28 is the supported floor (the operator's decision, 2026-11-21);
+# the Engine 27 canary for the copy-owner bug lives in CI (#1387), not here.
+# Pinned by digest (Docker Hub docker:28-dind, multi-arch index).
+DIND_IMAGE="${NOO_SANDBOX_DIND_IMAGE:-docker:28-dind@sha256:2a232a42256f70d78e3cc5d2b5d6b3276710a0de0596c145f627ecfae90282ac}"
 APP_DIR="/opt/pai-assistant"
 
 # Presentation via the shared launcher palette (CLI_STYLE_GUIDE §5).

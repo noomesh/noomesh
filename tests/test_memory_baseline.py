@@ -103,15 +103,19 @@ def _compose_container_names() -> set[str]:
 def test_backends_and_their_doors_are_the_node_share_and_the_rest_the_controllers():
     names = _compose_container_names()
     expected_node = {"noo-ollama", "noo-ollama-embed", "noo-ollama-embed-cpu", "noo-llamacpp", "noo-vllm",
-                     "noo-vllm-secondary", "noo-tei", "noo-tei-gpu", "noo-reranker", "noo-whisper", "noo-piper",
+                     "noo-vllm-secondary", "noo-whisper", "noo-piper",
                      "noo-stunnel-ollama", "noo-stunnel-ollama-embed", "noo-stunnel-ollama-embed-cpu",
-                     "noo-stunnel-llamacpp", "noo-stunnel-vllm", "noo-stunnel-vllm-secondary", "noo-stunnel-tei",
-                     "noo-stunnel-tei-gpu", "noo-stunnel-reranker", "noo-node-agent", "noo-node-agent-sensors"}
+                     "noo-stunnel-llamacpp", "noo-stunnel-vllm", "noo-stunnel-vllm-secondary",
+                     "noo-node-agent", "noo-node-agent-sensors"}
+    # Started by the node agent, not compose (so not in the compose names);
+    # noo-tei and its door are the orphans an upgrade removes, still the node's.
+    agent_started = {"noo-reranker", "noo-stunnel-reranker", "noo-tei", "noo-tei-gpu", "noo-stunnel-tei",
+                     "noo-stunnel-tei-gpu"}
     expected_controller = {"noo-gateway", "noo-postgres", "noo-redis", "noo-nats", "noo-trellion", "noo-worker",
                            "noo-prometheus", "noo-grafana", "noo-loki", "noo-tempo", "noo-alertmanager",
                            "noo-sandbox", "noo-browser"}
     assert expected_node | expected_controller <= names, sorted((expected_node | expected_controller) - names)
-    for n in expected_node:
+    for n in expected_node | agent_started:
         assert MB.classify(n) == "node", n
         assert MB.classify("/" + n) == "node", "docker inspect's .Name has a leading slash"
     for n in expected_controller:

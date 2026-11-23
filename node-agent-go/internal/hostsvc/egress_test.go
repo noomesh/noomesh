@@ -10,6 +10,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 const goodBinds = "/etc/noo/harness-net/resolv.conf:/etc/resolv.conf /etc/noo/harness-net/hosts:/etc/hosts /etc/noo/harness-net/nsswitch.conf:/etc/nsswitch.conf"
@@ -25,7 +26,7 @@ func selfTest(pid int, enforced bool) string {
 }
 
 func TestEgressReader(t *testing.T) {
-	good := show("4242", "0.0.0.0/0 ::/0", "localhost 10.0.0.0/8", goodBinds)
+	good := show("4242", "0.0.0.0/0 ::/0", "127.0.0.1/32 ::1/128 10.0.0.5/32", goodBinds)
 	cases := []struct {
 		name       string
 		showOut    string
@@ -39,7 +40,7 @@ func TestEgressReader(t *testing.T) {
 		wantRes    string
 	}{
 		{"enforced", good, nil, map[string]string{"st": selfTest(4242, true), "h": hostsFile}, map[string][]string{"ctl.example": {"10.0.0.5"}}, "enforced", "confirms", nil, true, "unit"},
-		{"deny spelled any", show("4242", "any", "localhost", goodBinds), nil, map[string]string{"st": selfTest(4242, true), "h": hostsFile}, nil, "enforced", "", nil, true, "unit"},
+		{"deny spelled any", show("4242", "any", "127.0.0.1/32", goodBinds), nil, map[string]string{"st": selfTest(4242, true), "h": hostsFile}, nil, "enforced", "", nil, true, "unit"},
 		{"unenforced from self-test", good, nil, map[string]string{"st": selfTest(4242, false), "h": hostsFile}, nil, "unenforced", "self-test says not enforced", nil, true, "unit"},
 		{"pid mismatch is unknown", good, nil, map[string]string{"st": selfTest(1, true), "h": hostsFile}, nil, "unknown", "not the running harness", nil, false, "unit"},
 		{"self-test absent is unknown", good, nil, map[string]string{"h": hostsFile}, nil, "unknown", "has not written", nil, false, "unit"},
@@ -50,6 +51,8 @@ func TestEgressReader(t *testing.T) {
 		{"running, no deny is unenforced", show("4242", "", "", goodBinds), nil, map[string]string{"st": selfTest(4242, true)}, nil, "unenforced", "no IPAddressDeny", nil, false, "unit"},
 		{"v4-only deny is unenforced", show("4242", "0.0.0.0/0", "", goodBinds), nil, map[string]string{"st": selfTest(4242, true)}, nil, "unenforced", "no IPAddressDeny", nil, false, "unit"},
 		{"resolver none is unenforced", show("4242", "0.0.0.0/0 ::/0", "", ""), nil, map[string]string{"st": selfTest(4242, true)}, nil, "unenforced", "resolv.conf", nil, false, "none"},
+		{"an old wide allow list is not held", show("4242", "0.0.0.0/0 ::/0", "10.0.0.0/8 100.64.0.0/10 127.0.0.1/32 ::1/128", goodBinds), nil, map[string]string{"st": selfTest(4242, true), "h": hostsFile}, nil, "unenforced", "still includes 10.0.0.0/8 100.64.0.0/10 (an older applier wrote it): re-apply", nil, false, "unit"},
+		{"a symbolic allow entry is not a single host", show("4242", "0.0.0.0/0 ::/0", "localhost 10.0.0.5/32", goodBinds), nil, map[string]string{"st": selfTest(4242, true), "h": hostsFile}, nil, "unenforced", "still includes localhost", nil, false, "unit"},
 		{"a stale host", good, nil, map[string]string{"st": selfTest(4242, true), "h": hostsFile}, map[string][]string{"ctl.example": {"10.0.0.5", "10.0.0.6"}}, "enforced", "", []string{"ctl.example"}, true, "unit"},
 		{"unresolvable name is not stale", good, nil, map[string]string{"st": selfTest(4242, true), "h": hostsFile}, map[string][]string{}, "enforced", "", nil, true, "unit"},
 	}
@@ -122,5 +125,81 @@ func TestResolverIsRecognisedOnTheSymlinkTarget(t *testing.T) {
 	}
 	if got := resolverFromBinds("/somewhere/else/resolv.conf:/etc/resolv.conf"); got != "none" {
 		t.Fatalf("a resolv.conf that is not the harness's: got %q", got)
+	}
+}
+
+// A harness that re-checks every minute (i1246): its latest check must be
+// recent, a reachable resolver is named, a gateway it cannot reach from inside
+// the hold is "stale" (not a leak), and a replaced resolv.conf is carried.
+func TestEgressReaderReadsTheCurrentCheckNotTheStart(t *testing.T) {
+	const now = 1_800_000_000
+	rec := func(checkedAt int64, enforced bool, extra string) string {
+		return fmt.Sprintf(`{"version":1,"pid":4242,"started_at":1,"lookup":{"result":"failed"},"connect":{"result":"timeout"},"enforced":%v,"checked_at":%d%s}`, enforced, checkedAt, extra)
+	}
+	read := func(binds, st string) Egress {
+		r := &EgressReader{
+			SelfTestPath: "st", HostsPath: "h",
+			Now: func() time.Time { return time.Unix(now, 0) },
+			Run: func(context.Context, string, ...string) ([]byte, error) {
+				return []byte(show("4242", "0.0.0.0/0 ::/0", "127.0.0.1/32 ::1/128 10.0.0.5/32", binds)), nil
+			},
+			ReadFile: func(p string) ([]byte, error) {
+				switch p {
+				case "st":
+					return []byte(st), nil
+				case "h":
+					return []byte(hostsFile), nil
+				}
+				return nil, errors.New("absent")
+			},
+			Resolve: func(context.Context, string) ([]string, error) { return []string{"10.0.0.5"}, nil },
+		}
+		return r.Read(context.Background())
+	}
+	fresh := read(goodBinds, rec(now-40, true, `,"resolv_held":true`))
+	if fresh.State != EgressEnforced || fresh.CheckedAgeSecs == nil || *fresh.CheckedAgeSecs != 40 || fresh.ResolvHeld == nil || !*fresh.ResolvHeld {
+		t.Fatalf("a 40 s old held check: %+v", fresh)
+	}
+	old := read(goodBinds, rec(now-181, true, ""))
+	if old.State != EgressUnknown || !strings.Contains(old.Reason, "181s old (it re-checks every 60 s)") {
+		t.Fatalf("a check older than 180 s is unknown, never a pass: %+v", old)
+	}
+	if edge := read(goodBinds, rec(now-180, true, "")); edge.State != EgressEnforced {
+		t.Fatalf("exactly 180 s is still current: %+v", edge)
+	}
+	dns := read(goodBinds, rec(now-5, false, `,"dns_reachable":["10.0.0.5"]`))
+	if dns.State != EgressUnenforced || !strings.Contains(dns.Reason, "a resolver answered at 10.0.0.5") {
+		t.Fatalf("an answering resolver is named: %+v", dns)
+	}
+	gw := read(goodBinds, rec(now-5, true, `,"gateway":{"addr":"10.0.0.5:8443","result":"failed"}`))
+	if gw.State != EgressStale || !strings.Contains(gw.Reason, "cannot reach the gateway at 10.0.0.5:8443") || !strings.Contains(gw.Reason, "re-apply") {
+		t.Fatalf("an unreachable gateway is stale, with the address: %+v", gw)
+	}
+	if ok := read(goodBinds, rec(now-5, true, `,"gateway":{"addr":"10.0.0.5:8443","result":"ok"}`)); ok.State != EgressEnforced {
+		t.Fatalf("a reachable gateway is held: %+v", ok)
+	}
+	lost := read(goodBinds, rec(now-5, true, `,"resolv_held":false`))
+	if lost.State != EgressEnforced || lost.ResolvHeld == nil || *lost.ResolvHeld {
+		t.Fatalf("a replaced resolv.conf alone stays held (the allow list holds) and is carried for verify: %+v", lost)
+	}
+	// An older harness writes no checked_at: read from its start-time check.
+	if legacy := read(goodBinds, selfTest(4242, true)); legacy.State != EgressEnforced || legacy.CheckedAgeSecs != nil {
+		t.Fatalf("an older harness's record still reads: %+v", legacy)
+	}
+	m := fresh.Map()
+	if m["checked_age_secs"] != int64(40) || m["resolv_held"] != true {
+		t.Fatalf("the wire map carries the age and resolv_held: %v", m)
+	}
+}
+
+// A resolver file outside /etc is held by binding the harness-net directory
+// over its parent: still the unit's resolver. /etc itself never is.
+func TestResolverIsRecognisedOnTheHeldDirectory(t *testing.T) {
+	dir := "/etc/noo/harness-net/resolvdir:/run/systemd/resolve:rbind /etc/noo/harness-net/hosts:/etc/hosts:rbind"
+	if got := resolverFromBinds(dir); got != "unit" {
+		t.Fatalf("held directory: got %q", got)
+	}
+	if got := resolverFromBinds("/etc/noo/harness-net/resolvdir:/etc"); got != "none" {
+		t.Fatalf("the held directory over /etc is not a resolver hold: got %q", got)
 	}
 }

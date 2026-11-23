@@ -3825,7 +3825,6 @@ pub(crate) fn backend_image_ref(backend: &str, get: &dyn Fn(&str) -> Option<Stri
         // release ref (prefix:tag, rail-staged); only an operator override
         // is forwarded.
         "llamacpp" => ("LLAMACPP_IMAGE", ""),
-        "embedding" => ("TEI_IMAGE", ""),
         _ => return None,
     };
     [operator, locked]
@@ -5789,6 +5788,36 @@ pub(super) fn nudge_reconcile(state: Arc<AppState>, node_id: String) {
     });
 }
 
+/// The TEI engine was removed in 0.6.30 (i1182a). A NEW running placement of
+/// it is refused with the replacement, never auto-mapped: an HF id is not an
+/// Ollama model name, and the embedding model is an embedding-space decision.
+///
+/// - backend `embedding` (the TEI path): always.
+/// - backend `reranker` with a model that is not a `.gguf` file (an HF repo
+///   id), or an explicit TEI image: refused. A `.gguf` reranker, and a
+///   reranker edit that names no model and no image, pass.
+///
+/// Pure; `placement_put` calls it before anything is read or written.
+pub(crate) fn removed_engine_refusal(node_id: &str, backend: &str, model: Option<&str>, image: Option<&str>) -> Option<String> {
+    match backend {
+        "embedding" => Some(format!(
+            "the TEI embedding engine was removed in 0.6.30: new placements are refused; place an Ollama embedder instead: `noo cluster place {node_id} ollama <model> --role embed`"
+        )),
+        "reranker" => {
+            let tei_image = image.is_some_and(|i| i.to_ascii_lowercase().contains("text-embeddings-inference"));
+            let not_gguf = model
+                .map(str::trim)
+                .filter(|m| !m.is_empty())
+                .is_some_and(|m| !m.to_ascii_lowercase().ends_with(".gguf"));
+            (tei_image || not_gguf).then(|| format!(
+                "the TEI reranker was removed in 0.6.30: new placements are refused; place a GGUF cross-encoder: `noo cluster place {node_id} reranker <file>.gguf` \
+                 (e.g. bge-reranker-v2-m3-Q8_0.gguf; ship it with `noo cluster sync-model-files {node_id} -m <file>`)"
+            ))
+        }
+        _ => None,
+    }
+}
+
 async fn placement_put(
     State(state): State<Arc<AppState>>,
     Path((node_id, backend)): Path<(String, String)>,
@@ -5803,6 +5832,13 @@ async fn placement_put(
     // The harness placement: backend `harness` is always role
     // `harness` and nothing else may claim that role.
     let role = resolve_role(&backend, body.role.as_deref()).map_err(AppError::BadRequest)?;
+    // i1182a: a new placement of the unsupported TEI engine is refused (a stop
+    // still goes through, so an operator can wind an old one down).
+    if desired == "running" {
+        if let Some(why) = removed_engine_refusal(&node_id, &backend, body.model.as_deref(), body.image.as_deref()) {
+            return Err(AppError::BadRequest(why));
+        }
+    }
     // i150 E1: a node may serve several embedding spaces, so an embed row is
     // keyed by its model too. A body that names none (a bare stop/start, a
     // tuning edit) can only mean "the" embed row there is exactly one of.
@@ -9393,6 +9429,41 @@ mod placement_role_tests {
             {"name": "zero", "size_bytes": 0}]});
         assert_eq!(sizes_of(&n), vec![json!({"name": "gemma4:26b", "size_bytes": 17_000_000_000u64})]);
         assert!(sizes_of(&json!({})).is_empty());
+    }
+
+    /// i1182a: the TEI engine was removed in 0.6.30; a new `embedding` placement or a
+    /// non-GGUF / TEI-image reranker is refused naming the replacement, a
+    /// GGUF reranker is not.
+    #[test]
+    fn the_unsupported_tei_engine_is_refused_with_the_replacement() {
+        let why = removed_engine_refusal("n1", "embedding", Some("BAAI/bge-small-en-v1.5"), None).expect("refused");
+        assert!(why.contains("the TEI embedding engine was removed in 0.6.30: new placements are refused"), "{why}");
+        assert!(why.contains("`noo cluster place n1 ollama <model> --role embed`"), "{why}");
+        assert!(removed_engine_refusal("n1", "embedding", None, None).is_some(), "a bare embedding place too");
+        let hf = removed_engine_refusal("n1", "reranker", Some("BAAI/bge-reranker-v2-m3"), None).expect("an HF id is refused");
+        assert!(hf.contains("the TEI reranker was removed in 0.6.30") && hf.contains("`noo cluster place n1 reranker <file>.gguf`"), "{hf}");
+        assert!(hf.contains("bge-reranker-v2-m3-Q8_0.gguf") && hf.contains("noo cluster sync-model-files n1 -m <file>"), "{hf}");
+        let img = removed_engine_refusal("n1", "reranker", Some("x.gguf"), Some("ghcr.io/huggingface/text-embeddings-inference:cpu-1.9.4")).expect("a TEI image is refused");
+        assert!(img.contains("the TEI reranker was removed in 0.6.30"), "{img}");
+        assert!(removed_engine_refusal("n1", "reranker", Some("bge-reranker-v2-m3-Q8_0.gguf"), None).is_none(), "a GGUF reranker is accepted");
+        assert!(removed_engine_refusal("n1", "reranker", Some("Model.GGUF"), Some("ghcr.io/noomesh/llamacpp:v1")).is_none());
+        assert!(removed_engine_refusal("n1", "reranker", None, None).is_none(), "an edit that names no model is not judged");
+        assert!(removed_engine_refusal("n1", "ollama", Some("harrier"), None).is_none());
+        assert!(removed_engine_refusal("n1", "llamacpp", Some("a/b"), None).is_none());
+    }
+
+    /// i1182a: the handler asks before it reads or writes anything, and only
+    /// for a running placement.
+    #[test]
+    fn placement_put_refuses_a_removed_engine_before_any_read_or_write() {
+        let own = crate::test_src::own_code(include_str!("cluster.rs"));
+        let put = crate::test_src::fn_body(&own, "async fn placement_put(");
+        let at = put.find("removed_engine_refusal(").expect("the handler asks");
+        assert!(put[..at].contains("desired == \"running\""), "only a running placement is refused");
+        assert!(at < put.find("stored_placements(").unwrap(), "before the first read");
+        // The write, found by its statement name (no `sqlx` + `::query` text here: the
+        // repo-layer ratchet counts that text, and a test line must not raise the count).
+        assert!(at < put.find("(PLACEMENT_UPSERT)").unwrap(), "before the write");
     }
 
     #[test]

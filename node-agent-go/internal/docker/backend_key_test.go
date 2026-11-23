@@ -17,7 +17,8 @@ func TestBackendKeyFromName(t *testing.T) {
 		"noo-llamacpp":       "llamacpp",
 		"noo-airllm":         "airllm",
 		"noo-ollama":         "ollama",
-		"noo-tei":            "embedding",
+		// The TEI engine is gone: its container is not a backend.
+		"noo-tei": "",
 		// Both reranker engines keep this container name — the key must not
 		// depend on which engine is inside.
 		"noo-reranker": "reranker",

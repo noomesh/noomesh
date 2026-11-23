@@ -170,7 +170,8 @@ pub fn cluster_import_model(g: &Globals, args: &[String]) -> Result<i32, Unhandl
             }
         }
         Err(e) => fail(g.json, ExitCode::Generic, "create_failed",
-            &format!("the node could not import the model: {e}"), None),
+            &format!("the node could not import the model: {e}"),
+            import_failure_remedy(node, name, &e).as_deref()),
     }
     if place {
         let mut pb = json!({"model": name, "desired_state": "running", "tls": false});
@@ -202,6 +203,24 @@ pub fn cluster_import_model(g: &Globals, args: &[String]) -> Result<i32, Unhandl
         println!("{}", json!({"status": "ok", "model": name, "node": node, "placed": place, "role": role}));
     }
     Ok(0)
+}
+
+/// The remedy for a failed `import-model` POST, chosen from the agent's
+/// detail by its stable phrases (never an exact string). The import goes into
+/// the node's ALREADY-RUNNING ollama and never starts a backend, so a "not
+/// running" detail has one fix per platform: Linux places the ollama backend
+/// (the noo-ollama container); a Mac's native Ollama is started by the
+/// command the agent's own text names, so that is deferred to, not invented.
+/// `--place` runs only after a successful import, so the re-run is the
+/// operator's next step either way. Any other failure has no remedy.
+fn import_failure_remedy(node: &str, model: &str, detail: &str) -> Option<String> {
+    if detail.contains("noo-ollama container is not running") {
+        Some(format!("start it with `noo cluster place {node} ollama {model}`, then re-run the import; --place runs only after a successful import"))
+    } else if detail.contains("native Ollama isn't running on this Mac") {
+        Some("start the Mac's native Ollama as the message says, then re-run the import; --place runs only after a successful import".to_string())
+    } else {
+        None
+    }
 }
 
 /// Stage `<name>.Modelfile` + its weight into the store from the OCI
@@ -2072,5 +2091,35 @@ mod stage_artifact_tests {
         assert!(e.contains("the signed stack lock vouches for"), "{e}");
         assert_eq!(std::fs::read_dir(&store).unwrap().count(), 0, "nothing staged");
         let _ = std::fs::remove_dir_all(store.parent().unwrap());
+    }
+}
+
+#[cfg(test)]
+mod import_failure_remedy_tests {
+    use super::import_failure_remedy;
+
+    /// Linux: the noo-ollama container is down, so the remedy places ollama
+    /// on THIS node with THIS model.
+    #[test]
+    fn import_remedy_linux_names_cluster_place_with_node_and_model() {
+        let r = import_failure_remedy("n1", "qwen3:8b", "the noo-ollama container is not running").unwrap();
+        assert!(r.contains("`noo cluster place n1 ollama qwen3:8b`"), "{r}");
+        assert!(r.contains("--place runs only after a successful import"), "{r}");
+    }
+
+    /// Mac: defer to the agent's own text; never `noo cluster place`.
+    #[test]
+    fn import_remedy_mac_defers_to_the_agent_text() {
+        let d = "the native Ollama isn't running on this Mac: start it with `sudo brew services start ollama` (a boot service), or run `noo enroll --resume`";
+        let r = import_failure_remedy("mac1", "qwen3:8b", d).unwrap();
+        assert!(r.contains("start the Mac's native Ollama"), "{r}");
+        assert!(!r.contains("noo cluster place"), "{r}");
+    }
+
+    /// Any other failure has no remedy.
+    #[test]
+    fn import_remedy_unrelated_failure_has_none() {
+        assert_eq!(import_failure_remedy("n1", "m", "disk full"), None);
+        assert_eq!(import_failure_remedy("n1", "m", "the native Ollama isn't installed on this Mac"), None);
     }
 }

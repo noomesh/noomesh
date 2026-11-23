@@ -798,7 +798,7 @@ dist_ref_is_stack_versioned() {
 # list) for a third-party runtime image the signed lock pins, by the REPOSITORY
 # name in the ref; empty for anything else. Mirrors THIRD_PARTY in
 # scripts/stack-lock-third-party.py (tests/test_third_party_image_lock.py
-# pins the two together). tei has two rows (GPU and cpu- tags).
+# pins the two together).
 dist_third_party_row() {
     local _r="${1%%@*}"
     _r="${_r##*/}"
@@ -813,7 +813,6 @@ dist_third_party_row() {
         alertmanager) echo ALERTMANAGER ;;
         grafana) echo GRAFANA ;;
         node-exporter) echo NODE_EXPORTER ;;
-        text-embeddings-inference) echo "TEI TEI_CPU" ;;
         vllm-openai) echo VLLM ;;
     esac
 }
@@ -926,7 +925,7 @@ dist_assert_pull_refs() {
     local _base="${NOO_BASE_REGISTRY:-${NOO_IMAGE_PREFIX:-}/dhi}"
     _base="${_base%/}"
     while IFS= read -r _ref; do
-        # Third-party runtime images (redis, nats, loki, vllm, tei ...) sit
+        # Third-party runtime images (redis, nats, loki, vllm ...) sit
         # outside the stack-versioned set, but the signed lock pins them by
         # digest: held to their pins below, wherever their registry is.
         dist_assert_third_party_ref "$_ref" || return 1

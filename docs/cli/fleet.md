@@ -146,20 +146,33 @@ noo cluster fit gpu-2 --with llamacpp gemma-3-27b-it-Q4_K_M.gguf --on cpu
 |---|---|
 | llamacpp | `N_GPU_LAYERS=0` in the placement env; the container gets no GPU device |
 | ollama | the container gets no GPU device (`CUDA_VISIBLE_DEVICES` emptied). One ollama serves every role on a node, so it runs on CPU only when every role asks for cpu |
-| TEI (`embedding`, the TEI `reranker`) | the CPU image (`cpu-1.9.4`), always |
 | vllm | refused: vLLM runs on a GPU only |
 
 With no `--on`, a placement keeps the target it already has; otherwise
 `N_GPU_LAYERS=0` means cpu, and a node with a GPU defaults to gpu. `--on
 gpu` on a node that reports no GPU is refused.
 
-TEI takes its GPU image only on a usable NVIDIA runtime: an NVIDIA GPU the
-agent sees and the `nvidia` runtime registered with docker (a `/dev/dxg`
-device alone, as on WSL2 without the toolkit, is not enough). `--on gpu`
-without one is refused at start, with the fix (install the NVIDIA container
-toolkit, or place it `--on cpu`), and shows as a start refusal; it never
-runs a CPU embedder that looks placed. With no `--on`, TEI takes the GPU
-image when a runtime is usable, else the CPU image.
+**The TEI engine was removed in 0.6.30.** New placements of it are
+refused: a new `embedding` placement is refused, so place an
+Ollama embedder instead, `noo cluster place <node> ollama <model> --role
+embed`. The model is an embedding-space decision, so it is not mapped for you.
+A `reranker` placement whose model is a Hugging Face id (not a `.gguf` file),
+or that names the TEI image, is refused too: place a GGUF cross-encoder,
+`noo cluster place <node> reranker <file>.gguf` (for example
+`bge-reranker-v2-m3-Q8_0.gguf`, shipped with `noo cluster sync-model-files
+<node> -m <file>`). A `.gguf` reranker is unchanged.
+
+**Upgrading a node that had a TEI placement.** The placement stays in the
+node's desired state but runs nothing: on its first reconcile pass after the
+upgrade the agent stops and removes the leftover TEI containers (and their
+TLS doors), and logs one line per container with the replacement command.
+`noo cluster verify` shows the placement in the `unsupported engine` row,
+with the command that replaces it, then `noo cluster unplace <node> <backend>`
+clears the old one. An embedding space whose model was a TEI model keeps
+serving searches over its existing vectors and refuses embed writes until a
+node serves that model or the space is migrated
+(`noo cluster embedding-space migrate <space> <model>`); verify shows it in the
+`unsupported engine space` row.
 
 llamacpp on gpu runs the CUDA build of llama.cpp (`llamacpp-cuda`, CUDA
 12.9, amd64) with every layer on the GPU, on a node with an NVIDIA GPU of
@@ -423,7 +436,7 @@ A node may serve several spaces: place each model as its own embed row
 (`noo cluster place gpu-2 ollama harrier --role embed`, then the code model
 the same way) and the node joins each space's pool. Placing a second embed
 model on ollama adds a row; chat and rerank placements still replace the
-role's one row, and a backend other than ollama (TEI, llama.cpp) holds one
+role's one row, and a backend other than ollama (llama.cpp) holds one
 embed model, so a second replaces the first. Remove one embed model with
 `noo cluster unplace gpu-2 ollama --role embed --model nomic-embed-code`.
 
@@ -483,6 +496,12 @@ dispatches a job per node that pulls existing GGUF files from the
 controller's model store (`$MODELS_DIR`, else `$NOO_DATA_ROOT/models`) and
 verifies them; `--dry-run` only plans. `--user` is refused.
 Catalog reads (`list`, `search`, `ollama`, `huggingface`) use a 24-hour
+`noo cluster import-model <node> <model>` imports a staged model into the
+node's **already-running** Ollama: the noo-ollama container, or the native
+Ollama on a Mac. It never starts a backend; if that Ollama is down the import
+fails and says how to start it (on Linux, `noo cluster place <node> ollama
+<model>`). With `--place`, the placement is sent only after the import
+succeeds.
 local cache with offline fallback; `noo models refresh` rebuilds it.
 See [weight-cache.md](../models/weight-cache.md).
 
@@ -546,12 +565,14 @@ Docker; `unreadable` with the error when Docker is there but its version
 could not be read). `noo cluster show <node>` prints it, and `noo cluster
 verify` has a `docker engine` row:
 
-- below **27**, the oldest Docker Engine the project tests (CI runs
-  `docker:27-dind`): WARN, with the upgrade as the remedy. Known consequence:
+- below **28**, the oldest Docker Engine noomesh supports: WARN, with the
+  upgrade as the remedy (Docker's apt repository, or Docker's convenience
+  script; Docker Desktop: update it). Nothing refuses an older engine. CI
+  still runs `docker:27-dind` as a canary below the floor. Known consequence:
   a container-lane Ollama import fails on an engine below 28 with an agent
   before 0.6.28;
 - `unreadable`: WARN, `cannot be checked`, with the error;
-- `none` (a native-only node) and 27 or newer: ok. Podman is shown, not
+- `none` (a native-only node) and 28 or newer: ok. Podman is shown, not
   compared;
 - an agent that predates the report: no row.
 
@@ -662,7 +683,7 @@ the GPU back, says so, and takes it again on its own once the GPU is free.
 
 **What counts as foreign.** A GPU process is noomesh's when it runs in a
 any noomesh container on the host: the agent's backends, the compose-managed
-controller stack (`noo-ollama-embed`, `noo-tei`, ...) and older leftovers.
+controller stack (`noo-ollama-embed`, ...) and older leftovers.
 Containers are recognised by their labels (compose project `noomesh` or
 `pai-assistant`, `noo.managed-by`), with the `noo-` name as the fallback; a
 container recognised only by name is reported as `orphan`. Everything else
@@ -971,7 +992,7 @@ drain_started, drained_at}`, plus `workload` for a reservation and
 | `noo cluster push-secrets` | `[<node>...] [--dry-run] [--explain] [--gateway-container <name>] [--sops-file <path>] [-y\|--yes]` | Stage fleet-wide secrets from env.sops as a bundle each node collects |
 | `noo cluster nats-users render` | `[--rotate] [--drop-legacy] [--dry-run] [-y\|--yes]` | Mint per-principal NATS passwords from the gateway registry and render users.conf |
 | `noo cluster nats-creds rotate` | `<node\|gateway\|worker\|trellion\|trellion_intel>... [--mint-only] [--restart] [-y\|--yes]` | Rotate a bus credential: nodes deliver over the rail; others re-render + recreate |
-| `noo cluster import-model` | `<node> <name> [--place] [--role chat\|embed\|rerank] [-b\|--backend <backend>]` | Import a store model or a staged ollama:<tag> into a node's ollama |
+| `noo cluster import-model` | `<node> <name> [--place] [--role chat\|embed\|rerank] [-b\|--backend <backend>]` | Import into the node's running ollama (container; Mac: native); --place only after success |
 | `noo cluster ship-model` | `<hf_id> <node> [--name <name>] [--quant <quant>] [--place] [-b\|--backend <backend>]` | Convert an HF model to GGUF and have a node import it; needs a source checkout |
 | `noo cluster clean` | `<node>\|all [--deep] [-y\|--yes]` | Remove this stack's containers on node(s) through their agents; --deep removes images too |
 | `noo cluster seed` | `[-f\|--file <path>] [--export] [--dry-run]` | Apply (or export) the cluster desired state from config/cluster-seed.yaml |

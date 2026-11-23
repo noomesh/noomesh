@@ -155,8 +155,8 @@ func TestHarnessKindCompatibility(t *testing.T) {
 	if err := harnessKindCompatible("claude-code", "llamacpp"); err != nil {
 		t.Fatal(err)
 	}
-	if err := harnessKindCompatible("claude-code", "tei"); err == nil {
-		t.Fatal("tei is not a chat backend; claude-code must be refused on it")
+	if err := harnessKindCompatible("claude-code", "reranker"); err == nil {
+		t.Fatal("reranker is not a chat backend; claude-code must be refused on it")
 	}
 	if err := harnessKindCompatible("copilot", "vllm"); err != nil {
 		t.Fatal(err)
@@ -178,8 +178,8 @@ func TestHarnessKindCompatibility(t *testing.T) {
 	}
 	// An incompatible kind names the backends that would do.
 	h.Env["NOO_HARNESS_KIND"] = "claude-code"
-	r.convergeHarness(context.Background(), h, []placement{{Backend: "tei", Model: "m", DesiredState: "running"}})
-	if len(f.Calls) != 0 || !strings.Contains(harnessRefusal(), "cannot use a tei backend") {
+	r.convergeHarness(context.Background(), h, []placement{{Backend: "reranker", Model: "m", DesiredState: "running"}})
+	if len(f.Calls) != 0 || !strings.Contains(harnessRefusal(), "cannot use a reranker backend") {
 		t.Fatalf("incompatible kind: calls=%v refusal=%q", f.Calls, harnessRefusal())
 	}
 	// The native kind starts.

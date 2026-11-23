@@ -31,7 +31,15 @@ const (
 	EgressEnforced   = "enforced"
 	EgressUnenforced = "unenforced"
 	EgressUnknown    = "unknown"
+	// EgressStale: held, but the harness cannot reach the gateway from inside
+	// its hold: the allow list names an address the controller no longer has.
+	// Not a leak (fail closed); a re-apply renders the current addresses.
+	EgressStale = "stale"
 )
+
+// SelfTestMaxAge: the harness re-runs its self-test every 60 s; a record
+// older than three intervals no longer says anything about now.
+const SelfTestMaxAge = 180 * time.Second
 
 // Egress is the heartbeat's host_services.harness.egress object. The json
 // tags are the wire names; every key is always present.
@@ -45,6 +53,10 @@ type Egress struct {
 	Lookup     string   `json:"lookup"`
 	Connect    string   `json:"connect"`
 	StaleHosts []string `json:"stale_hosts"`
+	// From a harness that re-checks (absent from an older one): how old its
+	// latest self-test is, and whether its private resolv.conf still holds.
+	CheckedAgeSecs *int64 `json:"checked_age_secs,omitempty"`
+	ResolvHeld     *bool  `json:"resolv_held,omitempty"`
 }
 
 // Map is the heartbeat form (the payload is map[string]any).
@@ -53,11 +65,18 @@ func (e Egress) Map() map[string]any {
 	if stale == nil {
 		stale = []string{}
 	}
-	return map[string]any{
+	m := map[string]any{
 		"state": e.State, "reason": e.Reason, "ip_deny": e.IPDeny, "ip_allow": e.IPAllow,
 		"resolver": e.Resolver, "pid_match": e.PIDMatch, "lookup": e.Lookup,
 		"connect": e.Connect, "stale_hosts": stale,
 	}
+	if e.CheckedAgeSecs != nil {
+		m["checked_age_secs"] = *e.CheckedAgeSecs
+	}
+	if e.ResolvHeld != nil {
+		m["resolv_held"] = *e.ResolvHeld
+	}
+	return m
 }
 
 // EgressReader holds every outside input of the egress reading so tests use
@@ -73,6 +92,8 @@ type EgressReader struct {
 	// SelfTestPath and HostsPath default to the constants above.
 	SelfTestPath string
 	HostsPath    string
+	// Now is the clock the self-test's age is read against (time.Now if nil).
+	Now func() time.Time
 }
 
 // DefaultEgressReader reads the real host.
@@ -100,6 +121,15 @@ type selfTestRecord struct {
 		Result string `json:"result"`
 	} `json:"connect"`
 	Enforced *bool `json:"enforced"`
+	// From a harness that re-checks every minute (absent from an older one).
+	CheckedAt    *int64   `json:"checked_at"`
+	ResolvHeld   *bool    `json:"resolv_held"`
+	DNSReachable []string `json:"dns_reachable"`
+	AllowFile    string   `json:"allow_file"`
+	Gateway      *struct {
+		Addr   string `json:"addr"`
+		Result string `json:"result"`
+	} `json:"gateway"`
 }
 
 // Read builds the egress object. Every absent, old or failing input yields
@@ -146,6 +176,14 @@ func (r *EgressReader) Read(ctx context.Context) Egress {
 		e.Reason = "the harness unit does not use the harness-only resolv.conf"
 		return e
 	}
+	// Every allowed entry must be one host: a range (an older applier wrote
+	// private, tailnet and link-local ranges) lets the unit reach whatever
+	// answers in it, a resolver included, whatever the self-test says.
+	if wide := wideAllowEntries(e.IPAllow); len(wide) > 0 {
+		e.State = EgressUnenforced
+		e.Reason = fmt.Sprintf("the harness's allow list still includes %s (an older applier wrote it): re-apply", strings.Join(wide, " "))
+		return e
+	}
 
 	raw, err := r.ReadFile(r.SelfTestPath)
 	if err != nil {
@@ -163,14 +201,59 @@ func (r *EgressReader) Read(ctx context.Context) Egress {
 		e.Reason = fmt.Sprintf("the egress self-test is from pid %d, not the running harness (pid %d)", st.PID, mainPID)
 		return e
 	}
+	// A harness that re-checks: its latest check must be recent. An older
+	// harness (no checked_at) is read as before, from its start-time check.
+	if st.CheckedAt != nil {
+		now := time.Now
+		if r.Now != nil {
+			now = r.Now
+		}
+		age := now().Unix() - *st.CheckedAt
+		if age < 0 {
+			age = 0
+		}
+		e.CheckedAgeSecs = &age
+		e.ResolvHeld = st.ResolvHeld
+		if time.Duration(age)*time.Second > SelfTestMaxAge {
+			e.Reason = fmt.Sprintf("the harness's egress self-test is %ds old (it re-checks every 60 s); nothing says the hold holds now", age)
+			return e
+		}
+	}
 	if !*st.Enforced {
 		e.State = EgressUnenforced
 		e.Reason = fmt.Sprintf("the harness's own self-test says not enforced (lookup %s, connect %s)", st.Lookup.Result, st.Connect.Result)
+		if len(st.DNSReachable) > 0 {
+			e.Reason += fmt.Sprintf("; a resolver answered at %s", strings.Join(st.DNSReachable, ", "))
+		}
+		if st.AllowFile == "missing" {
+			e.Reason += "; no allow file beside the drop-in (an older applier): re-apply"
+		}
+		return e
+	}
+	if st.Gateway != nil && st.Gateway.Result == "failed" {
+		e.State = EgressStale
+		e.Reason = fmt.Sprintf("held, but the harness cannot reach the gateway at %s from inside its hold (the allow list may be stale): re-apply", st.Gateway.Addr)
 		return e
 	}
 	e.State = EgressEnforced
-	e.Reason = "the unit denies all but local and tailnet addresses and the harness's own self-test confirms it"
+	e.Reason = fmt.Sprintf("the unit allows only %s and the harness's own self-test confirms it", e.IPAllow)
 	return e
+}
+
+// wideAllowEntries returns the entries of systemd's IPAddressAllow value that
+// are not a single host (/32 or /128). An empty value allows nothing.
+func wideAllowEntries(v string) []string {
+	var wide []string
+	for _, f := range strings.Fields(v) {
+		_, pfx, ok := strings.Cut(f, "/")
+		switch {
+		case ok && strings.Contains(f, ":") && pfx == "128":
+		case ok && !strings.Contains(f, ":") && pfx == "32":
+		default:
+			wide = append(wide, f)
+		}
+	}
+	return wide
 }
 
 func shortErr(err error) string {
@@ -206,6 +289,12 @@ func resolverFromBinds(v string) string {
 	for _, f := range strings.Fields(v) {
 		parts := strings.Split(strings.TrimLeft(f, "-+"), ":")
 		if len(parts) >= 2 && parts[0] == strings.TrimSuffix(HarnessNetDir, "/")+"/resolv.conf" && strings.HasSuffix(parts[1], "resolv.conf") {
+			return "unit"
+		}
+		// A resolver file outside /etc is held by binding the harness-net
+		// directory over its parent (a file bind would detach on the host's
+		// next rewrite of it).
+		if len(parts) >= 2 && parts[0] == strings.TrimSuffix(HarnessNetDir, "/")+"/resolvdir" && parts[1] != "" && parts[1] != "/etc" {
 			return "unit"
 		}
 	}

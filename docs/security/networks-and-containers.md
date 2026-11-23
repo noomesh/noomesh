@@ -176,7 +176,7 @@ agent sets `User: "0"` on them explicitly.
 | `trellion` | ALL | yes | yes (tmpfs `/tmp` 1g, `/home/nonroot` 256m) |
 | `stunnel-*` (the nine backend doors) | ALL | yes | yes (tmpfs `/tmp` 16m; non-root) |
 | `llamacpp` | ALL, plus the agent's backend set (below) | yes | yes (tmpfs `/tmp` 64m; non-root in the image) |
-| `vllm`, `vllm-secondary`, `ollama`, `ollama-embed`, `ollama-embed-cpu`, `tei`, `tei-gpu`, `reranker`, `airllm` | ALL, plus `CHOWN`, `DAC_OVERRIDE`, `FOWNER`, `SETGID`, `SETUID` (the node agent's backend set) | yes | no (below) |
+| `vllm`, `vllm-secondary`, `ollama`, `ollama-embed`, `ollama-embed-cpu`, `reranker`, `airllm` | ALL, plus `CHOWN`, `DAC_OVERRIDE`, `FOWNER`, `SETGID`, `SETUID` (the node agent's backend set) | yes | no (below) |
 
 **Backends that keep a writable root, and why** (measured with `docker diff`
 on running containers, node-a, 2026-10-28):
@@ -188,8 +188,6 @@ on running containers, node-a, 2026-10-28):
   root; non-root needs the Hugging Face cache owned by that user.
 - `ollama` (all three): writes its model store under `/root/.ollama` (a
   volume) as root; non-root needs the volume re-owned and `HOME` moved.
-- `tei`, `tei-gpu`, the TEI `reranker`: write the model cache under `/data` as
-  root; same re-own as Ollama.
 - `airllm`: a local build, not measured.
 - The node agent's own doors run as root (not the image's non-root user) to
   read the node's root-owned `0600` service key with `DAC_OVERRIDE`; they are

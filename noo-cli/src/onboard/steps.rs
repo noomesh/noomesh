@@ -399,11 +399,23 @@ pub fn prerequisites(ctx: &mut Ctx) -> bool {
                 // never piped into a shell. See crate::vendor.
                 let docker_cmd = crate::vendor::install_script_cmd(crate::vendor::DOCKER_INSTALL_URL);
                 let log = install_log_path("onboard-docker.log");
+                // i1098 row 12 (operator 2026-11-21): onboard holds the Docker
+                // packages THIS install adds, read from dpkg before and after;
+                // a Docker already here is the person's and is never held.
+                let mut hold_host = crate::docker_hold::LiveHold { may_prompt: ctx_sudo_may_prompt(ctx) };
+                let docker_before = crate::docker_hold::installed_now(&mut hold_host);
                 let ok = run_logged(ctx_sudo(ctx).args(["sh", "-c", &docker_cmd]), &log);
                 if ok {
                     let user = std::env::var("USER").unwrap_or_default();
                     let _ = ctx_sudo(ctx).args(["usermod", "-aG", "docker", &user]).status();
                     ctx.success(&format!("Docker installed; your user was added to the docker group (log: {})", log.display()));
+                    // Before the relaunch below: this process exits there.
+                    let held = crate::docker_hold::hold_what_this_run_installed(&mut hold_host, &docker_before);
+                    match crate::docker_hold::outcome_line(&held) {
+                        Some((true, line)) => ctx.success(&line),
+                        Some((false, line)) => ctx.warn(&line),
+                        None => {}
+                    }
                     // The running shell can't pick up new group membership —
                     // but `sg docker` reads /etc/group directly (usermod just
                     // updated it), so the wizard RELAUNCHES ITSELF through it
@@ -484,7 +496,7 @@ pub fn prerequisites(ctx: &mut Ctx) -> bool {
             // the controller's `docker compose` verify row.
             Ok(v) => {
                 use crate::commands::cluster_verify::{compose_version_from_text, docker_compose_check, Verdict};
-                let row = docker_compose_check(&compose_version_from_text(&v), "");
+                let row = docker_compose_check(&compose_version_from_text(&v), "", &compose_upgrade_remedy_here());
                 match row.verdict {
                     Verdict::Ok => ctx.success(&format!("docker compose: {v}")),
                     _ => {
@@ -731,6 +743,12 @@ pub(crate) fn compose_remedy_here() -> String {
     compose_remedy(&os_release_text(), docker_ce_installed())
 }
 
+/// The upgrade remedy for a Compose below the minimum on this machine (the
+/// `docker compose` verify row's WARN and onboard's say the same).
+pub(crate) fn compose_upgrade_remedy_here() -> String {
+    crate::commands::cluster_verify::compose_upgrade_remedy(compose_package(&os_release_text(), docker_ce_installed()))
+}
+
 fn os_release_text() -> String {
     std::fs::read_to_string("/etc/os-release").unwrap_or_default()
 }
@@ -740,7 +758,7 @@ fn docker_ce_installed() -> bool {
     Command::new("dpkg-query").args(["-W", "docker-ce"]).output().map(|o| o.status.success()).unwrap_or(false)
 }
 
-fn tool_version(tool: &str) -> Option<String> {
+pub(crate) fn tool_version(tool: &str) -> Option<String> {
     let out = Command::new(tool).arg("--version").output().ok()?;
     if !out.status.success() && out.stdout.is_empty() && out.stderr.is_empty() {
         return None;
@@ -818,8 +836,7 @@ fn apply_topology_env(ctx: &mut Ctx) {
         if ctx.state.tier == 2 {
             ctx.update_env("OLLAMA_URL", "https://stunnel-ollama:11434");
         }
-        // No PAGEINDEX_EMBEDDING_URL: tei is opt-in (tei-compose) and the
-        // embedding client resolves ollama-first / mesh-routed without it.
+        // No PAGEINDEX_EMBEDDING_URL: the embedding client resolves ollama-first / mesh-routed without it.
     }
 }
 
@@ -3107,7 +3124,7 @@ fn controller_services(ctx: &mut Ctx) -> Option<Vec<String>> {
 
 /// Externally-reachable services need the controller LAN IP in their SAN.
 pub(crate) const SVC_LIST: &[&str] = &[
-    "redis", "nats", "postgres", "vllm", "llamacpp", "ollama", "tei", "reranker", "loki",
+    "redis", "nats", "postgres", "vllm", "llamacpp", "ollama", "reranker", "loki",
     // The standalone profile's embedder, presented by its stunnel sidecar
     // (docker/stunnel-ollama-embed.conf). Its own leaf, not `ollama`'s:
     // `noo upgrade --stack` issues a MISSING leaf on its own
@@ -3183,7 +3200,6 @@ pub(crate) fn svc_extra_hostnames(svc: &str) -> Vec<String> {
         // container name (STANDALONE_OLLAMA_EMBED_URL) or compose alias.
         "ollama-embed" => &["noo-ollama-embed", "stunnel-ollama-embed", "noo-stunnel-ollama-embed"],
         "ollama-embed-cpu" => &["noo-ollama-embed-cpu", "stunnel-ollama-embed-cpu", "noo-stunnel-ollama-embed-cpu"],
-        "tei" => &["noo-tei", "stunnel-tei"],
         "reranker" => &["noo-reranker", "stunnel-reranker"],
         "redis" => &["noo-redis"],
         "nats" => &["noo-nats"],

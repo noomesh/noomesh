@@ -46,6 +46,37 @@ apt-mark showhold
 `sudo apt upgrade` then lists these as "kept back". That is the point; it is
 not an error.
 
+**The Docker that `noo onboard` installs is already held.** When the wizard
+installs Docker itself (get.docker.com, on apt systems), it holds the Docker
+packages that install added, so an unattended upgrade cannot restart dockerd
+(a dockerd restart restarts every container). It holds only what it
+installed: a Docker that was on the machine before is never held, and its
+summary says "not held: it was already installed". What it held is recorded
+in `/etc/noo/onboard-docker-holds`; the `holds` row of
+`noo cluster verify <node>` on that machine shows the set and says onboard
+placed it, and `noo offboard` releases exactly that set. Onboard installs
+Docker only where apt is, so on dnf or zypper systems it holds nothing.
+
+### Taking a Docker security update
+
+A hold is not "never update". To take a Docker update on purpose (the
+controller last, as below), with the packages onboard's summary or the
+`holds` row names:
+
+```sh
+sudo apt-mark unhold docker-ce docker-ce-cli containerd.io docker-compose-plugin docker-buildx-plugin
+sudo apt-get update
+sudo apt-get install --only-upgrade docker-ce docker-ce-cli containerd.io docker-compose-plugin docker-buildx-plugin
+noo cluster verify <node>
+sudo apt-mark hold docker-ce docker-ce-cli containerd.io docker-compose-plugin docker-buildx-plugin
+```
+
+The upgrade restarts dockerd, and with it every container on that machine;
+the stack comes back by itself. Hold again even when verify shows a problem:
+the hold is what keeps the next unattended run from moving Docker again.
+Only apt is held for now: on dnf or zypper, Docker updates with the system
+unless you lock it yourself (`dnf versionlock`, `zypper addlock`).
+
 Not covered here: a **WSL2** node's kernel and GPU driver come from Windows
 (update them through Windows Update and the NVIDIA Windows driver, on the same
 canary-first rule); a **macOS** node has no apt, and its agent updates with
@@ -146,6 +177,10 @@ then `noo stack start` starts the held services.
   update moves one node at a time on purpose (canary first, controller
   last, a day between). Never run `apt upgrade`, `apt-mark` or a reboot on
   a node yourself, and never on a remote node.
+- **Onboard's Docker holds:** `noo onboard` holds only the Docker packages
+  it installed (recorded in `/etc/noo/onboard-docker-holds`); `noo offboard`
+  releases exactly those. A Docker update is the person's: the five commands
+  under "Taking a Docker security update", on their node.
 - **Read, and report:** `noo --json cluster verify <node>` carries the
   rows this runbook relies on: `next boot`, `gpu driver`,
   `boot partition`, `holds` and `tailnet control`. Before a person reboots

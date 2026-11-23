@@ -434,7 +434,7 @@ func MetricsReader(cfg *config.Config) func(http.Handler) http.Handler {
 			// A service leaf opens /metrics only when it is the SCRAPER's
 			// (CN=prometheus, the gateway's METRICS_SCRAPER_SERVICE). Since
 			// every node holds its own backend-door leaves (vllm, llamacpp,
-			// ollama, tei, reranker — all O=Mesh Cluster Service), "any
+			// ollama, reranker — all O=Mesh Cluster Service), "any
 			// service leaf" would let one compromised node read every other
 			// node's metrics.
 			if p.Controller || (p.Service && p.CertCN == MetricsScraperCN) {

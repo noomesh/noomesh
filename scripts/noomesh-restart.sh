@@ -119,8 +119,6 @@ service_profile() {
         airllm)     echo "gpu-tier1" ;;
         llamacpp)   echo "gpu-tier2" ;;
         ollama)     echo "gpu-tier2" ;;
-        tei)        echo "controller" ;;
-        tei-gpu)    echo "gpu-tier2" ;;
         # whisper / piper: the voice OVERLAY — no profile.
         # trellion: the trellion OVERLAY — no profile.
         # licensed add-ons: OVERLAYS from their signed bundles — visible

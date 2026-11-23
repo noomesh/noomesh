@@ -80,7 +80,7 @@ func TestResolveEnv_EmptyDefault(t *testing.T) {
 }
 
 func TestBackendSpecs_AllKnownBackends(t *testing.T) {
-	expected := []string{"vllm", "llamacpp", "ollama", "airllm", "embedding"}
+	expected := []string{"vllm", "llamacpp", "ollama", "airllm", "reranker"}
 	for _, name := range expected {
 		spec, ok := backendSpecs[name]
 		if !ok {
@@ -101,11 +101,11 @@ func TestBackendSpecs_AllKnownBackends(t *testing.T) {
 
 func TestBackendSpecs_ContainerNames(t *testing.T) {
 	cases := map[string]string{
-		"vllm":      "noo-vllm",
-		"llamacpp":  "noo-llamacpp",
-		"ollama":    "noo-ollama",
-		"airllm":    "noo-airllm",
-		"embedding": "noo-tei",
+		"vllm":     "noo-vllm",
+		"llamacpp": "noo-llamacpp",
+		"ollama":   "noo-ollama",
+		"airllm":   "noo-airllm",
+		"reranker": "noo-reranker",
 	}
 	for backend, expectedName := range cases {
 		if backendSpecs[backend].ContainerName != expectedName {
@@ -232,14 +232,14 @@ func writePKIDir(t *testing.T, shape string) string {
 		touch("nodes/host3/node.key")
 		touch("nodes/host8/node.crt")
 		touch("nodes/host8/node.key")
-		for _, svc := range []string{"vllm", "llamacpp", "ollama", "tei", "reranker", "redis", "nats", "postgres"} {
+		for _, svc := range []string{"vllm", "llamacpp", "ollama", "reranker", "redis", "nats", "postgres"} {
 			leaf(svc, svc, "localhost", "noo-"+svc, "noo-stunnel-"+svc)
 		}
 	case "controller-wrong-san":
 		// Leaves issued by hand without the door names — what `noo security
 		// pki issue-service vllm` yields with no --san.
 		touch("ca.crt")
-		for _, svc := range []string{"vllm", "llamacpp", "ollama", "tei", "reranker"} {
+		for _, svc := range []string{"vllm", "llamacpp", "ollama", "reranker"} {
 			leaf(svc, svc, "localhost")
 		}
 	case "worker":
@@ -418,7 +418,7 @@ func TestBackendDoorCheck(t *testing.T) {
 		m, _ := buildMounts(backendSpecs[backend].Volumes)
 		return m
 	}
-	fronted := []string{"vllm", "llamacpp", "ollama", "embedding", "reranker"}
+	fronted := []string{"vllm", "llamacpp", "ollama", "reranker"}
 
 	// The controller's PKI shape: every leaf, every door name → allowed.
 	t.Setenv("NOO_PKI_DIR", controller)
@@ -528,7 +528,7 @@ func TestSidecarSpec(t *testing.T) {
 		}
 	}
 	// Every fronted backend has a sidecar name, a door port and a leaf.
-	for _, b := range []string{"vllm", "llamacpp", "ollama", "embedding", "reranker"} {
+	for _, b := range []string{"vllm", "llamacpp", "ollama", "reranker"} {
 		if SidecarFor(b) == "" || SidecarContainerFor(b) != StunnelContainerPrefix+SidecarFor(b) || DoorPort(b) == 0 {
 			t.Errorf("%s: sidecar %q container %q port %d", b, SidecarFor(b), SidecarContainerFor(b), DoorPort(b))
 		}
@@ -538,7 +538,7 @@ func TestSidecarSpec(t *testing.T) {
 	}
 	// Door ports are the compose sidecars' accept ports, so one URL reaches
 	// a compose door and an agent-run one.
-	for b, want := range map[string]int{"llamacpp": 8085, "ollama": 11434, "embedding": 443, "reranker": 443, "vllm": 8000} {
+	for b, want := range map[string]int{"llamacpp": 8085, "ollama": 11434, "reranker": 443, "vllm": 8000} {
 		if got := DoorPort(b); got != want {
 			t.Errorf("%s door port %d, want %d", b, got, want)
 		}
@@ -550,9 +550,6 @@ func TestSidecarSpec(t *testing.T) {
 	t.Setenv("LLAMACPP_PORT", "")
 	if got := sidecarConnectPort("llamacpp", backendSpecs["llamacpp"], nil); got != 8085 {
 		t.Errorf("spec PORT: %d", got)
-	}
-	if got := sidecarConnectPort("reranker", rerankerSpecTEI(), nil); got != 80 {
-		t.Errorf("TEI reranker listens on 80: %d", got)
 	}
 	if got := sidecarConnectPort("reranker", rerankerSpecLlamacpp(), nil); got != 8085 {
 		t.Errorf("llama.cpp reranker listens on 8085: %d", got)
@@ -583,10 +580,11 @@ func TestSidecarSpec(t *testing.T) {
 	if !strings.Contains(stunnelSidecarScript, "exec stunnel") || strings.Contains(stunnelSidecarScript, "apk") {
 		t.Error("sidecar script shape: it must exec the image's stunnel and install nothing")
 	}
-	// A sidecar name reads back to its backend; compose's tei-gpu too.
+	// A sidecar name reads back to its backend. The TEI door names read back
+	// to nothing: that engine is gone.
 	for name, want := range map[string]string{
-		"noo-stunnel-llamacpp": "llamacpp", "noo-stunnel-ollama": "ollama", "noo-stunnel-tei": "embedding",
-		"noo-stunnel-tei-gpu": "embedding", "noo-stunnel-reranker": "reranker", "noo-llamacpp": "", "noo-stunnel-nats": "",
+		"noo-stunnel-llamacpp": "llamacpp", "noo-stunnel-ollama": "ollama", "noo-stunnel-tei": "",
+		"noo-stunnel-tei-gpu": "", "noo-stunnel-reranker": "reranker", "noo-llamacpp": "", "noo-stunnel-nats": "",
 	} {
 		if got := sidecarBackend(name); got != want {
 			t.Errorf("sidecarBackend(%q) = %q, want %q", name, got, want)
@@ -613,7 +611,7 @@ func TestTheSidecarIsTheOnlyDoor(t *testing.T) {
 	if BackendDoorGeneration < 3 {
 		t.Fatalf("BackendDoorGeneration = %d: placed backends would keep the bridge shape", BackendDoorGeneration)
 	}
-	for _, b := range []string{"vllm", "llamacpp", "ollama", "embedding", "reranker"} {
+	for _, b := range []string{"vllm", "llamacpp", "ollama", "reranker"} {
 		if got, want := DoorNetworkMode(b), "container:"+SidecarContainerFor(b); got != want {
 			t.Errorf("%s network mode %q, want %q", b, got, want)
 		}
@@ -807,7 +805,7 @@ func TestTheDoorAdmitsNamedCallersOnly(t *testing.T) {
 	if BackendDoorGeneration < 4 {
 		t.Fatalf("BackendDoorGeneration = %d: a door started unpinned would never be recreated", BackendDoorGeneration)
 	}
-	for _, b := range []string{"llamacpp", "ollama", "embedding", "reranker"} {
+	for _, b := range []string{"llamacpp", "ollama", "reranker"} {
 		conf := stunnelConf(SidecarFor(b), SidecarContainerFor(b), DoorPort(b), 1234, "node-a")
 		var pins []string
 		for _, l := range strings.Split(conf, "\n") {
@@ -875,7 +873,7 @@ func TestReadOnlyRootFloor(t *testing.T) {
 	if !backendSpecs["llamacpp"].ReadOnlyRoot || !rerankerSpecLlamacpp().ReadOnlyRoot {
 		t.Error("llama-server writes nothing outside its read-only /models: llamacpp and the reranker take a read-only root")
 	}
-	for _, b := range []string{"vllm", "ollama", "embedding"} {
+	for _, b := range []string{"vllm", "ollama"} {
 		if backendSpecs[b].ReadOnlyRoot {
 			t.Errorf("%s writes caches into its image paths; a read-only root needs its write set measured first", b)
 		}
@@ -905,49 +903,45 @@ func TestReadOnlyRootFloor(t *testing.T) {
 	}
 }
 
-// teiStart renders what StartBackendSDK hands docker for a TEI spec and a
-// placed model: the model into the env overrides (embedRerankModelEnv), the
-// container env (buildEnvList), then the Command resolved against that env
-// (resolveCommand).
-func teiStart(spec BackendSpec, model string) (map[string]string, []string) {
+// The reranker is always llama.cpp: a placed GGUF runs the llama.cpp spec
+// (MODEL_PATH under /models), and no engine switch exists. RERANK_ENGINE=tei
+// used to restore the TEI image; it is read nowhere now.
+func TestTheRerankerIsAlwaysLlamacpp(t *testing.T) {
+	t.Setenv("RERANK_ENGINE", "tei") // retired: must change nothing
+	spec := backendSpecs["reranker"]
+	if spec.Env["MODEL_ID"] != "" || spec.Env["MODEL_PATH"] == "" || spec.Entrypoint == nil {
+		t.Errorf("the reranker spec is not llama.cpp's: %+v", spec.Env)
+	}
+	if strings.Contains(spec.Image, "text-embeddings-inference") || spec.CPUImage != "" {
+		t.Errorf("the reranker image is not llama.cpp's: %q / %q", spec.Image, spec.CPUImage)
+	}
 	ov := map[string]string{}
-	embedRerankModelEnv(spec, model, ov)
-	env := buildEnvList(spec.Env, ov)
-	return parseEnv(env), resolveCommand(spec.Command, env)
+	rerankerModelEnv("bge-reranker-v2-m3-Q8_0.gguf", ov)
+	env := parseEnv(buildEnvList(spec.Env, ov))
+	if env["MODEL_PATH"] != "/models/bge-reranker-v2-m3-Q8_0.gguf" {
+		t.Errorf("MODEL_PATH = %q", env["MODEL_PATH"])
+	}
+	if _, ok := env["MODEL_ID"]; ok {
+		t.Error("a llama.cpp reranker carries no MODEL_ID")
+	}
+	if !ExpectsGGUFModel("reranker") {
+		t.Error("the reranker loads a GGUF file even with RERANK_ENGINE=tei set")
+	}
+	if src, err := os.ReadFile("backends.go"); err == nil && strings.Contains(string(src), `Getenv("RERANK_ENGINE")`) {
+		t.Error("backends.go reads RERANK_ENGINE again: the engine switch is gone")
+	}
 }
 
-// A placed TEI backend runs the placed model. TEI's --model-id beats its
-// MODEL_ID env, and the Command used to resolve ${TEI_MODEL:-bge-base} from
-// the agent's own env: every placement ran the node default. The node's
-// TEI_MODEL / RERANK_MODEL stays the default when nothing is placed.
-func TestTEIRunsThePlacedModel(t *testing.T) {
-	for _, tc := range []struct {
-		name, nodeVar, dflt string
-		spec                func() BackendSpec
-	}{
-		{"embedding", "TEI_MODEL", "BAAI/bge-base-en-v1.5", func() BackendSpec { return backendSpecs["embedding"] }},
-		{"reranker(tei)", "RERANK_MODEL", "BAAI/bge-reranker-base", rerankerSpecTEI},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Setenv("MODEL_ID", "") // the agent's own env must not leak in
-			for _, c := range []struct {
-				what, nodeVal, placed, want string
-			}{
-				{"placed", "", "org/placed-model", "org/placed-model"},
-				{"placed beats the node default", "org/node-default", "org/placed-model", "org/placed-model"},
-				{"nothing placed", "", "", tc.dflt},
-				{"nothing placed, node default set", "org/node-default", "", "org/node-default"},
-			} {
-				t.Setenv(tc.nodeVar, c.nodeVal)
-				env, cmd := teiStart(tc.spec(), c.placed)
-				if env["MODEL_ID"] != c.want {
-					t.Errorf("%s: env MODEL_ID = %q, want %q", c.what, env["MODEL_ID"], c.want)
-				}
-				if len(cmd) != 2 || cmd[0] != "--model-id" || cmd[1] != c.want {
-					t.Errorf("%s: Cmd = %q, want [--model-id %s]", c.what, cmd, c.want)
-				}
-			}
-		})
+// There is no `embedding` (TEI) backend spec any more: a start of it is an
+// error, not a container.
+func TestThereIsNoTEIBackendSpec(t *testing.T) {
+	if _, ok := backendSpecs["embedding"]; ok {
+		t.Fatal("backendSpecs carries the removed TEI embedding spec")
+	}
+	c := &Client{}
+	if err := c.StartBackendSDK(t.Context(), "embedding", "BAAI/bge-base-en-v1.5", 0, StartOverrides{}); err == nil ||
+		!strings.Contains(err.Error(), "unknown backend") {
+		t.Fatalf("starting the removed embedding backend = %v, want unknown backend", err)
 	}
 }
 
@@ -984,7 +978,7 @@ func TestStartBackendResolvesTheCommandAgainstTheContainerEnv(t *testing.T) {
 		fn = fn[:end]
 	}
 	for _, call := range []string{
-		`case "embedding", "reranker":` + "\n\t\tembedRerankModelEnv(spec, model, envOverrides)",
+		`case "reranker":` + "\n\t\trerankerModelEnv(model, envOverrides)",
 		"env := buildEnvList(spec.Env, envOverrides)",
 		"cmd := resolveCommand(spec.Command, env)",
 		"Env:   env,",
@@ -995,20 +989,19 @@ func TestStartBackendResolvesTheCommandAgainstTheContainerEnv(t *testing.T) {
 	}
 }
 
-// What runs is what RunningBackends reports: a TEI container's --model-id,
-// not its MODEL_ID env. A container an older agent created with the placed
-// model in MODEL_ID and the node default in --model-id reads as the default,
-// so the reconciler sees the mismatch and recreates it.
-func TestRunningBackendsReadsTEIModelFromItsFlag(t *testing.T) {
+// A noo-tei container is not a backend any more: RunningBackends does not
+// list it (so it cannot be mistaken for a placed embedder), and the reranker
+// reads the llama.cpp MODEL_PATH.
+func TestRunningBackendsIgnoresTEIAndReadsTheRerankerFile(t *testing.T) {
 	f := &listFakeDaemon{
 		listStatus: 200,
 		listBody: `[
  {"Id":"ttt","Names":["/noo-tei"],"Image":"tei:test","Labels":{}},
- {"Id":"rrr","Names":["/noo-reranker"],"Image":"tei:test","Labels":{}}
+ {"Id":"rrr","Names":["/noo-reranker"],"Image":"llama:test","Labels":{}}
 ]`,
 		inspectBody: map[string]string{
 			"ttt": `{"Id":"ttt","Config":{"Env":["MODEL_ID=org/placed-embed"],"Cmd":["--model-id","BAAI/bge-base-en-v1.5"]}}`,
-			"rrr": `{"Id":"rrr","Config":{"Env":["MODEL_ID=org/placed-rerank"],"Cmd":["--model-id","BAAI/bge-reranker-base"]}}`,
+			"rrr": `{"Id":"rrr","Config":{"Env":["MODEL_PATH=/models/r.gguf"]}}`,
 		},
 	}
 	c := newFakeDaemon(t, f)
@@ -1016,17 +1009,7 @@ func TestRunningBackendsReadsTEIModelFromItsFlag(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got["embedding"] != "BAAI/bge-base-en-v1.5" || got["reranker"] != "BAAI/bge-reranker-base" {
-		t.Fatalf("RunningBackends = %v, want the --model-id each container runs", got)
-	}
-	// No flag (a hand-started container): MODEL_ID still names it.
-	f.inspectBody["ttt"] = `{"Id":"ttt","Config":{"Env":["MODEL_ID=org/env-only"]}}`
-	f.inspectBody["rrr"] = `{"Id":"rrr","Config":{"Env":["MODEL_ID=org/env-only-rerank"]}}`
-	got, err = c.RunningBackends(t.Context())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got["embedding"] != "org/env-only" || got["reranker"] != "org/env-only-rerank" {
-		t.Fatalf("RunningBackends = %v, want MODEL_ID when there is no --model-id", got)
+	if len(got) != 1 || got["reranker"] != "r.gguf" {
+		t.Fatalf("RunningBackends = %v, want only the reranker's file", got)
 	}
 }

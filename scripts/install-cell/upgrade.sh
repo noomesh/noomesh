@@ -12,7 +12,15 @@
 # nothing).
 #
 #   OUT=<dir> CELL=upgrade-24.04 RUNNER=<label> CLI_TAG=noo-cli-vX.Y.Z[-rc.N] \
-#   [PREV_TAG=noo-cli-vX.Y.Z] scripts/install-cell/upgrade.sh
+#   [PREV_TAG=noo-cli-vX.Y.Z] [LEG=ce|distro|compose-floor] scripts/install-cell/upgrade.sh
+#
+# LEG (the workflow's matrix): `ce` (default) runs on the runner image's own
+# docker-ce; `distro` first installs Ubuntu's `apt install docker.io` +
+# docker-compose-v2 exactly as the fresh matrix's DOCKER=distro cell does
+# (distro-docker.sh, one home for both); `compose-floor` keeps the runner's
+# docker-ce and installs the pinned lowest supported Compose (2.33.x,
+# compose-floor.sh: sha256-verified before install). Every leg records `docker version` and
+# `docker compose version` and prints `UPGRADE LEG <leg> NOTE: docker <v>, compose <v>`.
 #
 # PREV_TAG (the dispatch input `prev_tag`) chooses the final the box starts
 # on; empty, it is the newest final below the release under test. A chosen
@@ -26,11 +34,12 @@
 # Every judged assert prints exactly one line, `UPGRADE <id> PASS|FAIL|NOT
 # REACHED: <why>`, quoting the product's own line on a FAIL. The asserts are
 # 97's spec (A1-A7 after `--all`, B1-B4 after the same-tag `--stack`) and
-# general's (G1-G5: the verify rows, the journal, a chat answer after), and K1/K2:
+# general's (G1-G5: the verify rows, the journal, a chat answer after), and K1/K2/K4:
 # the roll's own "N recreated (...), M kept (...)" line against the cell's
-# container-id snapshots (before/after --all, after the same-tag --stack).
+# container-id snapshots (before/after --all, after the same-tag --stack, and
+# before/after a same-tag --stack --recreate, K4).
 set -uo pipefail
-: "${OUT:?}" "${CELL:=upgrade-24.04}" "${RUNNER:=?}" "${CLI_TAG:=latest}" "${PREV_TAG:=}"
+: "${OUT:?}" "${CELL:=upgrade-24.04}" "${RUNNER:=?}" "${CLI_TAG:=latest}" "${PREV_TAG:=}" "${LEG:=ce}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 # CLI_TAG and PREV_TAG are free-text dispatch inputs: hold both to the rule
 # before ANY use, on their own (the workflow refuses them first, resolve
@@ -39,6 +48,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 . "$HERE/validate_tag.sh"
 require_cli_tag "$CLI_TAG" || exit 2
 require_prev_tag "$PREV_TAG" || exit 2
+case "$LEG" in ce|distro|compose-floor) ;; *) echo "upgrade-cell: LEG must be ce, distro or compose-floor, not '$LEG'" >&2; exit 2 ;; esac
 # ── end of the dispatch-input check ──
 if [ -n "$PREV_TAG" ]; then START_KIND="chosen"; else START_KIND="previous final"; fi
 mkdir -p "$OUT" "$OUT/stranger-cwd"
@@ -48,6 +58,7 @@ export PATH="$HOME/.local/bin:$PATH"
 J="$OUT/judge"; mkdir -p "$J"
 
 meta cell "$CELL"
+meta leg "$LEG"
 meta runner "$RUNNER"
 meta modes "upgrade: ${PREV_TAG:-previous final} ($START_KIND) -> $CLI_TAG (noo upgrade --all, then a same-tag --stack); model=default"
 meta limits "the operator is the runner user with passwordless sudo: sudo password prompts are never seen"
@@ -71,6 +82,27 @@ sys.exit(0 if s["result"] in ("pass", "not run") else 1)
 PY
     exit $?
 }
+
+# ── 0. the docker engine under test (the leg), and its versions SEEN ───────
+# distro: Ubuntu's own docker.io + docker-compose-v2 (the same script the fresh
+# matrix's distro cell runs). ce: the runner image's engine, untouched. Both
+# legs then record `docker version` and `docker compose version`; the judge
+# prints them, so the compose version is read, never assumed.
+if [ "$LEG" = distro ]; then
+    step distro-docker 900 -- sudo bash "$HERE/distro-docker.sh" || finish
+fi
+if [ "$LEG" = compose-floor ]; then
+    step compose-floor 300 -- sudo bash "$HERE/compose-floor.sh" || finish
+fi
+step docker-versions 120 -- sh -c 'd=docker; docker info >/dev/null 2>&1 || d="sudo -n docker"
+  echo "== docker version"; $d version 2>&1 | head -40
+  echo "== docker compose version"; $d compose version 2>&1 | head -3
+  $d version --format "{{.Server.Version}}" 2>/dev/null | head -1 > "$1/docker-version"
+  $d compose version --short 2>/dev/null | head -1 > "$1/compose-version"
+  echo "docker $(cat "$1/docker-version"), compose $(cat "$1/compose-version")"' _ "$J" || true
+meta docker_version "$(cat "$J/docker-version" 2>/dev/null)"
+meta compose_version "$(cat "$J/compose-version" 2>/dev/null)"
+echo "$LEG" > "$J/leg"
 
 # ── 1. the previous final, from the releases API ────────────────────────────
 # The newest noo-cli-vX.Y.Z FINAL (no prerelease) strictly below the release
@@ -205,6 +237,22 @@ step start-after-upgrade 1800 -- sh -c 'python3 "$1" snap "$2/start-after.before
 sleep 1
 if [ "$DOCKER" = "docker" ]; then kill "$EVENTS_PID" 2>/dev/null; else sudo -n kill "$EVENTS_PID" 2>/dev/null; fi
 wait "$EVENTS_PID" 2>/dev/null
+
+# ── 4c. a same-tag --stack --recreate recreates EVERYTHING (K4) ─────────────
+# #1470 case 4's second half (K2 judged the first: a same-tag re-apply recreates
+# nothing). Last of the upgrade steps, AFTER B4's plain start (which must see the
+# stack exactly as the upgrade left it: --recreate would change every id) and
+# after the docker-events window closed, but BEFORE chat-after: the stack is
+# recreated and healthy by the time `noo upgrade` returns (it waits on the
+# gateway), and G5's chat then proves it still answers. Nothing needs restoring.
+# k4.before is its own snapshot (B4's plain start ran after stack.after). Only a
+# >= 0.6.30 CLI takes --recreate; an older one is NOTEd by the judge, not run.
+if python3 "$HERE/upgrade_judge.py" recreate-ok "$TARGET"; then
+  python3 "$HERE/recreated.py" snap "$J/k4.before" > /dev/null 2>&1 || true
+  step upgrade-recreate 2400 -- noo upgrade --stack --recreate --version "$TARGET" --yes
+  echo "$?" > "$J/recreate.rc"
+  python3 "$HERE/recreated.py" snap "$J/k4.after" > /dev/null 2>&1 || true
+fi
 
 # ── 5. a chat answer after both ────────────────────────────────────────────
 step chat-after 900 -- noo chat --message "Reply with the single word ok."

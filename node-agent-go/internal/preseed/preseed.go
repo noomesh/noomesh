@@ -40,6 +40,7 @@ import (
 	"time"
 
 	nodeconfig "github.com/noomesh/noomesh/node-agent-go/internal/config"
+	"github.com/noomesh/noomesh/node-agent-go/internal/dataroots"
 	"github.com/noomesh/noomesh/node-agent-go/internal/logship"
 	"github.com/noomesh/noomesh/node-agent-go/internal/refusals"
 )
@@ -266,7 +267,9 @@ func (c *Client) fetchVerified(ctx context.Context, fileURL, dest, expectedSHA25
 	}
 	// Absent, unreadable or mismatching: fetch and land over it.
 
-	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
+	// Gated: a dest under a data root that is not on its recorded
+	// filesystem (its mount is not there) is not created (dataroots.MkdirAll).
+	if err := dataroots.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
 		return false, err
 	}
 	tmp := dest + ".partial"

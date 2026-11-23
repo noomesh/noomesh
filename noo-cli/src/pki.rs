@@ -424,7 +424,6 @@ pub const SERVICE_KEY_READERS: &[(&str, KeyReader)] = &[
     ("ollama", KeyReader::ContainerUid(65532)),
     ("ollama-embed", KeyReader::ContainerUid(65532)),
     ("ollama-embed-cpu", KeyReader::ContainerUid(65532)),
-    ("tei", KeyReader::ContainerUid(65532)),
     ("reranker", KeyReader::ContainerUid(65532)),
     // DHI runtime images: nonroot 65532.
     ("loki", KeyReader::ContainerUid(65532)),
@@ -668,6 +667,26 @@ pub enum KeyIssueKind {
     /// re-issue, rotation and mode repair of it fails with EACCES until
     /// the printed `sudo chown` runs.
     WrongOwner,
+    /// The leaf of the TEI engine removed in 0.6.30 (`services/tei/` or
+    /// `services/tei-gpu/`). Nothing reads it and no reader row names it, so
+    /// the key material is dead weight at any mode. Reported at every mode;
+    /// `fix-modes` may tighten it to 0600 but never deletes it: delete it by
+    /// hand (`retired_leaf_rm_line`).
+    RetiredLeaf,
+}
+
+/// The hand-delete line for a retired leaf, with its exact path.
+pub fn retired_leaf_rm_line(pki_dir: &Path, rel: &str) -> String {
+    format!("rm {}", pki_dir.join(rel).display())
+}
+
+/// `services/tei/` and `services/tei-gpu/`: the leaves of the removed TEI
+/// compose services. The controller no longer issues them; an upgraded
+/// install may still hold the files, which the audit reports as
+/// `RetiredLeaf` and which are safe to delete by hand. The trailing slash
+/// matters: `services/teikit/` is another service.
+fn is_retired_tei_leaf(rel: &str) -> bool {
+    rel.starts_with("services/tei/") || rel.starts_with("services/tei-gpu/")
 }
 
 impl ClusterCa {
@@ -807,6 +826,15 @@ impl ClusterCa {
             let reader = self.key_reader(&key);
             let Some(acc) = access_of(&key) else { continue };
             let mode = acc.mode;
+            // A retired TEI leaf (i1182a) an install that once ran the opt-in
+            // compose profile may still hold: no reader row any more and
+            // nothing reads it. It is dead private key material, so it is a
+            // finding at ANY mode (never "unknown reader", which would imply
+            // a reader to hand it to). Never deleted here.
+            if is_retired_tei_leaf(&rel) {
+                out.push(KeyIssue { rel, mode, reader, kind: KeyIssueKind::RetiredLeaf });
+                continue;
+            }
             let kind = classify_key_access(reader, &acc);
             // The mode is right; is it the operator's to keep right?
             let kind = kind.or_else(|| self.stuck_foreign(&key).then_some(KeyIssueKind::WrongOwner));
@@ -3116,7 +3144,7 @@ mod key_mode_tests {
         );
         assert_eq!(r("services/postgres/service.key"), KeyReader::ContainerUid(70));
         // The stunnel doors and the NVIDIA exporter run as 65532 (i132).
-        for door in ["ollama", "ollama-embed", "ollama-embed-cpu", "tei", "reranker", "llamacpp", "nvidia-exporter"] {
+        for door in ["ollama", "ollama-embed", "ollama-embed-cpu", "reranker", "llamacpp", "nvidia-exporter"] {
             assert_eq!(r(&format!("services/{door}/service.key")), KeyReader::ContainerUid(65532), "{door}: Dockerfile USER 65532 + compose user:");
         }
         // Postgres role leaves: read by the owner's nonroot process; an
@@ -3290,6 +3318,74 @@ mod key_mode_tests {
         let (again, dirs_again) = ca.fix_key_modes();
         assert!(again.iter().all(|f| !f.changed() || matches!(f.reader, KeyReader::ContainerUid(_))), "second pass is a no-op: {again:?}");
         assert!(dirs_again.is_empty(), "{dirs_again:?}");
+    }
+
+    /// i1182a: a leftover `services/tei/service.key` (an install that once ran
+    /// the opt-in compose profile) has no reader row now. It is dead private
+    /// key material: a `RetiredLeaf` finding at ANY mode, FAIL on the verify
+    /// row when group/world-readable, never deleted by the scan.
+    #[test]
+    fn a_leftover_retired_tei_leaf_is_an_audit_finding() {
+        use crate::commands::cluster_verify::{pki_key_modes_check, Verdict};
+        let ca = ClusterCa::new(scratch());
+        ca.generate_ca("t", 3650).unwrap();
+        let (_, tei) = ca.issue_service_cert("tei", &[], &[], 90).unwrap();
+        let (_, other) = ca.issue_service_cert("rhaddon", &[], &[], 90).unwrap();
+        for k in [&tei, &other] {
+            std::fs::set_permissions(k, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        let issues = ca.audit_key_modes();
+        let retired: Vec<&KeyIssue> = issues.iter().filter(|i| i.rel == "services/tei/service.key").collect();
+        assert_eq!(retired.len(), 1, "{issues:?}");
+        assert_eq!((retired[0].kind, retired[0].mode), (KeyIssueKind::RetiredLeaf, 0o644));
+        assert!(issues.iter().any(|i| i.rel == "services/rhaddon/service.key" && i.kind == KeyIssueKind::UnknownReader), "{issues:?}");
+        assert!(tei.exists(), "the scan never deletes it");
+        // 0644 is a FAIL naming the hand-delete with the exact path.
+        let row = pki_key_modes_check(&issues, &[], 2, &ca.dir);
+        assert_eq!(row.verdict, Verdict::Fail, "{}", row.detail);
+        assert!(row.detail.contains("services/tei/service.key 0644") && row.detail.contains("delete it by hand"), "{}", row.detail);
+        assert_eq!(row.remedy.as_deref(), Some(format!("rm {}", tei.display()).as_str()));
+
+        // fix-modes tightens it, never deletes it; the finding drops to WARN.
+        let (fixes, _) = ca.fix_key_modes();
+        assert!(fixes.iter().any(|f| f.rel == "services/tei/service.key"), "{fixes:?}");
+        assert!(tei.exists(), "fix-modes never deletes a retired leaf");
+        assert_eq!(mode_of(&tei), 0o600);
+        let after = ca.audit_key_modes();
+        let still: Vec<&KeyIssue> = after.iter().filter(|i| i.rel == "services/tei/service.key").collect();
+        assert_eq!((still.len(), still[0].kind, still[0].mode), (1, KeyIssueKind::RetiredLeaf, 0o600), "{after:?}");
+        let row = pki_key_modes_check(&after, &[], 2, &ca.dir);
+        assert_eq!(row.verdict, Verdict::Warn, "{}", row.detail);
+        assert!(row.detail.contains("delete it by hand"), "{}", row.detail);
+    }
+
+    /// A 0600 leftover is still a finding (dead key material), a WARN.
+    #[test]
+    fn an_owner_only_retired_tei_leaf_is_still_a_finding() {
+        let ca = ClusterCa::new(scratch());
+        ca.generate_ca("t", 3650).unwrap();
+        let (_, gpu) = ca.issue_service_cert("tei-gpu", &[], &[], 90).unwrap();
+        assert_eq!(mode_of(&gpu), 0o600);
+        let issues = ca.audit_key_modes();
+        let f: Vec<&KeyIssue> = issues.iter().filter(|i| i.rel == "services/tei-gpu/service.key").collect();
+        assert_eq!(f.len(), 1, "{issues:?}");
+        assert_eq!((f[0].kind, f[0].mode), (KeyIssueKind::RetiredLeaf, 0o600));
+        assert!(gpu.exists());
+    }
+
+    /// `services/teikit/` merely starts with "services/tei": it is another
+    /// service and is audited normally, never classed retired.
+    #[test]
+    fn a_service_named_like_tei_is_not_retired() {
+        let ca = ClusterCa::new(scratch());
+        ca.generate_ca("t", 3650).unwrap();
+        let (_, kit) = ca.issue_service_cert("teikit", &[], &[], 90).unwrap();
+        std::fs::set_permissions(&kit, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let issues = ca.audit_key_modes();
+        let f: Vec<&KeyIssue> = issues.iter().filter(|i| i.rel == "services/teikit/service.key").collect();
+        assert_eq!(f.len(), 1, "{issues:?}");
+        assert_eq!(f[0].kind, KeyIssueKind::UnknownReader);
+        assert!(!is_retired_tei_leaf("services/teikit/service.key"));
     }
 
     /// i277a, the ctrl shape: a third-party add-on's leaf

@@ -219,8 +219,8 @@ def test_an_issue_is_found_by_its_marker_not_its_title():
 # ------------------------------------------------------------------ marker + public body
 
 def test_the_marker_round_trips():
-    mk = M.marker("tei-cpu", [DB, DA], "0123456789abcdef")
-    assert M.parse_marker("text\n" + mk + "\nmore") == {"row": "tei-cpu", "digests": [DA, DB],
+    mk = M.marker("loki", [DB, DA], "0123456789abcdef")
+    assert M.parse_marker("text\n" + mk + "\nmore") == {"row": "loki", "digests": [DA, DB],
                                                           "set": "0123456789abcdef"}
     assert M.parse_marker("no marker") is None
 
@@ -369,7 +369,7 @@ def test_apply_creates_with_the_label_updates_and_closes(tmp_path):
     (bin_ / "gh").chmod(0o755)
     acts = [{"action": "create", "row": "nginx", "title": "t1", "body": "B1"},
             {"action": "update", "row": "nats", "number": 5, "title": "t2", "body": "B2", "comment": "C2"},
-            {"action": "close", "row": "tei", "number": 6, "comment": "C3"},
+            {"action": "close", "row": "tempo", "number": 6, "comment": "C3"},
             {"action": "none", "row": "redis", "why": "x"}]
     (tmp_path / "a.json").write_text(json.dumps(acts))
     calls = tmp_path / "calls.jsonl"

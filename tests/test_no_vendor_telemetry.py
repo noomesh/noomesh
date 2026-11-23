@@ -14,7 +14,7 @@ must carry and fails when one goes missing:
   decides what its software phones home with — and carries its class's
   switches with the exact value;
 * the node agent's backendSpecs (node-agent-go/internal/docker/backends.go),
-  which launch the same vLLM / TEI / Ollama images on every node, carry the
+  which launch the same vLLM / Ollama images on every node, carry the
   same switches in their Env literals, and telemetry.go's table agrees with
   this one (the parity check);
 * our Python images bake the HF switches in, the headless and kiosk Chromium
@@ -74,7 +74,7 @@ TELEMETRY_SWITCHES: dict[str, dict[str, str]] = {
         "DO_NOT_TRACK": "1",
         "HF_HUB_DISABLE_TELEMETRY": "1",
     },
-    # huggingface_hub / transformers / faster-whisper / TEI's hf-hub fetch
+    # huggingface_hub / transformers / faster-whisper / hf-hub fetch
     "hf": {
         "HF_HUB_DISABLE_TELEMETRY": "1",
         "DO_NOT_TRACK": "1",
@@ -108,9 +108,6 @@ SERVICE_CLASS: dict[str, str] = {
     # inference backends
     "vllm": "vllm",
     "vllm-secondary": "vllm",
-    "tei": "hf",
-    "tei-gpu": "hf",
-    "reranker": "hf",  # the compose reranker is the TEI image
     "airllm": "hf",
     "ollama": "ollama",
     "ollama-embed": "ollama",
@@ -152,9 +149,6 @@ SERVICE_CLASS: dict[str, str] = {
     "stunnel-ollama": "none",
     "stunnel-ollama-embed": "none",
     "stunnel-ollama-embed-cpu": "none",
-    "stunnel-tei": "none",
-    "stunnel-tei-gpu": "none",
-    "stunnel-reranker": "none",
     # build-only image targets — never run
     "deps-core": "none",
     "deps-base": "none",
@@ -165,11 +159,9 @@ SERVICE_CLASS: dict[str, str] = {
 # engine constructors) -> class.
 GO_SPEC_CLASS: dict[str, str] = {
     "vllm": "vllm",
-    "embedding": "hf",
     "airllm": "hf",
     "ollama": "ollama",
     "llamacpp": "none",
-    "func rerankerSpecTEI": "hf",
     "func rerankerSpecLlamacpp": "none",
 }
 
@@ -285,7 +277,7 @@ def test_go_backend_specs_carry_the_same_switches():
             checked += 1
             if env.get(k) != v:
                 problems.append(f"{marker}: {k}={env.get(k)!r}, want {v!r}")
-    assert checked >= 10, f"only {checked} Go switches checked"
+    assert checked >= 7, f"only {checked} Go switches checked"
     assert not problems, (
         "node-agent backendSpecs lack vendor telemetry switches (every node-launched "
         "backend would phone home):\n  " + "\n  ".join(problems)
@@ -392,7 +384,7 @@ def test_the_doc_names_every_switch():
         for k in TELEMETRY_SWITCHES[cls]:
             assert k in doc, f"docs/security/telemetry.md does not mention {k}"
     assert "onnxruntime" in doc and "mobile.events.data.microsoft.com" in doc, "the onnxruntime row names what it sends and where"
-    for svc in ("vLLM", "Ollama", "text-embeddings-inference", "Loki", "Tempo", "Grafana", "NATS"):
+    for svc in ("vLLM", "Ollama", "Loki", "Tempo", "Grafana", "NATS"):
         assert svc in doc, f"docs/security/telemetry.md has no row for {svc}"
 
 

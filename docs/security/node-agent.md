@@ -663,7 +663,7 @@ Every container the agent creates on a controller's instruction runs with:
   process cap.
 - a read-only root filesystem with a tmpfs `/tmp` for llama.cpp, the
   llama.cpp reranker and every door sidecar (except on the `alpine` fallback
-  image): their write set outside their mounts is empty. vLLM, Ollama and TEI
+  image): their write set outside their mounts is empty. vLLM and Ollama
   keep a writable root until theirs is moved to a cache mount
   ([networks and containers](networks-and-containers.md#container-hardening)).
 
@@ -696,8 +696,7 @@ The backend's own port is never published on the host.
 | vLLM | `https://noo-vllm:8000` | the `noo-stunnel-vllm` sidecar (`verify = 2`, the `vllm` leaf), which joins the bridge under the alias `noo-vllm`: the name every caller already dials and the vllm leaf already carries (door generation 5). The engine serves plain on `127.0.0.1:8000` inside the door's namespace and mounts no PKI; its healthcheck probes that loopback listener. Until generation 5 vLLM served TLS itself (`--ssl-cert-reqs 2`), which admitted any cluster-CA leaf |
 | llama.cpp | `https://noo-stunnel-llamacpp:8085` | a stunnel sidecar the agent runs beside it (`verify = 2`, the `llamacpp` leaf); llama-server has no TLS listener |
 | Ollama | `https://noo-stunnel-ollama:11434` | the same sidecar shape, the `ollama` leaf |
-| TEI (`embedding`) | `https://noo-stunnel-tei:443` | the same, the `tei` leaf — `:443` is what compose's `stunnel-tei.conf` accepts on, so one URL reaches either |
-| reranker | `https://noo-stunnel-reranker:443` | the same, the `reranker` leaf, whichever engine (`llama-server --reranking` on 8085 or TEI on 80) sits behind it |
+| reranker | `https://noo-stunnel-reranker:443` | the same, the `reranker` leaf, `llama-server --reranking` on 8085 sits behind it |
 | airllm | `http://noo-airllm:8000` | **plaintext, by the same named exception as compose**: opt-in, experimental; the deferred private-network step covers it |
 
 The sidecar is one shape reused per backend (`internal/docker/sidecar.go`):
@@ -763,7 +762,7 @@ release's `stunnel@sha256:…` lock row; that costs one vLLM reload.
 
 **What a node must hold.** Each door serves with a service leaf under
 `$NOO_PKI_DIR/services/<x>/service.{crt,key}` (`vllm`, `llamacpp`,
-`ollama`, `tei`, `reranker`) that **names the door** in its SANs
+`ollama`, `reranker`) that **names the door** in its SANs
 (`noo-vllm`, `noo-stunnel-<x>`; the controller's own service leaves carry
 these — `onboard/steps.rs svc_extra_hostnames`). The agent checks the
 leaf, the CA and the SAN **before touching the running container**: a
@@ -791,9 +790,26 @@ spec hash, so the binary roll itself is the trigger — once the leaf is
 there).
 
 **The retired switches.** `NOO_VLLM_TLS`, `NOO_LLAMACPP_TLS`,
-`NOO_OLLAMA_TLS`, `NOO_TEI_TLS`, `NOO_RERANKER_TLS` select nothing.
+`NOO_OLLAMA_TLS`, `NOO_RERANKER_TLS` select nothing (`NOO_TEI_TLS` went with the TEI engine, removed in 0.6.30, and is ignored).
 `provision` renders them empty; a `false`/`0`/`no`/`off` value **refuses
 the agent's start**, naming the line, like `NOO_MTLS_NODES`.
+
+**Leftover TEI containers.** The TEI engine was removed in 0.6.30. On its first
+reconcile pass after an upgrade the agent stops and removes the TEI containers
+an older agent made: `noo-tei`, `noo-tei-gpu`, their `noo-stunnel-tei` and
+`noo-stunnel-tei-gpu` doors, and a `noo-reranker` running the TEI image. It
+matches those names exactly and only when the container carries the agent's own
+`noo.managed-by=node-agent-go` label, so a compose-run container or anyone
+else's is never touched. Each removal logs one line naming the replacement. A
+placement still in desired state is refused (`backend_start`, shown by `noo
+cluster show`) with `noo cluster place <node> ollama <model> --role embed` (an
+embedder) or `noo cluster place <node> reranker <file>.gguf` (a reranker).
+`noo cluster verify` shows the placement in its `unsupported engine` row. An
+embedding space whose model was a TEI model keeps serving searches over its
+existing vectors and refuses embed writes until a node serves it or
+`noo cluster embedding-space migrate` moves it. The controller no longer issues a
+`tei` service leaf; a node that still holds one is not refused for it for one
+release.
 
 **The one plaintext hop that stays.** A host-native Ollama — the
 operator's own process outside Docker (macOS Metal, or a Linux install the
@@ -1265,7 +1281,7 @@ says "the release's harrier". With no pin in the lock it is not compared.
 
 Every backend the agent starts serves through a door that requires a
 cluster-CA client certificate: vLLM's own listener, a `noo-stunnel-<x>`
-sidecar in front of llama.cpp, ollama, TEI and the reranker. Each door
+sidecar in front of llama.cpp, ollama and the reranker. Each door
 serves with a service leaf at `$NOO_PKI_DIR/services/<x>/service.{crt,key}`
 whose SANs name the host the agent dials it by, and the agent refuses to
 start a backend whose leaf is missing or does not name its door.
@@ -1278,7 +1294,7 @@ Those leaves reach a node on the rail, the same as its node certificate:
 | `svc-<x>.key` | `$NOO_PKI_DIR/nodes/<node>/services/<x>/service.key` (0600, the CLI only) | `/etc/noo/pki/services/<x>/service.key` | 0600, root on Linux (read by root inside the door's container); on a Mac the `~/noomesh` tree belongs to the enrolling user, who runs the agent and Docker Desktop |
 
 `<x>` is one of `vllm` (doors `noo-vllm`, `noo-vllm-secondary`), `llamacpp`,
-`ollama`, `tei`, `reranker` (door `noo-stunnel-<x>`). The table is
+`ollama`, `reranker` (door `noo-stunnel-<x>`). The table is
 `noo-cli/src/commands/node_leaves.rs` `NODE_DOOR_LEAVES`;
 `tests/test_node_backend_leaves_on_the_rail.py` pins it against the
 applier's install loop and the agent's own door table.
@@ -1337,8 +1353,8 @@ DNS SANs and NotAfter (unix seconds):
 
 ```json
 "backend_leaves": {
-  "vllm": {"dns": ["vllm", "localhost", "noo-vllm", "noo-vllm-secondary"], "not_after": 1790000000},
-  "tei":  {"dns": ["tei", "localhost", "noo-stunnel-tei"], "not_after": 1790000000}
+  "vllm":     {"dns": ["vllm", "localhost", "noo-vllm", "noo-vllm-secondary"], "not_after": 1790000000},
+  "reranker": {"dns": ["reranker", "localhost", "noo-stunnel-reranker"], "not_after": 1790000000}
 }
 ```
 
@@ -1779,24 +1795,32 @@ contains, one of those.
 This holds on Linux with systemd and `harness-egress=enforced` only. A Mac
 (launchd) has no egress hold: its harness runs with nothing holding it off
 the internet. A failed pre-check or an old systemd also leaves the harness
-unrestricted (the tag below says so). Where it is held, private, link-local
-and tailnet ranges stay reachable.
+unrestricted (the tag below says so). Where it is held, the harness reaches
+loopback and the controller's own addresses, nothing else. Containers it
+starts through Docker (the jail) are outside this hold: the jail's own
+network policy is their isolation.
 
 The Landlock jail limits files. On Linux the network is limited by the node's applier
 (`scripts/noo-apply.sh`), as root, on every apply that carries the harness
 unit or its env. It renders `/etc/noo/harness-net/` (a `resolv.conf` that
 names only 192.0.2.53, a TEST-NET-1 address that is never allowed, so a name
 lookup fails at once with no packet sent; an `nsswitch.conf` that is the
-host's with `hosts: files dns`; and a `hosts` file that holds only the names
+host's with `hosts: files`, so no lookup asks DNS; and a `hosts` file that holds only the names
 the harness needs, the hosts of `NOO_GATEWAY_URL` and `NATS_URL`, resolved
 by the applier) and the drop-in
 `noo-harness.service.d/50-noomesh-egress.conf`. The drop-in sets
 `IPAddressDeny=0.0.0.0/0 ::/0` (every address; written as prefixes because
-`systemd-run -p`, which the pre-check uses, rejects `any` and `localhost`) and allows only loopback, private, link-local and
-tailnet ranges, `fc00::/7` only on a host that has its own global address
-there, and each controller address outside those ranges as one `/32` or
-`/128`. It also bind-mounts the three files over `/etc` for the unit and its
-CLIs and hides the host's resolver sockets. The files are rewritten only when
+`systemd-run -p`, which the pre-check uses, rejects `any` and `localhost`) and allows exactly `127.0.0.1/32` and `::1/128`
+plus each address of the controller names in the hosts file (and a literal
+controller IP) as one `/32` or `/128`: no range, so no other host on the LAN
+or the tailnet is reachable. The harness needs nothing more: its model
+endpoint is this node's agent on loopback, and it resolves no name at run
+time. The drop-in sets `NOO_HARNESS_EGRESS_HOLD=1`, binds the three files for
+the unit and its CLIs (where the host's resolver file lives in a directory
+of its own, such as systemd-resolved's, the held copy is bound over that
+directory, so a host rewrite of the file does not reach the unit), and hides
+the host's resolver sockets. The allowed addresses are also written to
+`/etc/noo/harness-net/allow`. The files are rewritten only when
 their content changes; a change reloads systemd and restarts the harness the
 applier's usual way. A name that does not resolve is left out of the hosts
 file and is never looked up through a real resolver: the harness then fails
@@ -1809,20 +1833,32 @@ unresolved name. The probe never refuses the harness unit; the node agent
 reports the state and refuses the kinds that need enforcement. A teardown
 removes the drop-in and the directory.
 
+The harness checks its hold from inside its own unit at start and again
+every minute: no internet name resolves, the loopback canary is dropped, no
+allowed address answers DNS, its private `resolv.conf` is still in place,
+and the gateway answers. Under an installed hold, a check that does not hold
+stops the harness taking new work (the gateway runs a turn itself; a task
+waits for this node) until a later check holds again.
+
 Before it installs the hold, the applier runs a pre-check under the hold's own
 settings: every controller name must resolve from the rendered `hosts` file,
 and every controller port must answer. A controller URL that is a literal IPv4
-address is connected to without a lookup, and an address outside the base
-ranges is added to the allowlist. If the pre-check fails, nothing is installed
-and the tag says why:
+address is connected to without a lookup and allowed as itself. If the
+pre-check fails, nothing is installed and the tag says why (the apply output
+names the address that did not answer and the allowed list):
 - `UNENFORCED:selfcheck-<host>-<port>`: this node cannot reach that controller
   address under the hold;
 - `UNENFORCED:selfcheck-unavailable`: no `systemd-run` on this host.
 
-`noo cluster verify`'s `harness egress` row:
-- **OK:** the unit is held and the harness's own self-test confirms it.
-- **FAIL:** not held. Codex placements are refused there.
-- **WARN:** unknown, or the node runs another runtime (launchd).
+`noo cluster verify`'s `harness egress` row reads the harness's latest check
+(no row where no harness runs):
+- **OK:** the unit is held and the harness's own check confirms it, with how
+  long ago it ran.
+- **FAIL:** not held (codex placements are refused there); or held but the
+  gateway does not answer from inside the hold, which a re-apply fixes.
+- **WARN:** unknown (including a check more than three minutes old); the
+  harness's private `resolv.conf` replaced (still held, a restart restores
+  it); or the node runs another runtime (launchd).
 - **The remedy:** `noo cluster provision <node>`. Its apply report carries the
   tag above.
 

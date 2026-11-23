@@ -449,7 +449,7 @@ reason it kept those two variables — removing them early took a
 controller's bus down on the v0.2.78 roll) is retired, together with the
 pair and its `NOO_NATS_LEGACY_SHARED_CREDS` bridge. `HF_TOKEN` / `HUGGING_FACE_HUB_TOKEN`
 stay environment by design: no noomesh container receives them — they go
-only to third-party model images (vLLM, TEI, the reranker, Whisper), which
+only to third-party model images (vLLM, the reranker, Whisper), which
 read them natively, and through the node agent to the backends it starts.
 Moving the rest is not done yet.
 

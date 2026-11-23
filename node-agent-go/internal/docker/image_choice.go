@@ -73,7 +73,7 @@ type backendImageChoice struct {
 	// Pin is the digest the controller pinned for one of OUR images
 	// (`sha256:…`, from the signed stack lock), "" when none.
 	Pin string
-	// Why is the reason an automatic CPU image was taken ("TEI embedding on
+	// Why is the reason an automatic CPU image was taken ("<backend> on
 	// CPU: no usable NVIDIA runtime on this node"), "" otherwise.
 	Why string
 }
@@ -103,48 +103,48 @@ func (e *NoUsableGPUError) Error() string {
 		"Install the NVIDIA container toolkit (nvidia-ctk runtime configure, then restart docker), or place it `--on cpu`", e.Backend)
 }
 
-// TEIRuntimeUnknownError (TEI and llamacpp): the node has an NVIDIA GPU but the agent has never
+// GPURuntimeUnknownError (llamacpp): the node has an NVIDIA GPU but the agent has never
 // had an answer to "does docker list the nvidia runtime" (docker info failed
 // or was slow at boot). Unknown is not absent, so the start neither takes the
 // GPU image nor silently downgrades to the CPU one: it is refused for now and
 // the reconciler records it as a backend_start refusal, then asks again on its
 // next pass (RefreshGPUFacts runs first each tick).
-type TEIRuntimeUnknownError struct{ Backend, Detail string }
+type GPURuntimeUnknownError struct{ Backend, Detail string }
 
-func (e *TEIRuntimeUnknownError) Error() string {
+func (e *GPURuntimeUnknownError) Error() string {
 	return fmt.Sprintf("backend %s: cannot tell yet whether the NVIDIA runtime is registered: docker info failed: %s; retrying on the next pass",
 		e.Backend, e.Detail)
 }
 
-// teiGPUUsable is what "a usable NVIDIA runtime" means for the TEI GPU image:
+// nvidiaGPUUsable is what "a usable NVIDIA runtime" means for a GPU image:
 // an NVIDIA GPU is visible to the agent (GPUFacts.NvidiaGPU) AND the docker
 // daemon lists the nvidia runtime (GPUFacts.NvidiaRuntime, NvidiaRuntimeKnown;
 // unknown counts as absent). A device node alone is never proof: /dev/dxg
 // (WSL2's paravirtual device, which the GPU probe counts) or /dev/nvgpu exist
 // on boxes where docker cannot hand a GPU out. Unlike LlamacppGPUUsable there
-// is no compute-capability floor: TEI's CUDA image has none the agent knows.
-func teiGPUUsable(f GPUFacts) bool { return f.NvidiaGPU && f.NvidiaRuntime }
+// is no compute-capability floor.
+func nvidiaGPUUsable(f GPUFacts) bool { return f.NvidiaGPU && f.NvidiaRuntime }
 
 // wantsCPUImage says which of a spec's two images a start takes, and why
 // when the answer is an automatic CPU. llamacpp: the CPU build unless the
 // start runs on this node's GPU (llamacppOnGPU). Every other backend with a
-// CPUImage (TEI embedding/reranker), by the placement's target:
+// CPUImage (none today; llamacpp is handled above), by the placement's target:
 //
 //   - cpu: the CPU image, always;
-//   - a GPU present but the runtime never read: a retryable *TEIRuntimeUnknownError
+//   - a GPU present but the runtime never read: a retryable *GPURuntimeUnknownError
 //     for gpu and auto (cpu is unaffected);
-//   - gpu: the GPU image on a usable NVIDIA runtime (teiGPUUsable), else a
+//   - gpu: the GPU image on a usable NVIDIA runtime (nvidiaGPUUsable), else a
 //     *NoUsableGPUError: never a silent CPU image;
 //   - unset/auto: the GPU image on a usable runtime, else the CPU image, with
-//     the reason ("TEI embedding on CPU: no usable NVIDIA runtime on this node").
+//     the reason ("<backend> on CPU: no usable NVIDIA runtime on this node").
 //
 // llamacpp keeps its own rule once the runtime is read (a compute-capability
 // floor; a `gpu` target on an unusable node is cpu, logged, not a refusal);
-// only the never-read case waits, as for TEI (llamacppWaitsOnRuntime).
+// only the never-read case waits (llamacppWaitsOnRuntime).
 func wantsCPUImage(backend string, spec BackendSpec, target string, f GPUFacts) (cpu bool, why string, err error) {
 	if backend == "llamacpp" {
 		if llamacppWaitsOnRuntime(target, f) {
-			return false, "", &TEIRuntimeUnknownError{Backend: backend, Detail: f.NvidiaRuntimeErr}
+			return false, "", &GPURuntimeUnknownError{Backend: backend, Detail: f.NvidiaRuntimeErr}
 		}
 		return !llamacppOnGPU(target, f), "", nil
 	}
@@ -155,21 +155,21 @@ func wantsCPUImage(backend string, spec BackendSpec, target string, f GPUFacts) 
 		return true, "", nil
 	}
 	// A GPU is there but the runtime was never read: not "absent" (see
-	// TEIRuntimeUnknownError). No GPU at all: the runtime is irrelevant.
+	// GPURuntimeUnknownError). No GPU at all: the runtime is irrelevant.
 	if f.NvidiaGPU && !f.NvidiaRuntimeRead {
-		return false, "", &TEIRuntimeUnknownError{Backend: backend, Detail: f.NvidiaRuntimeErr}
+		return false, "", &GPURuntimeUnknownError{Backend: backend, Detail: f.NvidiaRuntimeErr}
 	}
 	switch target {
 	case "gpu":
-		if !teiGPUUsable(f) {
+		if !nvidiaGPUUsable(f) {
 			return false, "", &NoUsableGPUError{Backend: backend}
 		}
 		return false, "", nil
 	}
-	if teiGPUUsable(f) {
+	if nvidiaGPUUsable(f) {
 		return false, "", nil
 	}
-	return true, fmt.Sprintf("TEI %s on CPU: no usable NVIDIA runtime on this node", backend), nil
+	return true, fmt.Sprintf("%s on CPU: no usable NVIDIA runtime on this node", backend), nil
 }
 
 // chooseBackendImage is chooseBackendImageFor on this node's current GPU facts.

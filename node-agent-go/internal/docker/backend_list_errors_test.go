@@ -67,6 +67,12 @@ func newFakeDaemon(t *testing.T, f *listFakeDaemon) *Client {
 			_, _ = w.Write([]byte(f.inspectBody[m[1]]))
 			return
 		}
+		// A stop and a remove succeed (204), and are in calls.
+		if (r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/stop")) ||
+			(r.Method == http.MethodDelete && strings.Contains(r.URL.Path, "/containers/")) {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
 		w.WriteHeader(404)
 		_, _ = w.Write([]byte(`{"message":"unexpected"}`))
 	}))

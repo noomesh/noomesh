@@ -109,7 +109,7 @@ pub(crate) const ENV_ALLOWED: &[(&str, &str)] = &[
     // token, and only in containers that are not noomesh code.
     (
         "HF_TOKEN",
-        "model-hub token read natively (huggingface_hub) by third-party images — vllm, tei, reranker, \
+        "model-hub token read natively (huggingface_hub) by third-party images — vllm, reranker, \
          whisper — and handed by the Go node agent to the backends it starts; no noomesh-owned \
          container receives it",
     ),

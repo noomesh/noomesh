@@ -104,7 +104,10 @@ Each one has a followup that removes the need for the step.
   boot: it starts only if it was set up to start at the node user's login,
   and that user has logged in. As the node's user, run
   `HOMEBREW_NO_ANALYTICS=1 brew services start ollama` (it starts now and
-  at each login of that user). (i1156.)
+  at each login of that user). From 0.6.30 a newly enrolled Mac registers
+  Ollama as a boot service; a Mac enrolled before needs, once, as the node's
+  user, `noo enroll --resume` (it asks for sudo), and `noo cluster verify`
+  warns in its `native ollama` row until then. (i1156.)
 - **A model file was never shipped to a node** (0.6.28 and earlier): the
   backend shows as running but crash-loops without its file. From the
   controller: `noo cluster sync-model-files <node> -m <file.gguf>`. The node
@@ -122,7 +125,10 @@ Each one has a followup that removes the need for the step.
   checked.)
 
 The data disk itself not mounting is a separate refusal with its own page:
-[data-root-recovery.md](../operating/runbooks/data-root-recovery.md).
+[data-root-recovery.md](../operating/runbooks/data-root-recovery.md). On a
+node (0.6.30), a data disk that mounts late is refused, not written to. The
+agent starts no backend and fetches nothing onto the empty mount point, and
+it carries on by itself once the mount appears.
 
 ### Before the next power cut: powering on is the machine's setting
 

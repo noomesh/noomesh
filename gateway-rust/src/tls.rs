@@ -9,11 +9,7 @@
 //!                                     traffic (default embedder: ollama/
 //!                                     harrier; default reranker: hardened
 //!                                     llama.cpp) rides this leg, not a
-//!                                     dedicated TEI path. TEI is optional/
-//!                                     legacy: still reachable as a wire
-//!                                     format if an install still runs it
-//!                                     (HTTPS via stunnel), but is no longer
-//!                                     the deployed default.
+//!                                     dedicated embedder path.
 //!   Gateway ←→ NATS                  (TLS)
 //!   Gateway ←→ Postgres              (TLS)
 //!   Dashboard ←→ Gateway             (HTTPS, browser trusts cluster CA)
@@ -241,7 +237,7 @@ pub fn plain_client(t: ClientTimeouts) -> reqwest::Client {
 }
 
 /// Shared intra-cluster client: cluster CA + mTLS identity, one connection
-/// pool reused across all gateway → node-agent/backend/TEI traffic.
+/// pool reused across all gateway → node-agent/backend traffic.
 ///
 /// TLS material is loaded once at first use — after `noo security pki
 /// rotate-all` the gateway must be restarted to pick up new leaf certs
