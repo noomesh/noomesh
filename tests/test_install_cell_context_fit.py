@@ -715,12 +715,15 @@ def test_a_turn_is_attributed_by_its_conversation_id_when_the_gateway_names_it()
         json.dumps({"fields": {"message": "backend_call", "sent_estimate": 15700, "conversation_id": theirs}}),
         json.dumps({"fields": {"message": "loop.retrieval_nudge", "iteration": 2, "conversation_id": theirs}}),
         json.dumps({"fields": {"message": "coordinator.kb_tool_deferred", "iteration": 1, "conversation_id": mine}}),
-        json.dumps({"fields": {"message": "request_size", "tier": "Compact", "chars": 900}}),
+        json.dumps({"fields": {"message": "request_size", "tier": "Compact", "chars": 900, "conversation_id": mine}}),
+        json.dumps({"fields": {"message": "request_size", "tier": "Full", "chars": 9000, "conversation_id": theirs}}),
+        json.dumps({"fields": {"message": "coordinator.loop_started", "iteration": 1}}),
     ]
     f = CF.log_facts(lines, mine)
-    assert f["tiers"] == ["Compact"], "request_size carries no id: it stays the window's, never dropped"
+    assert f["tiers"] == ["Compact"], "this turn's request_size only"
+    assert "coordinator.loop_started" in [e["event"] for e in f["loop"]], "a coordinator line with no id stays the window's"
     assert [c["sent_estimate"] for c in f["backend_calls"]] == [6500]
-    assert [e["event"] for e in f["loop"]] == ["coordinator.kb_tool_deferred"]
+    assert [e["event"] for e in f["loop"]] == ["coordinator.kb_tool_deferred", "coordinator.loop_started"]
     assert f["injected"] == [{"has_rag": True}]
     a = f["attribution"]
     assert a["by"] == "conversation_id" and a["conversation_id"] == mine and a["other_conversations"] == [theirs]

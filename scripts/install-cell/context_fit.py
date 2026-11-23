@@ -317,11 +317,11 @@ TURN_PATHS = ("/api/inference", "/api/inference/chat", "/v1/chat/completions",
 INJECTED_FIELDS = ("dropped", "pre_dedup_chars", "post_dedup_chars")
 
 
-# The lines that name their turn (gateway: conversation_id exactly as the
-# turn's caller sent it) on backend_call, context_injected,
-# coordinator.kb_tool_deferred and every loop.* event. Other lines (request_size,
-# other coordinator.*) stay the window's.
-ID_EVENTS = ("backend_call", "context_injected", "coordinator.kb_tool_deferred")
+# The lines that name their turn (gateway: conversation_id as the turn's
+# caller sent it, bounded to 64 chars of [A-Za-z0-9._:-]) on backend_call,
+# context_injected, request_size, coordinator.kb_tool_deferred and every loop.*
+# event. Other lines (other coordinator.*) stay the window's.
+ID_EVENTS = ("backend_call", "context_injected", "request_size", "coordinator.kb_tool_deferred")
 
 
 def carries_id(event: str) -> bool:
