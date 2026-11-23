@@ -3712,10 +3712,12 @@ pub(crate) fn reranker_check(caps: Option<&Value>) -> Check {
             caps["rerank"]["reason"].as_str().unwrap_or("a reranker is placed but not serving yet").to_string(),
             None,
         ),
-        Some(false) => warn(
+        // Reranking is optional: none placed is not a fault, so it is OK and
+        // says what answers instead and how to place one. (A gateway older
+        // than `state` reports false only when no node advertises at all.)
+        Some(false) => ok(
             NAME,
-            "no reranker placed; rerank requests are served by the chat model, and when it ranks nothing the answer is the input order with no scores (noo.degraded: identity)",
-            Some(PLACE.into()),
+            format!("no reranker placed (optional): /api/external/rerank answers with the labelled chat-model fallback; place one with `{PLACE}`"),
         ),
         None => warn(NAME, "the gateway's capabilities carry no rerank.available", None),
     }
@@ -19877,11 +19879,14 @@ mod reranker_row_tests {
     /// i1182a: no reranker placed WARNs with the place command; a placed one
     /// is OK; an unread or shapeless answer is not judged as either.
     #[test]
-    fn no_reranker_placed_warns_with_the_place_command() {
-        let c = reranker_check(Some(&json!({"rerank": {"available": false, "models": []}})));
-        assert_eq!(c.verdict, Verdict::Warn);
-        assert!(c.detail.contains("no reranker placed; rerank requests are served by the chat model"), "{}", c.detail);
-        assert_eq!(c.remedy.as_deref(), Some("noo cluster place <node> reranker <file>.gguf --on cpu"));
+    fn no_reranker_placed_is_ok_and_a_loading_one_warns() {
+        // None placed is not a fault (reranking is optional): OK, saying what
+        // answers instead and how to place one. A fresh install reads OK here.
+        let c = reranker_check(Some(&json!({"rerank": {"available": false, "models": [], "state": "none"}})));
+        assert_eq!(c.verdict, Verdict::Ok);
+        assert_eq!(c.detail, "no reranker placed (optional): /api/external/rerank answers with the labelled chat-model fallback; place one with `noo cluster place <node> reranker <file>.gguf --on cpu`");
+        let older = reranker_check(Some(&json!({"rerank": {"available": false, "models": []}})));
+        assert_eq!(older.verdict, Verdict::Ok, "a gateway older than `state` says false only with none placed");
         let ok = reranker_check(Some(&json!({"rerank": {"available": true, "models": ["default"]}})));
         assert_eq!(ok.verdict, Verdict::Ok);
         let unread = reranker_check(None);

@@ -261,8 +261,9 @@ now: while one is placed but its model is still loading, it is false with
 every document 0, or cannot be asked), the answer is the input order with
 every `score` **null**, and `noo` carries `degraded: "identity"` and
 `degraded_reason`. A caller that needs a ranking checks `degraded`, or
-`rerank.available` first. `noo cluster verify` warns in its `reranker` row
-when no reranker is placed.
+`rerank.available` first. `noo cluster verify`'s `reranker` row reads OK
+with none placed (reranking is optional; it names the fallback and how to
+place one) and warns for a placed reranker that is not serving yet.
 
 ### Model classes, failover and what the answer says
 
