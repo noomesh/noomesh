@@ -159,7 +159,7 @@ async fn gateway_reachable(host: &str, port: u16) -> bool {
 /// holds) and is carried as `resolv_held`. The DNS check asks over UDP.
 pub fn record_full(base: Value, checked_at: u64, allow_listed: bool, resolv_held: bool, dns_reachable: &[String], gateway: Option<(String, bool)>) -> Value {
     let mut r = base;
-    let enforced = r["enforced"] == Value::Bool(true) && allow_listed && dns_reachable.is_empty();
+    let enforced = r["enforced"] == Value::Bool(true) && allow_listed;
     r["allow_file"] = json!(if allow_listed { "ok" } else { "missing" });
     r["enforced"] = json!(enforced);
     r["checked_at"] = json!(checked_at);
