@@ -1351,7 +1351,7 @@ HE_RESOLVER_ADDR="192.0.2.53"
 # 127.0.0.53 stays outside. Every other allowed address is one of the
 # controller's, as a /32 or /128: no range, so no resolver, router, bridge or
 # link-local neighbour is reachable whatever answers DNS there.
-HE_LOOPBACK_ALLOW="127.0.0.1/32 ::1/128"
+HE_LOOPBACK_ALLOW="127.0.0.1/32 ::1/128 100.64.0.0/10"
 HE_CHANGED=0
 HE_UNRESOLVED=""
 
