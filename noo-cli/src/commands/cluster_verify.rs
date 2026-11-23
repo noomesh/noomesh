@@ -741,7 +741,7 @@ pub(crate) fn agent_address_check(id: &str, n: &Value) -> Option<Check> {
 /// command follows the reason.
 fn ip_address_refused_check(id: &str, n: &Value, why: &str) -> Check {
     let detail = match n["ip_address"].as_str().filter(|s| !s.is_empty()) {
-        Some(ip) => format!("{id}: the controller refused the address it reported ({why}) and keeps its previous address {ip}"),
+        Some(_ip) => format!("{id}: the controller did not store the address it reported ({why}); the controller reaches it over its bus or tunnel only"),
         None => format!("{id}: the controller did not store the address it reported ({why}); the controller reaches it over its bus or tunnel only"),
     };
     let next = if let Some((_, other)) = why.split_once(" is claimed by ") {
