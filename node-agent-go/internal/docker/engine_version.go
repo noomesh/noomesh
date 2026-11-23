@@ -100,7 +100,7 @@ func engineReport(res client.ServerVersionResult, err error, noDocker func(error
 					if len(by) > maxEngineErrLen {
 						by = by[:maxEngineErrLen]
 					}
-					return map[string]any{"state": EngineStateDown, "installed_by": by}
+					return map[string]any{"state": EngineStateNone, "installed_by": by}
 				}
 			}
 			return map[string]any{"state": EngineStateNone}
