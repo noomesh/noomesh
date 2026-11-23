@@ -1357,6 +1357,26 @@ fn tier_tools(schemas: Vec<Value>, tier: WindowTier) -> Vec<Value> {
         .collect()
 }
 
+/// The one tool the knowledge-base frame already answers: withheld from the
+/// first model call of a turn whose frame carries the KB results.
+const KB_RETRIEVAL_TOOL: &str = "noo_rag_query";
+
+/// The tool list ONE model call is offered. When this turn's frame already
+/// carries the knowledge-base results (`kb_shown`), the first iteration
+/// answers from them: the retrieval tool is offered from the next iteration
+/// on, so a different query can still run later in the turn. Every other
+/// turn, and every other tool, is offered unchanged.
+fn offered_tools(tool_schemas: &[Value], iteration: u32, kb_shown: bool) -> Vec<Value> {
+    if !(kb_shown && iteration == 1) {
+        return tool_schemas.to_vec();
+    }
+    tool_schemas
+        .iter()
+        .filter(|s| s.get("function").and_then(|f| f.get("name")).and_then(|n| n.as_str()) != Some(KB_RETRIEVAL_TOOL))
+        .cloned()
+        .collect()
+}
+
 /// The backend's prefill time from a usage object: the node agent's
 /// `prompt_eval_ms` (from Ollama's prompt_eval_duration), when present.
 fn prefill_ms_of(usage: &Value) -> Option<u64> {
@@ -2545,6 +2565,7 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
     // frame carries the knowledge base, tell the model it is already shown
     // instead of "call noo_rag_query FIRST" (i1178a, half a).
     super::context::mark_kb_shown(&mut session.messages, data_frame.as_deref(), rag_ctx.as_deref());
+    let kb_shown = super::context::kb_in_frame(data_frame.as_deref(), rag_ctx.as_deref());
     super::context::place_clock(&mut session.messages, chrono::Utc::now());
     if let Some(f) = data_frame.as_deref() {
         record_layer_chars(rt.metrics(), "retrieved_data_frame", f).await;
@@ -2635,8 +2656,12 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
         }
         // What this call sends, in the loop's estimate, and the backend's
         // count before it: the cut check and the calibration read both (i802).
+        let offered = offered_tools(&tool_schemas, iteration, kb_shown);
+        if offered.len() < tool_schemas.len() {
+            tracing::info!(iteration, has_rag = true, tool = KB_RETRIEVAL_TOOL, "coordinator.kb_tool_deferred");
+        }
         let (evaluated_before, sent_estimate) =
-            (usage.prompt_tokens, (estimate_tokens(&session.messages) + estimate_tool_tokens(&tool_schemas)) as u64);
+            (usage.prompt_tokens, (estimate_tokens(&session.messages) + estimate_tool_tokens(&offered)) as u64);
         let mut call_prefill_ms: Option<u64> = None;
 
         // Debug: log message roles to diagnose ordering issues
@@ -2653,7 +2678,7 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
         let mut routed_frame: Option<Value> = None;
         let resp = match send_llm_with_fallback(
             rt, &mut backend, &mut failed_backend_urls, effective_model,
-            &session.messages, Some(&tool_schemas), true, enable_thinking, turn_ends,
+            &session.messages, Some(&offered), true, enable_thinking, turn_ends,
             // Its tokens reach the console as they come: never re-sent whole.
             Some((writer, &mut routed_frame)), false,
         ).await {
@@ -3823,6 +3848,7 @@ async fn run_inner_bound<R: HarnessRuntime>(
     // frame carries the knowledge base, tell the model it is already shown
     // instead of "call noo_rag_query FIRST" (i1178a, half a).
     super::context::mark_kb_shown(&mut session.messages, data_frame.as_deref(), rag_ctx.as_deref());
+    let kb_shown = super::context::kb_in_frame(data_frame.as_deref(), rag_ctx.as_deref());
     super::context::place_clock(&mut session.messages, chrono::Utc::now());
     if let Some(f) = data_frame.as_deref() {
         record_layer_chars(rt.metrics(), "retrieved_data_frame", f).await;
@@ -3905,8 +3931,12 @@ async fn run_inner_bound<R: HarnessRuntime>(
             break;
         }
         // What this call sends, and the backend's count before it (i802).
+        let offered = offered_tools(&tool_schemas, iteration, kb_shown);
+        if offered.len() < tool_schemas.len() {
+            tracing::info!(iteration, has_rag = true, tool = KB_RETRIEVAL_TOOL, "coordinator.kb_tool_deferred");
+        }
         let (evaluated_before, sent_estimate) =
-            (usage.prompt_tokens, (estimate_tokens(&session.messages) + estimate_tool_tokens(&tool_schemas)) as u64);
+            (usage.prompt_tokens, (estimate_tokens(&session.messages) + estimate_tool_tokens(&offered)) as u64);
         let mut call_prefill_ms: Option<u64> = None;
 
         // For OpenAI-compat (vLLM, node-agent proxy), use stream=true even
@@ -3924,7 +3954,7 @@ async fn run_inner_bound<R: HarnessRuntime>(
         // AFTER the call — fallback may have switched api_format.
         let resp = match send_llm_with_fallback(
             rt, &mut backend, &mut failed_backend_urls, effective_model,
-            &session.messages, Some(&tool_schemas), false, enable_thinking, turn_ends,
+            &session.messages, Some(&offered), false, enable_thinking, turn_ends,
             None::<(&crate::websocket::NullSink, &mut Option<Value>)>, true,
         ).await {
             Ok(r) => r,
@@ -3953,7 +3983,7 @@ async fn run_inner_bound<R: HarnessRuntime>(
                     tracing::warn!(iteration, cut = ?s.cut, "loop.model_call_resent_whole");
                     resp = match send_llm_with_fallback(
                         rt, &mut backend, &mut failed_backend_urls, effective_model,
-                        &session.messages, Some(&tool_schemas), false, enable_thinking, turn_ends,
+                        &session.messages, Some(&offered), false, enable_thinking, turn_ends,
                         None::<(&crate::websocket::NullSink, &mut Option<Value>)>, true,
                     ).await {
                         Ok(r) => r,
