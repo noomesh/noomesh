@@ -6884,7 +6884,8 @@ mod address_claim_tests {
         let code = include_str!("security_local.rs");
         let body = crate::test_src::fn_body(code, "fn pki_push_node_prove(");
         let prove = body.find("node_prove::prove_node_at(").expect("the dial-back");
-        let covered = body.find("if covered {").expect("the covered branch");
+        // The covered answer's own branch (a block, not an inline condition).
+        let covered = body.find("if covered {\n").expect("the covered branch");
         let confirm = body.find("confirm_destructive(").expect("the confirm");
         let mint = body.find("issue_node_cert(").expect("the mint");
         assert!(prove < covered, "the covered answer comes after the dial-back");
