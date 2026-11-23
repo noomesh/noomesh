@@ -447,7 +447,11 @@ hairpin that is not the node's own, and every call to it then fails TLS.
   leaf, with a fresh key, for exactly that address. It needs the node's
   `agent_url` to name an IP, not a host name, and a leaf that has not
   expired; otherwise `--prove` refuses and says why. The row says which
-  address it would certify.
+  address it would certify. On a node whose leaf already covers that address,
+  `--prove` still dials it: proven, it answers "already covers <address>, and
+  <address>:<port> answered with <node>'s own key: nothing to re-issue"
+  (exit 0; `--json`: `changed: false, proven: true`); not proven, it fails
+  like any other proof, and nothing is issued.
 - **FAIL with no remedy:** that address is also another node's (registered,
   dialled, or in its leaf). Investigate first; `push-nodes` refuses it too,
   unless `--allow-shared-address <addr>` names it.
