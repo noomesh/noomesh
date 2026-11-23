@@ -1638,10 +1638,14 @@ pub(crate) const MIN_DOCKER_ENGINE_MAJOR: u64 = 28;
 
 /// The `docker engine` row (i1058), from the node's `docker_engine` fact.
 /// No row from an agent that predates the fact (a fleet mid-roll stays
-/// quiet). `none` (no Docker, a native-only node) is OK. `unreadable` is a
-/// WARN: the engine is there and could not be checked. A known Docker Engine
-/// below [`MIN_DOCKER_ENGINE_MAJOR`] is a WARN naming the upgrade; at or above
-/// it, OK. Podman's compat API is reported, not compared: its version is
+/// quiet). `none` (Docker not installed, a native-only node) is OK. `down`
+/// (installed, its daemon's socket gone: a clean stop deletes it) is a WARN
+/// naming what showed it installed, a FAIL when the node has a container-lane
+/// backend placed or running ([`container_lane_backends`]: containers cannot
+/// run without the daemon), and OK on darwin, whose backends are native.
+/// `unreadable` is a WARN: the engine is there and could not be checked. A
+/// known Docker Engine below [`MIN_DOCKER_ENGINE_MAJOR`] is a WARN naming the
+/// upgrade; at or above it, OK. Podman's compat API is reported, not compared: its version is
 /// Podman's, not a Docker Engine's.
 pub(crate) fn docker_engine_check(n: &Value) -> Option<Check> {
     const NAME: &str = "docker engine";
@@ -1656,6 +1660,21 @@ pub(crate) fn docker_engine_check(n: &Value) -> Option<Check> {
     };
     match state {
         "none" => Some(ok(NAME, "no Docker on this node (native backends only)")),
+        "down" => {
+            let os = n["os"].as_str().or_else(|| n["hostd"]["host"]["os"].as_str());
+            if os == Some("darwin") {
+                return Some(ok(NAME, format!("Docker Desktop is installed on {id} but not running (not needed: its backends are native)")));
+            }
+            let by = e.get("installed_by").and_then(Value::as_str).unwrap_or("what showed it was not given");
+            let detail = format!("Docker is installed on {id} but its daemon is not answering ({by})");
+            let remedy = format!("on {id} (run on that machine, with sudo): sudo systemctl start docker   # then, from the controller: noo cluster verify {id}");
+            let containers = container_lane_backends(n);
+            if containers.is_empty() {
+                Some(warn(NAME, detail, Some(remedy)))
+            } else {
+                Some(fail(NAME, format!("{detail}; its container-lane backend(s) {} cannot run without it", containers.join(", ")), remedy))
+            }
+        }
         "unreadable" => Some(cannot(e.get("error").and_then(Value::as_str).unwrap_or("no error given").to_string())),
         "ok" if kind == "podman" => Some(ok(NAME, format!("Podman {version} (Docker-compatible API; not compared with the Docker Engine minimum {MIN_DOCKER_ENGINE_MAJOR})"))),
         "ok" => {
@@ -1671,6 +1690,31 @@ pub(crate) fn docker_engine_check(n: &Value) -> Option<Check> {
         }
         other => Some(cannot(format!("unknown state {other:?}"))),
     }
+}
+
+/// The container-lane backends a node has placed (the agent's `lanes`) or
+/// running (`running_backends`): every one whose `backend_runtimes` entry is
+/// not `native`. Sorted, each once. The `docker engine` row FAILs a node whose
+/// daemon is down while this is not empty.
+pub(crate) fn container_lane_backends(n: &Value) -> Vec<String> {
+    let mut names: Vec<&str> = Vec::new();
+    if let Some(lanes) = n["lanes"].as_array() {
+        names.extend(lanes.iter().filter_map(|l| l["backend"].as_str()));
+    }
+    match &n["running_backends"] {
+        Value::Object(m) => names.extend(m.keys().map(String::as_str)),
+        Value::Array(a) => names.extend(a.iter().filter_map(Value::as_str)),
+        _ => {}
+    }
+    let mut out: Vec<String> = names
+        .into_iter()
+        .map(str::trim)
+        .filter(|b| !b.is_empty() && n["backend_runtimes"][*b].as_str() != Some("native"))
+        .map(str::to_string)
+        .collect();
+    out.sort();
+    out.dedup();
+    out
 }
 
 /// What to run on a node whose Docker Engine is below
@@ -19201,6 +19245,71 @@ mod docker_engine_tests {
         assert!(docker_engine_check(&json!({"id": "node_a"})).is_none(), "an agent that predates the fact: no row");
         let podman = docker_engine_check(&node(json!({"state": "ok", "version": "5.2.2", "kind": "podman"}))).expect("a row");
         assert_eq!(podman.verdict, Verdict::Ok, "Podman's version is not a Docker Engine's: {podman:?}");
+    }
+
+    const DOWN_REMEDY: &str = "on node_a (run on that machine, with sudo): sudo systemctl start docker   # then, from the controller: noo cluster verify node_a";
+
+    /// rc.2 rehearsal: a Linux node whose dockerd was stopped read OK "no
+    /// Docker on this node". The agent now says `down`: a WARN naming what
+    /// showed Docker installed, with the start command run on that node.
+    #[test]
+    fn a_down_daemon_on_linux_warns_with_the_start_remedy() {
+        let mut n = node(json!({"state": "down", "installed_by": "dockerd at /usr/bin/dockerd"}));
+        n["os"] = "linux".into();
+        let c = docker_engine_check(&n).expect("a row");
+        assert_eq!(c.verdict, Verdict::Warn, "{c:?}");
+        assert_eq!(c.detail, "Docker is installed on node_a but its daemon is not answering (dockerd at /usr/bin/dockerd)");
+        assert_eq!(c.remedy.as_deref(), Some(DOWN_REMEDY));
+        // An agent that does not report `os` is judged as Linux.
+        let bare = docker_engine_check(&node(json!({"state": "down", "installed_by": "unit file /lib/systemd/system/docker.service"}))).expect("a row");
+        assert_eq!(bare.verdict, Verdict::Warn, "{bare:?}");
+    }
+
+    /// A down daemon on a node with a container-lane backend placed or
+    /// running FAILs: those containers cannot run. A native one does not count.
+    #[test]
+    fn a_down_daemon_under_a_container_backend_fails() {
+        let mut placed = node(json!({"state": "down", "installed_by": "dockerd at /usr/bin/dockerd"}));
+        placed["os"] = "linux".into();
+        placed["lanes"] = json!([{"backend": "vllm", "model": "m", "role": "chat", "state": "down", "reason": ""}]);
+        let c = docker_engine_check(&placed).expect("a row");
+        assert_eq!(c.verdict, Verdict::Fail, "{c:?}");
+        assert_eq!(c.detail, "Docker is installed on node_a but its daemon is not answering (dockerd at /usr/bin/dockerd); its container-lane backend(s) vllm cannot run without it");
+        assert_eq!(c.remedy.as_deref(), Some(DOWN_REMEDY));
+
+        let mut running = node(json!({"state": "down", "installed_by": "dockerd at /usr/bin/dockerd"}));
+        running["running_backends"] = json!({"llamacpp": "m.gguf", "ollama": "gemma"});
+        running["backend_runtimes"] = json!({"ollama": "native"});
+        let c = docker_engine_check(&running).expect("a row");
+        assert_eq!(c.verdict, Verdict::Fail, "{c:?}");
+        assert!(c.detail.ends_with("backend(s) llamacpp cannot run without it"), "{}", c.detail);
+
+        let mut native = node(json!({"state": "down", "installed_by": "dockerd at /usr/bin/dockerd"}));
+        native["running_backends"] = json!({"ollama": "gemma"});
+        native["backend_runtimes"] = json!({"ollama": "native"});
+        assert_eq!(docker_engine_check(&native).expect("a row").verdict, Verdict::Warn, "a native backend needs no daemon");
+    }
+
+    /// On a Mac the backends are native: Docker Desktop not running is fine.
+    #[test]
+    fn a_down_docker_desktop_on_darwin_is_ok() {
+        let mut n = node(json!({"state": "down", "installed_by": "Docker Desktop at /Applications/Docker.app"}));
+        n["os"] = "darwin".into();
+        n["running_backends"] = json!({"ollama": "gemma"});
+        let c = docker_engine_check(&n).expect("a row");
+        assert_eq!(c.verdict, Verdict::Ok, "{c:?}");
+        assert_eq!(c.detail, "Docker Desktop is installed on node_a but not running (not needed: its backends are native)");
+        let mut h = node(json!({"state": "down", "installed_by": "Docker Desktop at /Applications/Docker.app"}));
+        h["hostd"] = json!({"host": {"os": "darwin"}});
+        assert_eq!(docker_engine_check(&h).expect("a row").verdict, Verdict::Ok, "hostd's os when the beat's is absent");
+    }
+
+    /// An older agent's `none` keeps today's text.
+    #[test]
+    fn an_older_agents_none_keeps_its_text() {
+        let c = docker_engine_check(&node(json!({"state": "none"}))).expect("a row");
+        assert_eq!(c.verdict, Verdict::Ok, "{c:?}");
+        assert_eq!(c.detail, "no Docker on this node (native backends only)");
     }
 
     #[test]

@@ -8,6 +8,9 @@ import (
 	"errors"
 	"net/url"
 	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -17,15 +20,17 @@ import (
 
 // The heartbeat's `docker_engine` fact (i1058): which Docker Engine this node
 // runs, so the controller can tell which nodes sit below the oldest engine the
-// project tests. Three states, each explicit, so a reader never has to guess
+// project tests. Four states, each explicit, so a reader never has to guess
 // from an absent key (absent means an agent that predates the fact):
 //
 //	{"state":"ok","version":"27.3.1","kind":"dockerd"|"docker-desktop"|"podman"}
-//	{"state":"none"}                       no Docker on this node
+//	{"state":"none"}                       Docker is not installed on this node
+//	{"state":"down","installed_by":"..."}  installed, its daemon's socket is gone
 //	{"state":"unreadable","error":"..."}   Docker is there, its version is not
 const (
 	EngineStateOK         = "ok"
 	EngineStateNone       = "none"
+	EngineStateDown       = "down"
 	EngineStateUnreadable = "unreadable"
 
 	EngineKindDockerd = "dockerd"
@@ -34,8 +39,8 @@ const (
 )
 
 // The engine version changes only when the daemon is upgraded, so a good
-// answer is kept for an hour; "none" and "unreadable" are asked again sooner,
-// since a daemon that was starting may answer now.
+// answer is kept for an hour; "none", "down" and "unreadable" are asked again
+// sooner, since a daemon that was starting may answer now.
 const (
 	engineOKTTL    = time.Hour
 	engineRetryTTL = 5 * time.Minute
@@ -44,11 +49,14 @@ const (
 )
 
 // engineProbe caches the `/version` answer. version is the daemon call;
-// noDocker says whether its error means no daemon exists here at all.
+// noDocker says whether its error means no daemon socket exists here at all;
+// installedBy then names what shows Docker is installed anyway ("" when
+// nothing does), which tells "down" from "none".
 type engineProbe struct {
-	version  func(ctx context.Context) (client.ServerVersionResult, error)
-	noDocker func(err error) bool
-	now      func() time.Time
+	version     func(ctx context.Context) (client.ServerVersionResult, error)
+	noDocker    func(err error) bool
+	installedBy func() string
+	now         func() time.Time
 
 	mu      sync.Mutex
 	report  map[string]any
@@ -64,7 +72,7 @@ func (p *engineProbe) Report(ctx context.Context) map[string]any {
 		return copyReport(p.report)
 	}
 	res, err := p.version(ctx)
-	p.report = engineReport(res, err, p.noDocker)
+	p.report = engineReport(res, err, p.noDocker, p.installedBy)
 	ttl := engineRetryTTL
 	if p.report["state"] == EngineStateOK {
 		ttl = engineOKTTL
@@ -81,10 +89,20 @@ func copyReport(m map[string]any) map[string]any {
 	return out
 }
 
-// engineReport turns one `/version` answer into the fact.
-func engineReport(res client.ServerVersionResult, err error, noDocker func(error) bool) map[string]any {
+// engineReport turns one `/version` answer into the fact. No socket is
+// "none" only when nothing shows Docker installed: a cleanly stopped dockerd
+// deletes its socket, so "installed, daemon down" is "down", naming the find.
+func engineReport(res client.ServerVersionResult, err error, noDocker func(error) bool, installedBy func() string) map[string]any {
 	if err != nil {
 		if noDocker != nil && noDocker(err) {
+			if installedBy != nil {
+				if by := installedBy(); by != "" {
+					if len(by) > maxEngineErrLen {
+						by = by[:maxEngineErrLen]
+					}
+					return map[string]any{"state": EngineStateDown, "installed_by": by}
+				}
+			}
 			return map[string]any{"state": EngineStateNone}
 		}
 		msg := err.Error()
@@ -122,9 +140,10 @@ func engineKind(res client.ServerVersionResult) string {
 	return EngineKindDockerd
 }
 
-// socketAbsent is the "no Docker here" test: the call could not connect and
-// the daemon's unix socket does not exist. A socket that exists but refuses,
-// a TCP host, or any other error is "unreadable", never "none".
+// socketAbsent is the "no daemon socket here" test: the call could not
+// connect and the daemon's unix socket does not exist. A socket that exists
+// but refuses, a TCP host, or any other error is "unreadable", never "none"
+// or "down".
 func socketAbsent(daemonHost string) func(error) bool {
 	return func(err error) bool {
 		if !client.IsErrConnectionFailed(err) {
@@ -143,6 +162,45 @@ func socketAbsent(daemonHost string) func(error) bool {
 	}
 }
 
+// Where Docker shows it is installed, as package vars so tests never read the
+// real host: a dockerd binary (on PATH or at a packaged path), a docker unit
+// file, or on darwin the Docker Desktop app.
+var (
+	lookPath       = exec.LookPath
+	pathExists     = func(p string) bool { _, err := os.Stat(p); return err == nil }
+	hostOS         = runtime.GOOS
+	dockerdPaths   = []string{"/usr/bin/dockerd", "/usr/local/bin/dockerd", "/usr/sbin/dockerd"}
+	dockerUnitDirs = []string{"/etc/systemd/system", "/lib/systemd/system", "/usr/lib/systemd/system"}
+	dockerUnits    = []string{"docker.service", "docker.socket"}
+	dockerDesktop  = "/Applications/Docker.app"
+	// dockerInstalledBy is what EngineReport's probe asks; tests replace it.
+	dockerInstalledBy = installedByOnHost
+)
+
+// installedByOnHost names the first sign that Docker is installed here, or
+// "" when there is none.
+func installedByOnHost() string {
+	if p, err := lookPath("dockerd"); err == nil && p != "" {
+		return "dockerd at " + p
+	}
+	for _, p := range dockerdPaths {
+		if pathExists(p) {
+			return "dockerd at " + p
+		}
+	}
+	for _, d := range dockerUnitDirs {
+		for _, u := range dockerUnits {
+			if p := filepath.Join(d, u); pathExists(p) {
+				return "unit file " + p
+			}
+		}
+	}
+	if hostOS == "darwin" && pathExists(dockerDesktop) {
+		return "Docker Desktop at " + dockerDesktop
+	}
+	return ""
+}
+
 // EngineReport is the heartbeat's `docker_engine` fact for this client's
 // daemon (cached; see engineProbe).
 func (c *Client) EngineReport(ctx context.Context) map[string]any {
@@ -151,8 +209,9 @@ func (c *Client) EngineReport(ctx context.Context) map[string]any {
 			version: func(ctx context.Context) (client.ServerVersionResult, error) {
 				return c.docker.ServerVersion(ctx, client.ServerVersionOptions{})
 			},
-			noDocker: socketAbsent(c.docker.DaemonHost()),
-			now:      time.Now,
+			noDocker:    socketAbsent(c.docker.DaemonHost()),
+			installedBy: dockerInstalledBy,
+			now:         time.Now,
 		}
 	})
 	return c.engine.Report(ctx)

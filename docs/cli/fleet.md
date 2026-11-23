@@ -581,9 +581,12 @@ restarts named `noo-*` containers through the same rail. `noo upgrade
 ### Check each node's Docker Engine
 
 Each agent reports its Docker Engine in the heartbeat (`docker_engine`: the
-version and the kind, `dockerd`, `docker-desktop` or `podman`; `none` without
-Docker; `unreadable` with the error when Docker is there but its version
-could not be read). `noo cluster show <node>` prints it, and `noo cluster
+version and the kind, `dockerd`, `docker-desktop` or `podman`; `none` when
+Docker is not installed; `down` when Docker is installed (a `dockerd` binary,
+a `docker.service` or `docker.socket` unit file, or Docker Desktop on a Mac)
+but its daemon's socket is gone, as a cleanly stopped `dockerd` leaves it;
+`unreadable` with the error when Docker is there but its version could not be
+read). `noo cluster show <node>` prints it, and `noo cluster
 verify` has a `docker engine` row:
 
 - below **28**, the oldest Docker Engine noomesh supports: WARN, with the
@@ -593,8 +596,16 @@ verify` has a `docker engine` row:
   a container-lane Ollama import fails on an engine below 28 with an agent
   before 0.6.28;
 - `unreadable`: WARN, `cannot be checked`, with the error;
-- `none` (a native-only node) and 28 or newer: ok. Podman is shown, not
-  compared;
+- `down` on Linux: WARN, "Docker is installed on the node but its daemon is
+  not answering", naming what showed it installed. The remedy runs on that
+  node, with sudo: `sudo systemctl start docker`; then, from the controller,
+  `noo cluster verify <node>`. FAIL instead when the node has a container-lane
+  backend placed or running (its `lanes` or `running_backends`, less any
+  `backend_runtimes` calls native): those containers cannot run without the
+  daemon. On a Mac, `down` is ok: Docker Desktop is not needed there, its
+  backends are native;
+- `none` (Docker not installed, a native-only node) and 28 or newer: ok.
+  Podman is shown, not compared;
 - an agent that predates the report: no row.
 
 The minimum is the operator's decision. It is declared once, as

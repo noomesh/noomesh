@@ -51,8 +51,9 @@ type Facts struct {
 	NvidiaRuntime  func(ctx context.Context) (bool, error)
 	DataRootFreeGB func() (float64, error)
 	// DockerEngine is the `docker_engine` fact (i1058): always a state
-	// (ok with the version, none, or unreadable with the error), never
-	// omitted by a wired agent, so absent means an agent that predates it.
+	// (ok with the version, none, down with what shows Docker installed, or
+	// unreadable with the error), never omitted by a wired agent, so absent
+	// means an agent that predates it.
 	DockerEngine func(ctx context.Context) map[string]any
 
 	mu     sync.Mutex
