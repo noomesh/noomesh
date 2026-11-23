@@ -736,12 +736,13 @@ pub(crate) fn agent_address_check(id: &str, n: &Value) -> Option<Check> {
 /// The `agent address` row for an address the gateway did not store
 /// (`ip_address_refused`, i1174): another node holds it, it is the
 /// controller's own, or the heartbeat came from a different tailnet
-/// address. The record keeps its last accepted address (or none). The next
+/// address. The record keeps its last accepted address (or none: a first
+/// registration, or a stored address that is itself refused now). The next
 /// command follows the reason.
 fn ip_address_refused_check(id: &str, n: &Value, why: &str) -> Check {
-    let dials = match n["ip_address"].as_str().filter(|s| !s.is_empty()) {
-        Some(ip) => format!("the controller keeps dialling it at {ip}"),
-        None => "the controller reaches it over its bus or tunnel only".to_string(),
+    let detail = match n["ip_address"].as_str().filter(|s| !s.is_empty()) {
+        Some(ip) => format!("{id}: the controller refused the address it reported ({why}) and keeps its previous address {ip}"),
+        None => format!("{id}: the controller did not store the address it reported ({why}); the controller reaches it over its bus or tunnel only"),
     };
     let next = if let Some((_, other)) = why.split_once(" is claimed by ") {
         let other = other.trim();
@@ -753,7 +754,7 @@ fn ip_address_refused_check(id: &str, n: &Value, why: &str) -> Check {
     } else {
         format!("noo cluster logs {id}")
     };
-    fail("agent address", format!("{id}: the controller did not store the address it reported ({why}); {dials}"), next)
+    fail("agent address", detail, next)
 }
 
 /// The `backend caps` row (#1283): the capability set a node's backend
@@ -19408,8 +19409,16 @@ mod target_node_row_tests {
         assert_eq!((claimed.name, claimed.verdict), ("agent address", Verdict::Fail));
         assert_eq!(
             claimed.detail,
-            "node-b: the controller did not store the address it reported (192.0.2.42 is claimed by node-c); the controller keeps dialling it at 192.0.2.41"
+            "node-b: the controller refused the address it reported (192.0.2.42 is claimed by node-c) and keeps its previous address 192.0.2.41"
         );
+        // A first registration (or a stored address itself refused): none kept.
+        let none = agent_address_check("node-b", &serde_json::json!({"ip_address_refused": "192.0.2.42 is claimed by node-c"})).expect("a row");
+        assert_eq!((none.name, none.verdict), ("agent address", Verdict::Fail));
+        assert_eq!(
+            none.detail,
+            "node-b: the controller did not store the address it reported (192.0.2.42 is claimed by node-c); the controller reaches it over its bus or tunnel only"
+        );
+        assert!(none.remedy.as_deref().unwrap().starts_with("noo cluster verify node-c"), "{:?}", none.remedy);
         assert!(claimed.remedy.as_deref().unwrap().starts_with("noo cluster verify node-c"), "{:?}", claimed.remedy);
         let own = row("192.0.2.1 is the controller's own address");
         assert!(own.remedy.as_deref().unwrap().starts_with("on node-b, set NODE_IP"), "{:?}", own.remedy);

@@ -329,16 +329,28 @@ pub(crate) fn peer_refusal(offered: &str, peer: Option<&str>) -> Option<String> 
         .then(|| format!("the heartbeat came from tailnet address {peer}, not {offered}"))
 }
 
-/// A refused address is never stored. The stored one stays, unless it is
-/// itself another node's (or the controller's): then the record drops it,
-/// and the node is reached over its bus or tunnel until it reports one that
-/// is its own.
-pub(crate) fn hold_stored_address(data: &mut Value, node_id: &str, claims: &AddressClaims, leaf_ips: &[String]) {
-    let stored = data.get("ip_address").and_then(Value::as_str).unwrap_or("").to_string();
-    if !stored.is_empty() && address_refusal(node_id, &stored, claims, leaf_ips).is_some() {
-        if let Some(m) = data.as_object_mut() {
-            m.remove("ip_address");
-            m.remove("agent_url");
+/// The record (`data`) after the node's reported address was refused for
+/// `why`; the heartbeat and the registration both answer a refusal here.
+/// A refused address is never stored: the record keeps the address of the
+/// node's STORED record (`stored`, its last accepted one), unless that one is
+/// itself refused now (another node's, or the controller's): then the record
+/// drops it and its `agent_url`, and the node is reached over its bus or
+/// tunnel until it reports one that is its own. With no stored record (a
+/// first registration) the record has no address.
+pub(crate) fn keep_stored_address(data: &mut Value, stored: Option<&Value>, node_id: &str, claims: &AddressClaims, leaf_ips: &[String], why: &str) {
+    data["ip_address_refused"] = json!(why);
+    let kept = stored
+        .and_then(|s| s.get("ip_address"))
+        .and_then(Value::as_str)
+        .filter(|ip| !ip.is_empty() && address_refusal(node_id, ip, claims, leaf_ips).is_none())
+        .map(str::to_string);
+    match kept {
+        Some(ip) => data["ip_address"] = json!(ip),
+        None => {
+            if let Some(m) = data.as_object_mut() {
+                m.remove("ip_address");
+                m.remove("agent_url");
+            }
         }
     }
 }
@@ -897,8 +909,10 @@ async fn node_heartbeat(
                     }
                     Some(why) => {
                         tracing::warn!(node = %node_id, offered = %ip, reason = %why, "ip_address_refused");
-                        data["ip_address_refused"] = json!(why);
-                        hold_stored_address(&mut data, &node_id, &claims, &leaf_ips);
+                        // `data` is still the stored record here: the
+                        // offered address was not written.
+                        let stored = data.clone();
+                        keep_stored_address(&mut data, Some(&stored), &node_id, &claims, &leaf_ips, &why);
                         crate::operator_alert::send_operator_alert_with(
                             &state,
                             crate::operator_alert::OperatorAlert::new(
@@ -1636,14 +1650,22 @@ async fn node_register_body(
     // tunnel). Written every beat; an agent that does not say is an older
     // one and reads as the HTTPS listener only.
     data[crate::node_link::TRANSPORTS_FIELD] = crate::node_link::reported_transports(&body);
+    // The node's stored record: a refused address keeps its last accepted
+    // one (below), and the write carries routing fields from it.
+    let kv = state.js.get_key_value("mesh_nodes").await.ok();
+    let stored = match &kv {
+        Some(kv) => kv.get(node_id).await.ok().flatten().and_then(|v| serde_json::from_slice::<Value>(&v).ok()),
+        None => None,
+    };
     // i1174: a registration cannot claim another node's address or the
     // controller's own either (no leaf override here: a registration
     // rebuilds the record, and the next heartbeat may take a vetted one).
+    // A refusal keeps the stored address, as a heartbeat's does.
     if let Some(ip) = data.get("ip_address").and_then(Value::as_str).map(str::to_string) {
-        if let Some(why) = address_refusal(node_id, &ip, &AddressClaims::current(node_id, body.get("self_node").and_then(Value::as_bool) == Some(true)), &[]) {
+        let claims = AddressClaims::current(node_id, body.get("self_node").and_then(Value::as_bool) == Some(true));
+        if let Some(why) = address_refusal(node_id, &ip, &claims, &[]) {
             tracing::warn!(node = %node_id, offered = %ip, reason = %why, "ip_address_refused");
-            data["ip_address"] = Value::Null;
-            data["ip_address_refused"] = json!(why);
+            keep_stored_address(&mut data, stored.as_ref(), node_id, &claims, &[], &why);
         }
     }
     carry_target_node(&mut data, &body);
@@ -1654,8 +1676,7 @@ async fn node_register_body(
     // node offered a second ago (`carry_stored`). A forgotten node's record
     // was purged (`node_forget`), so a re-enrolled one inherits nothing.
     let mut kept: Vec<&str> = Vec::new();
-    if let Ok(kv) = state.js.get_key_value("mesh_nodes").await {
-        let stored = kv.get(node_id).await.ok().flatten().and_then(|v| serde_json::from_slice::<Value>(&v).ok());
+    if let Some(kv) = &kv {
         let from = stored_for_carry(stored.as_ref(), node_id, now);
         for &key in REGISTER_KEEPS_FROM_STORED {
             carry_stored(&mut data, from, &body, key);
@@ -11551,12 +11572,64 @@ mod address_claim_tests {
 
     #[test]
     fn a_stored_address_another_node_holds_is_dropped_not_kept() {
-        let mut data = json!({"ip_address": "100.64.0.12", "agent_url": "https://100.64.0.12:8081"});
-        hold_stored_address(&mut data, "node_a", &claims(), &[]);
+        let stored = json!({"ip_address": "100.64.0.12", "agent_url": "https://100.64.0.12:8081"});
+        let mut data = stored.clone();
+        keep_stored_address(&mut data, Some(&stored), "node_a", &claims(), &[], "100.64.0.1 is the controller's own address");
         assert!(data.get("ip_address").is_none() && data.get("agent_url").is_none(), "{data}");
-        let mut good = json!({"ip_address": "100.64.0.11"});
-        hold_stored_address(&mut good, "node_a", &claims(), &[]);
-        assert_eq!(good["ip_address"], "100.64.0.11", "the last good address stays");
+        assert_eq!(data["ip_address_refused"], "100.64.0.1 is the controller's own address");
+        // A heartbeat: `data` is the stored record.
+        let good = json!({"ip_address": "100.64.0.11", "agent_url": "https://100.64.0.11:8081"});
+        let mut beat = good.clone();
+        keep_stored_address(&mut beat, Some(&good), "node_a", &claims(), &[], "100.64.0.12 is claimed by node_b");
+        assert_eq!(beat["ip_address"], "100.64.0.11", "the last good address stays");
+        assert_eq!(beat["agent_url"], "https://100.64.0.11:8081", "with its agent_url");
+        assert_eq!(beat["ip_address_refused"], "100.64.0.12 is claimed by node_b");
+    }
+
+    /// The rc.2 rehearsal: a restarted agent re-registered with an address
+    /// another node holds, and the registration wiped its good stored one.
+    /// A registration's refusal keeps the stored address, as a beat's does.
+    #[test]
+    fn a_reregistration_with_a_claimed_address_keeps_the_stored_one() {
+        let stored = json!({"id": "node_a", "ip_address": "100.64.0.11"});
+        // The registration rebuilt the record with the address it offered.
+        let mut data = json!({"id": "node_a", "ip_address": "100.64.0.12"});
+        let why = address_refusal("node_a", "100.64.0.12", &claims(), &[]).expect("refused");
+        keep_stored_address(&mut data, Some(&stored), "node_a", &claims(), &[], &why);
+        assert_eq!(data["ip_address"], "100.64.0.11", "{data}");
+        assert_eq!(data["ip_address_refused"], "100.64.0.12 is claimed by node_b");
+        assert!(!data.to_string().contains("100.64.0.12\""), "the offered address is never stored: {data}");
+    }
+
+    #[test]
+    fn a_first_registration_with_a_claimed_address_stores_none() {
+        let mut data = json!({"id": "node_a", "ip_address": "100.64.0.12"});
+        keep_stored_address(&mut data, None, "node_a", &claims(), &[], "100.64.0.12 is claimed by node_b");
+        assert!(data.get("ip_address").is_none(), "{data}");
+        assert_eq!(data["ip_address_refused"], "100.64.0.12 is claimed by node_b");
+    }
+
+    #[test]
+    fn a_reregistration_whose_stored_address_is_now_claimed_stores_none() {
+        let stored = json!({"id": "node_a", "ip_address": "100.64.0.12", "agent_url": "https://100.64.0.12:8081"});
+        let mut data = json!({"id": "node_a", "ip_address": "100.64.0.1"});
+        keep_stored_address(&mut data, Some(&stored), "node_a", &claims(), &[], "100.64.0.1 is the controller's own address");
+        assert!(data.get("ip_address").is_none() && data.get("agent_url").is_none(), "{data}");
+    }
+
+    /// Both paths answer a refusal with the one helper, so they cannot
+    /// drift: the beat with its stored record (`data` before the offered
+    /// address is written), the registration with the record it read from KV.
+    #[test]
+    fn the_heartbeat_and_the_registration_keep_the_stored_address_alike() {
+        let code = crate::test_src::own_code(include_str!("cluster.rs"));
+        let beat = crate::test_src::fn_body(&code, "async fn node_heartbeat(");
+        assert!(beat.contains("keep_stored_address(&mut data, Some(&stored), &node_id, &claims, &leaf_ips, &why);"), "{beat}");
+        let reg = crate::test_src::fn_body(&code, "async fn node_register_body(");
+        let read = reg.find("let stored = match &kv {").expect("the stored record is read");
+        let keep = reg.find("keep_stored_address(&mut data, stored.as_ref(), node_id, &claims, &[], &why);").expect("the refusal keeps it");
+        assert!(read < keep, "{reg}");
+        assert!(!reg.contains("data[\"ip_address\"] = Value::Null;"), "{reg}");
     }
 
     #[test]
@@ -11570,7 +11643,7 @@ mod address_claim_tests {
         assert!(beat.contains("crate::node_pin::note(&node_id, &data);"));
         assert!(beat.contains("carry_target_node(&mut data, &body);"));
         let reg = crate::test_src::fn_body(&code, "async fn node_register_body(");
-        assert!(reg.contains("address_refusal(node_id, &ip, &AddressClaims::current("), "{reg}");
+        assert!(reg.contains("address_refusal(node_id, &ip, &claims, &[])"), "{reg}");
         assert!(reg.contains("crate::node_pin::note(node_id, &data);"));
     }
 

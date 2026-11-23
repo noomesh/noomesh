@@ -575,12 +575,14 @@ controller dials that node. The gateway stores it only when:
   docker's userland proxy the peer is a router or gateway address and
   legitimately differs; that is not judged.
 
-A refused address is never stored. The record keeps its last good address
-(dropped instead when that one, too, is another node's) and carries
-`ip_address_refused` with the reason; the gateway logs `ip_address_refused`
-and raises the `node.ip_address_refused` operator alert, which points at
-`noo cluster verify <node>`. Its `agent address` row FAILs with the reason
-and the next command for it.
+A refused address is never stored, whether a heartbeat or a registration
+reported it. The record keeps its last accepted address (dropped instead when
+that one, too, is another node's or the controller's; a first registration
+has none to keep, and the node is reached over its bus or tunnel) and carries
+`ip_address_refused` with the reason; the gateway logs `ip_address_refused`,
+and on a heartbeat raises the `node.ip_address_refused` operator alert, which
+points at `noo cluster verify <node>`. Its `agent address` row FAILs with the
+reason, the address kept (if any), and the next command for it.
 
 ---
 
