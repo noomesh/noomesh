@@ -1652,6 +1652,22 @@ fn print_final_summary(ctx: &Ctx) {
             ctx.raw(&format!("    {line}"));
         }
     }
+    // i1098 row 12 (operator 2026-11-21): the Docker holds onboard placed,
+    // read from their record, so every run says what apt will not upgrade,
+    // why, and how to take an update. Only apt: onboard holds nothing else.
+    if !ctx.dry_run && crate::docker_hold::apt_here() {
+        let docker_lines = crate::docker_hold::summary_lines(
+            &crate::docker_hold::recorded_here(),
+            std::env::var_os(crate::docker_group::RELAUNCHED_ENV).is_some(),
+            steps::tool_version("docker").is_some(),
+        );
+        if !docker_lines.is_empty() {
+            ctx.raw("");
+            for line in docker_lines {
+                ctx.info(&line);
+            }
+        }
+    }
     // i677 #10: this wizard installed Docker and relaunched itself with the
     // new group. The shell the user returns to does not have it: `noo`
     // commands bridge that themselves, `docker` does not.

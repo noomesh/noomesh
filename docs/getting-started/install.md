@@ -224,7 +224,7 @@ Enter accepts the default at every prompt. These are the ones to read:
 
 | The prompt | What to type |
 |---|---|
-| `Install the missing prerequisites now? (uses sudo)` | Enter (yes): installs Docker (get.docker.com) and the listed packages; asks your sudo password. |
+| `Install the missing prerequisites now? (uses sudo)` | Enter (yes): installs Docker (get.docker.com) and the listed packages; asks your sudo password. It then holds the Docker packages it installed (`apt-mark hold`), so an unattended upgrade cannot restart every container; a Docker you already had is not held. To take a Docker update: [Host updates](../operating/runbooks/host-updates.md#taking-a-docker-security-update). |
 | `Admin password`, then `Confirm password` | a password of your choice, twice: at least 12 characters, not a common one, not containing the username. Enter alone is refused. |
 | `Stored both in a password manager OFF this machine` | `y`, once you have copied the two backup passphrases it just printed somewhere off this machine. Without them an encrypted backup cannot be restored, so the default (N) asks again. |
 | `Tailscale is not installed. Install it now` | `n` on a single machine with no tailnet: the dashboard is then on `https://localhost:8080`. `y` puts this machine on your tailnet (it may ask for sudo, then shows a login link). There is no default: Enter asks again. |

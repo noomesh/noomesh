@@ -62,6 +62,7 @@ mod child_stdin;
 mod commands;
 mod credentials;
 mod docker_group;
+mod docker_hold;
 #[cfg(test)]
 mod config_readers;
 mod entitlement;

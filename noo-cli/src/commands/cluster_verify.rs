@@ -524,7 +524,7 @@ pub(crate) fn node_checks(n: &Value, controller_tag: &str, cli_version: &str, no
 
     // 6b. What the node's NEXT BOOT will do, from
     //     the facts noo-hostd reports as root.
-    out.extend(host_checks(id, &hostd["host"], hostd["alive"].as_bool() == Some(true)));
+    out.extend(host_checks_with(id, &hostd["host"], hostd["alive"].as_bool() == Some(true), onboard_holds_of(n).as_deref()));
 
     // 6c. Backend doors: every door-backed backend on
     //     the node has a leaf that names its door, and the agent records no
@@ -2858,6 +2858,11 @@ fn with_harness_wanted(g: &Globals, n: &Value) -> Value {
         if let Some(d) = declared {
             obj.insert("declared_data_root".into(), Value::String(d));
         }
+        // The `holds` row: what onboard held on THIS machine, for its own
+        // node only (another machine's record is not readable from here).
+        if crate::role::is_self_node(&id) {
+            obj.insert("onboard_docker_holds".into(), serde_json::json!(crate::docker_hold::recorded_here()));
+        }
     }
     n
 }
@@ -2914,7 +2919,23 @@ pub(crate) fn gpu_driver_remedy(host: &Value, next: &str, running: &str, runbook
     }
 }
 
+/// What onboard held on this machine (`docker_hold::RECORD_PATH`), as
+/// [`with_harness_wanted`] injects it for the self node only. `None` for any
+/// other node: this box cannot read another machine's record. Pure.
+pub(crate) fn onboard_holds_of(n: &Value) -> Option<Vec<String>> {
+    n["onboard_docker_holds"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+}
+
+/// [`host_checks_with`] for a node whose onboard record is not known here.
+#[cfg(test)]
 pub(crate) fn host_checks(id: &str, host: &Value, hostd_alive: bool) -> Vec<Check> {
+    host_checks_with(id, host, hostd_alive, None)
+}
+
+/// [`host_checks`], with what onboard held on this node when it is this
+/// machine (`onboard`: `None` = not known here, `Some(&[])` = onboard held
+/// nothing). The `holds` row then says whether onboard placed the hold.
+pub(crate) fn host_checks_with(id: &str, host: &Value, hostd_alive: bool, onboard: Option<&[String]>) -> Vec<Check> {
     let mut out = Vec::new();
     if host.is_null() {
         if hostd_alive {
@@ -2984,10 +3005,10 @@ pub(crate) fn host_checks(id: &str, host: &Value, hostd_alive: bool) -> Vec<Chec
         let mut unheld: Vec<&str> = platform.keys().map(String::as_str).filter(|p| !held.contains(p)).collect();
         unheld.sort_unstable();
         if unheld.is_empty() {
-            out.push(ok("holds", format!("{} platform package(s) held", platform.len())));
+            out.push(ok("holds", holds_ok_detail(platform.len(), onboard)));
         } else {
             out.push(warn("holds",
-                holds_detail(&unheld),
+                holds_detail_with(&unheld, onboard),
                 Some(format!("on {id}: sudo apt-mark hold {}", unheld.join(" ")))));
         }
     }
@@ -3049,6 +3070,38 @@ pub(crate) fn holds_detail(unheld: &[&str]) -> String {
     }
     let also = if other.is_empty() { String::new() } else { format!(" (also not pinned: {})", other.join(", ")) };
     format!("Docker isn't pinned ({}): a routine `apt upgrade` can restart every container. Hold it when you want control.{also}", docker.join(", "))
+}
+
+/// The `holds` row when every platform package is held, saying which holds
+/// onboard placed (i1098 row 12) when this is the machine onboard ran on, so
+/// months later the reason apt will not upgrade Docker is on the row. Pure.
+pub(crate) fn holds_ok_detail(count: usize, onboard: Option<&[String]>) -> String {
+    match onboard {
+        None => format!("{count} platform package(s) held"),
+        Some([]) => format!("{count} platform package(s) held; onboard placed none of these holds (it holds only a Docker it installed)"),
+        Some(held) => format!(
+            "{count} platform package(s) held; onboard held {} when it installed Docker, so an unattended upgrade cannot restart dockerd. To take an update: {}",
+            held.join(", "), crate::docker_hold::update_path(held)),
+    }
+}
+
+/// [`holds_detail`], plus whether onboard placed a hold on the Docker that is
+/// not held now, when this is the machine onboard ran on. Pure.
+pub(crate) fn holds_detail_with(unheld: &[&str], onboard: Option<&[String]>) -> String {
+    let base = holds_detail(unheld);
+    let Some(held) = onboard else { return base };
+    let docker_unheld: Vec<&str> = unheld.iter().copied().filter(|p| crate::docker_hold::CANDIDATES.contains(p)).collect();
+    if docker_unheld.is_empty() {
+        return base;
+    }
+    let released: Vec<&str> = docker_unheld.iter().copied().filter(|p| held.iter().any(|h| h == p)).collect();
+    if held.is_empty() {
+        format!("{base} Onboard placed no hold here: it holds only a Docker it installed itself.")
+    } else if released.is_empty() {
+        format!("{base} Onboard holds {} (it installed them); it did not install these.", held.join(", "))
+    } else {
+        format!("{base} Onboard held {} when it installed Docker, and the hold is gone (released for an update? hold it again).", released.join(", "))
+    }
 }
 
 /// The `host telemetry` row (docs/security/telemetry.md, "Host software").
@@ -19423,6 +19476,69 @@ mod remedy_command_tests {
             "Docker isn't pinned (docker-ce): a routine `apt upgrade` can restart every container. Hold it when you want control. (also not pinned: tailscale)"
         );
         assert_eq!(super::holds_detail(&["tailscale"]), "tailscale not pinned: a routine `apt upgrade` can move them. Hold them when you want control.");
+    }
+
+    /// i1098 row 12 (operator 2026-11-21): on the machine onboard ran on, the
+    /// `holds` row shows the set onboard held and says onboard placed it, with
+    /// the way to take an update; it says so when onboard placed none, and
+    /// when a hold onboard placed is gone. Another node's row is unchanged.
+    #[test]
+    fn the_holds_row_shows_what_onboard_held() {
+        let docker = ["containerd.io", "docker-buildx-plugin", "docker-ce", "docker-ce-cli", "docker-compose-plugin"];
+        let platform: serde_json::Map<String, Value> = docker.iter().chain(["tailscale"].iter()).map(|p| (p.to_string(), json!("1"))).collect();
+        let host = |held: &[&str]| json!({
+            "os": "linux", "running_kernel": "7.0.11", "default_kernel": "7.0.11",
+            "platform": platform, "held": held,
+            "tailscale_state": "Running", "tailscale_online": true,
+        });
+        let rec: Vec<String> = docker.iter().map(|p| p.to_string()).collect();
+        let nothing: &[String] = &[];
+        let row = |h: &Value, onboard: Option<&[String]>| host_checks_with("node_a", h, true, onboard).into_iter().find(|c| c.name == "holds").expect("a holds row");
+        let mut all: Vec<&str> = docker.to_vec();
+        all.push("tailscale");
+
+        let held = row(&host(&all), Some(rec.as_slice()));
+        assert_eq!(held.verdict, Verdict::Ok);
+        assert_eq!(held.detail, "6 platform package(s) held; onboard held containerd.io, docker-buildx-plugin, docker-ce, docker-ce-cli, docker-compose-plugin \
+            when it installed Docker, so an unattended upgrade cannot restart dockerd. To take an update: sudo apt-mark unhold containerd.io docker-buildx-plugin docker-ce docker-ce-cli docker-compose-plugin \
+            && sudo apt-get update && sudo apt-get install --only-upgrade containerd.io docker-buildx-plugin docker-ce docker-ce-cli docker-compose-plugin, \
+            then noo cluster verify, then sudo apt-mark hold containerd.io docker-buildx-plugin docker-ce docker-ce-cli docker-compose-plugin");
+        assert_eq!(row(&host(&all), Some(nothing)).detail,
+            "6 platform package(s) held; onboard placed none of these holds (it holds only a Docker it installed)");
+        assert_eq!(row(&host(&all), None).detail, "6 platform package(s) held", "another node: unchanged");
+
+        // Docker present before onboard: not held, and the row says onboard placed nothing.
+        let before = row(&host(&["tailscale"]), Some(nothing));
+        assert_eq!(before.verdict, Verdict::Warn);
+        assert!(before.detail.starts_with("Docker isn't pinned (containerd.io, docker-buildx-plugin, docker-ce, docker-ce-cli, docker-compose-plugin)"), "{}", before.detail);
+        assert!(before.detail.ends_with(" Onboard placed no hold here: it holds only a Docker it installed itself."), "{}", before.detail);
+        assert_eq!(before.remedy.as_deref(), Some("on node_a: sudo apt-mark hold containerd.io docker-buildx-plugin docker-ce docker-ce-cli docker-compose-plugin"));
+
+        // Onboard held docker-ce; the person unheld it for an update.
+        let gone = row(&host(&["containerd.io", "docker-buildx-plugin", "docker-ce-cli", "docker-compose-plugin", "tailscale"]), Some(rec.as_slice()));
+        assert_eq!(gone.detail, "Docker isn't pinned (docker-ce): a routine `apt upgrade` can restart every container. Hold it when you want control. \
+            Onboard held docker-ce when it installed Docker, and the hold is gone (released for an update? hold it again).");
+        // A Docker package onboard did not install, unheld: named as not onboard's.
+        let other = row(&host(&["containerd.io", "docker-ce", "tailscale"]), Some(&rec[..1]));
+        assert!(other.detail.ends_with(" Onboard holds containerd.io (it installed them); it did not install these."), "{}", other.detail);
+        // Only Docker is onboard's business: an unheld tailscale alone reads as before.
+        assert_eq!(row(&host(&docker), Some(rec.as_slice())).detail, super::holds_detail(&["tailscale"]));
+    }
+
+    /// The record reaches the row for the self node only: with_harness_wanted
+    /// injects it under that test, and node_checks hands it to the row.
+    #[test]
+    fn the_onboard_record_is_read_for_the_self_node_only() {
+        assert_eq!(onboard_holds_of(&json!({"id": "n"})), None);
+        assert_eq!(onboard_holds_of(&json!({"onboard_docker_holds": []})), Some(Vec::new()));
+        assert_eq!(onboard_holds_of(&json!({"onboard_docker_holds": ["docker-ce"]})), Some(vec!["docker-ce".to_string()]));
+        let own = crate::test_src::own_code(include_str!("cluster_verify.rs"));
+        let inject = crate::test_src::fn_body(&own, "fn with_harness_wanted(");
+        let gate = inject.find("if crate::role::is_self_node(&id) {").expect("gated on the self node");
+        let put = inject.find("obj.insert(\"onboard_docker_holds\".into(), serde_json::json!(crate::docker_hold::recorded_here()));").expect("the record");
+        assert!(gate < put, "{inject}");
+        let node = crate::test_src::fn_body(&own, "pub(crate) fn node_checks(");
+        assert!(node.contains("host_checks_with(id, &hostd[\"host\"], hostd[\"alive\"].as_bool() == Some(true), onboard_holds_of(n).as_deref())"), "{node}");
     }
 
     /// The at-rest rows say what is planned without an internal id.
