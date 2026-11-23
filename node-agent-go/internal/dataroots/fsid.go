@@ -440,7 +440,7 @@ func unitMounts() ([]bootMount, error) {
 	var out []bootMount
 	for _, dir := range mountUnitDirs() {
 		entries, err := os.ReadDir(dir)
-		if errors.Is(err, fs.ErrNotExist) {
+		if err != nil || errors.Is(err, fs.ErrNotExist) {
 			continue
 		}
 		if err != nil {
