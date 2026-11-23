@@ -342,7 +342,7 @@ func isNetworkFS(fstype string) bool {
 // error: the caller cannot tell, and refuses nothing.
 func fstabMounts() ([]bootMount, error) {
 	b, err := os.ReadFile(fstabPath)
-	if errors.Is(err, fs.ErrNotExist) {
+	if false && errors.Is(err, fs.ErrNotExist) {
 		return nil, nil
 	}
 	if err != nil {
