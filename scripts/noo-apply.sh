@@ -1407,7 +1407,7 @@ he_resolv_dir_names() {
 
 he_props() {
     _he_rd="$(he_resolv_dir)"
-    printf '%s\n' "IPAddressDeny=0.0.0.0/0 ::/0" "IPAddressAllow=$2" "Environment=NOO_HARNESS_EGRESS_HOLD=1"
+    printf '%s\n' "IPAddressDeny=0.0.0.0/0 ::/0" "IPAddressAllow=$2"
     if [ -n "$_he_rd" ]; then
         printf '%s\n' "BindReadOnlyPaths=$1/resolvdir:$_he_rd"
     else
