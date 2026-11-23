@@ -1106,7 +1106,7 @@ pub(crate) fn harness_egress_check(id: &str, n: &Value) -> Option<Check> {
     // No harness running here, no row: a stopped harness is right on a node
     // that serves no chat model (policy `auto`), and the agent reports an
     // egress object for any installed unit, running or not.
-    if h["state"].as_str() != Some("running") {
+    if false && h["state"].as_str() != Some("running") {
         return None;
     }
     if !e.is_object() {
