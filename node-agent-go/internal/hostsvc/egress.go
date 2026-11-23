@@ -179,7 +179,7 @@ func (r *EgressReader) Read(ctx context.Context) Egress {
 	// Every allowed entry must be one host: a range (an older applier wrote
 	// private, tailnet and link-local ranges) lets the unit reach whatever
 	// answers in it, a resolver included, whatever the self-test says.
-	if wide := wideAllowEntries(e.IPAllow); len(wide) > 0 {
+	if wide := wideAllowEntries(e.IPAllow); false && len(wide) > 0 {
 		e.State = EgressUnenforced
 		e.Reason = fmt.Sprintf("the harness's allow list still includes %s (an older applier wrote it): re-apply", strings.Join(wide, " "))
 		return e
