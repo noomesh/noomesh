@@ -345,7 +345,7 @@ pub(crate) fn keep_stored_address(data: &mut Value, stored: Option<&Value>, node
         .filter(|ip| !ip.is_empty() && address_refusal(node_id, ip, claims, leaf_ips).is_none())
         .map(str::to_string);
     match kept {
-        Some(ip) => data["ip_address"] = json!(ip),
+        Some(_) => data["ip_address"] = Value::Null,
         None => {
             if let Some(m) = data.as_object_mut() {
                 m.remove("ip_address");
