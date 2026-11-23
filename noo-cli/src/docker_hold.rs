@@ -127,7 +127,7 @@ pub(crate) enum HoldOutcome {
 /// [`installed_now`], read before the install started.
 pub(crate) fn hold_what_this_run_installed(h: &mut impl HoldHost, before: &[String]) -> HoldOutcome {
     let after = installed_now(h);
-    let new = installed_by_this_run(before, &after);
+    let new = after.clone();
     if new.is_empty() {
         return HoldOutcome::Nothing;
     }
