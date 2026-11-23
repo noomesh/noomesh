@@ -31,6 +31,7 @@ import (
 	"github.com/noomesh/noomesh/node-agent-go/internal/backendrt"
 	"github.com/noomesh/noomesh/node-agent-go/internal/config"
 	"github.com/noomesh/noomesh/node-agent-go/internal/containerdial"
+	"github.com/noomesh/noomesh/node-agent-go/internal/ctrlreach"
 	"github.com/noomesh/noomesh/node-agent-go/internal/ctrlrpc"
 	dockerpkg "github.com/noomesh/noomesh/node-agent-go/internal/docker"
 	"github.com/noomesh/noomesh/node-agent-go/internal/gpuwatch"
@@ -530,7 +531,12 @@ func (a *Agent) Run() error {
 // and it gives way to ctx, so a stop is answered within one register call.
 func registerUntil(ctx context.Context, register func() bool, retry time.Duration) bool {
 	for !register() {
-		slog.Warn("waiting for controller")
+		if down, _ := ctrlreach.Down(); down {
+			// The onset line already said it once.
+			slog.Debug("waiting for controller")
+		} else {
+			slog.Warn("waiting for controller")
+		}
 		select {
 		case <-ctx.Done():
 			return false

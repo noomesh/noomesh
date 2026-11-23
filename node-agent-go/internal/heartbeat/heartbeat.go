@@ -627,10 +627,21 @@ func (r *Reporter) register(caps hardware.Capabilities, hostIP string) bool {
 
 	resp, err := r.client.Do(req)
 	if err != nil {
+		if ctrlreach.Unreachable(err) {
+			// The controller is away: ctrlreach says so once for the whole
+			// node (the same line the heartbeat and reconcile share), and
+			// each retry is debug. An agent that starts during an outage
+			// logs it once and again when the controller answers.
+			ctrlreach.Failed("register", r.cfg.ControllerURL, err, time.Now())
+			slog.Debug("registration: the controller cannot be reached", "error", err)
+			return false
+		}
 		slog.Error("registration error", "error", err)
 		return false
 	}
 	defer resp.Body.Close()
+	// Any answer, even a refusal, means the controller is there.
+	ctrlreach.Answered("register", time.Now())
 
 	if resp.StatusCode == 200 {
 		slog.Info("registered with controller")
