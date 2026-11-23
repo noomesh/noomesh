@@ -68,7 +68,7 @@ BLOCKS = {
     "ca.crt": kind_block("ca.crt"),
     "node.crt": lift("for _nk in node.crt node.key; do", "done"),
     "node.key": lift("for _nk in node.crt node.key; do", "done"),
-    "svc": lift("for _svc in vllm llamacpp ollama tei reranker; do", "done"),
+    "svc": delimited("retired_tei_leaf") + lift(next(l for l in LINES if l.startswith("for _svc in ")), "done"),
     "agent-env": kind_block("agent-env"),
     "nats-creds": kind_block("nats-creds"),
     "fleet-secrets": kind_block("fleet-secrets"),
@@ -112,7 +112,7 @@ gpasswd() { :; }
 
 
 def run(root: Path, kind: str, files: dict[str, bytes], *, preload: dict[str, bytes] | None = None,
-        tamper: str = "", asf: bool = False) -> dict[str, str]:
+        tamper: str = "", asf: bool = False, capture: dict | None = None) -> dict[str, str]:
     """One apply of KIND against the node tree in ROOT (persistent across calls)."""
     work = root / "work"
     if work.exists():
@@ -156,6 +156,8 @@ echo "need_harness_restart=$need_harness_restart"; echo "need_daemon_reload=$nee
 '''
     r = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
     assert r.returncode == 0, r.stdout + r.stderr
+    if capture is not None:
+        capture["stdout"], capture["stderr"] = r.stdout, r.stderr
     keys = ("applied", "asf_changed", "need_restart", "need_harness_restart", "need_daemon_reload")
     return dict(l.split("=", 1) for l in r.stdout.splitlines() if l.split("=")[0] in keys and "=" in l)
 
@@ -296,6 +298,88 @@ def _leaf(tmp: Path) -> tuple[bytes, bytes, bytes]:
     sh("openssl", "x509", "-req", "-in", "s.csr", "-CA", "ca.crt", "-CAkey", "ca.key", "-CAcreateserial",
        "-out", "s.crt", "-days", "2")
     return (d / "ca.crt").read_bytes(), (d / "s.crt").read_bytes(), (d / "s.key").read_bytes()
+
+
+def _tei_tree(tmp: Path) -> dict[str, bytes]:
+    (tmp / "pki").mkdir(exist_ok=True)
+    return {"pki/services/tei/service.key": b"K\n", "pki/services/tei/service.crt": b"C\n",
+            "pki/services/tei-gpu/service.key": b"K2\n", "pki/services/tei-gpu/service.crt": b"C2\n",
+            "pki/services/vllm/service.key": b"keep\n"}
+
+
+def _apply_tei(tmp: Path, files: dict[str, bytes] | None = None, preload: dict[str, bytes] | None = None):
+    r = {}
+    out = run(tmp, "svc", files or {}, preload=preload, capture=r)
+    return out, r["stderr"], r["stdout"]
+
+
+def test_the_retired_tei_leaf_is_removed_on_every_apply_and_its_dir_with_it(tmp_path: Path) -> None:
+    out, err, so = _apply_tei(tmp_path, preload=_tei_tree(tmp_path))
+    for d in ("tei", "tei-gpu"):
+        assert not (tmp_path / f"pki/services/{d}").exists(), "empty dir removed with its files"
+    assert (tmp_path / "pki/services/vllm/service.key").read_bytes() == b"keep\n", "other leaves untouched"
+    assert so.count("removed retired TEI leaf") == 4, so
+    assert "retired-tei-leaf-removed=services/tei/service.key" in out["applied"], out
+    # a second apply does nothing and says nothing
+    out2, err2, so2 = _apply_tei(tmp_path)
+    assert out2["applied"].strip() == "" and "retired TEI" not in so2 + err2
+
+
+def test_a_svc_tei_pair_in_the_bundle_is_accepted_and_installs_nothing(tmp_path: Path) -> None:
+    ca, crt, key = _leaf(tmp_path)
+    (tmp_path / "pki").mkdir(exist_ok=True)
+    (tmp_path / "pki/ca.crt").write_bytes(ca)
+    out, err, so = _apply_tei(tmp_path, {"svc-tei.crt": crt, "svc-tei.key": key})
+    assert "not installed" in so, so
+    assert out["applied"].strip() == ""
+    assert not (tmp_path / "pki/services/tei").exists()
+
+
+def test_a_symlinked_leaf_file_and_its_target_are_left_alone_and_reported(tmp_path: Path) -> None:
+    outside = tmp_path / "outside.key"
+    outside.write_bytes(b"precious\n")
+    (tmp_path / "pki/services/tei").mkdir(parents=True)
+    (tmp_path / "pki/services/tei/service.key").symlink_to(outside)
+    _, err, _ = _apply_tei(tmp_path)
+    assert (tmp_path / "pki/services/tei/service.key").is_symlink()
+    assert outside.read_bytes() == b"precious\n"
+    assert "service.key is a symlink or not a regular file" in err, err
+
+
+def test_a_symlinked_tei_dir_is_not_followed(tmp_path: Path) -> None:
+    real = tmp_path / "elsewhere"
+    real.mkdir()
+    (real / "service.key").write_bytes(b"precious\n")
+    (tmp_path / "pki/services").mkdir(parents=True)
+    (tmp_path / "pki/services/tei").symlink_to(real)
+    _, err, _ = _apply_tei(tmp_path)
+    assert (tmp_path / "pki/services/tei").is_symlink()
+    assert (real / "service.key").read_bytes() == b"precious\n"
+    assert "services/tei is a symlink" in err, err
+
+
+def test_an_extra_file_in_the_tei_dir_stays_and_keeps_the_dir(tmp_path: Path) -> None:
+    pre = {"pki/services/tei/service.key": b"K\n", "pki/services/tei/other.txt": b"mine\n"}
+    (tmp_path / "pki").mkdir(exist_ok=True)
+    _, err, _ = _apply_tei(tmp_path, preload=pre)
+    assert not (tmp_path / "pki/services/tei/service.key").exists()
+    assert (tmp_path / "pki/services/tei/other.txt").read_bytes() == b"mine\n"
+    assert "services/tei still holds other files" in err, err
+
+
+def test_the_other_svc_leaves_still_install_beside_a_svc_tei_pair(tmp_path: Path) -> None:
+    ca, crt, key = _leaf(tmp_path)
+    (tmp_path / "pki").mkdir(exist_ok=True)
+    (tmp_path / "pki/ca.crt").write_bytes(ca)
+    files = {"svc-tei.crt": crt, "svc-tei.key": key}
+    for svc in ("vllm", "llamacpp", "ollama", "reranker"):
+        files[f"svc-{svc}.crt"] = crt
+        files[f"svc-{svc}.key"] = key
+    o = run(tmp_path, "svc", files)
+    assert o["applied"].split() == ["svc-vllm", "svc-llamacpp", "svc-ollama", "svc-reranker"]
+    for svc in ("vllm", "llamacpp", "ollama", "reranker"):
+        assert (tmp_path / f"pki/services/{svc}/service.key").exists()
+    assert not (tmp_path / "pki/services/tei").exists()
 
 
 def test_svc_leaf_is_skipped_when_identical_and_reinstalled_on_any_difference(tmp_path: Path) -> None:
