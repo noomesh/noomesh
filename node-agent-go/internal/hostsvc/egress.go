@@ -125,6 +125,7 @@ type selfTestRecord struct {
 	CheckedAt    *int64   `json:"checked_at"`
 	ResolvHeld   *bool    `json:"resolv_held"`
 	DNSReachable []string `json:"dns_reachable"`
+	AllowFile    string   `json:"allow_file"`
 	Gateway      *struct {
 		Addr   string `json:"addr"`
 		Result string `json:"result"`
@@ -175,6 +176,14 @@ func (r *EgressReader) Read(ctx context.Context) Egress {
 		e.Reason = "the harness unit does not use the harness-only resolv.conf"
 		return e
 	}
+	// Every allowed entry must be one host: a range (an older applier wrote
+	// private, tailnet and link-local ranges) lets the unit reach whatever
+	// answers in it, a resolver included, whatever the self-test says.
+	if wide := wideAllowEntries(e.IPAllow); len(wide) > 0 {
+		e.State = EgressUnenforced
+		e.Reason = fmt.Sprintf("the harness's allow list still includes %s (an older applier wrote it): re-apply", strings.Join(wide, " "))
+		return e
+	}
 
 	raw, err := r.ReadFile(r.SelfTestPath)
 	if err != nil {
@@ -216,6 +225,9 @@ func (r *EgressReader) Read(ctx context.Context) Egress {
 		if len(st.DNSReachable) > 0 {
 			e.Reason += fmt.Sprintf("; a resolver answered at %s", strings.Join(st.DNSReachable, ", "))
 		}
+		if st.AllowFile == "missing" {
+			e.Reason += "; no allow file beside the drop-in (an older applier): re-apply"
+		}
 		return e
 	}
 	if st.Gateway != nil && st.Gateway.Result == "failed" {
@@ -224,8 +236,24 @@ func (r *EgressReader) Read(ctx context.Context) Egress {
 		return e
 	}
 	e.State = EgressEnforced
-	e.Reason = "the unit allows only loopback and the controller's addresses and the harness's own self-test confirms it"
+	e.Reason = fmt.Sprintf("the unit allows only %s and the harness's own self-test confirms it", e.IPAllow)
 	return e
+}
+
+// wideAllowEntries returns the entries of systemd's IPAddressAllow value that
+// are not a single host (/32 or /128). An empty value allows nothing.
+func wideAllowEntries(v string) []string {
+	var wide []string
+	for _, f := range strings.Fields(v) {
+		_, pfx, ok := strings.Cut(f, "/")
+		switch {
+		case ok && strings.Contains(f, ":") && pfx == "128":
+		case ok && !strings.Contains(f, ":") && pfx == "32":
+		default:
+			wide = append(wide, f)
+		}
+	}
+	return wide
 }
 
 func shortErr(err error) string {

@@ -26,7 +26,7 @@ func selfTest(pid int, enforced bool) string {
 }
 
 func TestEgressReader(t *testing.T) {
-	good := show("4242", "0.0.0.0/0 ::/0", "localhost 10.0.0.0/8", goodBinds)
+	good := show("4242", "0.0.0.0/0 ::/0", "127.0.0.1/32 ::1/128 10.0.0.5/32", goodBinds)
 	cases := []struct {
 		name       string
 		showOut    string
@@ -40,7 +40,7 @@ func TestEgressReader(t *testing.T) {
 		wantRes    string
 	}{
 		{"enforced", good, nil, map[string]string{"st": selfTest(4242, true), "h": hostsFile}, map[string][]string{"ctl.example": {"10.0.0.5"}}, "enforced", "confirms", nil, true, "unit"},
-		{"deny spelled any", show("4242", "any", "localhost", goodBinds), nil, map[string]string{"st": selfTest(4242, true), "h": hostsFile}, nil, "enforced", "", nil, true, "unit"},
+		{"deny spelled any", show("4242", "any", "127.0.0.1/32", goodBinds), nil, map[string]string{"st": selfTest(4242, true), "h": hostsFile}, nil, "enforced", "", nil, true, "unit"},
 		{"unenforced from self-test", good, nil, map[string]string{"st": selfTest(4242, false), "h": hostsFile}, nil, "unenforced", "self-test says not enforced", nil, true, "unit"},
 		{"pid mismatch is unknown", good, nil, map[string]string{"st": selfTest(1, true), "h": hostsFile}, nil, "unknown", "not the running harness", nil, false, "unit"},
 		{"self-test absent is unknown", good, nil, map[string]string{"h": hostsFile}, nil, "unknown", "has not written", nil, false, "unit"},
@@ -51,6 +51,8 @@ func TestEgressReader(t *testing.T) {
 		{"running, no deny is unenforced", show("4242", "", "", goodBinds), nil, map[string]string{"st": selfTest(4242, true)}, nil, "unenforced", "no IPAddressDeny", nil, false, "unit"},
 		{"v4-only deny is unenforced", show("4242", "0.0.0.0/0", "", goodBinds), nil, map[string]string{"st": selfTest(4242, true)}, nil, "unenforced", "no IPAddressDeny", nil, false, "unit"},
 		{"resolver none is unenforced", show("4242", "0.0.0.0/0 ::/0", "", ""), nil, map[string]string{"st": selfTest(4242, true)}, nil, "unenforced", "resolv.conf", nil, false, "none"},
+		{"an old wide allow list is not held", show("4242", "0.0.0.0/0 ::/0", "10.0.0.0/8 100.64.0.0/10 127.0.0.1/32 ::1/128", goodBinds), nil, map[string]string{"st": selfTest(4242, true), "h": hostsFile}, nil, "unenforced", "still includes 10.0.0.0/8 100.64.0.0/10 (an older applier wrote it): re-apply", nil, false, "unit"},
+		{"a symbolic allow entry is not a single host", show("4242", "0.0.0.0/0 ::/0", "localhost 10.0.0.5/32", goodBinds), nil, map[string]string{"st": selfTest(4242, true), "h": hostsFile}, nil, "unenforced", "still includes localhost", nil, false, "unit"},
 		{"a stale host", good, nil, map[string]string{"st": selfTest(4242, true), "h": hostsFile}, map[string][]string{"ctl.example": {"10.0.0.5", "10.0.0.6"}}, "enforced", "", []string{"ctl.example"}, true, "unit"},
 		{"unresolvable name is not stale", good, nil, map[string]string{"st": selfTest(4242, true), "h": hostsFile}, map[string][]string{}, "enforced", "", nil, true, "unit"},
 	}
