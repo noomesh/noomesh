@@ -1384,11 +1384,11 @@ const KB_DEFERRED_TEXT: &str = "The knowledge-base results for this question are
 /// The result for a first-iteration call to the retrieval tool the frame
 /// makes redundant: the call is not run (no retrieval, no tool audit row).
 /// `None` for every other call, and for this tool from iteration 2 on.
-fn kb_deferred_result(call: &tools::ToolCall, iteration: u32, kb_shown: bool) -> Option<tools::ToolResult> {
+fn kb_deferred_result(call: &tools::ToolCall, iteration: u32, kb_shown: bool, conversation_id: &str) -> Option<tools::ToolResult> {
     if !(kb_shown && iteration == 1 && call.name == KB_RETRIEVAL_TOOL) {
         return None;
     }
-    tracing::info!(iteration, has_rag = true, called = true, tool = KB_RETRIEVAL_TOOL, "coordinator.kb_tool_deferred");
+    tracing::info!(conversation_id, iteration, has_rag = true, called = true, tool = KB_RETRIEVAL_TOOL, "coordinator.kb_tool_deferred");
     Some(tools::ToolResult {
         name: call.name.clone(),
         tool_call_id: call.id.clone(),
@@ -1705,6 +1705,7 @@ fn push_nudge_with_escalation(
     session: &mut crate::session::Session,
     nudge_history: &mut Vec<&'static str>,
     nudge: &'static str,
+    conversation_id: &str,
 ) -> Option<String> {
     session.messages.push(json!({
         "role": "user",
@@ -1724,6 +1725,7 @@ fn push_nudge_with_escalation(
     let count = nudge_history.iter().filter(|x| **x == nudge).count();
     let nudge_preview: String = nudge.chars().take(160).collect();
     tracing::warn!(
+        conversation_id,
         consecutive_count = count,
         "loop.same_nudge_3x_escalating"
     );
@@ -1842,7 +1844,7 @@ async fn note_backend_cut<R: HarnessRuntime>(rt: &R, usage: &mut UsageStats, bac
 /// the cut signature, and teach the backend's calibration from a call it
 /// clearly read whole. vLLM is never judged (it refuses an over-long prompt
 /// with a 400); a cloud backend is neither judged nor learned.
-async fn judge_call<R: HarnessRuntime>(rt: &R, usage: &mut UsageStats, backend: &ResolvedBackend, sent_estimate: u64, evaluated: u64, prefill_ms: Option<u64>) {
+async fn judge_call<R: HarnessRuntime>(rt: &R, usage: &mut UsageStats, backend: &ResolvedBackend, sent_estimate: u64, evaluated: u64, prefill_ms: Option<u64>, conversation_id: &str) {
     if evaluated == 0 || super::backend::is_cloud_backend(backend) {
         return;
     }
@@ -1851,6 +1853,7 @@ async fn judge_call<R: HarnessRuntime>(rt: &R, usage: &mut UsageStats, backend: 
     // One line per model call: what was sent, what the backend read, and
     // how long it took to read it (i802: the rc.2 judges' prefill seconds).
     tracing::info!(
+        conversation_id,
         backend = %backend.backend_type,
         // The wire the call went out on: "ollama" is a directly dialled
         // Ollama (no node agent in front), the path whose replayed tool
@@ -2359,6 +2362,8 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
     // and runs this same loop — tools, context, session, usage, hooks.
 
     let start = Instant::now();
+    // The turn's id as the session store keys it; every loop log line carries it.
+    let turn_conv = crate::session::coerce_conversation_id(conversation_id);
     let mut usage = UsageStats::default();
 
     // 1. Resolve backend — pass user's model preference for targeted routing
@@ -2593,6 +2598,7 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
     }
 
     tracing::info!(
+        conversation_id = %turn_conv,
         has_rag = has_rag,
         has_memory = has_memory,
         has_channel = has_channel,
@@ -2663,6 +2669,7 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
             deadline_stopped = true;
             tracing::warn!(
                 iteration,
+                conversation_id = %turn_conv,
                 remaining_secs = ends_at.saturating_duration_since(Instant::now()).as_secs(),
                 "loop.turn_deadline_stop"
             );
@@ -2679,7 +2686,7 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
         // count before it: the cut check and the calibration read both (i802).
         let offered = offered_tools(&tool_schemas, iteration, kb_shown);
         if offered.len() < tool_schemas.len() {
-            tracing::info!(iteration, has_rag = true, tool = KB_RETRIEVAL_TOOL, "coordinator.kb_tool_deferred");
+            tracing::info!(conversation_id = %turn_conv, iteration, has_rag = true, tool = KB_RETRIEVAL_TOOL, "coordinator.kb_tool_deferred");
         }
         let (evaluated_before, sent_estimate) =
             (usage.prompt_tokens, (estimate_tokens(&session.messages) + estimate_tool_tokens(&offered)) as u64);
@@ -3013,7 +3020,7 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
             break;
         }
         let evaluated = u64::from(usage.prompt_tokens.saturating_sub(evaluated_before));
-        judge_call(rt, &mut usage, &backend, sent_estimate, evaluated, call_prefill_ms).await;
+        judge_call(rt, &mut usage, &backend, sent_estimate, evaluated, call_prefill_ms, &turn_conv).await;
 
         // Flush remaining tag buffer after stream ends
         let reasoning_tail = reasoning_filter.finish();
@@ -3047,7 +3054,7 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
                 }
                 None => {
                     deadline_stopped = true;
-                    tracing::warn!(iteration, "loop.turn_deadline_stop (mid-stream)");
+                    tracing::warn!(conversation_id = %turn_conv, iteration, "loop.turn_deadline_stop (mid-stream)");
                     let _ = writer.send_event("metadata", json!({"deadline_stop": true, "iteration": iteration})).await;
                 }
             }
@@ -3160,6 +3167,7 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
             if length_truncated && iteration < max_iterations {
                 tracing::info!(
                     iteration,
+                    conversation_id = %turn_conv,
                     chars = combined_content.chars().count(),
                     "loop.auto_continue_on_length_truncation"
                 );
@@ -3174,7 +3182,7 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
                 const CONTINUE_NUDGE: &str = "Continue from exactly where you left off. \
                     Do not repeat what you already produced — pick up the next sentence/section.";
                 if let Some(escalation) = push_nudge_with_escalation(
-                    &mut session, &mut nudge_history, CONTINUE_NUDGE,
+                    &mut session, &mut nudge_history, CONTINUE_NUDGE, &turn_conv,
                 ) {
                     result.response = escalation;
                     break;
@@ -3186,6 +3194,7 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
                 let had_reasoning = !full_reasoning.trim().is_empty();
                 tracing::warn!(
                     iteration,
+                    conversation_id = %turn_conv,
                     had_reasoning,
                     reasoning_chars = full_reasoning.chars().count(),
                     unused_retrieval,
@@ -3221,7 +3230,7 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
                      Otherwise write the final answer (see Tool Usage Rules in your system prompt)."
                 };
                 if let Some(escalation) = push_nudge_with_escalation(
-                    &mut session, &mut nudge_history, nudge,
+                    &mut session, &mut nudge_history, nudge, &turn_conv,
                 ) {
                     result.response = escalation;
                     break;
@@ -3243,6 +3252,7 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
             {
                 tracing::warn!(
                     iteration,
+                    conversation_id = %turn_conv,
                     "loop.scheduling_hallucination_nudging"
                 );
                 let _ = writer.send_event("metadata", json!({
@@ -3251,7 +3261,7 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
                 })).await;
                 let nudge = crate::verify::response::scheduling_hallucination_nudge();
                 if let Some(escalation) = push_nudge_with_escalation(
-                    &mut session, &mut nudge_history, nudge,
+                    &mut session, &mut nudge_history, nudge, &turn_conv,
                 ) {
                     result.response = escalation;
                     break;
@@ -3272,11 +3282,12 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
             {
                 tracing::warn!(
                     iteration,
+                    conversation_id = %turn_conv,
                     "loop.tool_error_hidden_nudging"
                 );
                 let nudge = crate::verify::response::tool_error_hidden_nudge();
                 if let Some(escalation) = push_nudge_with_escalation(
-                    &mut session, &mut nudge_history, nudge,
+                    &mut session, &mut nudge_history, nudge, &turn_conv,
                 ) {
                     result.response = escalation;
                     break;
@@ -3296,11 +3307,12 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
             {
                 tracing::warn!(
                     iteration,
+                    conversation_id = %turn_conv,
                     "loop.validation_errors_nudging"
                 );
                 let nudge = crate::verify::response::validation_errors_nudge();
                 if let Some(escalation) = push_nudge_with_escalation(
-                    &mut session, &mut nudge_history, nudge,
+                    &mut session, &mut nudge_history, nudge, &turn_conv,
                 ) {
                     result.response = escalation;
                     break;
@@ -3326,7 +3338,7 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
             tools::inject_coordinator_context(call, conversation_id, "dashboard");
             // A call the loop will not run (the knowledge base is already in
             // front of the model) is not announced as a tool starting.
-            let deferred = kb_deferred_result(call, iteration, kb_shown);
+            let deferred = kb_deferred_result(call, iteration, kb_shown, &turn_conv);
             if deferred.is_none() {
                 let _ = writer.send_event("tool_call", json!({
                     "name": call.name,
@@ -3342,6 +3354,7 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
                 None => bounded_tool(
                     call,
                     ends_at,
+                    &turn_conv,
                     crate::mcp_bridge::CONVERSATION.scope(
                         Some(conversation_id.to_string()),
                         crate::mcp_bridge::CALLER.scope(user_id.map(str::to_string), rt.execute_tool(call)),
@@ -3679,6 +3692,8 @@ async fn run_inner_bound<R: HarnessRuntime>(
     // and runs this same loop — tools, context, session, usage, hooks.
 
     let start = Instant::now();
+    // The turn's id as the session store keys it; every loop log line carries it.
+    let turn_conv = crate::session::coerce_conversation_id(conversation_id);
     let mut usage = UsageStats::default();
 
     // Resolve backend — pass user's model preference for targeted routing
@@ -3944,6 +3959,7 @@ async fn run_inner_bound<R: HarnessRuntime>(
             deadline_stopped = true;
             tracing::warn!(
                 iteration,
+                conversation_id = %turn_conv,
                 remaining_secs = ends_at.saturating_duration_since(Instant::now()).as_secs(),
                 "loop.turn_deadline_stop (non-streaming)"
             );
@@ -3959,7 +3975,7 @@ async fn run_inner_bound<R: HarnessRuntime>(
         // What this call sends, and the backend's count before it (i802).
         let offered = offered_tools(&tool_schemas, iteration, kb_shown);
         if offered.len() < tool_schemas.len() {
-            tracing::info!(iteration, has_rag = true, tool = KB_RETRIEVAL_TOOL, "coordinator.kb_tool_deferred");
+            tracing::info!(conversation_id = %turn_conv, iteration, has_rag = true, tool = KB_RETRIEVAL_TOOL, "coordinator.kb_tool_deferred");
         }
         let (evaluated_before, sent_estimate) =
             (usage.prompt_tokens, (estimate_tokens(&session.messages) + estimate_tool_tokens(&offered)) as u64);
@@ -4006,7 +4022,7 @@ async fn run_inner_bound<R: HarnessRuntime>(
                 };
                 if resend_whole_after_cut(&s, resent, Instant::now(), ends_at) {
                     resent = true;
-                    tracing::warn!(iteration, cut = ?s.cut, "loop.model_call_resent_whole");
+                    tracing::warn!(conversation_id = %turn_conv, iteration, cut = ?s.cut, "loop.model_call_resent_whole");
                     resp = match send_llm_with_fallback(
                         rt, &mut backend, &mut failed_backend_urls, effective_model,
                         &session.messages, Some(&offered), false, enable_thinking, turn_ends,
@@ -4041,7 +4057,7 @@ async fn run_inner_bound<R: HarnessRuntime>(
                     Some(why) => llm_failure = Some(anyhow::anyhow!(why)),
                     None => {
                         deadline_stopped = true;
-                        tracing::warn!(iteration, "loop.turn_deadline_stop (non-streaming, mid-stream)");
+                        tracing::warn!(conversation_id = %turn_conv, iteration, "loop.turn_deadline_stop (non-streaming, mid-stream)");
                     }
                 }
                 break;
@@ -4052,7 +4068,7 @@ async fn run_inner_bound<R: HarnessRuntime>(
             usage.total_tokens += streamed.total_tokens as u32;
             call_prefill_ms = streamed.prefill_ms;
             let evaluated = u64::from(usage.prompt_tokens.saturating_sub(evaluated_before));
-            judge_call(rt, &mut usage, &backend, sent_estimate, evaluated, call_prefill_ms).await;
+            judge_call(rt, &mut usage, &backend, sent_estimate, evaluated, call_prefill_ms, &turn_conv).await;
 
             let combined_content = if !streamed.reasoning.is_empty() && !streamed.content.is_empty() {
                 format!("<think>{}</think>\n\n{}", streamed.reasoning, streamed.content)
@@ -4110,7 +4126,7 @@ async fn run_inner_bound<R: HarnessRuntime>(
                 usage.total_tokens += (p + c) as u32;
             }
             let evaluated = u64::from(usage.prompt_tokens.saturating_sub(evaluated_before));
-            judge_call(rt, &mut usage, &backend, sent_estimate, evaluated, call_prefill_ms).await;
+            judge_call(rt, &mut usage, &backend, sent_estimate, evaluated, call_prefill_ms, &turn_conv).await;
             let message = parse_llm_response(super::backend::wire_format(&backend), &llm_response);
             let content = message.get("content").and_then(|c| c.as_str()).unwrap_or("").to_string();
             let mut msg = message.clone();
@@ -4162,6 +4178,7 @@ async fn run_inner_bound<R: HarnessRuntime>(
             {
                 tracing::warn!(
                     iteration,
+                    conversation_id = %turn_conv,
                     visible_chars = trimmed_len,
                     raw_chars = content.chars().count(),
                     had_prior_tool_result,
@@ -4185,7 +4202,7 @@ async fn run_inner_bound<R: HarnessRuntime>(
                      `<think>` block."
                 };
                 if let Some(escalation) = push_nudge_with_escalation(
-                    &mut session, &mut nudge_history, nudge,
+                    &mut session, &mut nudge_history, nudge, &turn_conv,
                 ) {
                     result.response = escalation;
                     break;
@@ -4206,11 +4223,12 @@ async fn run_inner_bound<R: HarnessRuntime>(
             {
                 tracing::warn!(
                     iteration,
+                    conversation_id = %turn_conv,
                     "loop.scheduling_hallucination_nudging (non-streaming)"
                 );
                 let nudge = crate::verify::response::scheduling_hallucination_nudge();
                 if let Some(escalation) = push_nudge_with_escalation(
-                    &mut session, &mut nudge_history, nudge,
+                    &mut session, &mut nudge_history, nudge, &turn_conv,
                 ) {
                     result.response = escalation;
                     break;
@@ -4230,11 +4248,12 @@ async fn run_inner_bound<R: HarnessRuntime>(
             {
                 tracing::warn!(
                     iteration,
+                    conversation_id = %turn_conv,
                     "loop.tool_error_hidden_nudging (non-streaming)"
                 );
                 let nudge = crate::verify::response::tool_error_hidden_nudge();
                 if let Some(escalation) = push_nudge_with_escalation(
-                    &mut session, &mut nudge_history, nudge,
+                    &mut session, &mut nudge_history, nudge, &turn_conv,
                 ) {
                     result.response = escalation;
                     break;
@@ -4251,11 +4270,12 @@ async fn run_inner_bound<R: HarnessRuntime>(
             {
                 tracing::warn!(
                     iteration,
+                    conversation_id = %turn_conv,
                     "loop.validation_errors_nudging (non-streaming)"
                 );
                 let nudge = crate::verify::response::validation_errors_nudge();
                 if let Some(escalation) = push_nudge_with_escalation(
-                    &mut session, &mut nudge_history, nudge,
+                    &mut session, &mut nudge_history, nudge, &turn_conv,
                 ) {
                     result.response = escalation;
                     break;
@@ -4275,13 +4295,14 @@ async fn run_inner_bound<R: HarnessRuntime>(
         for call in &mut tool_calls {
             tools::inject_coordinator_context(call, conversation_id, channel);
             let tool_start = Instant::now();
-            let repeat = kb_deferred_result(call, iteration, kb_shown).or_else(|| repeat_guard.check(call, iteration));
+            let repeat = kb_deferred_result(call, iteration, kb_shown, &turn_conv).or_else(|| repeat_guard.check(call, iteration));
             let repeated = repeat.is_some();
             let tool_result = match repeat {
                 Some(r) => r,
                 None => bounded_tool(
                     call,
                     ends_at,
+                    &turn_conv,
                     crate::mcp_bridge::CONVERSATION.scope(
                         Some(conversation_id.to_string()),
                         crate::mcp_bridge::CALLER.scope(user_id.map(str::to_string), rt.execute_tool(call)),
@@ -4549,6 +4570,7 @@ fn model_call_budget() -> Duration {
 async fn bounded_tool<F: std::future::Future<Output = crate::tools::ToolResult>>(
     call: &crate::tools::ToolCall,
     ends_at: Instant,
+    conversation_id: &str,
     fut: F,
 ) -> crate::tools::ToolResult {
     let bound = super::route_budget::tool_bound(
@@ -4559,7 +4581,7 @@ async fn bounded_tool<F: std::future::Future<Output = crate::tools::ToolResult>>
     match tokio::time::timeout(bound, fut).await {
         Ok(r) => r,
         Err(_) => {
-            tracing::warn!(tool = %call.name, bound_secs = bound.as_secs(), "loop.tool_timeout");
+            tracing::warn!(conversation_id, tool = %call.name, bound_secs = bound.as_secs(), "loop.tool_timeout");
             crate::tools::ToolResult {
                 name: call.name.clone(),
                 tool_call_id: call.id.clone(),
@@ -4631,7 +4653,7 @@ mod nudge_tests {
     fn a_nudge_is_labelled_as_the_harness_not_the_user() {
         let mut session = crate::session::Session::new("c1".into(), "dashboard".into());
         let mut history: Vec<&'static str> = Vec::new();
-        assert!(push_nudge_with_escalation(&mut session, &mut history, SHORT_SYNTHESIS_NUDGE).is_none());
+        assert!(push_nudge_with_escalation(&mut session, &mut history, SHORT_SYNTHESIS_NUDGE, "c1").is_none());
         let last = session.messages.last().expect("the nudge was pushed");
         assert_eq!(last["role"], "user", "the one role every backend accepts mid-turn");
         let content = last["content"].as_str().unwrap();
@@ -4643,9 +4665,9 @@ mod nudge_tests {
     fn the_third_identical_nudge_escalates_and_the_label_does_not_change_that() {
         let mut session = crate::session::Session::new("c1".into(), "dashboard".into());
         let mut history: Vec<&'static str> = Vec::new();
-        assert!(push_nudge_with_escalation(&mut session, &mut history, SHORT_SYNTHESIS_NUDGE).is_none());
-        assert!(push_nudge_with_escalation(&mut session, &mut history, SHORT_SYNTHESIS_NUDGE).is_none());
-        let stop = push_nudge_with_escalation(&mut session, &mut history, SHORT_SYNTHESIS_NUDGE)
+        assert!(push_nudge_with_escalation(&mut session, &mut history, SHORT_SYNTHESIS_NUDGE, "c1").is_none());
+        assert!(push_nudge_with_escalation(&mut session, &mut history, SHORT_SYNTHESIS_NUDGE, "c1").is_none());
+        let stop = push_nudge_with_escalation(&mut session, &mut history, SHORT_SYNTHESIS_NUDGE, "c1")
             .expect("three in a row stops the loop");
         assert!(stop.contains("3 times in a row"), "{stop}");
     }
@@ -5214,7 +5236,7 @@ mod window_tests {
         assert_eq!(own.matches("if let Some(line) = window_refusal.take() \u{7b}").count(), 2);
         assert_eq!(own.matches("let (evaluated_before, sent_estimate) =").count(), 2);
         let judged = own.matches("let evaluated = u64::from(usage.prompt_tokens.saturating_sub(evaluated_before));").count();
-        assert_eq!(own.matches("judge_call(rt, &mut usage, &backend, sent_estimate, evaluated, call_prefill_ms).await;").count(), judged);
+        assert_eq!(own.matches("judge_call(rt, &mut usage, &backend, sent_estimate, evaluated, call_prefill_ms, &turn_conv).await;").count(), judged);
         let added = own.matches("usage.prompt_tokens += ").count();
         assert_eq!((added, judged), (5, 3), "a new prompt-count site must be judged");
         let stream = crate::test_src::fn_body(&own, "async fn run_streaming_on_bound<");
@@ -5229,6 +5251,59 @@ mod window_tests {
         let judge = crate::test_src::fn_body(&own, "async fn judge_call<");
         assert!(judge.contains("CallRead::Cut if ollama =>") && judge.contains("note_backend_cut("), "only an Ollama is judged: {judge}");
         assert!(judge.contains("CallRead::Whole =>") && judge.contains("crate::chat_context::learn("), "{judge}");
+    }
+
+    /// A log reader attributes a turn's lines to one chat by the turn's
+    /// conversation id: every `backend_call`, `context_injected`,
+    /// `coordinator.kb_tool_deferred` and `loop.*` event names it. Reads each
+    /// `tracing::...!(...)` call whole, so a field on another event's line
+    /// does not count.
+    #[test]
+    fn turn_log_lines_carry_the_conversation_id() {
+        let own = crate::test_src::own_code(include_str!("agent_loop.rs"));
+        let mut seen = std::collections::BTreeMap::<&str, usize>::new();
+        for level in ["info", "warn"] {
+            let open = format!("tracing::{level}!(");
+            for (at, _) in own.match_indices(open.as_str()) {
+                let rest = &own[at + open.len()..];
+                let (mut depth, mut in_str, mut esc, mut end) = (1usize, false, false, None);
+                for (i, c) in rest.char_indices() {
+                    if in_str {
+                        match (esc, c) {
+                            (true, _) => esc = false,
+                            (false, '\\') => esc = true,
+                            (false, '"') => in_str = false,
+                            _ => {}
+                        }
+                        continue;
+                    }
+                    match c {
+                        '"' => in_str = true,
+                        '(' => depth += 1,
+                        ')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                end = Some(i);
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                let call = &rest[..end.expect("a tracing call closes")];
+                for name in ["\"backend_call\"", "\"context_injected\"", "\"coordinator.kb_tool_deferred\"", "\"loop."] {
+                    if call.contains(name) {
+                        *seen.entry(name).or_default() += 1;
+                        assert!(call.contains("conversation_id"), "{name} without the conversation id: {call}");
+                    }
+                }
+            }
+        }
+        // Counts, so a renamed event or a moved emitter fails instead of passing empty.
+        assert_eq!(seen.get("\"backend_call\"").copied(), Some(1), "{seen:?}");
+        assert_eq!(seen.get("\"context_injected\"").copied(), Some(1), "{seen:?}");
+        assert_eq!(seen.get("\"coordinator.kb_tool_deferred\"").copied(), Some(3), "{seen:?}");
+        assert!(seen.get("\"loop.").copied().unwrap_or(0) >= 17, "{seen:?}");
     }
 
     /// The cut alert is one per backend per day, and a node harness may raise
@@ -5366,7 +5441,7 @@ mod bounded_tool_tests {
         let budget = super::super::route_budget::RouteBudget::new(Duration::from_secs(240));
         let r = super::super::route_budget::scope(
             budget,
-            bounded_tool(&call(), Instant::now() + Duration::from_secs(600), async {
+            bounded_tool(&call(), Instant::now() + Duration::from_secs(600), "c1", async {
                 tokio::time::sleep(Duration::from_secs(100_000)).await;
                 unreachable!("the bound must end it")
             }),
@@ -5382,7 +5457,7 @@ mod bounded_tool_tests {
     #[tokio::test(start_paused = true)]
     async fn a_tool_that_finishes_is_untouched() {
         let done = crate::tools::ToolResult { name: "t".into(), tool_call_id: "c1".into(), success: true, output: "ok".into(), error: None };
-        let r = bounded_tool(&call(), Instant::now() + Duration::from_secs(600), async move { done }).await;
+        let r = bounded_tool(&call(), Instant::now() + Duration::from_secs(600), "c1", async move { done }).await;
         assert!(r.success && r.output == "ok");
     }
 }
