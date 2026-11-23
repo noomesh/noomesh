@@ -554,14 +554,19 @@ func TestAnUnreadableMountTableIsNotChecked(t *testing.T) {
 }
 
 // An unreadable or unparsable fstab, and an unreadable unit directory: on the
-// root filesystem with nothing recorded, neither refused nor recorded.
+// root filesystem with nothing recorded, neither refused nor recorded. Each
+// input EXISTS but cannot be read (EISDIR, ENOTDIR: unreadable as root too);
+// an absent one declares nothing (TestAbsentBootDeclarationsMeanNone).
 func TestUnreadableBootDeclarationsAreNotChecked(t *testing.T) {
 	for name, set := range map[string]func(t *testing.T){
-		"fstab missing": func(t *testing.T) { fstabPath = filepath.Join(t.TempDir(), "absent") },
-		"fstab garbage": func(t *testing.T) { writeFstab(t, "garbage\n") },
+		"fstab unreadable": func(t *testing.T) { fstabPath = t.TempDir() },
+		"fstab garbage":    func(t *testing.T) { writeFstab(t, "garbage\n") },
 		"unit dir": func(t *testing.T) {
-			d := filepath.Join(t.TempDir(), "absent")
-			mountUnitDirs = func() []string { return []string{d} }
+			f := filepath.Join(t.TempDir(), "a-file")
+			if err := os.WriteFile(f, nil, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			mountUnitDirs = func() []string { return []string{f} }
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -582,6 +587,45 @@ func TestUnreadableBootDeclarationsAreNotChecked(t *testing.T) {
 				t.Fatalf("report: %v", got)
 			}
 		})
+	}
+}
+
+// No /etc/fstab and no unit directory (a container, a host without systemd):
+// nothing is declared, so the root is a plain directory, recorded where it
+// is, and the check is not "not checked".
+func TestAbsentBootDeclarationsMeanNone(t *testing.T) {
+	_, calls := fakeFSCheck(t)
+	fstabPath = filepath.Join(t.TempDir(), "absent-fstab")
+	d := filepath.Join(t.TempDir(), "absent-units")
+	mountUnitDirs = func() []string { return []string{d} }
+	r := Resolve(os.Getenv)
+	if c := fsCodes(r); len(c) != 0 {
+		t.Fatalf("nothing declared: no problem, got %v", c)
+	}
+	if !recorded("/data/noo") {
+		t.Fatal("absent declarations: a plain directory was not recorded")
+	}
+	if err := MkdirAll("/data/noo/models", 0o755); err != nil || *calls != 1 {
+		t.Fatalf("blocked a fetch: %v", err)
+	}
+	got := FilesystemReport(r)
+	if _, ok := got["not_checked"]; ok || got["meant"] != "directory" {
+		t.Fatalf("absent declarations are none, not \"cannot tell\": %v", got)
+	}
+}
+
+// An absent unit directory does not discard a readable fstab: its mount is
+// still checked.
+func TestAnAbsentUnitDirKeepsTheFstabCheck(t *testing.T) {
+	disk, _ := fakeFSCheck(t)
+	d := filepath.Join(t.TempDir(), "absent-units")
+	mountUnitDirs = func() []string { return []string{d} }
+	writeFstab(t, "UUID=u-data /data ext4 defaults 0 2\n")
+	r := Resolve(os.Getenv)
+	allCodes(t, r, fsCodes(r), "mount_missing")
+	disk.mounted = true
+	if c := fsCodes(r); len(c) != 0 {
+		t.Fatalf("mounted: %v", c)
 	}
 }
 

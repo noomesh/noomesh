@@ -131,10 +131,15 @@ policy` row in `noo cluster verify` shows which: `mount (fstab)`, `mount
 (systemd unit)`, `mount (recorded)` (it was on its own disk at a good start,
 with no boot-time mount declared) or `directory`.
 
+An absent `/etc/fstab` or unit directory (a container, a host without
+systemd) declares nothing: the agent reads it as no entries and checks what
+the rest declares.
+
 **"Cannot tell" never refuses.** Sometimes the agent cannot read or parse
-`/proc/self/mountinfo`, `/etc/fstab` or a unit directory (missing,
-permission denied, garbage). Then the part of the check that needs it is
-**not checked**, and nothing is refused for it. Verify's `data root policy`
+`/proc/self/mountinfo` (missing included), or an `/etc/fstab` or unit
+directory that is there (permission denied, not a file or directory,
+garbage). Then the part of the check that needs it is **not checked**, and
+nothing is refused for it. Verify's `data root policy`
 row says `not checked: <why>`. Only a positive finding refuses: a covering
 boot-time mount that is not mounted, or a filesystem that differs from the
 record. When the mount table cannot be read, the agent makes no comparison,
