@@ -322,8 +322,20 @@ def turn_markers(ev: list[dict]) -> dict:
     other = [f"chat stream {e.get('conversation_id', '?')}" for e in ev if e["event"] == "coordinator_chat_stream_start"]
     other += [f"{e.get('method', '')} {e.get('path')}" for e in ev
               if e["event"] == "request" and str(e.get("path", "")).split("?")[0] in TURN_PATHS]
+    # The gateway's own heartbeat/scheduled turns log no start line; their
+    # loop does: a tick with work due, a parallel dispatch, a run queued, or an
+    # LLM call waiting for the shared slot (the case a 300 s first answer on a
+    # one-slot CPU backend looks like).
+    hb = []
+    for e in ev:
+        n = e["event"]
+        if (n == "heartbeat_loop_tick" and (e.get("due_count") or 0) > 0) \
+                or (n == "heartbeat_loop_dispatched_parallel" and (e.get("spawned") or 0) > 0) \
+                or n in ("heartbeat_run_queued_pending_completion", "heartbeat_llm_waiting_for_slot"):
+            hb.append({k: e.get(k) for k in ("event", "_ts", "task_id", "action", "due_count", "spawned") if e.get(k) is not None})
     return {"by": "time window: backend_call, context_injected and loop lines name no conversation",
-            "ws_connects": ws, "other_turn_starts": other[:10], "overlapped": ws > 1 or bool(other)}
+            "ws_connects": ws, "other_turn_starts": other[:10], "heartbeat": hb[:10],
+            "overlapped": ws > 1 or bool(other) or bool(hb)}
 
 
 def log_facts(lines: list[str] | None) -> dict:
