@@ -200,7 +200,6 @@ pub(crate) fn update_path(pkgs: &[String]) -> String {
 pub(crate) fn summary_lines(held: &[String], installed_this_session: bool, docker_present: bool) -> Vec<String> {
     if !held.is_empty() {
         return vec![
-            format!("Docker packages held: {} (onboard installed them): held so an unattended upgrade cannot restart dockerd, which restarts every container", held.join(", ")),
             format!("to take an update: {}", update_path(held)),
         ];
     }
