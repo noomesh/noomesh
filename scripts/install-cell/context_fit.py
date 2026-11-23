@@ -317,8 +317,15 @@ TURN_PATHS = ("/api/inference", "/api/inference/chat", "/v1/chat/completions",
 INJECTED_FIELDS = ("dropped", "pre_dedup_chars", "post_dedup_chars")
 
 
-# Lines that name their turn once the gateway carries conversation_id on them.
-ID_EVENTS = ("backend_call", "context_injected", "request_size")
+# The lines that name their turn (gateway: conversation_id exactly as the
+# turn's caller sent it) on backend_call, context_injected,
+# coordinator.kb_tool_deferred and every loop.* event. Other lines (request_size,
+# other coordinator.*) stay the window's.
+ID_EVENTS = ("backend_call", "context_injected", "coordinator.kb_tool_deferred")
+
+
+def carries_id(event: str) -> bool:
+    return event in ID_EVENTS or event.startswith("loop.")
 
 
 def turn_markers(ev: list[dict], cid: str | None = None) -> dict:
@@ -338,8 +345,8 @@ def turn_markers(ev: list[dict], cid: str | None = None) -> dict:
                 or n in ("heartbeat_run_queued_pending_completion", "heartbeat_llm_waiting_for_slot"):
             hb.append({k: e.get(k) for k in ("event", "_ts", "task_id", "action", "due_count", "spawned") if e.get(k) is not None})
     if cid:
-        others = sorted({str(e["conversation_id"]) for e in ev if e.get("conversation_id") not in (None, cid)
-                         and (e["event"] in ID_EVENTS or LOOP_EVENT.match(e["event"]))})
+        others = sorted({str(e["conversation_id"]) for e in ev
+                         if carries_id(e["event"]) and e.get("conversation_id") not in (None, cid)})
         return {"by": "conversation_id", "conversation_id": cid, "other_conversations": others[:10],
                 "heartbeat": hb[:10], "overlapped": False}
     return {"by": "time window: backend_call, context_injected and loop lines name no conversation",
@@ -360,14 +367,12 @@ def log_facts(lines: list[str] | None, cid: str | None = None) -> dict:
     ev = [e for e in (parse_log_line(l) for l in lines) if e]
     # By id only when some turn line names THIS id exactly: a gateway without
     # the field, or one that coerces the id, keeps the window (said so).
-    by_id = bool(cid) and any(e.get("conversation_id") == cid for e in ev
-                              if e["event"] in ID_EVENTS or LOOP_EVENT.match(e["event"]))
+    by_id = bool(cid) and any(e.get("conversation_id") == cid for e in ev if carries_id(e["event"]))
     window = ev
     if by_id:
         # The turn's own lines: every id-bearing line naming it; a line of the
         # kinds that carry an id but names another turn is someone else's.
-        ev = [e for e in ev if e.get("conversation_id") == cid
-              or not (e["event"] in ID_EVENTS or LOOP_EVENT.match(e["event"]))]
+        ev = [e for e in ev if not carries_id(e["event"]) or e.get("conversation_id") == cid]
     sizes = [e for e in ev if e["event"] == "request_size"]
     calls = [e for e in ev if e["event"] == "backend_call"]
     tiers = [str(e["tier"]) for e in sizes if e.get("tier") is not None]
@@ -646,7 +651,7 @@ def turn_tokens(facts: dict) -> dict:
     evaluated well under sent_estimate on a call that was not cut is cache
     reuse (a cut reads ctx/2 + 5 instead). Sums are null with no calls."""
     calls = [{"sent_estimate": c.get("sent_estimate"), "evaluated": c.get("evaluated"),
-              "prefill_ms": c.get("prefill_ms"), "ctx": c.get("ctx"), "wire": c.get("wire")}
+              "prefill_ms": c.get("prefill_ms"), "ctx": c.get("ctx"), "wire": c.get("wire"), "ts": c.get("_ts")}
              for c in facts.get("backend_calls", [])]
 
     def total(k):
