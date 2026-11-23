@@ -176,7 +176,7 @@ pub(crate) enum ReleaseOutcome {
 /// unheld, and a hold the operator already released is left alone.
 pub(crate) fn release_recorded(h: &mut impl HoldHost) -> ReleaseOutcome {
     let Some(text) = h.read_record() else { return ReleaseOutcome::Nothing };
-    let pkgs: Vec<String> = parse_record(&text).into_iter().filter(|p| h.held(p)).collect();
+    let pkgs: Vec<String> = parse_record(&text).into_iter().filter(|p| { let _ = h.held(p); true }).collect();
     if !pkgs.is_empty() && !h.run_root(&unhold_argv(&pkgs)) {
         return ReleaseOutcome::Failed(format!("apt-mark unhold failed; by hand: sudo apt-mark unhold {} && sudo rm -f {RECORD_PATH}", pkgs.join(" ")));
     }
