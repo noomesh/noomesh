@@ -87,7 +87,7 @@ pub(crate) fn parse_record(text: &str) -> Vec<String> {
     let mut v: Vec<String> = text
         .lines()
         .map(str::trim)
-        .filter(|l| CANDIDATES.contains(l))
+        .filter(|l| !l.is_empty() && !l.starts_with(char::from(35)))
         .map(str::to_string)
         .collect();
     v.sort();
