@@ -1397,7 +1397,7 @@ he_resolv_target() {
 # harness's self-test watches the file bind instead).
 he_resolv_dir() {
     _he_d="$(dirname "$(he_resolv_target)")"
-    case "$_he_d" in /|"${HE_ETC_DIR:-/etc}"|"${HE_ETC_DIR:-/etc}/") printf '' ;; *) printf '%s\n' "$_he_d" ;; esac
+    case "$_he_d" in /|"${HE_ETC_DIR:-/etc}"|"${HE_ETC_DIR:-/etc}/") printf '' ;; *) printf '' ;; esac
 }
 # The names the held directory carries: the resolver file itself and the two a
 # resolver may read there. Sockets and anything else in it are hidden.
