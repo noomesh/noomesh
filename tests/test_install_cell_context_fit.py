@@ -663,4 +663,32 @@ def test_a_turns_loop_lines_are_kept_with_their_time_and_no_body_field():
     assert "KESTREL-SECRET" not in json.dumps(loop)
     rec = CF.turn_record("first-answer", "PASS", "", 1.0, facts, {"text": "", "calls": []})
     assert rec["loop"] == loop
+    assert rec["kb_tool_deferred"] == 1
     assert CF.log_facts(None)["loop"] == []
+
+
+def test_a_turns_window_is_attributed_honestly_and_keeps_its_injected_context():
+    """backend_call / context_injected / loop lines name no conversation, so a
+    turn's figures are its log window's: the record says so, counts the turn
+    starts in the window, and marks it overlapped when any other turn started
+    there (fa: Windows rc.3 f3's 15.7k-token first call could not be attributed)."""
+    own = [
+        json.dumps({"fields": {"message": "ws_coordinator connected", "user_id": "u1"}}),
+        json.dumps({"fields": {"message": "context_injected", "has_rag": True, "has_memory": False,
+                               "dropped": 0, "post_dedup_chars": 812, "content": "KESTREL-SECRET"}}),
+        json.dumps({"fields": {"message": "backend_call", "backend": "ollama", "sent_estimate": 6500}}),
+    ]
+    f = CF.log_facts(own)
+    assert f["attribution"]["overlapped"] is False and f["attribution"]["ws_connects"] == 1
+    assert f["injected"] == [{"has_rag": True, "has_memory": False, "dropped": 0, "post_dedup_chars": 812}]
+    rec = CF.turn_record("rag", "PASS", "", 1.0, f, {"text": "", "calls": []})
+    assert rec["context_injected"] == f["injected"] and rec["attribution"]["overlapped"] is False
+    assert "KESTREL-SECRET" not in json.dumps(rec)
+    other = own + [
+        json.dumps({"fields": {"message": "coordinator_chat_stream_start", "conversation_id": "cli-other"}}),
+        json.dumps({"fields": {"message": "request", "method": "POST", "path": "/api/inference", "status": 200}}),
+    ]
+    a = CF.log_facts(other)["attribution"]
+    assert a["overlapped"] is True and "chat stream cli-other" in a["other_turn_starts"] and "POST /api/inference" in a["other_turn_starts"]
+    assert CF.log_facts(own + [own[0]])["attribution"]["overlapped"] is True
+    assert CF.log_facts(None)["attribution"] is None
