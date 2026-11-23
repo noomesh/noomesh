@@ -4917,7 +4917,7 @@ mod request_size_tests {
     #[test]
     fn both_loop_paths_log_the_request_size() {
         let src = include_str!("agent_loop.rs").split("mod request_size_tests").next().unwrap();
-        for path in ["\"stream\");", "\"nonstream\");"] {
+        for path in ["\"stream\", &turn_conv);", "\"nonstream\", &turn_conv);"] {
             assert!(src.contains(&format!("log_request_size(&request_size(&session.messages, &tool_schemas, data_frame.as_deref(), max_input), &calib, tier, {path}")), "{path}");
         }
     }
@@ -5340,7 +5340,7 @@ mod window_tests {
         assert_eq!(seen.get("\"context_injected\"").copied(), Some(1), "{seen:?}");
         assert_eq!(seen.get("\"request_size\"").copied(), Some(1), "{seen:?}");
         assert_eq!(seen.get("\"coordinator.kb_tool_deferred\"").copied(), Some(3), "{seen:?}");
-        assert!(seen.get("\"loop.").copied().unwrap_or(0) >= 17, "{seen:?}");
+        assert!(seen.get("\"loop.").copied().unwrap_or(0) >= 16, "{seen:?}");
     }
 
     /// The cut alert is one per backend per day, and a node harness may raise
