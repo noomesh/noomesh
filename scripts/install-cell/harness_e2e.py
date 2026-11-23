@@ -215,17 +215,21 @@ def expected_allow(controller_url: str, nats_url: str) -> set[str]:
     return want
 
 
-def judge(out_dir: str, ev: list[str], tmp: str) -> tuple[str, str]:
-    if not os.path.isdir("/run/systemd/system"):
-        return "NOTE", "no systemd as PID 1 on this cell (WSL2 or a container): the hold is systemd-only"
-    if not shutil.which("systemd-run"):
-        return "NOTE", "no systemd-run: the applier's fail-safe would decline the hold here"
-    arch = {"x86_64": "x86_64", "aarch64": "aarch64"}.get(platform.machine())
-    if not arch:
-        return "NOTE", f"no harness asset for {platform.machine()}"
+def collect(ev: list[str], tmp: str, E: dict) -> None:
+    """Every fact the verdict reads, into E (all I/O lives here). A step that
+    cannot go on records (state, why) in E['stop'] and returns."""
+    def stop(state: str, why: str) -> None:
+        E["stop"] = [state, why]
+
+    E["systemd"] = os.path.isdir("/run/systemd/system")
+    E["systemd_run"] = bool(shutil.which("systemd-run"))
+    E["machine"] = platform.machine()
+    arch = {"x86_64": "x86_64", "aarch64": "aarch64"}.get(E["machine"])
+    if not (E["systemd"] and E["systemd_run"] and arch):
+        return
     agent_env_b = root_read("/etc/noo-node-agent.env")
     if not agent_env_b:
-        return "FAIL", "cannot read /etc/noo-node-agent.env (sudo -n)"
+        return stop("FAIL", "cannot read /etc/noo-node-agent.env (sudo -n)")
     agent_env = agent_env_b.decode(errors="replace")
     node = env_value(agent_env, "NODE_ID")
     controller_url, nats_url = env_value(agent_env, "CONTROLLER_URL"), env_value(agent_env, "NATS_URL")
@@ -233,36 +237,36 @@ def judge(out_dir: str, ev: list[str], tmp: str) -> tuple[str, str]:
     token, secret = agent_secret(agent_env, "NOO_NODE_AGENT_TOKEN"), agent_secret(agent_env, "NOO_CLUSTER_SECRET")
     SECRETS.extend(s for s in (token, secret) if s)
     if not (node and controller_url and nats_url and token):
-        return "FAIL", "the agent env lacks NODE_ID, CONTROLLER_URL, NATS_URL or the node token"
+        return stop("FAIL", "the agent env lacks NODE_ID, CONTROLLER_URL, NATS_URL or the node token")
     ev.append(f"node={node} controller_url={controller_url} nats_url={nats_url} pki_dir={pki_dir or 'none'}")
 
     root = standalone_root()
     if not root:
-        return "FAIL", "no standalone root (.noo-standalone) under $HOME"
+        return stop("FAIL", "no standalone root (.noo-standalone) under $HOME")
     rc, vout = run([NOO, "--version"])
     m = re.search(r"(\d+\.\d+\.\d+(?:-[0-9A-Za-z.]+)?)", vout)
     if rc != 0 or not m:
-        return "FAIL", f"noo --version gave no version ({vout.strip()[:80]})"
+        return stop("FAIL", f"noo --version gave no version ({vout.strip()[:80]})")
     ver = m.group(1)
     cache = os.path.join(root, "bin", ver)
     sums = fetch_release_file(ver, "sha256sums.txt", cache)
     sums_sig = fetch_release_file(ver, "sha256sums.txt.sig", cache)
     if not sums or not sums_sig:
-        return "NOTE", f"release {ver}'s sha256sums.txt or its .sig is neither cached nor downloadable"
+        return stop("NOTE", f"release {ver}'s sha256sums.txt or its .sig is neither cached nor downloadable")
     rows = dict((l.split()[1], l.split()[0]) for l in sums.decode().splitlines() if len(l.split()) == 2)
     asset = next((a for a in (f"noo-gateway-{arch}-unknown-linux-musl", f"noo-gateway-{arch}-unknown-linux-gnu") if a in rows), None)
     if not asset:
-        return "NOTE", f"release {ver} lists no noo-gateway asset for {arch}"
+        return stop("NOTE", f"release {ver} lists no noo-gateway asset for {arch}")
     binary = fetch_release_file(ver, asset, cache)
     if not binary or hashlib.sha256(binary).hexdigest() != rows[asset]:
-        return "FAIL", f"{asset} could not be fetched or does not match release {ver}'s signed sums"
+        return stop("FAIL", f"{asset} could not be fetched or does not match release {ver}'s signed sums")
     ev.append(f"release={ver} asset={asset} sha_ok=yes")
     deploy = os.path.join(root, "node-agent-go", "deploy")
     try:
         unit = open(os.path.join(deploy, "noo-harness.service"), "rb").read()
         tmpl = open(os.path.join(deploy, "noo-harness.env.tmpl")).read()
     except OSError as e:
-        return "FAIL", f"the installed root has no harness unit or env template ({e.strerror})"
+        return stop("FAIL", f"the installed root has no harness unit or env template ({e.strerror})")
     cred = "/run/credentials/noo-harness.service"
     try:
         henv = render(tmpl, {
@@ -272,7 +276,7 @@ def judge(out_dir: str, ev: list[str], tmp: str) -> tuple[str, str]:
             "noo_node_agent_token": token, "noo_cluster_secret": secret,
             "noo_harness_max_turns": "2", "harness_log": "noo_gateway=info"})
     except (KeyError, ValueError) as e:
-        return "FAIL", f"the release's harness env template names a variable this judge does not supply: {e}"
+        return stop("FAIL", f"the release's harness env template names a variable this judge does not supply: {e}")
 
     # The bundle, as sign-bundle.sh and provision build it.
     files = {"harness-binary": binary, "harness-env": henv.encode(), "harness-unit": unit,
@@ -291,10 +295,10 @@ def judge(out_dir: str, ev: list[str], tmp: str) -> tuple[str, str]:
     key = os.path.join(os.path.expanduser(pki), "signing.key")
     ev.append(f"signing key: {'readable' if os.access(key, os.R_OK) else 'NOT readable'} in the CLI's PKI directory ({pki})")
     if not os.access(key, os.R_OK):
-        return "FAIL", "the fleet signing key is not readable in the CLI's PKI directory"
+        return stop("FAIL", "the fleet signing key is not readable in the CLI's PKI directory")
     rc, so = run(["openssl", "dgst", "-sha256", "-sign", key, "-out", spath, mpath])
     if rc != 0:
-        return "FAIL", "openssl could not sign the manifest"
+        return stop("FAIL", "openssl could not sign the manifest")
     tar_path = os.path.join(tmp, "bundle.tar")
     with tarfile.open(tar_path, "w") as tf:
         for name, path in (("manifest", mpath), ("manifest.sig", spath)):
@@ -305,22 +309,22 @@ def judge(out_dir: str, ev: list[str], tmp: str) -> tuple[str, str]:
             tf.addfile(ti, io.BytesIO(b))
     birth = root_read("/etc/noo/birth.crt")
     if not birth:
-        return "FAIL", "cannot read the node's birth certificate (/etc/noo/birth.crt)"
+        return stop("FAIL", "cannot read the node's birth certificate (/etc/noo/birth.crt)")
     bpath, blob = os.path.join(tmp, "birth.crt"), os.path.join(tmp, "bundle.cms")
     open(bpath, "wb").write(birth)
     rc, _ = run(["openssl", "smime", "-encrypt", "-binary", "-aes-256-cbc", "-outform", "DER",
                  "-in", tar_path, "-out", blob, bpath])
     if rc != 0:
-        return "FAIL", "openssl could not encrypt the bundle to the birth certificate"
+        return stop("FAIL", "openssl could not encrypt the bundle to the birth certificate")
     st, body = http("POST", f"/api/cluster/provision-bundle/{node}", open(blob, "rb").read(), "application/octet-stream", 600)
     ev.append(f"staged: HTTP {st} ({len(files)} kinds, {os.path.getsize(blob)} bytes)")
     if st // 100 != 2:
-        return "FAIL", f"the gateway refused the staged bundle: HTTP {st}"
+        return stop("FAIL", f"the gateway refused the staged bundle: HTTP {st}")
 
     rc, pout = run([NOO, "cluster", "place", node, "harness", "auto"], timeout=120)
     ev.append(f"place: rc={rc} {pout.strip().splitlines()[-1][:160] if pout.strip() else ''}")
     if rc != 0:
-        return "FAIL", "noo cluster place <self> harness auto failed"
+        return stop("FAIL", "noo cluster place <self> harness auto failed")
 
     # The product applies it (noo-fetch, noo-apply) and the agent starts it.
     deadline, rec, h, apply_msg = time.time() + 900, None, {}, ""
@@ -339,42 +343,27 @@ def judge(out_dir: str, ev: list[str], tmp: str) -> tuple[str, str]:
     ev.append(f"apply: {apply_msg}")
     ev.append("harness: state={} egress={}".format(h.get("state"), json.dumps(
         {k: eg.get(k) for k in ("state", "reason", "resolver", "pid_match", "ip_deny", "ip_allow", "lookup", "connect")})))
-    if "harness-egress=enforced" not in apply_msg and "harness-egress=" in apply_msg:
-        return "FAIL", "the applier did not apply the hold: " + re.search(r"harness-egress=\S+", apply_msg).group(0)
-    if h.get("state") != "running":
-        return "FAIL", f"the harness never ran on {node} within 15 min (state={h.get('state')})"
-
-    # The hold, as the agent reads it and as the unit carries it.
-    want = expected_allow(controller_url, nats_url)
-    got = set((eg.get("ip_allow") or "").split())
-    deny = set((eg.get("ip_deny") or "").split())
+    E["node"], E["apply_msg"], E["harness_state"] = node, apply_msg, h.get("state")
+    E["egress"] = {k: eg.get(k) for k in ("state", "resolver", "pid_match", "ip_deny", "ip_allow")}
+    E["want_allow"] = sorted(expected_allow(controller_url, nats_url))
     _, show = run(["systemctl", "show", "noo-harness", "-p", "IPAddressDeny", "-p", "IPAddressAllow", "-p", "ControlGroup"])
     props = dict(l.split("=", 1) for l in show.splitlines() if "=" in l)
+    E["unit_deny"], E["unit_allow"] = props.get("IPAddressDeny", ""), props.get("IPAddressAllow", "")
+    E["cgroup"] = props.get("ControlGroup", "")
     ev.append("unit: " + " ".join(f"{k}={props.get(k, '')}" for k in ("IPAddressDeny", "IPAddressAllow", "ControlGroup")))
-    held = []
-    held.append(("egress.state=enforced", eg.get("state") == "enforced"))
-    held.append(("resolver=unit", eg.get("resolver") == "unit"))
-    held.append(("pid_match", eg.get("pid_match") is True))
-    held.append(("ip_deny covers any", {"0.0.0.0/0", "::/0"} <= deny))
-    held.append((f"ip_allow exactly {' '.join(sorted(want))}", got == want))
-    held.append(("unit IPAddressDeny covers any", {"0.0.0.0/0", "::/0"} <= set(props.get("IPAddressDeny", "").split())))
-    held.append(("unit IPAddressAllow = the agent's", set(props.get("IPAddressAllow", "").split()) == want))
-    for name, ok in held:
-        ev.append(f"hold: {name}: {'yes' if ok else 'NO'}")
-    bad = [n for n, ok in held if not ok]
-    if bad:
-        return "FAIL", "the harness runs but is not held as the product holds it: " + "; ".join(bad)
+    if h.get("state") != "running":
+        return
 
     # One turn pinned to this node's chat backend, and the refused connection
     # from inside the unit's cgroup while it is served.
     show = noo_json("cluster", "show", node) or {}
     model = (show.get("running_backends") or {}).get("ollama", "")
     if not model:
-        return "FAIL", f"{node} runs no ollama chat model to pin the turn to"
+        return stop("FAIL", f"{node} runs no ollama chat model to pin the turn to")
     rc, cout = run([NOO, "cluster", "class", "set", CLASS, f"{node}/ollama={model}"])
     ev.append(f"class: rc={rc} {CLASS} -> {node}/ollama={model}")
     if rc != 0:
-        return "FAIL", "noo cluster class set failed"
+        return stop("FAIL", "noo cluster class set failed")
     cid = str(uuid.uuid4())
     t0 = time.time()
     turn: dict = {}
@@ -386,35 +375,77 @@ def judge(out_dir: str, ev: list[str], tmp: str) -> tuple[str, str]:
     th = threading.Thread(target=do_turn, daemon=True)
     th.start()
     time.sleep(0.5)
-    cg = props.get("ControlGroup", "")
+    cg = E["cgroup"]
     probe = "echo $$ > \"$1/cgroup.procs\" && exec timeout 6 bash -c 'exec 3<>/dev/tcp/1.1.1.1/443'"
     prc, pout = run((["sudo", "-n"] if os.geteuid() else []) + ["sh", "-c", probe, "probe", f"/sys/fs/cgroup{cg}"], timeout=30)
     in_flight = th.is_alive()
     crc, _ = run(["timeout", "6", "bash", "-c", "exec 3<>/dev/tcp/1.1.1.1/443"], timeout=30)
     th.join(600)
+    E["turn_status"], E["in_flight"], E["probe_rc"], E["control_rc"] = turn.get("status"), in_flight, prc, crc
     ev.append(f"turn: conversation={cid} HTTP {turn.get('status')} in {time.time() - t0:.1f}s")
     ev.append(f"probe from the unit's cgroup ({cg}) to 1.1.1.1:443: rc={prc} ({pout.strip()[:120]}); turn in flight={in_flight}; host control rc={crc}")
     lines, why = ae.docker("logs", "--since", f"{t0 - 5:.0f}", os.environ.get("NOO_CONTAINER_PREFIX", "noo") + "-gateway", timeout=60)
     lines = (lines or "").splitlines()
     dispatched = [l for l in lines if "harness_dispatched" in l and cid in l and f'"node":"{node}"' in l.replace(" ", "")]
     fallback = [l for l in lines if any(f in l for f in FALLBACKS) and node in l]
+    E["gateway_log_unreadable"] = why if (why and not lines) else ""
+    E["dispatched"], E["fallback"] = len(dispatched), [l[:160] for l in fallback[:3]]
     for l in (dispatched + fallback)[:6]:
         ev.append("gateway: " + l[:300])
-    if why and not lines:
-        return "FAIL", f"the gateway log is not readable: {why}"
-    if turn.get("status") != 200:
-        return "FAIL", f"the turn answered HTTP {turn.get('status')}"
-    if fallback:
-        return "FAIL", f"the gateway ran the turn in process: {fallback[0][:160]}"
-    if len(dispatched) != 1:
-        return "FAIL", f"{len(dispatched)} harness_dispatched lines name {node} and this conversation (want 1)"
-    if crc != 0:
+
+
+ALLOW_ANY = {"0.0.0.0/0", "::/0"}
+
+
+def verdict(E: dict) -> tuple[str, str]:
+    """The decision, from the evidence alone (pure: tests and mutants run it
+    without a cell). PASS and NOTE exit 0; FAIL and NOT REACHED do not."""
+    if E.get("leaked"):
+        return "FAIL", "a secret value reached this judge's output (withheld)"
+    if not E.get("systemd"):
+        return "NOTE", "no systemd as PID 1 on this cell (WSL2 or a container): the hold is systemd-only"
+    if not E.get("systemd_run"):
+        return "NOTE", "no systemd-run: the applier's fail-safe would decline the hold here"
+    if E.get("machine") not in ("x86_64", "aarch64"):
+        return "NOTE", f"no harness asset for {E.get('machine')}"
+    if E.get("stop"):
+        return tuple(E["stop"])
+    node, apply_msg = E.get("node", "?"), E.get("apply_msg", "")
+    tag = re.search(r"harness-egress=\S+", apply_msg)
+    if tag and tag.group(0) != "harness-egress=enforced":
+        return "FAIL", "the applier did not apply the hold: " + tag.group(0)
+    if E.get("harness_state") != "running":
+        return "FAIL", f"the harness never ran on {node} within 15 min (state={E.get('harness_state')})"
+    eg, want = E.get("egress") or {}, set(E.get("want_allow") or [])
+    held = [
+        ("egress.state=enforced", eg.get("state") == "enforced"),
+        ("resolver=unit", eg.get("resolver") == "unit"),
+        ("pid_match", eg.get("pid_match") is True),
+        ("ip_deny covers any", ALLOW_ANY <= set((eg.get("ip_deny") or "").split())),
+        (f"ip_allow exactly {' '.join(sorted(want))}", bool(want) and set((eg.get("ip_allow") or "").split()) == want),
+        ("unit IPAddressDeny covers any", ALLOW_ANY <= set((E.get("unit_deny") or "").split())),
+        ("unit IPAddressAllow = the agent's", bool(want) and set((E.get("unit_allow") or "").split()) == want),
+    ]
+    bad = [n for n, ok in held if not ok]
+    if bad:
+        return "FAIL", "the harness runs but is not held as the product holds it: " + "; ".join(bad)
+    if E.get("turn_status") is None:
+        return "NOT REACHED", "the turn never ran"
+    if E.get("gateway_log_unreadable"):
+        return "FAIL", f"the gateway log is not readable: {E['gateway_log_unreadable']}"
+    if E.get("turn_status") != 200:
+        return "FAIL", f"the turn answered HTTP {E.get('turn_status')}"
+    if E.get("fallback"):
+        return "FAIL", f"the gateway ran the turn in process: {E['fallback'][0]}"
+    if E.get("dispatched") != 1:
+        return "FAIL", f"{E.get('dispatched')} harness_dispatched lines name {node} and this conversation (want 1)"
+    if E.get("control_rc") != 0:
         return "NOTE", "the host itself cannot reach 1.1.1.1:443, so the refused connection cannot be judged"
-    if prc == 0:
+    if E.get("probe_rc") == 0:
         return "FAIL", "a connection from inside the harness unit's cgroup to 1.1.1.1:443 CONNECTED"
-    if prc == 999 or not cg:
+    if E.get("probe_rc") == 999 or not E.get("cgroup"):
         return "FAIL", "the probe could not join the harness unit's cgroup"
-    if not in_flight:
+    if not E.get("in_flight"):
         return "FAIL", "the turn had finished before the refused-connection probe ended (not judged while served)"
     return "PASS", (f"a turn was dispatched to {node}'s harness (harness_dispatched, no in-process fallback), "
                     f"the harness is held (enforced, allow = {' '.join(sorted(want))}), and a connection from its "
@@ -443,32 +474,36 @@ def main() -> int:
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
     ev: list[str] = []
+    E: dict = {}
     base = os.environ.get("RUNNER_TEMP") or tempfile.gettempdir()
     tmp = tempfile.mkdtemp(prefix="noo-he-", dir=base)
     os.chmod(tmp, 0o700)
-    node = ""
     try:
-        verdict, why = judge(a.out, ev, tmp)
-        node = next((l.split()[0].split("=", 1)[1] for l in ev if l.startswith("node=")), "")
+        collect(ev, tmp, E)
     except Exception as e:  # a crash is a FAIL with its type, never a traceback with values
-        verdict, why = "FAIL", f"the judge crashed: {type(e).__name__}"
+        E["stop"] = ["FAIL", f"the judge crashed: {type(e).__name__}"]
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     if any(l.startswith("place:") for l in ev):
-        cleanup(node, ev)
-    os.makedirs(os.path.join(a.out, "logs"), exist_ok=True)
-    evp = os.path.join(a.out, "logs", "harness-e2e-evidence.log")
+        cleanup(E.get("node", ""), ev)
+    logs = os.path.join(a.out, "logs")
+    os.makedirs(logs, exist_ok=True)
     # Checked before anything is printed or written: what would go out.
-    lines = ["  " + l for l in ev] + [f"HARNESS-E2E {verdict}: {why}"]
-    if leaked(lines):
-        ev = ["evidence withheld: a secret value would have been written"]
-        verdict, why = "FAIL", "a secret value reached this judge's output (withheld)"
-        lines = ["  " + ev[0], f"HARNESS-E2E {verdict}: {why}"]
-    open(evp, "w").write("\n".join(ev) + "\n")
+    E["leaked"] = leaked(ev + [json.dumps(E)])
+    if E["leaked"]:
+        ev, E = ["evidence withheld: a secret value would have been written"], {"leaked": True}
+    verdict_state, why = verdict(E)
+    lines = ["  " + l for l in ev] + [f"HARNESS-E2E {verdict_state}: {why}"]
+    if not E.get("leaked") and leaked(lines):
+        ev, E = ["evidence withheld: a secret value would have been written"], {"leaked": True}
+        verdict_state, why = verdict(E)
+        lines = ["  " + ev[0], f"HARNESS-E2E {verdict_state}: {why}"]
+    open(os.path.join(logs, "harness-e2e-evidence.log"), "w").write("\n".join(ev) + "\n")
+    open(os.path.join(logs, "harness-e2e.json"), "w").write(json.dumps(E, indent=1, sort_keys=True) + "\n")
     for l in lines:
         say(l)
     say(f"HARNESS-E2E secrets: none of the agent token, the cluster secret or their sha256 is in this output ({len(SECRETS)} checked)")
-    return 1 if verdict == "FAIL" else 0
+    return 0 if verdict_state in ("PASS", "NOTE") else 1
 
 
 if __name__ == "__main__":
