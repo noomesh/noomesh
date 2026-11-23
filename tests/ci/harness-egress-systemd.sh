@@ -44,10 +44,23 @@ WORK="$(mktemp -d /tmp/noo-egress-ci.XXXXXX)" || exit 2
 cleanup() {
     for p in $PIDS; do kill "$p" 2>/dev/null || true; done
     systemctl stop noo-harness 2>/dev/null || true
+    # The runner's own resolver file, as it started.
+    if [ -n "${RS_ORIG_LINK:-}" ]; then ln -sfn "$RS_ORIG_LINK" /etc/resolv.conf
+    elif [ -s "${RS_ORIG_FILE:-}" ]; then rm -f /etc/resolv.conf; cp "$RS_ORIG_FILE" /etc/resolv.conf; fi
 }
 trap cleanup EXIT
-systemctl --version | head -1
 echo "resolv.conf at start: $(ls -l /etc/resolv.conf | awk '{print $1, $9, $10, $11}')"
+RS_ORIG_LINK=""; RS_ORIG_FILE=""
+if [ -L /etc/resolv.conf ]; then RS_ORIG_LINK="$(readlink /etc/resolv.conf)"; else RS_ORIG_FILE="$WORK/resolv.conf.orig"; cp /etc/resolv.conf "$RS_ORIG_FILE"; fi
+case "$(readlink -f /etc/resolv.conf)" in
+    /run/systemd/resolve/*) echo "runner started with: the systemd-resolved layout (/etc/resolv.conf its symlink)" ;;
+    *)
+        echo "runner started with: a plain-file /etc/resolv.conf; the systemd-resolved layout is made for the first part, f3 makes the plain-file one"
+        systemctl start systemd-resolved 2>/dev/null || true
+        for _ in $(seq 1 10); do [ -s /run/systemd/resolve/stub-resolv.conf ] && break; sleep 1; done
+        [ -s /run/systemd/resolve/stub-resolv.conf ] && ln -sfn ../run/systemd/resolve/stub-resolv.conf /etc/resolv.conf ;;
+esac
+systemctl --version | head -1
 
 # ── a. the fake controller ──────────────────────────────────────────────────
 PRIV="$(ip -4 route get 1.1.1.1 | sed -n 's/.* src \([0-9.]*\).*/\1/p' | head -1)"
@@ -276,11 +289,12 @@ HP="$(systemctl show -p MainPID --value noo-harness)"
 RT="$(readlink -f /etc/resolv.conf)"
 case "$RT" in /run/systemd/resolve/*) RESOLVED_HOST=yes ;; *) RESOLVED_HOST=no ;; esac
 echo "systemd-resolved host: $RESOLVED_HOST ($RT)"
+check "the systemd-resolved layout is in place for the first part" test "$RESOLVED_HOST" = yes
 if [ "$RESOLVED_HOST" = yes ]; then
     check "systemd-resolved host: the hold binds the resolver directory" grep -qx "BindReadOnlyPaths=/etc/noo/harness-net/resolvdir:/run/systemd/resolve" "$DROPIN"
     cp -p "$RT" "$RT.noo-ci" && echo "# rewritten by the CI" >> "$RT.noo-ci" && mv -f "$RT.noo-ci" "$RT"
     sleep 1
-    HELD_NS="$(nsenter -t "$HP" -m cat /etc/resolv.conf | grep -m1 nameserver)"
+    HELD_NS="$(nsenter -t "$HP" -m cat /etc/resolv.conf | grep -m1 '^nameserver')"
     echo "after the host rewrite the unit reads: ${HELD_NS:-nothing}"
     check "after a host rewrite of $RT the unit still reads its own resolv.conf" test "$HELD_NS" = "nameserver 192.0.2.53"
 fi
@@ -329,13 +343,13 @@ rec_of() { python3 -c 'import json,sys; d=json.load(open("/run/noo-harness/egres
 for _ in $(seq 1 60); do [ "$(rec_of | cut -d' ' -f1)" = "$HP" ] && break; sleep 1; done
 echo "plain-file host: the unit's record before the rewrite: $(rec_of || echo none)"
 inside() { sh -c 'cg=$1; hp=$2; shift 2; echo $$ > "/sys/fs/cgroup$cg/cgroup.procs" && exec nsenter -t "$hp" -m -- setpriv --reuid=65534 --regid=65534 --clear-groups "$@"' inside "$CG" "$HP" "$@"; }
-BEFORE="$(nsenter -t "$HP" -m cat /etc/resolv.conf | grep -m1 nameserver)"
+BEFORE="$(nsenter -t "$HP" -m cat /etc/resolv.conf | grep -m1 '^nameserver')"
 check "plain-file host: the unit reads its own resolver file" test "$BEFORE" = "nameserver 192.0.2.53"
 cp -p /etc/resolv.conf /etc/resolv.conf.noo-ci && echo "# rewritten by the CI" >> /etc/resolv.conf.noo-ci && mv -f /etc/resolv.conf.noo-ci /etc/resolv.conf
 # The stand-in re-checks every 2 s: wait (bounded) for a record written after the rewrite.
 for _ in $(seq 1 15); do [ "$(rec_of)" = "$HP False" ] && break; sleep 1; done
 echo "plain-file host: the unit's record after the rewrite: $(rec_of || echo none)"
-AFTER="$(nsenter -t "$HP" -m cat /etc/resolv.conf | grep -m1 nameserver)"
+AFTER="$(nsenter -t "$HP" -m cat /etc/resolv.conf | grep -m1 '^nameserver')"
 echo "plain-file host: after the host rewrite the unit reads: ${AFTER:-nothing}"
 if (cd "$REPO/node-agent-go" && NOO_REAL_SYSTEMD_RESOLV_REPLACED=1 go test ./internal/hostsvc -run '^TestRealSystemdEgressResolvReplaced$' -v -count=1); then
     pass "plain-file host, after a host rewrite: the node agent reports the private resolver file replaced and the hold enforced"
@@ -346,9 +360,10 @@ check "control: the host itself resolves example.com" getent hosts example.com
 # Nothing resolves: not through the system resolver, and not for a client that
 # reads resolv.conf itself and asks the nameserver it names (as c-ares does).
 NS_NOW="$(awk '{print $2}' <<<"$AFTER")"
+case "$NS_NOW" in *.*.*.*|*:*) ;; *) NS_NOW="" ;; esac
 DIRECT="$(inside /usr/local/libexec/noo-ci-dns-ask "${NS_NOW:-0.0.0.0}" 2>&1)"
 echo "plain-file host: asking ${NS_NOW:-no nameserver} directly from inside: $DIRECT"
-if inside getent hosts example.com >/dev/null 2>&1 || ! grep -q "no answer" <<<"$DIRECT"; then
+if [ -z "$NS_NOW" ] || inside getent hosts example.com >/dev/null 2>&1 || ! grep -q "no answer" <<<"$DIRECT"; then
     fail "plain-file host, after a host rewrite: nothing resolves from inside the unit"
 else
     pass "plain-file host, after a host rewrite: nothing resolves from inside the unit"
@@ -369,7 +384,7 @@ fi
 systemctl restart noo-harness
 sleep 2
 HP2="$(systemctl show -p MainPID --value noo-harness)"
-RESTORED="$(nsenter -t "$HP2" -m cat /etc/resolv.conf | grep -m1 nameserver)"
+RESTORED="$(nsenter -t "$HP2" -m cat /etc/resolv.conf | grep -m1 '^nameserver')"
 check "plain-file host: a restart of the harness restores its own resolver file" test "$RESTORED" = "nameserver 192.0.2.53"
 # The runner as it was, for the fail-safe below.
 [ -n "$RS_LINK" ] && ln -sfn "$RS_LINK" /etc/resolv.conf
