@@ -1672,7 +1672,7 @@ pub(crate) fn docker_engine_check(n: &Value) -> Option<Check> {
             if containers.is_empty() {
                 Some(warn(NAME, detail, Some(remedy)))
             } else {
-                Some(fail(NAME, format!("{detail}; its container-lane backend(s) {} cannot run without it", containers.join(", ")), remedy))
+                Some(warn(NAME, format!("{detail}; its container-lane backend(s) {} cannot run without it", containers.join(", ")), Some(remedy)))
             }
         }
         "unreadable" => Some(cannot(e.get("error").and_then(Value::as_str).unwrap_or("no error given").to_string())),
