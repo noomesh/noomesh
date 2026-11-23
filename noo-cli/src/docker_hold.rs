@@ -38,11 +38,19 @@ pub(crate) fn status_installed(status: &str) -> bool {
     status.split_whitespace().nth(2) == Some("installed")
 }
 
+/// Whether the same status says held: its first word (the selection state)
+/// is "hold". Pure.
+pub(crate) fn status_held(status: &str) -> bool {
+    status.split_whitespace().next() == Some("hold")
+}
+
 /// What the hold steps do to the machine. Every decision is in this file, so
 /// a test drives it with a fake.
 pub(crate) trait HoldHost {
     /// Whether dpkg says `pkg` is installed now.
     fn installed(&mut self, pkg: &str) -> bool;
+    /// Whether dpkg says `pkg` is held now.
+    fn held(&mut self, pkg: &str) -> bool;
     /// Run `argv` as root; true when it exited 0.
     fn run_root(&mut self, argv: &[String]) -> bool;
     /// The record's text; `None` when there is none.
@@ -162,11 +170,13 @@ pub(crate) enum ReleaseOutcome {
     Failed(String),
 }
 
-/// Teardown: release exactly the recorded set, then drop the record. A package
-/// onboard did not record is never unheld.
+/// Teardown: release exactly the recorded set, then drop the record. A name is
+/// unheld only when it is in Docker's fixed set AND in the record AND held now,
+/// so a package onboard did not record, or a name planted in the file, is never
+/// unheld, and a hold the operator already released is left alone.
 pub(crate) fn release_recorded(h: &mut impl HoldHost) -> ReleaseOutcome {
     let Some(text) = h.read_record() else { return ReleaseOutcome::Nothing };
-    let pkgs = parse_record(&text);
+    let pkgs: Vec<String> = parse_record(&text).into_iter().filter(|p| h.held(p)).collect();
     if !pkgs.is_empty() && !h.run_root(&unhold_argv(&pkgs)) {
         return ReleaseOutcome::Failed(format!("apt-mark unhold failed; by hand: sudo apt-mark unhold {} && sudo rm -f {RECORD_PATH}", pkgs.join(" ")));
     }
@@ -229,6 +239,13 @@ impl HoldHost for LiveHold {
             .output()
             .is_ok_and(|o| o.status.success() && status_installed(&String::from_utf8_lossy(&o.stdout)))
     }
+    fn held(&mut self, pkg: &str) -> bool {
+        Command::new("dpkg-query")
+            .args(["-W", "-f=${Status}", pkg])
+            .stderr(Stdio::null())
+            .output()
+            .is_ok_and(|o| o.status.success() && status_held(&String::from_utf8_lossy(&o.stdout)))
+    }
     fn run_root(&mut self, argv: &[String]) -> bool {
         crate::onboard::steps::sudo_cmd(self.may_prompt)
             .args(argv)
@@ -264,11 +281,16 @@ mod tests {
         ran: Vec<Vec<String>>,
         refuse_root: bool,
         refuse_write: bool,
+        /// Packages the operator has unheld since; every other one reads held.
+        not_held: Vec<String>,
     }
 
     impl HoldHost for FakeHost {
         fn installed(&mut self, pkg: &str) -> bool {
             self.installed.iter().any(|p| p == pkg)
+        }
+        fn held(&mut self, pkg: &str) -> bool {
+            !self.not_held.iter().any(|p| p == pkg)
         }
         fn run_root(&mut self, argv: &[String]) -> bool {
             self.ran.push(argv.to_vec());
@@ -416,6 +438,36 @@ mod tests {
         assert_eq!(release_recorded(&mut h), ReleaseOutcome::Released(s(&["docker-ce", "docker-ce-cli"])));
         assert_eq!(h.ran, vec![s(&["apt-mark", "unhold", "docker-ce", "docker-ce-cli"])]);
         assert!(h.record.is_none());
+    }
+
+    #[test]
+    fn a_name_planted_in_the_record_is_never_unheld() {
+        // Someone edits the root-owned record to name another package: only
+        // Docker's fixed set counts, whatever the file says.
+        let planted = format!("{}openssh-server\nlibc6\n../../etc/passwd\ndocker-ce\n docker-ce-cli \n", RECORD_HEADER);
+        let mut h = FakeHost { installed: s(&ALL), record: Some(planted), ..Default::default() };
+        assert_eq!(release_recorded(&mut h), ReleaseOutcome::Released(s(&["docker-ce", "docker-ce-cli"])));
+        assert_eq!(h.ran, vec![s(&["apt-mark", "unhold", "docker-ce", "docker-ce-cli"])]);
+    }
+
+    #[test]
+    fn a_recorded_package_no_longer_held_is_left_alone() {
+        let mut h = FakeHost {
+            installed: s(&ALL),
+            record: Some(render_record(&s(&["docker-ce", "docker-ce-cli"]))),
+            not_held: s(&["docker-ce-cli"]),
+            ..Default::default()
+        };
+        assert_eq!(release_recorded(&mut h), ReleaseOutcome::Released(s(&["docker-ce"])));
+        assert_eq!(h.ran, vec![s(&["apt-mark", "unhold", "docker-ce"])]);
+        assert!(h.record.is_none());
+    }
+
+    #[test]
+    fn dpkg_status_reads_held_from_its_first_word() {
+        assert!(status_held("hold ok installed"));
+        assert!(!status_held("install ok installed"));
+        assert!(!status_held(""));
     }
 
     #[test]
