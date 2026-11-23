@@ -281,9 +281,17 @@ def judge(out_dir: str, ev: list[str], tmp: str) -> tuple[str, str]:
     manifest += "".join(f"{hashlib.sha256(b).hexdigest()}  {k}\n" for k, b in files.items())
     mpath, spath = os.path.join(tmp, "manifest"), os.path.join(tmp, "manifest.sig")
     open(mpath, "w").write(manifest)
-    key = os.path.join(os.environ.get("NOO_PKI_DIR") or os.path.expanduser("~/.config/mesh/pki"), "signing.key")
+    # The CLI's own resolution (noo-cli pki.rs pki_dir): NOO_PKI_DIR, which a
+    # standalone install sets in its root's .env, else ~/.config/mesh/pki.
+    try:
+        root_env = open(os.path.join(root, ".env")).read()
+    except OSError:
+        root_env = ""
+    pki = os.environ.get("NOO_PKI_DIR") or env_value(root_env, "NOO_PKI_DIR") or os.path.expanduser("~/.config/mesh/pki")
+    key = os.path.join(os.path.expanduser(pki), "signing.key")
+    ev.append(f"signing key: {'readable' if os.access(key, os.R_OK) else 'NOT readable'} in the CLI's PKI directory ({pki})")
     if not os.access(key, os.R_OK):
-        return "FAIL", "the fleet signing key is not readable at its standard path"
+        return "FAIL", "the fleet signing key is not readable in the CLI's PKI directory"
     rc, so = run(["openssl", "dgst", "-sha256", "-sign", key, "-out", spath, mpath])
     if rc != 0:
         return "FAIL", "openssl could not sign the manifest"
