@@ -254,8 +254,10 @@ pub async fn run() -> Result<()> {
         api_format: coordinator::api_format_for(&backend_type, &model_url),
     };
     // Am I held off the internet? From inside this unit's own namespace, before
-    // anything else connects (enforcement step 1; the node agent reads it).
-    crate::harness::egress_selftest::run_at_start().await;
+    // anything else connects (enforcement step 1; the node agent reads it), and
+    // again every minute: under an installed hold, a check that is not held
+    // stops the loops below taking work until one holds again (i1246).
+    crate::harness::egress_selftest::run_at_start(&gateway).await;
     let get = |k: &str| std::env::var(k).ok();
     check_harness_secrets(&get).map_err(|e| anyhow!("harness: secrets: {e}"))?;
     tracing::info!(capability = HARNESS_SECRET_FILES_CAPABILITY, "harness: secret reader");
@@ -479,6 +481,15 @@ pub async fn run() -> Result<()> {
                         continue;
                     }
                 };
+                if !crate::harness::egress_selftest::serving() {
+                    // Fail closed: the hold's latest check is not held. Busy, not
+                    // dead: the gateway keeps the task for this node.
+                    tracing::warn!(task = %req.task_id, "harness: egress hold not held; taking no task until it is");
+                    if let Some(reply) = msg.reply.clone() {
+                        let _ = nats_t.publish(reply, serde_json::to_vec(&json!({"ack": false, "busy": true, "node": node_t, "egress": "not_held"})).unwrap_or_default().into()).await;
+                    }
+                    continue;
+                }
                 if running_t.lock().map(|r| r.contains(&req.task_id)).unwrap_or(false) {
                     // Already here: say so, do not start it again.
                     tracing::info!(task = %req.task_id, "harness: task already running here; acknowledged, not started again");
@@ -566,6 +577,15 @@ pub async fn run() -> Result<()> {
                 continue;
             }
         };
+        if !crate::harness::egress_selftest::serving() {
+            // Fail closed: the hold's latest check is not held. Busy: the gateway
+            // runs the turn itself, outside this unit.
+            tracing::warn!(conversation = %req.conversation_id, "harness: egress hold not held; taking no turn until it is");
+            if let Some(reply) = msg.reply.clone() {
+                let _ = nats.publish(reply, serde_json::to_vec(&json!({"ack": false, "busy": true, "node": node, "egress": "not_held"})).unwrap_or_default().into()).await;
+            }
+            continue;
+        }
         let Ok(permit) = limit.clone().try_acquire_owned() else {
             // Full: say busy (a turn cannot wait, so the gateway runs it
             // itself, and its log says busy rather than dead).
@@ -1330,5 +1350,27 @@ mod placement_race_tests {
         assert!(fetch.contains("reqwest::StatusCode::NOT_FOUND") && fetch.contains("if !resp.status().is_success()"), "{fetch}");
         let ask = crate::test_src::fn_body(&code, "async fn ask_agent_kind(");
         assert!(ask.contains("Err(e) => match delays.next()"), "an error (a 503 included) is asked again: {ask}");
+    }
+}
+
+#[cfg(test)]
+mod egress_gate_tests {
+    /// i1246: both loops that take work ask the egress self-test first, and
+    /// decline as busy (never take) while an installed hold is not held.
+    #[test]
+    fn every_loop_that_takes_work_asks_the_egress_check_first() {
+        let own = crate::test_src::own_code(include_str!("harness_main.rs"));
+        let run = crate::test_src::fn_body(&own, "pub async fn run(");
+        let gate = "if !crate::harness::egress_selftest::serving() {";
+        let gates: Vec<usize> = run.match_indices(gate).map(|(i, _)| i).collect();
+        let takes: Vec<usize> = run.match_indices("try_acquire_owned()").map(|(i, _)| i).collect();
+        assert_eq!(gates.len(), 2, "the task loop and the turn loop");
+        assert_eq!(takes.len(), 2);
+        for (g, t) in gates.iter().zip(&takes) {
+            assert!(g < t, "the gate comes before the permit");
+            assert!(run[*g..*t].contains("\"busy\": true") && run[*g..*t].contains("\"egress\": \"not_held\"") && run[*g..*t].contains("continue;"));
+        }
+        let start = run.find("egress_selftest::run_at_start(&gateway).await").expect("checked at start");
+        assert!(start < run.find("crate::bus::connect(").expect("connects"), "checked before anything connects");
     }
 }

@@ -1103,10 +1103,13 @@ pub(crate) fn harness_egress_check(id: &str, n: &Value) -> Option<Check> {
     }
     let h = &n["host_services"]["harness"];
     let e = &h["egress"];
+    // No harness running here, no row: a stopped harness is right on a node
+    // that serves no chat model (policy `auto`), and the agent reports an
+    // egress object for any installed unit, running or not.
+    if h["state"].as_str() != Some("running") {
+        return None;
+    }
     if !e.is_object() {
-        if h["state"].as_str() != Some("running") {
-            return None;
-        }
         return Some(match h["runtime"].as_str() {
             Some(rt) if rt != "systemd" => warn(NAME, format!(
                 "no egress hold on {rt}: the hold is systemd-only, so this node's harness runs with nothing holding it off the internet"), None),
@@ -1116,10 +1119,16 @@ pub(crate) fn harness_egress_check(id: &str, n: &Value) -> Option<Check> {
     }
     let reason = e["reason"].as_str().unwrap_or("");
     let stale: Vec<&str> = e["stale_hosts"].as_array().map(|a| a.iter().filter_map(|v| v.as_str()).collect()).unwrap_or_default();
+    // From a harness that re-checks every minute: how old its latest check is.
+    let age = e["checked_age_secs"].as_i64().map(|a| format!(" (checked {a}s ago)")).unwrap_or_default();
     Some(match e["state"].as_str() {
+        Some("enforced") if stale.is_empty() && e["resolv_held"].as_bool() == Some(false) => warn(NAME, format!(
+            "held off the internet{age}, but the harness's private resolv.conf was replaced by the host's (a host resolver rewrote its file); its allow list still denies every resolver, so nothing leaks; a restart of the harness restores the file"), None),
         Some("enforced") if stale.is_empty() => ok(NAME, format!(
-            "held off the internet: deny {}, unit resolver; the harness's own check from inside the unit: lookup {}, connect {}",
+            "held off the internet{age}: deny {}, unit resolver; the harness's own check from inside the unit: lookup {}, connect {}",
             e["ip_deny"].as_str().unwrap_or("?"), e["lookup"].as_str().unwrap_or("?"), e["connect"].as_str().unwrap_or("?"))),
+        Some("stale") => fail(NAME, format!("{reason}; the harness takes no work it cannot reach the gateway for"),
+            format!("noo cluster provision {id}   # re-renders the hosts file and the allow list from the controller's current address")),
         Some("enforced") => fail(NAME, format!(
             "held off the internet, but {} changed address since the harness's hosts file was rendered: the harness cannot reach its controller (it never falls back to real DNS)",
             stale.join(", ")), format!("noo cluster provision {id}   # re-renders the hosts file and the allowlist")),
@@ -12562,6 +12571,41 @@ mod tests {
         let mut ctl = with_egress(now, serde_json::json!({"state": "unknown"}));
         ctl["self_node"] = true.into();
         assert!(node_checks(&ctl, "v0.2.70", "0.5.57", now, Some(true)).iter().all(|c| c.name != "harness egress"));
+    }
+
+    /// i1246: the row reads the harness's CURRENT check. A stopped harness has
+    /// no row (robopi: policy auto, no chat model), the age is shown, a
+    /// replaced private resolv.conf alone is a WARN (the allow list still
+    /// holds), and a gateway the hold cuts off is its own FAIL with re-apply.
+    #[test]
+    fn the_harness_egress_row_reads_the_current_check() {
+        let now = 1_800_000_000;
+        let held = serde_json::json!({"state": "enforced", "reason": "", "ip_deny": "0.0.0.0/0 ::/0", "ip_allow": "127.0.0.1/32 ::1/128 10.0.0.5/32",
+            "resolver": "unit", "pid_match": true, "lookup": "failed", "connect": "timeout", "stale_hosts": [], "checked_age_secs": 40, "resolv_held": true});
+        let row = |e: serde_json::Value| node_checks(&with_egress(now, e), "v0.2.70", "0.5.57", now, Some(true)).into_iter().find(|c| c.name == "harness egress");
+
+        let ok = row(held.clone()).unwrap();
+        assert_eq!(ok.verdict, Verdict::Ok);
+        assert!(ok.detail.starts_with("held off the internet (checked 40s ago):"), "{}", ok.detail);
+
+        let mut lost = held.clone();
+        lost["resolv_held"] = false.into();
+        let w = row(lost).unwrap();
+        assert_eq!(w.verdict, Verdict::Warn);
+        assert!(w.detail.contains("private resolv.conf was replaced") && w.detail.contains("nothing leaks"), "{}", w.detail);
+
+        let mut stale = held.clone();
+        stale["state"] = "stale".into();
+        stale["reason"] = "held, but the harness cannot reach the gateway at 10.0.0.5:8443 from inside its hold (the allow list may be stale): re-apply".into();
+        let f = row(stale).unwrap();
+        assert_eq!(f.verdict, Verdict::Fail);
+        assert!(f.detail.contains("cannot reach the gateway at 10.0.0.5:8443"), "{}", f.detail);
+        assert!(f.remedy.as_deref().unwrap().starts_with("noo cluster provision host6"), "{:?}", f.remedy);
+
+        let mut stopped = with_egress(now, serde_json::json!({"state": "unknown", "reason": "the harness unit is not running"}));
+        stopped["host_services"]["harness"]["state"] = "stopped".into();
+        assert!(node_checks(&stopped, "v0.2.70", "0.5.57", now, Some(true)).iter().all(|c| c.name != "harness egress"),
+            "a stopped harness (and its egress object) gives no row");
     }
 
     /// A harness under a runtime with no hold (node-mac, a Mac node: launchd)

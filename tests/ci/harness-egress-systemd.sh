@@ -177,6 +177,59 @@ journalctl -u noo-harness -b --no-pager -o cat 2>/dev/null | tail -15 || true
 grep -E 'CONFIG_CGROUP_BPF|CONFIG_BPF_SYSCALL' "/boot/config-$(uname -r)" 2>/dev/null || true
 timeout 15 systemd-run --wait --pipe --quiet --collect -p IPAccounting=yes -p 'IPAddressDeny=0.0.0.0/0 ::/0' -p 'IPAddressAllow=127.0.0.1/32' /bin/bash -c 'exec 3<>/dev/tcp/1.1.1.1/443' 2>&1 | head -3 || true
 
+# ── e2. only loopback and the controller ────────────────────────────────────
+# The allow list names single hosts, and a DNS server at any other address,
+# private or tailnet-range, gets no question through from inside the hold,
+# while the host itself reaches it (the control).
+ALLOWED="$(sed -n 's/^IPAddressAllow=//p' "$DROPIN")"
+echo "allowed: $ALLOWED"
+NOT_HOST="$(for a in $ALLOWED; do case $a in */32|*/128) ;; *) echo "$a" ;; esac; done)"
+check "the allow list holds single hosts only" test -z "$NOT_HOST"
+A_FILE="$(sort /etc/noo/harness-net/allow | tr '\n' ' ')"
+A_UNIT="$(for a in $ALLOWED; do echo "${a%/*}"; done | sort | tr '\n' ' ')"
+check "the allow file lists the same addresses" test "$A_FILE" = "$A_UNIT"
+ip link add noo-ci-dns type dummy && ip link set noo-ci-dns up
+for a in 10.66.0.53 100.64.0.53; do ip addr add "$a/32" dev noo-ci-dns; done
+cat > "$WORK/dns-server.py" <<'PY'
+import socket, sys, threading
+def serve(addr):
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.bind((addr, 53))
+    while True:
+        q, peer = s.recvfrom(512)
+        s.sendto(q[:2] + b"\x81\x80" + q[4:6] + b"\x00\x00\x00\x00\x00\x00" + q[12:], peer)
+for a in sys.argv[1:]:
+    threading.Thread(target=serve, args=(a,), daemon=True).start()
+threading.Event().wait()
+PY
+python3 "$WORK/dns-server.py" 10.66.0.53 100.64.0.53 & PIDS="$PIDS $!"
+sleep 1
+cat > /usr/local/libexec/noo-ci-dns-ask <<'PY'
+#!/usr/bin/env python3
+import socket, sys
+q = b"\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x07example\x03com\x00\x00\x01\x00\x01"
+for a in sys.argv[1:]:
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.settimeout(2)
+    try:
+        s.sendto(q, (a, 53)); s.recvfrom(512); print("%s answered" % a)
+    except Exception:
+        print("%s no answer" % a)
+PY
+chmod 755 /usr/local/libexec/noo-ci-dns-ask
+held=(); while IFS= read -r l; do case "$l" in IPAddress*|Environment=*|BindReadOnlyPaths=*|InaccessiblePaths=*) held+=(-p "$l");; esac; done < "$DROPIN"
+INSIDE="$(systemd-run --wait --pipe --quiet --collect -p User=nobody "${held[@]}" /usr/local/libexec/noo-ci-dns-ask 10.66.0.53 100.64.0.53 2>&1)"
+echo "$INSIDE"
+check "control: the host gets an answer from the DNS servers" bash -c "/usr/local/libexec/noo-ci-dns-ask 10.66.0.53 | grep -q answered"
+N_ANSWERED="$(grep -c answered <<<"$INSIDE")"; N_NONE="$(grep -c "no answer" <<<"$INSIDE")"
+check "inside the hold: no DNS server at another address answers" test "$N_ANSWERED" = 0 -a "$N_NONE" = 2
+# A host rewrite of its resolver file (a rename, as resolvers do) leaves the
+# unit reading its own.
+HP="$(systemctl show -p MainPID --value noo-harness)"
+RT="$(readlink -f /etc/resolv.conf)"
+cp -p "$RT" "$RT.noo-ci" && echo "# rewritten by the CI" >> "$RT.noo-ci" && mv -f "$RT.noo-ci" "$RT"
+sleep 1
+HELD_NS="$(nsenter -t "$HP" -m cat /etc/resolv.conf | grep -m1 nameserver)"
+check "after a host rewrite of $RT the unit still reads its own resolv.conf" test "$HELD_NS" = "nameserver 192.0.2.53"
+
 # ── f. the node agent's real reader ─────────────────────────────────────────
 if (cd "$REPO/node-agent-go" && NOO_REAL_SYSTEMD=1 go test ./internal/hostsvc -run TestRealSystemdEgress -v -count=1); then
     pass "node agent reads the live unit as enforced"
