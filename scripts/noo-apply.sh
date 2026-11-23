@@ -1605,7 +1605,7 @@ harness_egress_apply() {
     # The allowed addresses, one per line, for the harness's own self-test: it
     # asks each for DNS every minute, and an answer means not held.
     # shellcheck disable=SC2086
-    printf '%s\n' $_he_allow | sed 's#/[0-9]*$##' > "$_he_tmp/allow"
+    : > "$_he_tmp/allow"
     {
         printf '%s\n' "# Rendered by noo-apply: the harness and every CLI it launches reach only loopback and" \
             "# the controller's addresses, and cannot resolve internet names (docs/security/telemetry.md)." \
