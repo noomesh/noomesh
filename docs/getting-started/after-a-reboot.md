@@ -15,6 +15,15 @@ does not come back on its own yet. Done when `noo cluster verify` exits 0.
 | **A Mac node** | Its node agent starts at boot. Its Ollama does not, yet: see below. |
 | **A kiosk seat** | Its display starts at boot, except, before 0.6.30, a dedicated seat on a machine with a desktop installed: see below. |
 
+**A Linux node that boots before its controller** keeps serving the backends
+Docker restarted, and the node's own boot steps run as usual. Until the
+controller answers, the node agent only waits: the node shows as offline in
+`noo cluster status`, nothing is started, stopped or kept warm, a shared GPU
+is not yielded, the GPU watchdog and disk reclaim do not run, and the node's
+logs do not reach the cluster's log store. On the node itself,
+`journalctl -u noo-node-agent` shows `waiting for controller` every 10 seconds.
+Everything starts when the controller answers; there is nothing to run on the node.
+
 Give it a few minutes, then:
 
 ```bash
