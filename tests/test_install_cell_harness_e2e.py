@@ -21,7 +21,7 @@ GOOD = {
     "want_allow": ["127.0.0.1/32", "::1/128"],
     "unit_deny": "0.0.0.0/0 ::/0", "unit_allow": "::1/128 127.0.0.1/32",
     "cgroup": "/system.slice/noo-harness.service",
-    "turn_status": 200, "in_flight": True, "probe_rc": 124, "control_rc": 0,
+    "turn_status": 200, "in_flight": True, "probe_rc": 124, "probe_err": "", "control_rc": 0,
     "gateway_log_unreadable": "", "dispatched": 1, "fallback": [],
 }
 
@@ -130,3 +130,15 @@ def test_a_recorded_stop_is_the_verdict():
 
 def test_a_harness_that_never_ran_fails():
     assert state(with_(harness_state="stopped")) == "FAIL"
+
+
+def test_a_probe_that_never_really_tried_fails():
+    for rc in (127, 126, 137, 2, 90):
+        assert state(with_(probe_rc=rc)) == "FAIL", rc
+
+
+def test_a_connect_that_failed_inside_the_hold_passes_and_one_refused_by_the_far_end_fails():
+    assert state(with_(probe_rc=1, probe_err="/bin/bash: connect: Operation not permitted")) == "PASS"
+    assert state(with_(probe_rc=1, probe_err="/bin/bash: connect: Connection timed out")) == "PASS"
+    assert state(with_(probe_rc=1, probe_err="/bin/bash: connect: Connection refused")) == "FAIL"
+    assert state(with_(probe_rc=1, probe_err="")) == "FAIL"

@@ -344,6 +344,8 @@ def collect(ev: list[str], tmp: str, E: dict) -> None:
     ev.append("harness: state={} egress={}".format(h.get("state"), json.dumps(
         {k: eg.get(k) for k in ("state", "reason", "resolver", "pid_match", "ip_deny", "ip_allow", "lookup", "connect")})))
     E["node"], E["apply_msg"], E["harness_state"] = node, apply_msg, h.get("state")
+    if "harness-egress=" not in apply_msg:
+        ev.append("note: the applier printed no harness-egress tag (the agent's egress object below is what is judged)")
     E["egress"] = {k: eg.get(k) for k in ("state", "resolver", "pid_match", "ip_deny", "ip_allow")}
     E["want_allow"] = sorted(expected_allow(controller_url, nats_url))
     _, show = run(["systemctl", "show", "noo-harness", "-p", "IPAddressDeny", "-p", "IPAddressAllow", "-p", "ControlGroup"])
@@ -376,12 +378,15 @@ def collect(ev: list[str], tmp: str, E: dict) -> None:
     th.start()
     time.sleep(0.5)
     cg = E["cgroup"]
-    probe = "echo $$ > \"$1/cgroup.procs\" && exec timeout 6 bash -c 'exec 3<>/dev/tcp/1.1.1.1/443'"
+    # Exit 90: the probe could not join the unit's cgroup (kept apart from
+    # bash's own connect failure, which is 1).
+    probe = "echo $$ > \"$1/cgroup.procs\" || exit 90; exec timeout 6 bash -c 'exec 3<>/dev/tcp/1.1.1.1/443'"
     prc, pout = run((["sudo", "-n"] if os.geteuid() else []) + ["sh", "-c", probe, "probe", f"/sys/fs/cgroup{cg}"], timeout=30)
     in_flight = th.is_alive()
     crc, _ = run(["timeout", "6", "bash", "-c", "exec 3<>/dev/tcp/1.1.1.1/443"], timeout=30)
     th.join(600)
     E["turn_status"], E["in_flight"], E["probe_rc"], E["control_rc"] = turn.get("status"), in_flight, prc, crc
+    E["probe_err"] = next((l.strip() for l in pout.splitlines() if l.strip()), "")[:200]
     ev.append(f"turn: conversation={cid} HTTP {turn.get('status')} in {time.time() - t0:.1f}s")
     ev.append(f"probe from the unit's cgroup ({cg}) to 1.1.1.1:443: rc={prc} ({pout.strip()[:120]}); turn in flight={in_flight}; host control rc={crc}")
     lines, why = ae.docker("logs", "--since", f"{t0 - 5:.0f}", os.environ.get("NOO_CONTAINER_PREFIX", "noo") + "-gateway", timeout=60)
@@ -395,6 +400,15 @@ def collect(ev: list[str], tmp: str, E: dict) -> None:
 
 
 ALLOW_ANY = {"0.0.0.0/0", "::/0"}
+# How the probe (timeout 6 bash /dev/tcp) ends when it TRIED and the
+# connection did not happen: the timeout fired (124), or bash's connect failed
+# without reaching the far end (1, with one of these). "Connection refused"
+# came from the far end: it is not here.
+PROBE_BLOCKED_ERR = re.compile(r"connect: (Operation not permitted|Connection timed out|Network is unreachable)")
+
+
+def probe_blocked(rc, err: str) -> bool:
+    return rc == 124 or (rc == 1 and bool(PROBE_BLOCKED_ERR.search(err or "")))
 
 
 def verdict(E: dict) -> tuple[str, str]:
@@ -443,8 +457,10 @@ def verdict(E: dict) -> tuple[str, str]:
         return "NOTE", "the host itself cannot reach 1.1.1.1:443, so the refused connection cannot be judged"
     if E.get("probe_rc") == 0:
         return "FAIL", "a connection from inside the harness unit's cgroup to 1.1.1.1:443 CONNECTED"
-    if E.get("probe_rc") == 999 or not E.get("cgroup"):
+    if E.get("probe_rc") in (999, 90) or not E.get("cgroup"):
         return "FAIL", "the probe could not join the harness unit's cgroup"
+    if not probe_blocked(E.get("probe_rc"), E.get("probe_err", "")):
+        return "FAIL", f"the probe did not run as a connection attempt that was held (rc={E.get('probe_rc')}: {E.get('probe_err') or 'no output'})"
     if not E.get("in_flight"):
         return "FAIL", "the turn had finished before the refused-connection probe ended (not judged while served)"
     return "PASS", (f"a turn was dispatched to {node}'s harness (harness_dispatched, no in-process fallback), "
