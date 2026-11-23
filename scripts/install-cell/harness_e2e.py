@@ -400,6 +400,7 @@ def collect(ev: list[str], tmp: str, E: dict) -> None:
     crc, _ = run(["timeout", "6", "bash", "-c", "exec 3<>/dev/tcp/1.1.1.1/443"], timeout=30)
     th.join(600)
     E["turn_status"], E["in_flight"], E["probe_rc"], E["control_rc"] = turn.get("status"), in_flight, prc, crc
+    E["turn_s"] = round(time.time() - t0, 1)  # dispatch to the answer (the request's whole time)
     E["probe_err"] = next((l.strip() for l in pout.splitlines() if l.strip()), "")[:200]
     ev.append(f"turn: conversation={cid} HTTP {turn.get('status')} in {time.time() - t0:.1f}s")
     ev.append(f"probe from the unit's cgroup ({cg}) to 1.1.1.1:443: rc={prc} ({pout.strip()[:120]}); turn in flight={in_flight}; host control rc={crc}")
