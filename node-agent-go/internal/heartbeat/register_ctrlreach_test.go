@@ -90,3 +90,39 @@ func TestRegister_AnErrorAnswerStaysAnErrorAndOpensNoOutage(t *testing.T) {
 		t.Fatalf("a 500 must not open an outage:\n%s", out)
 	}
 }
+
+// A controller that comes back and refuses the node: the outage closes (one
+// "answers again" line) and the refusal still logs at ERROR. The
+// once-per-outage state never swallows a real failure that follows it.
+func TestRegister_AFailureAfterAnOutageStillLogsError(t *testing.T) {
+	buf := captureSlog(t)
+	tries := 0
+	r := newTestReporter(t, "http://ctrl.invalid:8080", nil)
+	r.client = &http.Client{Transport: rtFunc(func(req *http.Request) (*http.Response, error) {
+		tries++
+		if tries == 1 {
+			return nil, &url.Error{Op: "Post", URL: req.URL.String(), Err: &net.OpError{Op: "dial", Net: "tcp", Err: syscall.ECONNREFUSED}}
+		}
+		return answer(401), nil
+	})}
+	caps := hardware.Capabilities{CPUCores: 1}
+	if r.register(caps, "10.0.0.1") {
+		t.Fatal("register succeeded while the controller was away")
+	}
+	if down, _ := ctrlreach.Down(); !down {
+		t.Fatal("a refused dial must open the outage")
+	}
+	if r.register(caps, "10.0.0.1") {
+		t.Fatal("a 401 must not register")
+	}
+	out := buf.String()
+	if n := strings.Count(out, "event=controller_reachable"); n != 1 {
+		t.Fatalf("back lines = %d, want 1:\n%s", n, out)
+	}
+	if !strings.Contains(out, "level=ERROR") || !strings.Contains(out, "registration failed") || !strings.Contains(out, "status=401") {
+		t.Fatalf("a 401 after an outage must log ERROR registration failed status=401:\n%s", out)
+	}
+	if down, _ := ctrlreach.Down(); down {
+		t.Fatalf("an answer must close the outage:\n%s", out)
+	}
+}
