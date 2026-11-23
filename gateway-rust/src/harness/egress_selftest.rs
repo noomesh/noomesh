@@ -366,7 +366,7 @@ mod tests {
     fn a_dns_answer_is_told_from_anything_else() {
         let q = dns_question();
         assert_eq!(&q[..2], &[0x6e, 0x6f]);
-        assert!(q.windows(7).any(|w| w == b"\x07example"), "asks for the canary name");
+        assert!(q.windows(8).any(|w| w == b"\x07example"), "asks for the canary name");
         let mut answer = q.clone();
         answer[2] |= 0x80;
         assert!(is_dns_answer(&answer));

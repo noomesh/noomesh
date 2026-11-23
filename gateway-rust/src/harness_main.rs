@@ -1008,7 +1008,9 @@ mod tests {
         let dedupe = loop_body.find("\"already\": true").expect("an already-running task is acknowledged as taken");
         let permit = loop_body.find("try_acquire_owned()").expect("the permit");
         assert!(dedupe < permit, "the dedupe runs before a permit is taken");
-        let busy = loop_body.find("\"busy\": true").expect("at capacity: a busy reply");
+        // The at-capacity busy reply is the one after the permit (an earlier
+        // one is the egress gate's, i1246, pinned in egress_gate_tests).
+        let busy = permit + loop_body[permit..].find("\"busy\": true").expect("at capacity: a busy reply");
         assert!(permit < busy && busy < loop_body.find("\"ack\": true, \"node\"").unwrap(), "busy is answered on the refusal path");
         assert!(loop_body.contains("\"slot_freed\": true"), "a finished task re-announces ready");
         assert!(loop_body.find("r.remove(&req.task_id)").unwrap() < loop_body.find("\"slot_freed\": true").unwrap(), "the id leaves the running set before the re-announce");
