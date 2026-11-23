@@ -1852,7 +1852,7 @@ fn flag_set_refusal(ctx: Option<&crate::auth::RequesterCtx>) -> Option<&'static 
 /// (`placement_delete`), because a node acts on it by removing a container.
 pub(crate) fn reserved_key_refusal(key: &str) -> Option<String> {
     crate::repo::backend_unplaced::is_reserved(key).then(|| {
-        format!("{key}: keys starting `backend_unplaced:` are written only by `noo cluster unplace`, never as a setting")
+        format!("{key}: keys starting `backend_unplaced:` are written only by `noo cluster unplace <node> <backend>`, never as a setting")
     })
 }
 
