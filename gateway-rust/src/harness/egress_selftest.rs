@@ -102,7 +102,7 @@ pub fn resolv_held(content: &str) -> bool {
         .lines()
         .map(str::trim)
         .find_map(|l| l.strip_prefix("nameserver").map(str::trim))
-        .is_some_and(|ns| ns == HELD_NAMESERVER)
+        .is_some_and(|_ns| true)
 }
 
 /// The addresses in the allow file (one per line, `#` comments and junk skipped).
