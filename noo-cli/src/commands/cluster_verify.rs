@@ -4932,6 +4932,14 @@ fn grafana_mounts_sso_pub() -> Option<bool> {
     }))
 }
 
+fn retired_text(v: &[&crate::pki::KeyIssue]) -> String {
+    format!(
+        "{} leftover private key(s) of the TEI engine removed in 0.6.30 — nothing reads them; delete it by hand: {}",
+        v.len(),
+        v.iter().map(|i| format!("{} {:04o}", i.rel, i.mode)).collect::<Vec<_>>().join(", ")
+    )
+}
+
 /// The "pki key modes" row. Every private key under the PKI dir has one
 /// reader (`pki::KeyReader`). A key readable beyond it (0644, a group
 /// that is not its reader's) is a FAIL: that is a private key someone
@@ -4943,7 +4951,7 @@ fn grafana_mounts_sso_pub() -> Option<bool> {
 /// readable beyond its owner is a WARN that `fix-modes` closes (i277a). Issuance, `noo upgrade --stack`, provision and
 /// onboard set every mode they can, so a FAIL here that needs no sudo
 /// line means one of them has not run since the key changed.
-pub(crate) fn pki_key_modes_check(issues: &[crate::pki::KeyIssue], grant_lines: &[String], total_keys: usize) -> Check {
+pub(crate) fn pki_key_modes_check(issues: &[crate::pki::KeyIssue], grant_lines: &[String], total_keys: usize, pki_dir: &std::path::Path) -> Check {
     use crate::pki::KeyIssueKind as K;
     let names = |kind: K| -> Vec<String> {
         issues.iter().filter(|i| i.kind == kind).map(|i| format!("{} {:04o}", i.rel, i.mode)).collect()
@@ -4968,6 +4976,14 @@ pub(crate) fn pki_key_modes_check(issues: &[crate::pki::KeyIssue], grant_lines: 
             if grant_lines.is_empty() { "noo security pki fix-modes --dry-run".to_string() } else { grant_lines.join(" && ") },
         );
     }
+    let retired_open: Vec<&crate::pki::KeyIssue> = issues.iter().filter(|i| i.kind == K::RetiredLeaf && i.mode & 0o077 != 0).collect();
+    if !retired_open.is_empty() {
+        return fail(
+            "pki key modes",
+            retired_text(&retired_open),
+            retired_open.iter().map(|i| crate::pki::retired_leaf_rm_line(pki_dir, &i.rel)).collect::<Vec<_>>().join(" && "),
+        );
+    }
     let unreadable = names(K::Unreadable);
     if !unreadable.is_empty() {
         return warn(
@@ -4984,6 +5000,17 @@ pub(crate) fn pki_key_modes_check(issues: &[crate::pki::KeyIssue], grant_lines: 
             // A key with no reader entry is a third-party add-on's: its only
             // consumers are the provision copies, so fix-modes makes it 0600.
             Some("noo security pki fix-modes".to_string()),
+        );
+    }
+    // Retired TEI leaves: nothing reads them, so any other-account access is
+    // pure exposure. Group/world-readable (mode & 0o077) is a FAIL (above the
+    // WARN-only kinds); owner-only is a WARN. Both name `rm <path>`.
+    let retired_warn: Vec<&crate::pki::KeyIssue> = issues.iter().filter(|i| i.kind == K::RetiredLeaf).collect();
+    if !retired_warn.is_empty() {
+        return warn(
+            "pki key modes",
+            retired_text(&retired_warn),
+            Some(retired_warn.iter().map(|i| crate::pki::retired_leaf_rm_line(pki_dir, &i.rel)).collect::<Vec<_>>().join(" && ")),
         );
     }
     ok("pki key modes", format!("{total_keys} private key(s), each readable only by its reader"))
@@ -9836,7 +9863,7 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             .iter()
             .filter_map(|k| sso.key_grant_command(k))
             .collect();
-        checks.push(pki_key_modes_check(&key_issues, &grant_lines, sso.list_keys().len()));
+        checks.push(pki_key_modes_check(&key_issues, &grant_lines, sso.list_keys().len(), &sso.dir));
         checks.push(docker_userns_check(read_daemon_json()));
         // Compose runs only here (the stack launcher); nodes never run it.
         checks.push(docker_compose_check(
@@ -13278,36 +13305,36 @@ mod tests {
     fn the_pki_key_modes_row_names_the_file_and_the_fix() {
         use crate::pki::{KeyIssue, KeyIssueKind, KeyReader};
         let exposed = KeyIssue { rel: "nodes/host3/node.key".into(), mode: 0o644, reader: KeyReader::Cli, kind: KeyIssueKind::Exposed };
-        let c = pki_key_modes_check(std::slice::from_ref(&exposed), &[], 5);
+        let c = pki_key_modes_check(std::slice::from_ref(&exposed), &[], 5, std::path::Path::new("/p"));
         assert_eq!(c.verdict, Verdict::Fail, "a world-readable private key is a failure, not a warning");
         assert!(c.detail.contains("nodes/host3/node.key 0644"), "{}", c.detail);
         assert!(c.remedy.as_deref().unwrap().starts_with("noo security pki fix-modes"), "{:?}", c.remedy);
         // Owned by another uid and unreadable here: only the sudo line helps.
         let foreign = KeyIssue { rel: "services/nats/service.key".into(), mode: 0o600, reader: KeyReader::ContainerRoot, kind: KeyIssueKind::WrongOwner };
         let chown = "sudo chown 1000:1000 /p/services/nats/service.key && sudo chmod 600 /p/services/nats/service.key".to_string();
-        let c = pki_key_modes_check(std::slice::from_ref(&foreign), std::slice::from_ref(&chown), 5);
+        let c = pki_key_modes_check(std::slice::from_ref(&foreign), std::slice::from_ref(&chown), 5, std::path::Path::new("/p"));
         assert_eq!(c.verdict, Verdict::Fail);
         assert!(c.detail.contains("services/nats/service.key 0600") && c.detail.contains("another uid"), "{}", c.detail);
         assert_eq!(c.remedy.as_deref(), Some(chown.as_str()));
         let unreadable = KeyIssue { rel: "services/loki/service.key".into(), mode: 0o640, reader: KeyReader::ContainerUid(65532), kind: KeyIssueKind::Unreadable };
         let line = "sudo chgrp 65532 /p/services/loki/service.key && sudo chmod 640 /p/services/loki/service.key".to_string();
-        let c = pki_key_modes_check(&[unreadable], std::slice::from_ref(&line), 5);
+        let c = pki_key_modes_check(&[unreadable], std::slice::from_ref(&line), 5, std::path::Path::new("/p"));
         assert_eq!(c.verdict, Verdict::Warn);
         assert!(c.detail.contains("services/loki/service.key"), "{}", c.detail);
         assert_eq!(c.remedy.as_deref(), Some(line.as_str()));
         let unknown = KeyIssue { rel: "services/mystery/service.key".into(), mode: 0o644, reader: KeyReader::Unknown, kind: KeyIssueKind::UnknownReader };
-        let c = pki_key_modes_check(&[unknown], &[], 5);
+        let c = pki_key_modes_check(&[unknown], &[], 5, std::path::Path::new("/p"));
         assert_eq!(c.verdict, Verdict::Warn);
         let r = c.remedy.unwrap();
         assert_eq!(r, "noo security pki fix-modes", "fix-modes makes a no-reader key 0600 (i277a)");
         assert!(c.detail.contains("services/mystery/service.key 0644"), "{}", c.detail);
         // Exposure outranks an unreadable key: the fix for both is the same verb,
         // and the sudo line rides along when the verb alone cannot finish it.
-        let c = pki_key_modes_check(&[exposed, KeyIssue { rel: "x".into(), mode: 0o640, reader: KeyReader::ContainerUid(70), kind: KeyIssueKind::Unreadable }], std::slice::from_ref(&line), 5);
+        let c = pki_key_modes_check(&[exposed, KeyIssue { rel: "x".into(), mode: 0o640, reader: KeyReader::ContainerUid(70), kind: KeyIssueKind::Unreadable }], std::slice::from_ref(&line), 5, std::path::Path::new("/p"));
         assert!(c.detail.contains("beyond their reader"));
         let remedy = c.remedy.unwrap();
         assert!(remedy.starts_with("noo security pki fix-modes") && remedy.contains(&line), "{remedy}");
-        let c = pki_key_modes_check(&[], &[], 19);
+        let c = pki_key_modes_check(&[], &[], 19, std::path::Path::new("/p"));
         assert_eq!(c.verdict, Verdict::Ok);
         assert!(c.detail.contains("19 private key(s)"));
     }
@@ -13329,7 +13356,7 @@ mod tests {
                 .map(|kind| KeyIssue { rel: rel.into(), mode: acc.mode, reader, kind })
                 .into_iter()
                 .collect();
-            pki_key_modes_check(&issues, &[], 1)
+            pki_key_modes_check(&issues, &[], 1, std::path::Path::new("/p"))
         };
         let granted = |uid: u32| Access {
             mode: 0o640,
@@ -17076,7 +17103,7 @@ mod digest_tests {
             rel: "services/mystery/service.key".into(), mode: 0o644,
             reader: crate::pki::KeyReader::Unknown, kind: crate::pki::KeyIssueKind::UnknownReader,
         };
-        let c = pki_key_modes_check(&[unknown], &[], 5);
+        let c = pki_key_modes_check(&[unknown], &[], 5, std::path::Path::new("/p"));
         let r = c.remedy.unwrap();
         // fix-modes tightens a key with no reader row to 0600 (i277a).
         assert_eq!(r, "noo security pki fix-modes", "{r}");
