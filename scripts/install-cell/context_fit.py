@@ -307,12 +307,32 @@ def loop_lines(ev: list[dict]) -> list[dict]:
     return out
 
 
+# Turn markers: what starts a coordinator turn in the gateway's log. A WS
+# turn (this judge's) logs only its connection; an HTTP turn its stream start
+# or its completed request. backend_call, context_injected and the loop lines
+# name no conversation, so a turn's window is attributed by time, and any
+# OTHER turn start inside it makes the window's figures unattributable.
+TURN_PATHS = ("/api/inference", "/api/inference/chat", "/v1/chat/completions",
+              "/api/external/chat/completions", "/api/agent/run")
+INJECTED_FIELDS = ("dropped", "pre_dedup_chars", "post_dedup_chars")
+
+
+def turn_markers(ev: list[dict]) -> dict:
+    ws = sum(e["event"] == "ws_coordinator connected" for e in ev)
+    other = [f"chat stream {e.get('conversation_id', '?')}" for e in ev if e["event"] == "coordinator_chat_stream_start"]
+    other += [f"{e.get('method', '')} {e.get('path')}" for e in ev
+              if e["event"] == "request" and str(e.get("path", "")).split("?")[0] in TURN_PATHS]
+    return {"by": "time window: backend_call, context_injected and loop lines name no conversation",
+            "ws_connects": ws, "other_turn_starts": other[:10], "overlapped": ws > 1 or bool(other)}
+
+
 def log_facts(lines: list[str] | None) -> dict:
     """What a turn's gateway log says. `readable` False when the log could
     not be read at all (every other figure is then unknown)."""
     if lines is None:
         return {"readable": False, "request_size": [], "backend_calls": [], "cuts": 0, "too_small": 0,
-                "tiers": [], "has_tier": False, "prefill_s": None, "auth_failures": [], "loop": []}
+                "tiers": [], "has_tier": False, "prefill_s": None, "auth_failures": [], "loop": [],
+                "injected": [], "attribution": None}
     ev = [e for e in (parse_log_line(l) for l in lines) if e]
     sizes = [e for e in ev if e["event"] == "request_size"]
     calls = [e for e in ev if e["event"] == "backend_call"]
@@ -323,7 +343,10 @@ def log_facts(lines: list[str] | None) -> dict:
             "too_small": sum(e["event"] == "context_too_small_for_instructions" for e in ev),
             "tiers": tiers, "has_tier": bool(tiers),
             "prefill_s": round(sum(prefills) / 1000, 3) if prefills else None,
-            "auth_failures": auth_failure_reasons(lines), "loop": loop_lines(ev)}
+            "auth_failures": auth_failure_reasons(lines), "loop": loop_lines(ev),
+            "injected": [{k: v for k, v in e.items() if k.startswith("has_") or k in INJECTED_FIELDS}
+                         for e in ev if e["event"] == "context_injected"],
+            "attribution": turn_markers(ev)}
 
 
 def pick_contexts(items: list[dict], model: str | None) -> list[dict]:
@@ -576,7 +599,9 @@ def turn_record(name: str, verdict, reason: str, elapsed_s: float, facts: dict, 
             "cached": bool(done.get("cached")), "tools": [c.get("name") for c in chat.get("calls", [])],
             "approval_request": bool(chat.get("approval")), "error": chat.get("error"),
             "answer": _excerpt(chat.get("text", ""), 800), "wire": turn_wires(facts),
-            "loop": facts.get("loop", []), **turn_tokens(facts)}
+            "loop": facts.get("loop", []), "context_injected": facts.get("injected", []),
+            "kb_tool_deferred": sum(e.get("event") == "coordinator.kb_tool_deferred" for e in facts.get("loop", [])),
+            "attribution": facts.get("attribution"), **turn_tokens(facts)}
 
 
 def turn_tokens(facts: dict) -> dict:
