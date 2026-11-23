@@ -69,7 +69,7 @@ jobs:
           cargo test --locked --no-run --message-format=json > "$RUNNER_TEMP/build.json"
           for b in $(jq -r 'select(.reason == "compiler-artifact" and .profile.test == true and .executable != null) | .executable' "$RUNNER_TEMP/build.json"); do
             if "$b" --list --ignored 2>/dev/null | grep -qx 'harness::egress_selftest::tests::real_hold_serves: test'; then
-              sudo install -m 755 "$b" /usr/local/libexec/noo-ci-selftest
+              sudo install -D -m 755 "$b" /usr/local/libexec/noo-ci-selftest
               break
             fi
           done
