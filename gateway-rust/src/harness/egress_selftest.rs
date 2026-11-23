@@ -153,12 +153,14 @@ async fn gateway_reachable(host: &str, port: u16) -> bool {
 }
 
 /// One check's full record: [`record`] plus what the periodic check adds.
-/// `enforced` also needs no allowed address to answer DNS; a replaced
-/// resolv.conf alone does not clear it (the allow list still holds) and is
-/// carried as `resolv_held`.
-pub fn record_full(base: Value, checked_at: u64, resolv_held: bool, dns_reachable: &[String], gateway: Option<(String, bool)>) -> Value {
+/// `enforced` also needs the allow file to list something (with none, the
+/// DNS check would pass having asked nobody) and no allowed address to answer
+/// DNS; a replaced resolv.conf alone does not clear it (the allow list still
+/// holds) and is carried as `resolv_held`. The DNS check asks over UDP.
+pub fn record_full(base: Value, checked_at: u64, allow_listed: bool, resolv_held: bool, dns_reachable: &[String], gateway: Option<(String, bool)>) -> Value {
     let mut r = base;
-    let enforced = r["enforced"] == Value::Bool(true) && dns_reachable.is_empty();
+    let enforced = r["enforced"] == Value::Bool(true) && allow_listed && dns_reachable.is_empty();
+    r["allow_file"] = json!(if allow_listed { "ok" } else { "missing" });
     r["enforced"] = json!(enforced);
     r["checked_at"] = json!(checked_at);
     r["resolv_held"] = json!(resolv_held);
@@ -276,9 +278,12 @@ pub async fn check_once(started_at: u64, gateway_url: &str) -> Option<Value> {
     let udp6 = std::fs::read_to_string("/proc/net/udp6").unwrap_or_default();
     let loopback_dns = reachable_dns_listener(&udp, &udp6);
     let held_resolv = resolv_held(&std::fs::read_to_string("/etc/resolv.conf").unwrap_or_default());
+    // A missing or empty allow file (an applier older than it) is not held:
+    // the DNS check below would otherwise pass having asked nobody.
+    let allowed = std::fs::read_to_string(ALLOW_FILE).map(|t| allowed_addrs(&t)).unwrap_or_default();
     let mut dns_reachable = Vec::new();
-    for a in allowed_addrs(&std::fs::read_to_string(ALLOW_FILE).unwrap_or_default()) {
-        if dns_answers(a).await {
+    for a in &allowed {
+        if dns_answers(*a).await {
             dns_reachable.push(a.to_string());
         }
     }
@@ -287,7 +292,7 @@ pub async fn check_once(started_at: u64, gateway_url: &str) -> Option<Value> {
         None => None,
     };
     let base = record(std::process::id(), started_at, resolved, &connect, loopback_dns.as_deref());
-    let rec = record_full(base, now_secs(), held_resolv, &dns_reachable, gateway);
+    let rec = record_full(base, now_secs(), !allowed.is_empty(), held_resolv, &dns_reachable, gateway);
     let enforced = rec["enforced"] == Value::Bool(true);
     let hold_installed = std::env::var(HOLD_ENV).is_ok_and(|v| v.trim() == "1");
     SERVING.store(serving_for(hold_installed, enforced), Ordering::SeqCst);
@@ -375,19 +380,22 @@ mod tests {
     #[test]
     fn an_answering_address_clears_enforced_and_a_replaced_resolv_conf_does_not() {
         let held = record(7, 1, false, "denied", None);
-        let r = record_full(held.clone(), 100, true, &["10.0.0.5".into()], None);
+        let r = record_full(held.clone(), 100, true, true, &["10.0.0.5".into()], None);
         assert_eq!(r["enforced"], false, "a resolver answered at an allowed address");
         assert_eq!(r["dns_reachable"], json!(["10.0.0.5"]));
-        let lost = record_full(held.clone(), 100, false, &[], Some(("ctl:8443".into(), true)));
+        let lost = record_full(held.clone(), 100, true, false, &[], Some(("ctl:8443".into(), true)));
         assert_eq!(lost["enforced"], true, "the allow list still holds");
         assert_eq!(lost["resolv_held"], false);
         assert_eq!(lost["gateway"], json!({"addr": "ctl:8443", "result": "ok"}));
         assert_eq!(lost["checked_at"], 100);
-        let gw = record_full(held, 100, true, &[], Some(("ctl:8443".into(), false)));
+        let gw = record_full(held.clone(), 100, true, true, &[], Some(("ctl:8443".into(), false)));
         assert_eq!((gw["enforced"].clone(), gw["gateway"]["result"].clone()), (json!(true), json!("failed")), "a stale allow list is not a leak");
-        let open = record_full(record(7, 1, true, "denied", None), 100, true, &[], None);
+        let open = record_full(record(7, 1, true, "denied", None), 100, true, true, &[], None);
         assert_eq!(open["enforced"], false, "a resolving lookup stays not held");
         assert_eq!(open["version"], 1, "the record stays version 1 for the agents already out");
+        let none = record_full(held, 100, false, true, &[], None);
+        assert_eq!((none["enforced"].clone(), none["allow_file"].clone()), (json!(false), json!("missing")),
+            "no allow file: the DNS check asked nobody, so never held");
     }
 
     #[test]
