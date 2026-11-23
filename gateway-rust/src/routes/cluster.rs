@@ -1665,7 +1665,7 @@ async fn node_register_body(
         let claims = AddressClaims::current(node_id, body.get("self_node").and_then(Value::as_bool) == Some(true));
         if let Some(why) = address_refusal(node_id, &ip, &claims, &[]) {
             tracing::warn!(node = %node_id, offered = %ip, reason = %why, "ip_address_refused");
-            keep_stored_address(&mut data, stored.as_ref(), node_id, &claims, &[], &why);
+            data["ip_address"] = Value::Null; let _ = (&stored, &claims, &why);
         }
     }
     carry_target_node(&mut data, &body);
