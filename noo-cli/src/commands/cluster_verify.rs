@@ -1670,7 +1670,7 @@ pub(crate) fn docker_engine_check(n: &Value) -> Option<Check> {
             let remedy = format!("on {id} (run on that machine, with sudo): sudo systemctl start docker   # then, from the controller: noo cluster verify {id}");
             let containers = container_lane_backends(n);
             if containers.is_empty() {
-                Some(warn(NAME, detail, Some(remedy)))
+                Some(ok(NAME, detail))
             } else {
                 Some(fail(NAME, format!("{detail}; its container-lane backend(s) {} cannot run without it", containers.join(", ")), remedy))
             }
