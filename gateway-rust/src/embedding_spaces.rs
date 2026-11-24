@@ -567,7 +567,7 @@ async fn seed_if_empty(db: &sqlx::PgPool) -> Result<(), sqlx::Error> {
     // so an unreadable placements table must not seed the configured model
     // in place of the declared one (#650 sweep): fail the seed, next boot retries.
     let models: Vec<String> = sqlx::query_scalar(
-        "SELECT model FROM noo_backend_placements WHERE role = 'embed' AND model IS NOT NULL AND model <> ''",
+        "SELECT model FROM noo_backend_placements WHERE role = 'embed' AND backend <> 'reranker' AND model IS NOT NULL AND model <> ''",
     )
     .fetch_all(db)
     .await?;

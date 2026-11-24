@@ -211,7 +211,7 @@ async fn harness_effective_in(db: &sqlx::PgPool, node: &str, is_self: bool, runn
         return Ok(false);
     }
     let chat: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM noo_backend_placements WHERE node_id = $1 AND backend <> 'harness'          AND desired_state = 'running' AND (role IS NULL OR role = '' OR role = 'chat')",
+        "SELECT COUNT(*) FROM noo_backend_placements WHERE node_id = $1 AND backend <> 'harness'          AND backend <> 'reranker' AND desired_state = 'running' AND (role IS NULL OR role = '' OR role = 'chat')",
     )
     .bind(node)
     .fetch_one(db)
@@ -623,6 +623,19 @@ pub async fn try_dispatch<S: TurnSink>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The `auto` harness policy runs a harness only beside a chat placement:
+    /// an rc.5 reranker row stored as chat is not one (it is rerank,
+    /// `role_capability::effective_role`).
+    #[test]
+    fn a_chat_roled_reranker_row_does_not_count_as_a_chat_placement() {
+        let own = crate::test_src::own_code(include_str!("dispatch.rs"));
+        let body = crate::test_src::fn_body(&own, "async fn harness_effective_in(");
+        let count = &body[body.find("SELECT COUNT(*) FROM noo_backend_placements").expect("the chat count")..];
+        let count = &count[..count.find("\",").expect("one statement")];
+        assert!(count.contains("AND backend <> 'reranker'"), "{count}");
+        assert!(count.contains("role = 'chat'"), "{count}");
+    }
 
     /// The console names the node and kind answering (i233 fix 3). A
     /// harness older than 0.6.13 acks without a kind: the event then names

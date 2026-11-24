@@ -4557,6 +4557,9 @@ async fn desired_config_get(
         .map(
             |(backend, model, image, port, tls, env, desired_state, role, target, memory_limit_bytes, keep_warm)| {
                 let image = placement_image(&backend, image, &|k: &str| std::env::var(k).ok());
+                // The role the placement SERVES: an rc.5 reranker row stored
+                // as chat reaches the agent (and every reader below) as rerank.
+                let role = crate::role_capability::effective_role(&backend, &role).to_string();
                 json!({
                     "backend": backend,
                     "model": model,
@@ -5398,11 +5401,21 @@ fn staged_image_space_facts(dir: &std::path::Path, node: &Value, backend: &str, 
 pub const PLACEMENT_ROLES: &[&str] = &["chat", "embed", "rerank", "harness"];
 
 /// The role a placement request names: explicit, else the backend's default
-/// (`harness` for the harness backend, `chat` for everything else).
+/// (`harness` for the harness backend, `rerank` for the reranker, `chat` for
+/// everything else).
+///
+/// A `reranker` (llama.cpp `--reranking`) serves the rerank role only: a bare
+/// place (`noo cluster place <node> reranker <file>.gguf`, the documented
+/// form) is `rerank`, and any other role is refused. Until 0.6.30-rc.6 the
+/// bare form stored `chat`, so the reranker never routed. The reverse stays
+/// open: any other backend may be placed for `rerank` (`llamacpp --role
+/// rerank`, an ollama cross-encoder), as before.
 pub(crate) fn resolve_role(backend: &str, role: Option<&str>) -> Result<String, String> {
     let r = match (backend, role.map(str::trim).filter(|r| !r.is_empty())) {
         ("harness", None) | ("harness", Some("harness")) => "harness",
         ("harness", Some(other)) => return Err(format!("the harness has no role {other:?}")),
+        ("reranker", None) | ("reranker", Some("rerank")) => "rerank",
+        ("reranker", Some(other)) => return Err(reranker_role_refusal(other)),
         (_, None) => "chat",
         (_, Some(r)) => r,
     };
@@ -5413,6 +5426,27 @@ pub(crate) fn resolve_role(backend: &str, role: Option<&str>) -> Result<String, 
         return Err("role 'harness' belongs to the 'harness' backend only".into());
     }
     Ok(r.to_string())
+}
+
+/// Why a `reranker` placement may not name `role`. The CLI says the same.
+pub(crate) fn reranker_role_refusal(role: &str) -> String {
+    format!("a reranker serves the rerank role only, not {role:?}: place it with no role (or role rerank)")
+}
+
+/// The role a placement is STORED under: `resolved` ([`resolve_role`]),
+/// except that a `reranker` already stored under another role (`chat`, from
+/// an rc.5 gateway) keeps that row's key. No migration rewrites those rows
+/// and every reader reads them as rerank
+/// ([`crate::role_capability::effective_role`]); writing `rerank` beside one
+/// would give the node two reranker rows for one container. `stored` is the
+/// roles the node's rows for `backend` hold now.
+pub(crate) fn storage_role(backend: &str, resolved: &str, stored: &[String]) -> String {
+    if backend == crate::role_capability::RERANKER_BACKEND && !stored.iter().any(|r| r == resolved) {
+        if let Some(legacy) = stored.first() {
+            return legacy.clone();
+        }
+    }
+    resolved.to_string()
 }
 
 /// The placement upsert, keyed (node, backend, ROLE) -- and, for role=embed
@@ -5615,7 +5649,11 @@ pub(crate) async fn stored_placements(state: &AppState, node_id: &str) -> Result
     .map_err(|e| AppError::Internal(format!("placements query: {e}")))?;
     Ok(rows
         .into_iter()
-        .map(|(backend, role, model, env, desired_state, target, keep_warm)| StoredPlacement { backend, role, model, env, desired_state, target, keep_warm })
+        .map(|(backend, role, model, env, desired_state, target, keep_warm)| {
+            // Read through the one helper: an rc.5 reranker row is rerank.
+            let role = crate::role_capability::effective_role(&backend, &role).to_string();
+            StoredPlacement { backend, role, model, env, desired_state, target, keep_warm }
+        })
         .collect())
 }
 
@@ -6127,6 +6165,16 @@ async fn placement_put(
     // just the primary row of any other backend), so a second embed model on
     // TEI/llamacpp REPLACES the first, as it always did, instead of adding a
     // row the node could not serve.
+    // An rc.5 reranker row (role chat) is the slot this place updates: its
+    // key is kept, and it reads as rerank everywhere.
+    let stored_as = if backend == crate::role_capability::RERANKER_BACKEND {
+        let held = crate::repo::cluster::node_backend_stored_roles(&state.db, &node_id, &backend)
+            .await
+            .map_err(|e| AppError::Internal(format!("placement lookup: {e}")))?;
+        storage_role(&backend, &role, &held)
+    } else {
+        role.clone()
+    };
     // The replace, the upsert and the kill of this slot's unplace tombstone
     // commit together: a place after an unplace can never be followed by a
     // node removing the container (repo/backend_unplaced.rs).
@@ -6152,14 +6200,14 @@ async fn placement_put(
         .bind(body.tls)
         .bind(&body.env)
         .bind(&desired)
-        .bind(&role)
+        .bind(&stored_as)
         .bind(target)
         .bind(memory_limit.as_ref().map(|(b, _)| *b as i64))
         .bind(body.keep_warm)
         .execute(&mut *tx)
         .await
         .map_err(|e| AppError::Internal(format!("placement upsert: {e}")))?;
-    crate::repo::backend_unplaced::kill(&mut *tx, &node_id, &backend, &role)
+    crate::repo::backend_unplaced::kill(&mut *tx, &node_id, &backend, &stored_as)
         .await
         .map_err(|e| AppError::Internal(format!("placement upsert: unplace record: {e}")))?;
     tx.commit().await.map_err(|e| AppError::Internal(format!("placement upsert: {e}")))?;
@@ -6221,6 +6269,12 @@ async fn placement_delete(
         // One role: the old unambiguous meaning, unless that role is embed
         // with several models (then the model must be named below).
         None => roles.first().filter(|r| r.as_str() == "embed").cloned(),
+    };
+    // A reranker has one row, read as rerank whatever it stored (an rc.5 row
+    // says chat): `role=rerank` removes it.
+    let target = match target {
+        Some(r) if backend == crate::role_capability::RERANKER_BACKEND && r == "rerank" => None,
+        t => t,
     };
     if target.as_deref() == Some("embed") && model.is_none() {
         let models: Vec<&str> = rows.iter().filter(|(r, _)| r == "embed").filter_map(|(_, m)| m.as_deref()).collect();
@@ -6752,7 +6806,7 @@ async fn embedding_spaces_get(State(state): State<Arc<AppState>>) -> AppResult {
         .await
         .map_err(|e| AppError::Internal(format!("embedding spaces read: {e}")))?;
     let placements = sqlx::query_as::<_, (String, String, Option<String>, String)>(
-        "SELECT node_id, backend, model, desired_state FROM noo_backend_placements WHERE role = 'embed' ORDER BY node_id, backend",
+        "SELECT node_id, backend, model, desired_state FROM noo_backend_placements WHERE role = 'embed' AND backend <> 'reranker' ORDER BY node_id, backend",
     )
     .fetch_all(&state.db)
     .await
@@ -9603,6 +9657,68 @@ mod placement_role_tests {
         assert!(resolve_role("ollama", Some("bogus")).is_err());
     }
 
+    /// The documented reranker place names no role: it is rerank, never the
+    /// chat default (0.6.30-rc.5 rehearsal).
+    #[test]
+    fn a_bare_reranker_place_is_the_rerank_role() {
+        assert_eq!(resolve_role("reranker", None).unwrap(), "rerank");
+        assert_eq!(resolve_role("reranker", Some(" ")).unwrap(), "rerank");
+        assert_eq!(resolve_role("reranker", Some("rerank")).unwrap(), "rerank");
+    }
+
+    /// A reranker serves rerank only: chat or embed is refused, with the
+    /// message the CLI gives too.
+    #[test]
+    fn a_reranker_with_another_role_is_refused() {
+        for r in ["chat", "embed", "harness"] {
+            let e = resolve_role("reranker", Some(r)).expect_err(r);
+            assert_eq!(e, reranker_role_refusal(r));
+            assert!(e.contains("a reranker serves the rerank role only"), "{e}");
+        }
+    }
+
+    /// The reverse stays open (as before rc.6): any other model backend may be
+    /// placed for rerank (`noo cluster place <node> llamacpp <file> --role
+    /// rerank`), and its bare place is still chat.
+    #[test]
+    fn a_non_reranker_backend_may_still_serve_rerank() {
+        for b in ["llamacpp", "ollama", "vllm"] {
+            assert_eq!(resolve_role(b, Some("rerank")).unwrap(), "rerank", "{b}");
+            assert_eq!(resolve_role(b, None).unwrap(), "chat", "{b}");
+        }
+        assert_eq!(crate::role_capability::effective_role("llamacpp", "rerank"), "rerank");
+    }
+
+    /// The stored key: rerank for a new reranker, the existing row's key for
+    /// an rc.5 one (so a re-place updates it, never adds a second row), and
+    /// the resolved role for every other backend.
+    #[test]
+    fn a_reranker_keeps_its_stored_key() {
+        let held = |rs: &[&str]| rs.iter().map(|r| r.to_string()).collect::<Vec<String>>();
+        assert_eq!(storage_role("reranker", "rerank", &held(&[])), "rerank");
+        assert_eq!(storage_role("reranker", "rerank", &held(&["chat"])), "chat");
+        assert_eq!(storage_role("reranker", "rerank", &held(&["rerank"])), "rerank");
+        assert_eq!(storage_role("llamacpp", "rerank", &held(&["chat"])), "rerank", "another backend's rerank is a second row beside its chat");
+        assert_eq!(storage_role("ollama", "embed", &held(&["chat"])), "embed");
+    }
+
+    /// Every placement the agent (and the harness policy, the context rows,
+    /// the tombstone filter) reads from desired-config carries the SERVED
+    /// role, and the fit/slot reads take it from `stored_placements`.
+    #[test]
+    fn desired_config_and_stored_placements_read_the_served_role() {
+        let own = crate::test_src::own_code(include_str!("cluster.rs"));
+        let get = crate::test_src::fn_body(&own, "async fn desired_config_get(");
+        let at = get.find("let role = crate::role_capability::effective_role(&backend, &role).to_string();").expect("desired-config reads the served role");
+        assert!(at < get.find("\"role\": role,").expect("and sends it"));
+        let stored = crate::test_src::fn_body(&own, "pub(crate) async fn stored_placements(");
+        assert!(stored.contains("crate::role_capability::effective_role(&backend, &role)"), "stored placements read the served role");
+        let put = crate::test_src::fn_body(&own, "async fn placement_put(");
+        assert!(put.contains(".bind(&stored_as)") && !put.contains(".bind(&role)"), "the upsert writes the stored key");
+        let del = crate::test_src::fn_body(&own, "async fn placement_delete(");
+        assert!(del.contains("r == \"rerank\" => None"), "role=rerank removes the reranker's row whatever it stored");
+    }
+
     #[test]
     fn a_model_change_does_not_carry_env_over_but_the_same_model_keeps_it() {
         let harrier = stored("ollama", "embed", "harrier", json!({"OLLAMA_NUM_PARALLEL": "4"}));
@@ -9717,16 +9833,51 @@ mod placement_role_tests {
     }
 
     /// The live incident, on the real upsert and the real migrated schema.
-    #[tokio::test]
-    async fn two_roles_on_one_backend_coexist_and_nothing_carries_over() {
-        let Some((admin, db)) = scratch("mrp_roles_test").await else { return };
+    /// A scratch database with the real migrated schema (None without a DSN).
+    async fn migrated(name: &str) -> Option<(sqlx::PgPool, sqlx::PgPool)> {
+        let (admin, db) = scratch(name).await?;
         std::env::set_var("NOO_APP_DB_PASSWORD", "ephemeral-not-a-secret");
         for ext in ["vector", "pg_trgm"] {
             sqlx::query(sqlx::AssertSqlSafe(format!("CREATE EXTENSION IF NOT EXISTS {ext}"))).execute(&db).await.expect("extension");
         }
         crate::mesh_migrate::apply(&db).await.expect("apply");
         db.close().await;
-        let db = pool(&std::env::var("NOO_BROKER_TEST_DSN").unwrap(), "mrp_roles_test").await;
+        Some((admin, pool(&std::env::var("NOO_BROKER_TEST_DSN").unwrap(), name).await))
+    }
+
+    /// An rc.5 reranker row (role chat) on the real schema: every SQL reader
+    /// reads it as rerank, and placing the reranker again (no role) updates
+    /// that row instead of adding a second one. No migration touches it.
+    #[tokio::test]
+    async fn an_rc5_chat_roled_reranker_row_reads_as_rerank_in_every_query() {
+        let Some((admin, db)) = migrated("mrp_reranker_role_test").await else { return };
+        let gguf = "bge-reranker-v2-m3-Q8_0.gguf";
+        upsert(&db, "llamacpp", Some("chat.gguf"), None, "chat").await;
+        upsert(&db, "reranker", Some(gguf), None, "chat").await;
+        let nc = crate::repo::cluster::placements_non_chat(&db).await.unwrap();
+        assert_eq!(nc, vec![("host6".to_string(), "reranker".to_string())], "the reranker is out of chat, llamacpp is not");
+        let chats = crate::repo::cluster::running_chat_placements_newest_first(&db).await.unwrap();
+        assert!(chats.iter().all(|(_, b, _, _)| b != "reranker") && chats.iter().any(|(_, b, _, _)| b == "llamacpp"), "{chats:?}");
+        let roles = crate::repo::cluster::node_running_roles(&db, "host6").await.unwrap();
+        assert!(roles.contains(&("reranker".to_string(), "rerank".to_string())) && !roles.contains(&("reranker".to_string(), "chat".to_string())), "{roles:?}");
+        assert!(crate::repo::cluster::node_has_running_role(&db, "host6", "rerank").await.unwrap());
+        crate::role_capability::invalidate();
+        let facts = crate::role_capability::all_facts(&db).await.unwrap();
+        crate::role_capability::invalidate();
+        assert!(facts.iter().any(|f| f.node_id == "host6" && f.backend == "reranker" && f.role == "rerank"), "{facts:?}");
+        // Re-placed with no role: resolved rerank, stored under the row's own key.
+        let held = crate::repo::cluster::node_backend_stored_roles(&db, "host6", "reranker").await.unwrap();
+        assert_eq!(held, vec!["chat".to_string()]);
+        let stored_as = storage_role("reranker", &resolve_role("reranker", None).unwrap(), &held);
+        assert_eq!(stored_as, "chat");
+        upsert(&db, "reranker", Some(gguf), None, &stored_as).await;
+        assert_eq!(rows(&db).await.iter().filter(|r| r.0 == "reranker").count(), 1, "one reranker row, never two");
+        drop_db(&admin, db, "mrp_reranker_role_test").await;
+    }
+
+    #[tokio::test]
+    async fn two_roles_on_one_backend_coexist_and_nothing_carries_over() {
+        let Some((admin, db)) = migrated("mrp_roles_test").await else { return };
 
         // chat first, then the embedder beside it: the second place must not replace the first.
         upsert(&db, "ollama", Some("gemma4:26b-a4b-it-qat"), None, "chat").await;

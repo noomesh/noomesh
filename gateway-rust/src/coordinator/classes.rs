@@ -329,15 +329,19 @@ pub struct Lane {
     pub backend: String,
     /// The placed model, verbatim; never empty (a lane without one is dropped).
     pub model: String,
-    /// The placement role; `""` or `chat` is a chat lane.
+    /// The placement role; `""` or `chat` is a chat lane (read through
+    /// [`crate::role_capability::effective_role`]: a reranker never is).
     pub role: String,
     pub state: LaneState,
     pub reason: String,
 }
 
 impl Lane {
+    /// A chat lane: role `""` or `chat`, read through
+    /// [`crate::role_capability::effective_role`], so a `reranker` lane is
+    /// never one, even from an agent that copied an rc.5 placement's `chat`.
     pub fn is_chat(&self) -> bool {
-        matches!(self.role.as_str(), "" | "chat")
+        matches!(crate::role_capability::effective_role(&self.backend, &self.role), "" | "chat")
     }
 
     /// One `lanes` entry, or `None` when it names no backend or no model.
@@ -595,11 +599,12 @@ pub fn is_embedding_model_name(model: &str) -> bool {
 /// model the operator placed as chat is always chat.
 fn chat_model_for(n: &NodeFacts, placements: &[PlacementRow], backend: &str, reported: &str) -> Option<String> {
     let rows = || placements.iter().filter(|(node, b, _, _)| node == &n.node_id && b == backend);
-    let placed_chat: Vec<&str> = rows().filter(|(_, _, _, r)| r == "chat").filter_map(|(_, _, m, _)| m.as_deref()).collect();
+    let chat = |b: &str, r: &str| crate::role_capability::effective_role(b, r) == "chat";
+    let placed_chat: Vec<&str> = rows().filter(|(_, b, _, r)| chat(b.as_str(), r.as_str())).filter_map(|(_, _, m, _)| m.as_deref()).collect();
     if placed_chat.iter().any(|m| same_model(m, reported)) {
         return Some(reported.to_string());
     }
-    let not_chat = rows().any(|(_, _, m, r)| r != "chat" && m.as_deref().is_some_and(|m| same_model(m, reported)))
+    let not_chat = rows().any(|(_, b, m, r)| !chat(b.as_str(), r.as_str()) && m.as_deref().is_some_and(|m| same_model(m, reported)))
         || n.reported_non_chat_models.iter().any(|(b, m)| b == backend && same_model(m, reported))
         || is_embedding_model_name(reported);
     if !not_chat {
@@ -927,7 +932,7 @@ pub fn build_table(nodes: &[NodeFacts], placements: &[PlacementRow], decl: &Decl
                 .filter(|(n, b, _, _)| n == &dc.node_id && b == &dc.backend)
                 // Several roles may share the backend: a chat class names
                 // the CHAT row's model, else the first row.
-                .min_by_key(|(_, _, _, role)| if role == "chat" { 0 } else { 1 })
+                .min_by_key(|(_, b, _, role)| if crate::role_capability::effective_role(b, role) == "chat" { 0 } else { 1 })
                 .and_then(|(_, _, m, _)| m.clone());
             let node = nodes.iter().find(|n| n.node_id == dc.node_id);
             // What the backend runs, as a CHAT model: an embedder it reports
@@ -1654,7 +1659,10 @@ pub fn node_facts_from_kv(key: &str, data: &Value, non_chat: &[(String, String)]
         .and_then(Value::as_object)
         .map(|o| {
             o.iter()
-                .filter(|(_, e)| !matches!(e["role"].as_str(), None | Some("") | Some("chat")))
+                .filter(|(k, e)| {
+                    let backend = k.split('#').next().unwrap_or_default();
+                    !matches!(crate::role_capability::effective_role(backend, e["role"].as_str().unwrap_or("")), "" | "chat")
+                })
                 .filter_map(|(k, e)| Some((k.split('#').next()?.to_string(), e["model"].as_str().filter(|m| !m.is_empty())?.to_string())))
                 .collect()
         })
@@ -1810,7 +1818,8 @@ pub fn non_chat_pairs(placements: &[PlacementRow]) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = placements
         .iter()
         .filter(|(n, b, _, role)| {
-            role != "chat" && !placements.iter().any(|(n2, b2, _, r2)| n2 == n && b2 == b && r2 == "chat")
+            let chat = |b: &str, r: &str| crate::role_capability::effective_role(b, r) == "chat";
+            !chat(b.as_str(), role.as_str()) && !placements.iter().any(|(n2, b2, _, r2)| n2 == n && b2 == b && chat(b2.as_str(), r2.as_str()))
         })
         .map(|(n, b, _, _)| (n.clone(), b.clone()))
         .collect();
@@ -2114,13 +2123,21 @@ fn note_yaml_model_is_a_hint(state: &AppState) {
 
 // ── storage ──────────────────────────────────────────────────────────────
 
+/// The RUNNING placements, each role read through
+/// [`crate::role_capability::effective_role`] (a reranker's row is rerank).
 pub async fn load_placements(db: &sqlx::PgPool) -> Result<Vec<PlacementRow>, sqlx::Error> {
     let rows: Vec<(String, String, Option<String>, String)> = sqlx::query_as(
         "SELECT node_id, backend, model, COALESCE(role, 'chat') FROM noo_backend_placements WHERE desired_state = 'running'",
     )
     .fetch_all(db)
     .await?;
-    Ok(rows)
+    Ok(rows
+        .into_iter()
+        .map(|(n, b, m, r)| {
+            let r = crate::role_capability::effective_role(&b, &r).to_string();
+            (n, b, m, r)
+        })
+        .collect())
 }
 
 pub async fn load_declarations(db: &sqlx::PgPool) -> Result<Declarations, sqlx::Error> {
@@ -3523,6 +3540,88 @@ mod lane_tests {
 
     fn lane(backend: &str, model: &str, role: &str, state: &str, reason: &str) -> Value {
         json!({"backend": backend, "model": model, "role": role, "state": state, "reason": reason})
+    }
+
+    const RERANKER_GGUF: &str = "bge-reranker-v2-m3-Q8_0.gguf";
+
+    /// What an rc.5 gateway stored for `noo cluster place n1 reranker <file>`:
+    /// both rows role chat.
+    fn chat_roled_reranker_rows() -> Vec<PlacementRow> {
+        vec![
+            ("n1".into(), "llamacpp".into(), Some("/models/chat.gguf".into()), "chat".into()),
+            ("n1".into(), "reranker".into(), Some(format!("/models/{RERANKER_GGUF}")), "chat".into()),
+        ]
+    }
+
+    fn assert_reranker_not_chat_default(t: &ClassTable, file: &str, case: &str) {
+        let cands = &t.all_chat.as_ref().unwrap_or_else(|| panic!("{case}: a chat-default")).candidates;
+        assert!(cands.iter().any(|c| c.backend == "llamacpp" && c.model == "chat.gguf"), "{case}: the chat model is a candidate: {cands:?}");
+        assert!(!cands.iter().any(|c| c.backend == "reranker"), "{case}: the reranker never is: {cands:?}");
+        assert!(t.class(file).is_none(), "{case}: no class is named after the reranker's file");
+    }
+
+    /// A running reranker whose placement (and, from an agent that copies
+    /// it, lane) says role chat is never a chat-default candidate. Not a live
+    /// misroute on dev: `build_table` admits only `INFERENCE_TYPES`. This
+    /// guards that, and the lane role (`Lane::is_chat`) beside it.
+    #[test]
+    fn a_running_reranker_stored_with_role_chat_is_not_in_chat_default() {
+        let placements = chat_roled_reranker_rows();
+        // Case 1, lanes as the agent sends them, the placement role copied.
+        let lanes = json!([
+            lane("llamacpp", "/models/chat.gguf", "chat", LaneState::Serving.as_str(), ""),
+            lane("reranker", &format!("/models/{RERANKER_GGUF}"), "chat", LaneState::Serving.as_str(), ""),
+        ]);
+        let running = json!({"running_backends": {"llamacpp": "chat.gguf", "reranker": RERANKER_GGUF}});
+        let with_lanes = facts(&rec("n1", "100.64.0.1", lanes, running.clone()));
+        assert_reranker_not_chat_default(&build_table(&[with_lanes], &placements, &Declarations::default()), RERANKER_GGUF, "lanes");
+        // Case 2, no lanes: running_backends only, with no placement join to
+        // help (dev's `non_chat_pairs` never listed a chat-roled row).
+        let mut bare = rec("n1", "100.64.0.1", json!([]), running);
+        bare.as_object_mut().expect("a record").remove("lanes");
+        let no_lanes = node_facts_from_kv("n1", &bare, &[], 1001.0);
+        assert!(no_lanes.lanes.is_none() && no_lanes.running.iter().any(|(b, _)| b == "reranker"), "{:?}", no_lanes.running);
+        assert_reranker_not_chat_default(&build_table(&[no_lanes], &placements, &Declarations::default()), RERANKER_GGUF, "no lanes");
+        // Case 3: a cross-encoder file the name registry does not know, no
+        // lanes, no placement rows: only `INFERENCE_TYPES` keeps it out.
+        let mut unknown = rec("n1", "100.64.0.1", json!([]), json!({"running_backends": {"llamacpp": "chat.gguf", "reranker": "cross-encoder-q8.gguf"}}));
+        unknown.as_object_mut().expect("a record").remove("lanes");
+        let unknown = node_facts_from_kv("n1", &unknown, &[], 1001.0);
+        assert_reranker_not_chat_default(&build_table(&[unknown], &[], &Declarations::default()), "cross-encoder-q8.gguf", "unknown file name");
+    }
+
+    /// The lane role: a reranker lane is never a chat lane, whatever role an
+    /// older agent copied onto it, so it is out of `running` and in `non_chat`
+    /// (and `node_chat_route`, which takes the first running non-chat-free
+    /// backend with no `INFERENCE_TYPES` filter, cannot name it).
+    #[test]
+    fn a_reranker_lane_is_never_a_chat_lane() {
+        let l = |backend: &str, role: &str| Lane { backend: backend.into(), model: "m".into(), role: role.into(), state: LaneState::Serving, reason: String::new() };
+        assert!(!l("reranker", "chat").is_chat() && !l("reranker", "").is_chat() && !l("reranker", "rerank").is_chat());
+        assert!(l("llamacpp", "chat").is_chat() && l("llamacpp", "").is_chat());
+        assert!(!l("llamacpp", "rerank").is_chat(), "an llamacpp placed for rerank stays non-chat");
+        let f = facts(&rec(
+            "n1",
+            "100.64.0.1",
+            json!([lane("reranker", RERANKER_GGUF, "chat", "serving", ""), lane("llamacpp", "chat.gguf", "chat", "serving", "")]),
+            json!({}),
+        ));
+        assert_eq!(f.running, vec![("llamacpp".to_string(), "chat.gguf".to_string())]);
+        assert_eq!(f.non_chat, vec!["reranker".to_string()]);
+        assert_eq!(f.running.iter().find(|(b, _)| !f.non_chat.contains(b)).map(|(b, _)| b.as_str()), Some("llamacpp"));
+    }
+
+    /// The placement join: an rc.5 row (reranker, role chat) is non-chat, and
+    /// does not make its backend look like a chat target. An llamacpp placed
+    /// for rerank is non-chat as before.
+    #[test]
+    fn a_chat_roled_reranker_row_is_non_chat_in_the_placement_join() {
+        assert_eq!(non_chat_pairs(&chat_roled_reranker_rows()), vec![("n1".to_string(), "reranker".to_string())]);
+        let llama_rerank: Vec<PlacementRow> = vec![("n2".into(), "llamacpp".into(), Some(RERANKER_GGUF.into()), "rerank".into())];
+        assert_eq!(non_chat_pairs(&llama_rerank), vec![("n2".to_string(), "llamacpp".to_string())]);
+        // The class table's own chat-model choice reads the same role.
+        let n = NodeFacts { node_id: "n1".into(), ..Default::default() };
+        assert_eq!(chat_model_for(&n, &chat_roled_reranker_rows(), "reranker", RERANKER_GGUF), None, "a reranker has no chat model");
     }
 
     #[test]

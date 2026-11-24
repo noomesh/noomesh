@@ -69,6 +69,10 @@ where
 /// AND an embedder. Such a pair is a chat target (its chat model is what the
 /// node reports as the backend's model), so a backend with a RUNNING chat row
 /// is not in this set — only a backend whose every running row is non-chat.
+/// A `reranker` row is never chat, whatever its role says (an rc.5 gateway
+/// stored a bare reranker place as `chat`): the SQL spelling of
+/// [`crate::role_capability::effective_role`], on both sides.
+///
 /// A runtime query, not a `query!`: the NOT EXISTS shape is what changed, and
 /// the offline cache is keyed by the query text.
 pub async fn placements_non_chat<'e, E>(db: E) -> Result<Vec<Placement>, sqlx::Error>
@@ -77,10 +81,10 @@ where
 {
     let rows: Vec<(String, String)> = sqlx::query_as(
         "SELECT DISTINCT p.node_id, p.backend FROM noo_backend_placements p \
-         WHERE p.role <> 'chat' AND NOT EXISTS ( \
+         WHERE (p.role <> 'chat' OR p.backend = 'reranker') AND NOT EXISTS ( \
              SELECT 1 FROM noo_backend_placements c \
              WHERE c.node_id = p.node_id AND c.backend = p.backend \
-               AND c.role = 'chat' AND c.desired_state = 'running')",
+               AND c.role = 'chat' AND c.backend <> 'reranker' AND c.desired_state = 'running')",
     )
     .fetch_all(db)
     .await?;
@@ -96,6 +100,7 @@ where
 /// model` rewrites without a reload. Read fresh on that rare path because
 /// the class table's 30 s copy is the very window it covers (a placement
 /// written a second ago). Runtime query for the offline-cache reason above.
+/// A `reranker` row is never chat (see `placements_non_chat`).
 pub async fn running_chat_placements_newest_first<'e, E>(
     db: E,
 ) -> Result<Vec<(String, String, Option<String>, String)>, sqlx::Error>
@@ -104,7 +109,7 @@ where
 {
     sqlx::query_as(
         "SELECT node_id, backend, model, role FROM noo_backend_placements \
-         WHERE desired_state = 'running' AND role = 'chat' \
+         WHERE desired_state = 'running' AND role = 'chat' AND backend <> 'reranker' \
          ORDER BY updated_at DESC, node_id, backend",
     )
     .fetch_all(db)
@@ -116,17 +121,42 @@ where
 /// For naming what a node serves when a pinned chat cannot go there (i69a:
 /// "node node-pi serves embed (ollama)"), not for routing. Runtime query for
 /// the same offline-cache reason as `placements_non_chat`.
+/// Each role is read through [`crate::role_capability::effective_role`].
 pub async fn node_running_roles<'e, E>(db: E, node_id: &str) -> Result<Vec<(String, String)>, sqlx::Error>
 where
     E: sqlx::PgExecutor<'e>,
 {
-    sqlx::query_as(
+    let rows: Vec<(String, String)> = sqlx::query_as(
         "SELECT DISTINCT backend, role FROM noo_backend_placements \
          WHERE node_id = $1 AND desired_state = 'running' ORDER BY backend, role",
     )
     .bind(node_id)
     .fetch_all(db)
-    .await
+    .await?;
+    let mut out: Vec<(String, String)> = rows
+        .into_iter()
+        .map(|(b, r)| {
+            let r = crate::role_capability::effective_role(&b, &r).to_string();
+            (b, r)
+        })
+        .collect();
+    out.dedup();
+    Ok(out)
+}
+
+/// The roles `node_id`'s rows for `backend` are STORED under, as written
+/// (not read through `effective_role`): the keys a placement write may
+/// update (`routes::cluster::storage_role`). Runtime query for the same
+/// offline-cache reason as `placements_non_chat`.
+pub async fn node_backend_stored_roles<'e, E>(db: E, node_id: &str, backend: &str) -> Result<Vec<String>, sqlx::Error>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    sqlx::query_scalar("SELECT role FROM noo_backend_placements WHERE node_id = $1 AND backend = $2 ORDER BY role")
+        .bind(node_id)
+        .bind(backend)
+        .fetch_all(db)
+        .await
 }
 
 /// Does `node_id` have a RUNNING placement declared for `role`?
@@ -134,13 +164,16 @@ where
 /// The gateway's own answer to "is this node an embedder", independent of what
 /// the node's gossip still claims: a node that stops advertising `embed` only
 /// after its agent next reconciles keeps drawing embed traffic until then.
+/// A `reranker` row has the rerank role whatever it stored (the SQL spelling
+/// of [`crate::role_capability::effective_role`]).
 pub async fn node_has_running_role<'e, E>(db: E, node_id: &str, role: &str) -> Result<bool, sqlx::Error>
 where
     E: sqlx::PgExecutor<'e>,
 {
     sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM noo_backend_placements \
-         WHERE node_id = $1 AND role = $2 AND desired_state = 'running')",
+         WHERE node_id = $1 AND desired_state = 'running' \
+           AND (CASE WHEN backend = 'reranker' THEN 'rerank' ELSE role END) = $2)",
     )
     .bind(node_id)
     .bind(role)
