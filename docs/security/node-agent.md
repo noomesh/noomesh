@@ -1147,7 +1147,7 @@ starts` row shows the refusal until the verified file is shipped (`noo
 cluster sync-model-files <node> -m <model>`); a container already running
 keeps running until its next start; with no manifest, or an unreachable
 controller and no proof of a mismatch, the agent logs a WARN and llama.cpp
-loads the local file; Ollama models are checked about every 10 minutes and at backend start,
+loads the local file; Ollama models are checked every 10 to 15 minutes (on the agent's 5-minute reconcile tick, once 10 minutes have passed since the model's last check) and at backend start,
 repaired from the controller, and refused only when the repair fails (native
 Ollama on a Mac is report-only), a hand pull is not.
 
