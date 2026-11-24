@@ -87,8 +87,11 @@ pub fn parse(node: &str, key: &str, value: &str) -> Option<Tombstone> {
 /// placements array is the one desired-config sends, and nothing here ever
 /// adds to it.
 pub fn ship(tombstones: &[Tombstone], placements: &[Value], now_unix: i64) -> (Vec<Value>, Vec<String>) {
+    // Roles read through the one helper on both sides: a reranker tombstone
+    // or placement is rerank whatever it stored.
+    use crate::role_capability::effective_role as served;
     let placed = |b: &str, r: &str| {
-        placements.iter().any(|p| p["backend"].as_str() == Some(b) && p["role"].as_str().unwrap_or("chat") == r)
+        placements.iter().any(|p| p["backend"].as_str() == Some(b) && served(b, p["role"].as_str().unwrap_or("chat")) == served(b, r))
     };
     let mut unplaced = Vec::new();
     let mut expired = Vec::new();
@@ -303,6 +306,16 @@ mod tests {
         let (u, _) = ship(&[tomb("ollama", "chat", NOW - 5), tomb("ollama", "embed", NOW - 5)], &placements, NOW);
         assert_eq!(u.len(), 1);
         assert_eq!(u[0]["role"], "embed");
+    }
+
+    /// An rc.5 reranker tombstone (role chat) is the reranker's slot: a
+    /// reranker placed again, read as rerank, suppresses it.
+    #[test]
+    fn a_reranker_tombstone_is_suppressed_by_the_reranker_placement_whatever_its_role() {
+        let placements = vec![json!({"backend": "reranker", "role": "rerank", "desired_state": "running"})];
+        let (u, _) = ship(&[tomb("reranker", "chat", NOW - 5), tomb("llamacpp", "chat", NOW - 5)], &placements, NOW);
+        assert_eq!(u.len(), 1, "{u:?}");
+        assert_eq!(u[0]["backend"], "llamacpp");
     }
 
     /// `ship` never touches `placements`: it takes them by reference and its

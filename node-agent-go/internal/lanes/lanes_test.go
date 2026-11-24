@@ -338,3 +338,32 @@ func TestPlacedRoundTrip(t *testing.T) {
 		t.Errorf("got %#v", got)
 	}
 }
+
+// A reranker placement an rc.5 gateway stored as role chat (or that names no
+// role) is reported as a rerank lane: an agent never offers a reranker as a
+// chat lane, whatever gateway it talks to. Every other backend's lane keeps
+// its placement's role, rerank included.
+func TestBuild_RerankerLaneIsRerankWhateverItsPlacementSays(t *testing.T) {
+	docker := map[string]string{"reranker": "docker", "llamacpp": "docker"}
+	for _, placed := range []string{"chat", "", "rerank"} {
+		got, _ := Build(Inputs{
+			Placed:     []Placed{{"reranker", "bge-reranker-v2-m3-Q8_0.gguf", placed}, {"llamacpp", "chat.gguf", "chat"}},
+			Running:    map[string]string{"reranker": "bge-reranker-v2-m3-Q8_0.gguf", "llamacpp": "chat.gguf"},
+			Runtimes:   docker,
+			Containers: map[string]any{"reranker": healthy(), "llamacpp": healthy()},
+		})
+		want := []Lane{
+			{"reranker", "bge-reranker-v2-m3-Q8_0.gguf", "rerank", StateServing, ReasonNone},
+			{"llamacpp", "chat.gguf", "chat", StateServing, ReasonNone},
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("placed role %q: got %#v", placed, got)
+		}
+	}
+	if got := laneRole("llamacpp", "rerank"); got != "rerank" {
+		t.Errorf("an llamacpp placed for rerank: got %q", got)
+	}
+	if got := laneRole("llamacpp", ""); got != "" {
+		t.Errorf("an llamacpp lane keeps its placement's role: got %q", got)
+	}
+}

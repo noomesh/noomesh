@@ -151,6 +151,19 @@ func roleOf(r string) string {
 	return "chat"
 }
 
+// laneRole is the role a placed lane reports: the placement's, except that a
+// reranker serves rerank whatever its placement says. A 0.6.30-rc.5 gateway
+// stored a bare `noo cluster place <node> reranker <file>.gguf` as chat; a
+// lane copying that would put the reranker in the chat pool of any gateway
+// that reads lanes. The gateway reads the same way (role_capability.rs
+// effective_role), so mixed versions agree.
+func laneRole(backend, role string) string {
+	if backend == "reranker" {
+		return "rerank"
+	}
+	return role
+}
+
 // placeholders are the stand-ins docker.RunningBackends reports when a
 // container names no model; they are not claims about a model.
 var placeholders = map[string]string{"ollama": "ollama", "embedding": "tei", "harness": "auto"}
@@ -186,13 +199,14 @@ func Build(in Inputs) (lanes []Lane, unnamed []string) {
 			continue
 		}
 		placedBackends[p.Backend] = true
-		key := p.Backend + "\x00" + strings.TrimSpace(p.Model) + "\x00" + roleOf(p.Role)
+		role := laneRole(p.Backend, p.Role)
+		key := p.Backend + "\x00" + strings.TrimSpace(p.Model) + "\x00" + roleOf(role)
 		if seen[key] {
 			continue
 		}
 		seen[key] = true
 		state, reason := derive(in, p)
-		lanes = append(lanes, Lane{Backend: p.Backend, Model: p.Model, Role: p.Role, State: state, Reason: reason})
+		lanes = append(lanes, Lane{Backend: p.Backend, Model: p.Model, Role: role, State: state, Reason: reason})
 	}
 	var rest []string
 	for b := range in.Running {

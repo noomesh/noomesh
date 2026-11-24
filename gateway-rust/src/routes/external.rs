@@ -570,7 +570,12 @@ async fn do_rerank(
     let wanted = crate::coordinator::model_hint(wanted);
     let mut cands = Vec::new();
     for t in mesh_targets(state, "rerank", "rerank", 8).await {
-        let declared = crate::model_presence::node_role_model(state, &t.node_id, "rerank").await;
+        // What the node reports for rerank, else what its rerank placement
+        // declares: a llama.cpp reranker's agent reports no model presence.
+        let declared = match crate::model_presence::node_role_model(state, &t.node_id, "rerank").await {
+            Some(m) => Some(m),
+            None => crate::role_capability::node_placed_model(&state.db, &t.node_id, "rerank").await,
+        };
         cands.push((t, declared));
     }
     let ordered = rerank_order(cands, wanted);

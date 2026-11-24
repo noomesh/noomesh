@@ -56,12 +56,19 @@ pub fn backend_model_missing(node: &Value, backend: &str) -> bool {
 /// The embed side stays loud: `role_model_missing(.., "embed")` drops the node
 /// from embed routing and `backend_model_missing` still marks the placement.
 pub fn backend_chat_model_missing(node: &Value, backend: &str) -> bool {
-    entries(node, backend).any(|e| is_chat(e) && e["present"].as_bool() == Some(false))
+    entries(node, backend).any(|e| served_role(backend, e) == "chat" && e["present"].as_bool() == Some(false))
 }
 
-/// An entry with no role (an older agent) is a chat placement.
-fn is_chat(e: &Value) -> bool {
-    matches!(e["role"].as_str(), None | Some("") | Some("chat"))
+/// The role an entry serves: its `role` (none, from an older agent, is chat),
+/// read through [`crate::role_capability::effective_role`] with the backend
+/// its key names (`<backend>` or `<backend>#…`), so a reranker's entry is
+/// rerank whatever role it was reported under.
+fn served_role<'a>(key: &str, e: &'a Value) -> &'a str {
+    let r = match e["role"].as_str() {
+        Some("") | None => "chat",
+        Some(r) => r,
+    };
+    crate::role_capability::effective_role(key.split('#').next().unwrap_or(key), r)
 }
 
 /// The first absent-model entry the node reports for `backend`, if any.
@@ -76,25 +83,15 @@ pub fn role_model_missing(node: &Value, role: &str) -> bool {
     let Some(map) = node.get("model_presence").and_then(|v| v.as_object()) else {
         return false;
     };
-    map.values().any(|e| {
-        let r = match e["role"].as_str() {
-            Some("") | None => "chat",
-            Some(r) => r,
-        };
-        r == role && e["present"].as_bool() == Some(false)
-    })
+    map.iter().any(|(k, e)| served_role(k, e) == role && e["present"].as_bool() == Some(false))
 }
 
 /// The model the node reports for `role` (the role=embed placement's
 /// model for `embed`), or None when it does not report one.
 pub fn role_model(node: &Value, role: &str) -> Option<String> {
     let map = node.get("model_presence")?.as_object()?;
-    map.values().find_map(|e| {
-        let r = match e["role"].as_str() {
-            Some("") | None => "chat",
-            Some(r) => r,
-        };
-        (r == role).then(|| e["model"].as_str().map(str::to_string)).flatten().filter(|m| !m.is_empty())
+    map.iter().find_map(|(k, e)| {
+        (served_role(k, e) == role).then(|| e["model"].as_str().map(str::to_string)).flatten().filter(|m| !m.is_empty())
     })
 }
 
@@ -110,12 +107,8 @@ pub fn role_models(node: &Value, role: &str) -> Vec<String> {
         return Vec::new();
     };
     let mut out: Vec<String> = Vec::new();
-    for e in map.values() {
-        let r = match e["role"].as_str() {
-            Some("") | None => "chat",
-            Some(r) => r,
-        };
-        if r != role {
+    for (k, e) in map {
+        if served_role(k, e) != role {
             continue;
         }
         if let Some(m) = e["model"].as_str().filter(|m| !m.is_empty()) {
@@ -253,6 +246,24 @@ mod tests {
             assert!(!backend_model_missing(&odd, "ollama"), "{odd}");
             assert!(!role_model_missing(&odd, "chat"), "{odd}");
         }
+    }
+
+    /// `do_rerank` names the model a reranker serves from `role_model(..,
+    /// "rerank")`: a reranker entry reported under role chat (an agent that
+    /// copied an rc.5 placement's role), or under no role, is the rerank one.
+    #[test]
+    fn a_reranker_entry_is_the_rerank_role_whatever_it_was_reported_as() {
+        for role in [json!("chat"), json!(""), serde_json::Value::Null] {
+            let n = json!({"model_presence": {
+                "ollama": {"model": "gemma4:12b", "role": "chat", "present": true},
+                "reranker": {"model": "bge-reranker-v2-m3-Q8_0.gguf", "role": role, "present": true}}});
+            assert_eq!(role_model(&n, "rerank").as_deref(), Some("bge-reranker-v2-m3-Q8_0.gguf"), "{n}");
+            assert_eq!(role_models(&n, "rerank"), vec!["bge-reranker-v2-m3-Q8_0.gguf"]);
+            assert_eq!(role_models(&n, "chat"), vec!["gemma4:12b"], "the reranker is no chat model");
+        }
+        let gone = json!({"model_presence": {"reranker": {"model": "bge-reranker-v2-m3-Q8_0.gguf", "role": "chat", "present": false}}});
+        assert!(role_model_missing(&gone, "rerank") && !role_model_missing(&gone, "chat"));
+        assert!(!backend_chat_model_missing(&gone, "reranker"), "an absent reranker model is rerank's, never chat's");
     }
 
     #[test]

@@ -182,6 +182,14 @@ or that names the TEI image, is refused too: place a GGUF cross-encoder,
 `bge-reranker-v2-m3-Q8_0.gguf`, shipped with `noo cluster sync-model-files
 <node> -m <file>`). A `.gguf` reranker is unchanged.
 
+A `reranker` placement serves the rerank role and nothing else: the bare
+`noo cluster place <node> reranker <file>.gguf` is placed for rerank, so it
+needs no `--role`, and `--role chat` or `--role embed` on it is refused. A
+reranker placed before 0.6.30-rc.6 (stored with the chat role) is read as
+rerank: it routes rerank requests and stays out of the chat pool with no
+need to place it again. Placing another backend with `--role rerank` is
+accepted as before.
+
 **Upgrading a node that had a TEI placement.** The placement stays in the
 node's desired state but runs nothing: on its first reconcile pass after the
 upgrade the agent stops and removes the leftover TEI containers (and their
