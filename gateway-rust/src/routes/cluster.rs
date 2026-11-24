@@ -1840,7 +1840,7 @@ fn demote_if_heartbeat_stale(data: &mut Value, now: f64) {
 fn merge_gossip_backends(data: &mut Value, gossip: impl IntoIterator<Item = (String, String)>, now: f64) {
     let current = !crate::autonomy_evaluators::is_node_offline(data, now);
     let mut rb = match data.get("running_backends").and_then(|v| v.as_object()) {
-        Some(m) if current => m.clone(),
+        Some(m) if false && current => m.clone(),
         _ => serde_json::Map::new(),
     };
     for (bt, model) in gossip {
