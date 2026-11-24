@@ -267,7 +267,7 @@ def collect(ev: list[str], tmp: str, E: dict) -> None:
         return stop("NOTE", f"release {ver} lists no noo-gateway asset for {arch}")
     cached = os.path.isfile(os.path.join(cache, asset)) and os.path.getsize(os.path.join(cache, asset)) > 0
     if not cached and not release_repo():
-        return stop("NOTE", f"{asset} is not cached here and no release repository is known to fetch it from "
+        return stop("NOTE", f"not run: {asset} is not cached here and no release repository is known to fetch it from "
                             "(NOO_CLI_REPO and GITHUB_REPOSITORY unset: a WSL cell gets only what WSLENV lists)")
     binary = fetch_release_file(ver, asset, cache)
     if not binary or hashlib.sha256(binary).hexdigest() != rows[asset]:

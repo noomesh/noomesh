@@ -174,9 +174,14 @@ def test_no_release_repo_and_no_cached_asset_is_a_note_not_a_fail():
     body = src[src.index("def collect("):src.index("def verdict(")]
     guard = body.index("if not cached and not release_repo():")
     fetch = body.index("binary = fetch_release_file(ver, asset, cache)")
-    assert guard < fetch and 'return stop("NOTE"' in body[guard:fetch]
+    assert guard < fetch and 'return stop("NOTE", f"not run: ' in body[guard:fetch]
     wf = (ROOT / ".github" / "workflows" / "install-matrix.yml").read_text()
     assert "WSLENV: CLI_TAG:GITHUB_REPOSITORY" in wf
+    # The step tested nothing: that is never a PASS, whatever else the cell has.
+    E = {"systemd": True, "systemd_run": True, "machine": "x86_64",
+         "stop": ["NOTE", "not run: noo-gateway-x86_64-unknown-linux-musl is not cached here and no release repository is known"]}
+    state, why = he.verdict(E)
+    assert state == "NOTE" and state != "PASS" and why.startswith("not run:"), (state, why)
 
 
 def test_the_evidence_records_the_turns_seconds():
