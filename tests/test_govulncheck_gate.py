@@ -40,7 +40,7 @@ def finding(osv="GO-2026-6278", module="github.com/gorilla/websocket",
 def run(tmp_path, findings, excs=(EXC,), today="2026-11-23", raw_exc=None, stream=None):
     out = tmp_path / "out.json"
     if stream is None:
-        stream = [{"config": {"scanner_name": "govulncheck"}}] + list(findings)
+        stream = [{"config": {"scanner_name": "govulncheck", "scan_level": "symbol", "scan_mode": "source"}}] + list(findings)
     out.write_text("\n".join(json.dumps(o, indent=2) for o in stream))
     exc = tmp_path / "exc.json"
     exc.write_text(raw_exc if raw_exc is not None else json.dumps(list(excs)))
@@ -123,3 +123,16 @@ def test_real_govulncheck_output_passes_with_real_exceptions(tmp_path):
                         "--today", "2026-11-23"], capture_output=True, text=True)
     assert r.returncode == 0, r.stdout
     assert "GO-2026-6278" in r.stdout
+
+
+def test_a_scan_below_symbol_level_fails(tmp_path):
+    """At module or package level no finding names a function, so every
+    advisory would pass by omission: the gate refuses such a scan."""
+    real = REAL_OUT.read_text(encoding="utf-8")
+    assert '"scan_level": "symbol"' in real
+    for level in ("module", "package"):
+        out = tmp_path / f"scan-{level}.json"
+        out.write_text(real.replace('"scan_level": "symbol"', f'"scan_level": "{level}"', 1), encoding="utf-8")
+        r = subprocess.run([sys.executable, str(GATE), str(out), str(REAL_EXC),
+                            "--today", "2026-11-23"], capture_output=True, text=True)
+        assert r.returncode == 1 and "scan level" in r.stdout, r.stdout

@@ -118,8 +118,16 @@ def main(argv: list[str]) -> int:
     except (OSError, ValueError) as e:
         print(f"FAIL: govulncheck output {a.out} unreadable: {e}")
         return 1
-    if not any(isinstance(o.get("config"), dict) for o in objs):
+    configs = [o["config"] for o in objs if isinstance(o.get("config"), dict)]
+    if not configs:
         print(f"FAIL: {a.out} has no govulncheck config message; the scan did not run")
+        return 1
+    # "Reachable" is a symbol-level fact: at module or package level no finding
+    # names a function, and every advisory would pass by omission.
+    level, mode = configs[0].get("scan_level"), configs[0].get("scan_mode")
+    if level != "symbol" or mode != "source":
+        print(f"FAIL: govulncheck ran at scan level {level!r} (mode {mode!r}); "
+              f"the gate needs symbol-level findings from a source scan")
         return 1
     found = reachable_findings(objs)
 
