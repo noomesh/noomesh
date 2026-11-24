@@ -713,7 +713,44 @@ fi
 # A FAIL is recorded (the cell fails) without stopping the cell; NOTE where
 # the hold cannot exist (no systemd, no systemd-run).
 if [ -f "$HERE/harness_e2e.py" ]; then
+    # The window around the judge, kept so a red is attributable: the
+    # gateway's log from 7 min before it (the context-fit turns before it
+    # included), its container state after, and the node side (the harness
+    # and agent journals, the Ollama logs). Every file goes through the
+    # redactor and is uploaded only when the upload scan passes on that
+    # exact file; otherwise only its lines' timestamps and levels are kept.
+    GW_WIN_SINCE="$(date -u -d '-420 sec' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -v-420S +%Y-%m-%dT%H:%M:%SZ)"
     step harness-e2e 1500 -- env NOO_BIN="$NOO_BIN" python3 -I "$HERE/harness_e2e.py" --out "$OUT" || true
+    step harness-e2e-capture 300 -- env GW_WIN_SINCE="$GW_WIN_SINCE" OUT="$OUT" CELL_PY="$CELL_PY" sh -c '
+        if docker info >/dev/null 2>&1; then D="docker"; else D="sudo -n docker"; fi
+        echo "gateway state after harness-e2e: $($D inspect -f "status={{.State.Status}} started_at={{.State.StartedAt}} restart_count={{.RestartCount}} oom_killed={{.State.OOMKilled}} exit_code={{.State.ExitCode}}" noo-gateway)"
+        tmp="$(mktemp)"
+        $D logs --timestamps --since "$GW_WIN_SINCE" noo-gateway 2>&1 | python3 "$CELL_PY" redact > "$tmp"
+        echo "gateway window: since $GW_WIN_SINCE, $(wc -l < "$tmp") lines"
+        if python3 "$CELL_PY" scan "$tmp" && python3 -I "$(dirname "$CELL_PY")/secret_check.py" "$tmp"; then
+            mv "$tmp" "$OUT/logs/gateway-window.log"
+            echo "upload scan and secret check passed on logs/gateway-window.log; kept"
+        else
+            rm -f "$tmp"
+            echo "upload scan or secret check refused the gateway window; withheld (only the state line above is kept)"
+        fi
+        # Node side, same rule: each file is kept only when the scan passes on
+        # it; else only its lines timestamps and levels.
+        keep() {  # keep <name>: reads stdin
+            t2="$(mktemp)"; python3 "$CELL_PY" redact > "$t2"
+            n="$(wc -l < "$t2")"
+            if python3 "$CELL_PY" scan "$t2" && python3 -I "$(dirname "$CELL_PY")/secret_check.py" "$t2"; then mv "$t2" "$OUT/logs/$1"; echo "upload scan and secret check passed on logs/$1 ($n lines); kept"
+            else python3 -I "$(dirname "$CELL_PY")/stamps.py" < "$t2" > "$OUT/logs/$1.stamps"; rm -f "$t2"; echo "upload scan or secret check refused logs/$1 ($n lines); kept only timestamps and levels (logs/$1.stamps)"; fi
+        }
+        S="$(echo "$GW_WIN_SINCE" | sed "s/T/ /; s/Z$//")"
+        sudo -n journalctl -u noo-harness --since "$S UTC" --no-pager -o short-iso 2>&1 | keep harness-journal.log
+        sudo -n journalctl -u noo-node-agent --since "$S UTC" --no-pager -o short-iso 2>&1 | keep agent-journal.log
+        if systemctl list-unit-files ollama.service >/dev/null 2>&1; then
+            sudo -n journalctl -u ollama --since "$S UTC" --no-pager -o short-iso 2>&1 | keep ollama-native.log
+        fi
+        for c in $($D ps -a --format "{{.Names}}" | grep -E "ollama" | grep -v stunnel); do
+            $D logs --timestamps --since "$GW_WIN_SINCE" "$c" 2>&1 | keep "container-$c.log"
+        done' || true
 fi
 
 # ── the real CLI's reload and forced restart (the release lead) ──────────

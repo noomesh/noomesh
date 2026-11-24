@@ -205,7 +205,9 @@ jobs:
         shell: wsl-bash {0}
         env:
           CLI_TAG: ${{ inputs.cli_tag || 'latest' }}
-          WSLENV: CLI_TAG   # environment variables reach WSL only when listed here
+          # Environment variables reach WSL only when listed here. GITHUB_REPOSITORY:
+          # where HARNESS-E2E fetches the release's harness asset from.
+          WSLENV: CLI_TAG:GITHUB_REPOSITORY
         run: |
           OUT="$PWD/cell-out" CELL=windows-2025-wsl2 RUNNER=windows-2025 DOCKER=preinstalled ONBOARD=ci \
             MODEL=tiny SCOPE=full CLI_TAG="${CLI_TAG:-latest}" bash scripts/install-cell/run.sh

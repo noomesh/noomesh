@@ -402,6 +402,9 @@ const DOCKER_NETWORK_SEGMENTS: &[&str] = &[
     "connection refused",
     "TLS handshake timeout",
     "context deadline exceeded",
+    // net/http's Transport.ResponseHeaderTimeout: the registry accepted the
+    // connection and sent no headers in time (a blob GET on a slow registry).
+    "timeout awaiting response headers",
 ];
 /// `net/http`'s client timeout, appended to the request's error
 /// (`client.go`: `" (Client.Timeout exceeded while awaiting headers)"`).
@@ -1027,6 +1030,20 @@ mod docker_pull_tests {
             let (class, status) = classify_docker_pull(line);
             assert_eq!((class, status), (FetchClass::Network, None), "{line}");
         }
+    }
+
+    /// The registry's response-header timeout, exactly as a harrier pull met
+    /// it (a ghcr blob GET): transient, so the pull is retried on its backoff,
+    /// not given up after one try.
+    #[test]
+    fn a_response_header_timeout_is_transient() {
+        let stderr = "failed to copy: httpReadSeeker: failed open: failed to do request: Get \"https://ghcr.io/v2/noomesh/harrier/blobs/sha256:d2ecfbef7a3504e89ece4976462dd8c84b5f2306067fc5a2798505e644b7484d\": net/http: timeout awaiting response headers";
+        assert_eq!(classify_docker_pull(stderr), (FetchClass::Network, None), "{stderr}");
+        assert!(FetchClass::Network.transient());
+        // A refusal on another line still wins: the new segment never makes a
+        // permanent failure transient.
+        let both = format!("{stderr}\nError response from daemon: received unexpected HTTP status: 401 Unauthorized");
+        assert_eq!(classify_docker_pull(&both), (FetchClass::Auth, Some(401)), "{both}");
     }
 
     /// The substring trap: "500" (or a timeout word) elsewhere in the text is

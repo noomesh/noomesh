@@ -1825,6 +1825,30 @@ fn demote_if_heartbeat_stale(data: &mut Value, now: f64) {
     ));
 }
 
+/// The listing's `running_backends`: the heartbeat's map with gossip's
+/// entries laid over it. Gossip's model wins for every backend it carries, but
+/// the agent gossips only backends with a compose door, so a running
+/// `reranker` or `vllm-secondary` is never in it. Replacing the map with
+/// gossip's dropped them from `cluster status`/`show`, and the role derived
+/// from it read `down` while the backend served.
+///
+/// A key only the heartbeat reports is kept while that heartbeat is current
+/// (`is_node_offline` false: within the node class's offline threshold). Each
+/// beat rewrites the map, so a stopped backend is shown running for at most one
+/// heartbeat interval, and never once the heartbeat is stale: then only
+/// gossip's entries are listed, as before.
+fn merge_gossip_backends(data: &mut Value, gossip: impl IntoIterator<Item = (String, String)>, now: f64) {
+    let current = !crate::autonomy_evaluators::is_node_offline(data, now);
+    let mut rb = match data.get("running_backends").and_then(|v| v.as_object()) {
+        Some(m) if current => m.clone(),
+        _ => serde_json::Map::new(),
+    };
+    for (bt, model) in gossip {
+        rb.insert(bt, json!(model));
+    }
+    data["running_backends"] = Value::Object(rb);
+}
+
 pub(crate) async fn collect_cluster_nodes(state: &Arc<AppState>) -> (Vec<Value>, Option<String>) {
     let mut nodes: Vec<Value> = Vec::new();
     // The declared harness policy per node. It lives in `noo_node_config`, so
@@ -1887,13 +1911,14 @@ pub(crate) async fn collect_cluster_nodes(state: &Arc<AppState>) -> (Vec<Value>,
                             // touch `last_heartbeat`, so a node silent for
                             // minutes still gossips "alive".
                             demote_if_heartbeat_stale(&mut data, unix_now_f64());
-                            // Update backends from gossip (more current than KV)
+                            // Gossip's backends laid over the heartbeat's,
+                            // never replacing them (see merge_gossip_backends).
                             if !peer.backends.is_empty() {
-                                let mut rb = serde_json::Map::new();
-                                for (bt, info) in &peer.backends {
-                                    rb.insert(bt.clone(), json!(info.model));
-                                }
-                                data["running_backends"] = Value::Object(rb);
+                                merge_gossip_backends(
+                                    &mut data,
+                                    peer.backends.iter().map(|(bt, info)| (bt.clone(), info.model.clone())),
+                                    unix_now_f64(),
+                                );
                             }
                         } else {
                             // Absent from gossip. The old code left whatever
@@ -11940,5 +11965,83 @@ mod unplace_tombstone_tests {
             let b = crate::test_src::fn_body(&own, f);
             assert!(!b.contains("settings::upsert(") && !b.contains("backend_unplaced::write("), "{f} writes no setting");
         }
+    }
+}
+
+#[cfg(test)]
+mod listing_backends_tests {
+    use super::*;
+
+    fn node(age_secs: f64, now: f64) -> Value {
+        json!({"id": "node_a", "tier": 2, "last_heartbeat": now - age_secs,
+            "running_backends": {"ollama": "old-tag", "reranker": "bge-reranker-v2-m3-Q8_0.gguf", "vllm-secondary": "small-model"}})
+    }
+
+    fn gossip() -> Vec<(String, String)> {
+        vec![("ollama".to_string(), "gemma4:26b".to_string())]
+    }
+
+    #[test]
+    fn a_reranker_and_a_vllm_secondary_survive_gossip_which_does_not_carry_them() {
+        let now = 1_000_000.0;
+        let mut n = node(5.0, now);
+        merge_gossip_backends(&mut n, gossip(), now);
+        let rb = n["running_backends"].as_object().unwrap();
+        assert_eq!(rb.get("reranker"), Some(&json!("bge-reranker-v2-m3-Q8_0.gguf")), "{n}");
+        assert_eq!(rb.get("vllm-secondary"), Some(&json!("small-model")), "{n}");
+        assert_eq!(rb.get("ollama"), Some(&json!("gemma4:26b")), "gossip's model wins for a key it carries");
+    }
+
+    #[test]
+    fn a_running_reranker_derives_as_serving_not_down() {
+        let now = 1_000_000.0;
+        let mut n = node(5.0, now);
+        merge_gossip_backends(&mut n, gossip(), now);
+        let fact = crate::role_capability::PlacementFact {
+            node_id: "node_a".into(), backend: "reranker".into(),
+            model: Some("bge-reranker-v2-m3-Q8_0.gguf".into()), role: "rerank".into(), desired_state: "running".into(),
+        };
+        let caps = crate::role_capability::derive(&n, &[fact]);
+        assert_ne!(caps[0]["state"], json!("down"), "{caps:?}");
+        assert!(crate::role_capability::serves(&caps, "rerank"), "{caps:?}");
+        assert!(!crate::role_capability::summary(&caps).contains("(down)"), "status shows no (down)");
+    }
+
+    #[test]
+    fn a_stale_heartbeat_keeps_none_of_its_own_backends() {
+        // Past the worker offline threshold: a backend only the old beat
+        // reported is not shown running; gossip's entries still are.
+        let now = 1_000_000.0;
+        let mut n = node(10_000.0, now);
+        merge_gossip_backends(&mut n, gossip(), now);
+        let rb = n["running_backends"].as_object().unwrap();
+        assert!(!rb.contains_key("reranker") && !rb.contains_key("vllm-secondary"), "{n}");
+        assert_eq!(rb.get("ollama"), Some(&json!("gemma4:26b")));
+    }
+
+    #[test]
+    fn the_fence_is_the_node_class_offline_threshold() {
+        let now = 1_000_000.0;
+        let kept = |tier: u64, age: f64| {
+            let mut n = node(age, now);
+            n["tier"] = json!(tier);
+            merge_gossip_backends(&mut n, gossip(), now);
+            n["running_backends"].as_object().unwrap().contains_key("reranker")
+        };
+        // A worker: 120 s.
+        assert!(kept(2, 119.0), "a worker beat 119 s old is current");
+        assert!(!kept(2, 121.0), "a worker beat 121 s old is stale");
+        // An edge node: 300 s.
+        assert!(kept(4, 200.0), "an edge beat 200 s old is current");
+        assert!(!kept(4, 301.0), "an edge beat 301 s old is stale");
+    }
+
+    #[test]
+    fn the_listing_merges_gossip_into_the_heartbeat_map_and_never_replaces_it() {
+        let src = include_str!("cluster.rs");
+        let own = crate::test_src::own_code(src);
+        let body = crate::test_src::fn_body(&own, "pub(crate) async fn collect_cluster_nodes(");
+        assert!(body.contains("merge_gossip_backends("), "the listing merges");
+        assert!(!body.contains("data[\"running_backends\"] = Value::Object("), "no wholesale replacement");
     }
 }

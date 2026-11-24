@@ -169,7 +169,28 @@ def self_record(node: str) -> dict | None:
     return None
 
 
+# Every attempt that failed at the connection (not an
+# HTTP status), by the reason's class and errno only (no values).
+ATTEMPTS: list[dict] = []
+
+
 def http(method: str, path: str, body: bytes | None = None, ctype: str = "application/json", timeout: float = 120):
+    for attempt in (1, 2):
+        try:
+            return _http(method, path, body, ctype, timeout)
+        except urllib.error.HTTPError:
+            raise
+        except urllib.error.URLError as e:
+            r = getattr(e, "reason", None)
+            ATTEMPTS.append({"attempt": attempt, "method": method, "path": path.split("?")[0],
+                             "class": type(r).__name__ if r is not None else type(e).__name__,
+                             "errno": getattr(r, "errno", None)})
+            if attempt == 2:
+                raise
+            time.sleep(10)
+
+
+def _http(method: str, path: str, body: bytes | None = None, ctype: str = "application/json", timeout: float = 120):
     ctx = ssl.create_default_context(cafile=ws_chat.cluster_ca())
 
     def once():
@@ -188,13 +209,17 @@ def http(method: str, path: str, body: bytes | None = None, ctype: str = "applic
         return e.code, e.read()
 
 
+def release_repo() -> str:
+    """Resolved, never typed: NOO_CLI_REPO, else the repository this workflow
+    runs in (Actions sets it). Empty: nothing to fetch from."""
+    return os.environ.get("NOO_CLI_REPO") or os.environ.get("GITHUB_REPOSITORY") or ""
+
+
 def fetch_release_file(ver: str, name: str, cache: str) -> bytes | None:
     p = os.path.join(cache, name)
     if os.path.isfile(p) and os.path.getsize(p) > 0:
         return open(p, "rb").read()
-    # Resolved, never typed: NOO_CLI_REPO, else the repository this workflow
-    # runs in (Actions sets it). Neither: nothing to fetch from.
-    repo = os.environ.get("NOO_CLI_REPO") or os.environ.get("GITHUB_REPOSITORY") or ""
+    repo = release_repo()
     if not repo:
         return None
     url = f"https://github.com/{repo}/releases/download/noo-cli-v{ver}/{name}"
@@ -261,6 +286,10 @@ def collect(ev: list[str], tmp: str, E: dict) -> None:
     asset = next((a for a in (f"noo-gateway-{arch}-unknown-linux-musl", f"noo-gateway-{arch}-unknown-linux-gnu") if a in rows), None)
     if not asset:
         return stop("NOTE", f"release {ver} lists no noo-gateway asset for {arch}")
+    cached = os.path.isfile(os.path.join(cache, asset)) and os.path.getsize(os.path.join(cache, asset)) > 0
+    if not cached and not release_repo():
+        return stop("NOTE", f"not run: {asset} is not cached here and no release repository is known to fetch it from "
+                            "(NOO_CLI_REPO and GITHUB_REPOSITORY unset: a WSL cell gets only what WSLENV lists)")
     binary = fetch_release_file(ver, asset, cache)
     if not binary or hashlib.sha256(binary).hexdigest() != rows[asset]:
         return stop("FAIL", f"{asset} could not be fetched or does not match release {ver}'s signed sums")
@@ -392,6 +421,7 @@ def collect(ev: list[str], tmp: str, E: dict) -> None:
     crc, _ = run(["timeout", "6", "bash", "-c", "exec 3<>/dev/tcp/1.1.1.1/443"], timeout=30)
     th.join(600)
     E["turn_status"], E["in_flight"], E["probe_rc"], E["control_rc"] = turn.get("status"), in_flight, prc, crc
+    E["turn_s"] = round(time.time() - t0, 1)  # dispatch to the answer (the request's whole time)
     E["probe_err"] = next((l.strip() for l in pout.splitlines() if l.strip()), "")[:200]
     ev.append(f"turn: conversation={cid} HTTP {turn.get('status')} in {time.time() - t0:.1f}s")
     ev.append(f"probe from the unit's cgroup ({cg}) to 1.1.1.1:443: rc={prc} ({pout.strip()[:120]}); turn in flight={in_flight}; host control rc={crc}")
@@ -515,6 +545,11 @@ def main() -> int:
     if E["leaked"]:
         ev, E = ["evidence withheld: a secret value would have been written"], {"leaked": True}
     verdict_state, why = verdict(E)
+    if ATTEMPTS:
+        E["connection_attempts"] = ATTEMPTS
+        ev += [f"connection attempt {a['attempt']} failed: {a['method']} {a['path']}: {a['class']} errno={a['errno']}" for a in ATTEMPTS]
+        if verdict_state == "PASS":
+            verdict_state, why = "NOTE", f"passed only after a retry (attempt 1: {ATTEMPTS[0]['class']} errno={ATTEMPTS[0]['errno']}): {why}"
     lines = ["  " + l for l in ev] + [f"HARNESS-E2E {verdict_state}: {why}"]
     if not E.get("leaked") and leaked(lines):
         ev, E = ["evidence withheld: a secret value would have been written"], {"leaked": True}
