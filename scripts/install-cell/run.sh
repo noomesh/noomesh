@@ -725,7 +725,7 @@ if [ -f "$HERE/harness_e2e.py" ]; then
         if docker info >/dev/null 2>&1; then D="docker"; else D="sudo -n docker"; fi
         echo "gateway state after harness-e2e: $($D inspect -f "status={{.State.Status}} started_at={{.State.StartedAt}} restart_count={{.RestartCount}} oom_killed={{.State.OOMKilled}} exit_code={{.State.ExitCode}}" noo-gateway)"
         tmp="$(mktemp)"
-        $D logs --since "$GW_WIN_SINCE" noo-gateway 2>&1 | python3 "$CELL_PY" redact > "$tmp"
+        $D logs --timestamps --since "$GW_WIN_SINCE" noo-gateway 2>&1 | python3 "$CELL_PY" redact > "$tmp"
         echo "gateway window: since $GW_WIN_SINCE, $(wc -l < "$tmp") lines"
         if python3 "$CELL_PY" scan "$tmp" && python3 -I "$(dirname "$CELL_PY")/secret_check.py" "$tmp"; then
             mv "$tmp" "$OUT/logs/gateway-window.log"
@@ -749,7 +749,7 @@ if [ -f "$HERE/harness_e2e.py" ]; then
             sudo -n journalctl -u ollama --since "$S UTC" --no-pager -o short-iso 2>&1 | keep ollama-native.log
         fi
         for c in $($D ps -a --format "{{.Names}}" | grep -E "ollama" | grep -v stunnel); do
-            $D logs --since "$GW_WIN_SINCE" "$c" 2>&1 | keep "container-$c.log"
+            $D logs --timestamps --since "$GW_WIN_SINCE" "$c" 2>&1 | keep "container-$c.log"
         done' || true
 fi
 
