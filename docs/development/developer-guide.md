@@ -497,9 +497,12 @@ information" when the knowledge base already holds the fact
   results are already in its context. The tool is offered from the next
   iteration on, so a different query can still run (`offered_tools` and
   `kb_deferred_result` in `agent_loop.rs`, logged as
-  `coordinator.kb_tool_deferred`). A very small model (0.5B class) can still
-  reach for another tool on its first step before answering, which costs it
-  a further model turn.
+  `coordinator.kb_tool_deferred`; a deferred call logs it with `called=true`).
+  A model can still make that first-step call, the default chat model in
+  some turns; its next step can then come back empty and be nudged
+  (`loop.stall_detected_empty_response`), which costs two further model
+  calls before the answer. A very small model (0.5B class) may instead reach
+  for another tool on its first step, which costs it a further model turn.
 - **A post-tool answer that ignores the result is a stall.** After a turn that
   ran a retrieval tool (`noo_rag_query`, `noo_memory_search`,
   `noo_recall_search`, `noo_graph_semantic_search`), the loop re-nudges ONCE
