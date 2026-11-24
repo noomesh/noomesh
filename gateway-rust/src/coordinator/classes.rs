@@ -871,7 +871,7 @@ pub fn build_table(nodes: &[NodeFacts], placements: &[PlacementRow], decl: &Decl
     let mut served: Vec<Candidate> = Vec::new();
     for n in nodes {
         for (bt, m) in &n.running {
-            if !INFERENCE_TYPES.contains(&bt.as_str()) || m.is_empty() {
+            if m.is_empty() {
                 continue;
             }
             if n.non_chat.iter().any(|b| b == bt) || n.model_missing.iter().any(|b| b == bt) {
