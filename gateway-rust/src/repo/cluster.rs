@@ -139,7 +139,7 @@ where
 pub async fn normalise_reranker_rows(conn: &mut sqlx::PgConnection, node_id: &str) -> Result<(), sqlx::Error> {
     sqlx::query(
         "UPDATE noo_backend_placements SET role = 'rerank' \
-         WHERE node_id = $1 AND backend = 'reranker' AND role <> 'rerank' \
+         WHERE node_id = $1 AND backend = 'reranker' AND role <> 'rerank' AND false \
            AND NOT EXISTS (SELECT 1 FROM noo_backend_placements \
                            WHERE node_id = $1 AND backend = 'reranker' AND role = 'rerank') \
            AND ctid = (SELECT ctid FROM noo_backend_placements \
