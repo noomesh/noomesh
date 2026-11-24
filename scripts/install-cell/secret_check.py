@@ -8,15 +8,18 @@ the actual values.
 Values are chosen by key NAME, the redactor's own `SECRET_NAME`
 (…PASSWORD, …PASSPHRASE, …TOKEN, …SECRET, …KEY), from every `KEY=value` in
 the node agent's and the harness's env files and in the gateway container's
-environment. A `…_FILE` pointer is followed (a gateway path through the
+environment, plus the password of any `scheme://user:pass@` URL value
+(whatever its key). A `…_FILE` pointer is followed (a gateway path through the
 container's mounts to the host file). A value shorter than 8 characters, or
 an absolute path, is not a credential. They are compared in memory and never
 printed: the output names only the file."""
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
+import urllib.parse
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from cell import SECRET_NAME  # noqa: E402
@@ -71,16 +74,38 @@ def host_path(path: str, mounts: list[dict]) -> str | None:
     return best[1] + path[len(best[0]):]
 
 
+# A credential that reaches the gateway only inside a URL value, under a key
+# whose name is not a secret's (`DATABASE_URL`, `PGVECTOR_URL`: the app and
+# postgres passwords, secrets.rs): the URL's password, whatever the key.
+URL_PASS = re.compile(r"^[a-z][a-z0-9+.-]*://[^/:@\s]+:([^@\s/]+)@")
+
+
+def usable(v: str) -> bool:
+    # Not an absolute path: every generated secret here is URL-safe base64 or
+    # alphanumeric (token_urlsafe, mint_password, fernet_key), so none starts
+    # with "/". A path-valued key (NOO_TLS_KEY=/app/pki/...) names a file, and
+    # paths are logged constantly. A standard-base64 secret could start with
+    # "/": if one is ever generated, this rule must change.
+    return len(v) >= 8 and not v.startswith("/")
+
+
 def pick(pairs: list[tuple[str, str]], resolve) -> list[str]:
     vals = []
     for k, v in pairs:
-        if not SECRET_NAME.match(k) or not v:
+        if not v:
+            continue
+        m = URL_PASS.match(v)
+        if m:
+            for pw in {m.group(1), urllib.parse.unquote(m.group(1))}:
+                if usable(pw):
+                    vals.append(pw)
+        if not SECRET_NAME.match(k):
             continue
         if k.endswith("_FILE"):
             p = resolve(v)
             b = root_read(p) if p else None
             v = b.decode(errors="replace").strip() if b else ""
-        if len(v) >= 8 and not v.startswith("/"):
+        if usable(v):
             vals.append(v)
     return vals
 

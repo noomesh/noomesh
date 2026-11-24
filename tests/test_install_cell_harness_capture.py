@@ -55,6 +55,20 @@ def test_a_gateway_only_credential_is_refused_and_a_gateway_file_is_followed_thr
     assert GW_NATS not in out and GW_JWT not in out and "nats.log" in out
 
 
+def test_a_password_delivered_only_inside_a_url_value_is_refused(tmp_path, monkeypatch, capsys):
+    pw = "Zx8Qw2Er4Ty6Ui8Op0As2Df4Gh6Jk8Lm"  # 32 alphanumerics: the shape scan does not see it
+    enc = "p%40ss%2Fword-with-escapes-1234"   # URL-encoded: both forms are known
+    gw = ([f"PGVECTOR_URL=postgresql://noo:{pw}@postgres:5432/noo", f"DATABASE_URL=postgresql://noo_app:{enc}@postgres:5432/noomesh"], [])
+    _envs(monkeypatch, {"/etc/noo-node-agent.env": b"NODE_ID=n1\n"}, gw)
+    a, b2, c = (tmp_path / n for n in ("pg.log", "dec.log", "clean.log"))
+    a.write_text(f"connecting as noo with {pw}\n")
+    b2.write_text("password p@ss/word-with-escapes-1234 rejected\n")
+    c.write_text("postgres ready\n")
+    assert sc.main([str(a)]) == 3 and sc.main([str(b2)]) == 3 and sc.main([str(c)]) == 0
+    out = capsys.readouterr().out
+    assert pw not in out and "p@ss" not in out and "pg.log" in out
+
+
 def test_unreadable_credentials_are_not_a_pass(tmp_path, monkeypatch):
     f = tmp_path / "x.log"
     f.write_text("anything\n")
