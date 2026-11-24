@@ -149,7 +149,7 @@ pub async fn normalise_reranker_rows(conn: &mut sqlx::PgConnection, node_id: &st
     .bind(node_id)
     .execute(&mut *conn)
     .await?;
-    sqlx::query("DELETE FROM noo_backend_placements WHERE node_id = $1 AND backend = 'reranker' AND role <> 'rerank'")
+    sqlx::query("DELETE FROM noo_backend_placements WHERE node_id = $1 AND backend = 'reranker' AND role <> 'rerank' AND false")
         .bind(node_id)
         .execute(&mut *conn)
         .await?;
