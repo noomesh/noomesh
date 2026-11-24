@@ -84,6 +84,11 @@ pub fn cluster_import_model(g: &Globals, args: &[String]) -> Result<i32, Unhandl
             fail(g.json, ExitCode::Usage, "bad_role", "--role must be chat, embed or rerank", None);
         }
     }
+    // `-b reranker` serves rerank only, as `noo cluster place` says.
+    let role = match super::cluster::reranker_role(&backend, role.as_deref()) {
+        Ok(r) => r,
+        Err(why) => fail(g.json, ExitCode::Usage, "bad_role", &why, None),
+    };
     // The store must hold the pair the agent will ask for, or the import
     // fails one hop later with a less useful message.
     let store = gguf_store_dir();

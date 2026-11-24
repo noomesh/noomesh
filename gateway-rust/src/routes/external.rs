@@ -570,7 +570,12 @@ async fn do_rerank(
     let wanted = crate::coordinator::model_hint(wanted);
     let mut cands = Vec::new();
     for t in mesh_targets(state, "rerank", "rerank", 8).await {
-        let declared = crate::model_presence::node_role_model(state, &t.node_id, "rerank").await;
+        // What the node reports for rerank, else what its rerank placement
+        // declares: a llama.cpp reranker's agent reports no model presence.
+        let declared = match crate::model_presence::node_role_model(state, &t.node_id, "rerank").await {
+            Some(m) => Some(m),
+            None => crate::role_capability::node_placed_model(&state.db, &t.node_id, "rerank").await,
+        };
         cands.push((t, declared));
     }
     let ordered = rerank_order(cands, wanted);
@@ -1543,6 +1548,19 @@ mod rerank_preference_tests {
         assert!(caps.contains("mesh_targets(&state, \"rerank\", \"rerank\", 8).await"), "{caps}");
         assert!(caps.contains("let rerank = rerank_capability(&advertising, &routable);"));
         assert!(caps.contains("\"rerank\": rerank,"));
+    }
+
+    /// The model a rerank answer names: the node's reported rerank model,
+    /// else its running rerank placement's model (a llama.cpp reranker's agent
+    /// reports no model presence). `role_capability::placed_model` is the
+    /// pure half (its tests read an rc.5 `chat` row as rerank).
+    #[test]
+    fn do_rerank_names_the_placed_model_when_the_node_reports_none() {
+        let own = crate::test_src::own_code(include_str!("external.rs"));
+        let body = crate::test_src::fn_body(&own, "async fn do_rerank(");
+        let reported = body.find("crate::model_presence::node_role_model(state, &t.node_id, \"rerank\").await").expect("the reported model first");
+        let placed = body.find("None => crate::role_capability::node_placed_model(&state.db, &t.node_id, \"rerank\").await,").expect("then the placement's");
+        assert!(reported < placed && placed < body.find("cands.push((t, declared));").expect("before the candidate"));
     }
 
     /// i1182a: an unranked answer says so; a ranked one carries no flag.
