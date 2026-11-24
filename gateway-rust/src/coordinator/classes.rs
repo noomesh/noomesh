@@ -3525,6 +3525,54 @@ mod lane_tests {
         json!({"backend": backend, "model": model, "role": role, "state": state, "reason": reason})
     }
 
+    const RERANKER_GGUF: &str = "bge-reranker-v2-m3-Q8_0.gguf";
+
+    /// What an rc.5 gateway stored for `noo cluster place n1 reranker <file>`:
+    /// both rows role chat.
+    fn chat_roled_reranker_rows() -> Vec<PlacementRow> {
+        vec![
+            ("n1".into(), "llamacpp".into(), Some("/models/chat.gguf".into()), "chat".into()),
+            ("n1".into(), "reranker".into(), Some(format!("/models/{RERANKER_GGUF}")), "chat".into()),
+        ]
+    }
+
+    fn assert_reranker_not_chat_default(t: &ClassTable, file: &str, case: &str) {
+        let cands = &t.all_chat.as_ref().unwrap_or_else(|| panic!("{case}: a chat-default")).candidates;
+        assert!(cands.iter().any(|c| c.backend == "llamacpp" && c.model == "chat.gguf"), "{case}: the chat model is a candidate: {cands:?}");
+        assert!(!cands.iter().any(|c| c.backend == "reranker"), "{case}: the reranker never is: {cands:?}");
+        assert!(t.class(file).is_none(), "{case}: no class is named after the reranker's file");
+    }
+
+    /// A running reranker whose placement (and, from an agent that copies
+    /// it, lane) says role chat is never a chat-default candidate. Not a live
+    /// misroute: `build_table` admits only `INFERENCE_TYPES`, and this module's
+    /// chat path reads the role exactly as before; this guards that filter.
+    #[test]
+    fn a_running_reranker_stored_with_role_chat_is_not_in_chat_default() {
+        let placements = chat_roled_reranker_rows();
+        // Case 1, lanes as the agent sends them, the placement role copied.
+        let lanes = json!([
+            lane("llamacpp", "/models/chat.gguf", "chat", LaneState::Serving.as_str(), ""),
+            lane("reranker", &format!("/models/{RERANKER_GGUF}"), "chat", LaneState::Serving.as_str(), ""),
+        ]);
+        let running = json!({"running_backends": {"llamacpp": "chat.gguf", "reranker": RERANKER_GGUF}});
+        let with_lanes = facts(&rec("n1", "100.64.0.1", lanes, running.clone()));
+        assert_reranker_not_chat_default(&build_table(&[with_lanes], &placements, &Declarations::default()), RERANKER_GGUF, "lanes");
+        // Case 2, no lanes: running_backends only, with no placement join to
+        // help (dev's `non_chat_pairs` never listed a chat-roled row).
+        let mut bare = rec("n1", "100.64.0.1", json!([]), running);
+        bare.as_object_mut().expect("a record").remove("lanes");
+        let no_lanes = node_facts_from_kv("n1", &bare, &[], 1001.0);
+        assert!(no_lanes.lanes.is_none() && no_lanes.running.iter().any(|(b, _)| b == "reranker"), "{:?}", no_lanes.running);
+        assert_reranker_not_chat_default(&build_table(&[no_lanes], &placements, &Declarations::default()), RERANKER_GGUF, "no lanes");
+        // Case 3: a cross-encoder file the name registry does not know, no
+        // lanes, no placement rows: only `INFERENCE_TYPES` keeps it out.
+        let mut unknown = rec("n1", "100.64.0.1", json!([]), json!({"running_backends": {"llamacpp": "chat.gguf", "reranker": "cross-encoder-q8.gguf"}}));
+        unknown.as_object_mut().expect("a record").remove("lanes");
+        let unknown = node_facts_from_kv("n1", &unknown, &[], 1001.0);
+        assert_reranker_not_chat_default(&build_table(&[unknown], &[], &Declarations::default()), "cross-encoder-q8.gguf", "unknown file name");
+    }
+
     #[test]
     fn running_comes_from_the_routable_chat_lanes_only() {
         let f = facts(&rec(

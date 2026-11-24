@@ -5398,11 +5398,20 @@ fn staged_image_space_facts(dir: &std::path::Path, node: &Value, backend: &str, 
 pub const PLACEMENT_ROLES: &[&str] = &["chat", "embed", "rerank", "harness"];
 
 /// The role a placement request names: explicit, else the backend's default
-/// (`harness` for the harness backend, `chat` for everything else).
+/// (`harness` for the harness backend, `rerank` for the reranker, `chat` for
+/// everything else).
+///
+/// A `reranker` (llama.cpp `--reranking`) serves the rerank role only: a bare
+/// place (`noo cluster place <node> reranker <file>.gguf`, the documented
+/// form) is `rerank`, and any other role is refused. Until 0.6.30-rc.6 the
+/// bare form stored `chat`, so the reranker never routed. Any other backend
+/// may still be placed for `rerank`, as before.
 pub(crate) fn resolve_role(backend: &str, role: Option<&str>) -> Result<String, String> {
     let r = match (backend, role.map(str::trim).filter(|r| !r.is_empty())) {
         ("harness", None) | ("harness", Some("harness")) => "harness",
         ("harness", Some(other)) => return Err(format!("the harness has no role {other:?}")),
+        ("reranker", None) | ("reranker", Some("rerank")) => "rerank",
+        ("reranker", Some(other)) => return Err(reranker_role_refusal(other)),
         (_, None) => "chat",
         (_, Some(r)) => r,
     };
@@ -5413,6 +5422,11 @@ pub(crate) fn resolve_role(backend: &str, role: Option<&str>) -> Result<String, 
         return Err("role 'harness' belongs to the 'harness' backend only".into());
     }
     Ok(r.to_string())
+}
+
+/// Why a `reranker` placement may not name `role`. The CLI says the same.
+pub(crate) fn reranker_role_refusal(role: &str) -> String {
+    format!("a reranker serves the rerank role only, not {role:?}: place it with no role (or role rerank)")
 }
 
 /// The placement upsert, keyed (node, backend, ROLE) -- and, for role=embed
@@ -5543,6 +5557,10 @@ pub(crate) fn fit_specs(existing: &[StoredPlacement], replacing: Option<(&str, &
         .iter()
         .filter(|e| e.desired_state == "running" && e.backend != "harness")
         .filter(|e| replacing.map(|(b, r, m)| !same_placement_slot(e, b, r, m)).unwrap_or(true))
+        // A reranker place replaces EVERY reranker row on the node
+        // (`normalise_reranker_rows` folds a release candidate's chat-stored
+        // row into the one rerank row), so none of them is counted twice.
+        .filter(|e| !(e.backend == "reranker" && replacing.is_some_and(|(b, _, _)| b == "reranker")))
         .filter_map(spec_of)
         .collect();
     if let Some(n) = new.filter(|n| n.desired_state == "running" && n.backend != "harness") {
@@ -6131,6 +6149,14 @@ async fn placement_put(
     // commit together: a place after an unplace can never be followed by a
     // node removing the container (repo/backend_unplaced.rs).
     let mut tx = state.db.begin().await.map_err(|e| AppError::Internal(format!("placement upsert: {e}")))?;
+    // A reranker a 0.6.30 release candidate stored under role chat is
+    // corrected in place by this place of it (rerank), so the upsert below
+    // hits that one row, keeping its env, target and keep_warm.
+    if backend == "reranker" {
+        crate::repo::cluster::normalise_reranker_rows(&mut tx, &node_id)
+            .await
+            .map_err(|e| AppError::Internal(format!("placement upsert: reranker role: {e}")))?;
+    }
     if role == "embed" && desired == "running" && backend != "ollama" {
         sqlx::query(
             "DELETE FROM noo_backend_placements WHERE node_id = $1 AND backend = $2 AND role = 'embed' AND model IS DISTINCT FROM $3",
@@ -9603,6 +9629,48 @@ mod placement_role_tests {
         assert!(resolve_role("ollama", Some("bogus")).is_err());
     }
 
+    /// The documented reranker place names no role: it is rerank, never the
+    /// chat default (0.6.30-rc.5 rehearsal).
+    #[test]
+    fn a_bare_reranker_place_is_the_rerank_role() {
+        assert_eq!(resolve_role("reranker", None).unwrap(), "rerank");
+        assert_eq!(resolve_role("reranker", Some(" ")).unwrap(), "rerank");
+        assert_eq!(resolve_role("reranker", Some("rerank")).unwrap(), "rerank");
+    }
+
+    /// A reranker serves rerank only: chat or embed is refused, with the
+    /// message the CLI gives too.
+    #[test]
+    fn a_reranker_with_another_role_is_refused() {
+        for r in ["chat", "embed", "harness"] {
+            let e = resolve_role("reranker", Some(r)).expect_err(r);
+            assert_eq!(e, reranker_role_refusal(r));
+            assert!(e.contains("a reranker serves the rerank role only"), "{e}");
+        }
+    }
+
+    /// The reranker normalisation runs in the upsert's transaction, before it,
+    /// for the reranker only.
+    #[test]
+    fn placement_put_corrects_an_rc_reranker_row_before_the_upsert() {
+        let own = crate::test_src::own_code(include_str!("cluster.rs"));
+        let put = crate::test_src::fn_body(&own, "async fn placement_put(");
+        let begin = put.find("let mut tx = state.db.begin()").expect("the transaction");
+        let fix = put.find("crate::repo::cluster::normalise_reranker_rows(&mut tx, &node_id)").expect("the normalisation");
+        assert!(begin < fix && fix < put.find("(PLACEMENT_UPSERT)").expect("the write"), "in the transaction, before the write");
+        assert!(put[begin..fix].contains("if backend == \"reranker\" {"), "only for the reranker");
+    }
+
+    /// The reverse stays open (as before rc.6): any other model backend may be
+    /// placed for rerank, and its bare place is still chat.
+    #[test]
+    fn a_non_reranker_backend_may_still_serve_rerank() {
+        for b in ["llamacpp", "ollama", "vllm"] {
+            assert_eq!(resolve_role(b, Some("rerank")).unwrap(), "rerank", "{b}");
+            assert_eq!(resolve_role(b, None).unwrap(), "chat", "{b}");
+        }
+    }
+
     #[test]
     fn a_model_change_does_not_carry_env_over_but_the_same_model_keeps_it() {
         let harrier = stored("ollama", "embed", "harrier", json!({"OLLAMA_NUM_PARALLEL": "4"}));
@@ -9632,6 +9700,25 @@ mod placement_role_tests {
         let specs = fit_specs(&existing, Some(("ollama", "embed", Some("harrier"))), Some(&new));
         let names: Vec<_> = specs.iter().map(|s| format!("{}/{}", s.role, s.model)).collect();
         assert_eq!(names, vec!["chat/gemma4:26b-a4b-it-qat", "embed/bge-m3"], "harness holds no model memory");
+    }
+
+    #[test]
+    fn a_reranker_place_counts_no_old_reranker_row_beside_the_new_one() {
+        // A release candidate stored the reranker under role chat; placing it
+        // again folds that row into the rerank row (normalise_reranker_rows),
+        // so the fit set holds the new reranker once, not old + new.
+        let existing = vec![
+            stored("ollama", "chat", "gemma4:26b-a4b-it-qat", json!({})),
+            stored("reranker", "chat", "bge-reranker-v2-m3-Q8_0.gguf", json!({})),
+        ];
+        let new = stored("reranker", "rerank", "bge-reranker-v2-m3-Q8_0.gguf", json!({}));
+        let specs = fit_specs(&existing, Some(("reranker", "rerank", Some("bge-reranker-v2-m3-Q8_0.gguf"))), Some(&new));
+        let names: Vec<_> = specs.iter().map(|s| format!("{}/{}/{}", s.backend, s.role, s.model)).collect();
+        assert_eq!(names, vec!["ollama/chat/gemma4:26b-a4b-it-qat", "reranker/rerank/bge-reranker-v2-m3-Q8_0.gguf"]);
+        // Placing another backend still counts the reranker.
+        let other = stored("ollama", "embed", "harrier", json!({}));
+        let specs = fit_specs(&existing, Some(("ollama", "embed", Some("harrier"))), Some(&other));
+        assert!(specs.iter().any(|s| s.backend == "reranker"), "a non-reranker place keeps the reranker in the fit set");
     }
 
     #[test]
@@ -9717,16 +9804,59 @@ mod placement_role_tests {
     }
 
     /// The live incident, on the real upsert and the real migrated schema.
-    #[tokio::test]
-    async fn two_roles_on_one_backend_coexist_and_nothing_carries_over() {
-        let Some((admin, db)) = scratch("mrp_roles_test").await else { return };
+    /// A scratch database with the real migrated schema (None without a DSN).
+    async fn migrated(name: &str) -> Option<(sqlx::PgPool, sqlx::PgPool)> {
+        let (admin, db) = scratch(name).await?;
         std::env::set_var("NOO_APP_DB_PASSWORD", "ephemeral-not-a-secret");
         for ext in ["vector", "pg_trgm"] {
             sqlx::query(sqlx::AssertSqlSafe(format!("CREATE EXTENSION IF NOT EXISTS {ext}"))).execute(&db).await.expect("extension");
         }
         crate::mesh_migrate::apply(&db).await.expect("apply");
         db.close().await;
-        let db = pool(&std::env::var("NOO_BROKER_TEST_DSN").unwrap(), "mrp_roles_test").await;
+        Some((admin, pool(&std::env::var("NOO_BROKER_TEST_DSN").unwrap(), name).await))
+    }
+
+    /// The rc.6 roll on the real schema: a reranker a 0.6.30 release
+    /// candidate stored under role chat is corrected in place by the next
+    /// place of it (no role): one row, role rerank, its env kept. A chat row
+    /// beside a rerank one is removed. Same transaction statements as
+    /// `placement_put` (the repo function, then `PLACEMENT_UPSERT`).
+    #[tokio::test]
+    async fn a_reranker_place_corrects_an_rc_chat_row_in_place() {
+        let Some((admin, db)) = migrated("mrp_reranker_roll_test").await else { return };
+        let gguf = "bge-reranker-v2-m3-Q8_0.gguf";
+        let env = json!({"N_PARALLEL": "1"});
+        upsert(&db, "reranker", Some(gguf), Some(env.clone()), "chat").await;
+        let mut conn = db.acquire().await.unwrap();
+        crate::repo::cluster::normalise_reranker_rows(&mut conn, "host6").await.unwrap();
+        drop(conn);
+        upsert(&db, "reranker", Some(gguf), None, &resolve_role("reranker", None).unwrap()).await;
+        let r = rows(&db).await;
+        assert_eq!(r.len(), 1, "one reranker row: {r:?}");
+        assert_eq!((r[0].0.as_str(), r[0].1.as_str(), r[0].3.clone()), ("reranker", "rerank", env), "role rerank, env kept");
+
+        // chat + rerank rows (an rc row, then a second place beside it): one row.
+        upsert(&db, "reranker", Some(gguf), None, "chat").await;
+        assert_eq!(rows(&db).await.len(), 2);
+        let mut conn = db.acquire().await.unwrap();
+        crate::repo::cluster::normalise_reranker_rows(&mut conn, "host6").await.unwrap();
+        drop(conn);
+        upsert(&db, "reranker", Some(gguf), None, "rerank").await;
+        let r = rows(&db).await;
+        assert_eq!(r.iter().map(|x| (x.0.as_str(), x.1.as_str())).collect::<Vec<_>>(), vec![("reranker", "rerank")]);
+
+        // Another backend's chat row on the node is never touched.
+        upsert(&db, "llamacpp", Some("chat.gguf"), None, "chat").await;
+        let mut conn = db.acquire().await.unwrap();
+        crate::repo::cluster::normalise_reranker_rows(&mut conn, "host6").await.unwrap();
+        drop(conn);
+        assert_eq!(rows(&db).await.len(), 2);
+        drop_db(&admin, db, "mrp_reranker_roll_test").await;
+    }
+
+    #[tokio::test]
+    async fn two_roles_on_one_backend_coexist_and_nothing_carries_over() {
+        let Some((admin, db)) = migrated("mrp_roles_test").await else { return };
 
         // chat first, then the embedder beside it: the second place must not replace the first.
         upsert(&db, "ollama", Some("gemma4:26b-a4b-it-qat"), None, "chat").await;
