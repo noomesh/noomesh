@@ -1844,7 +1844,7 @@ fn merge_gossip_backends(data: &mut Value, gossip: impl IntoIterator<Item = (Str
         _ => serde_json::Map::new(),
     };
     for (bt, model) in gossip {
-        rb.insert(bt, json!(model));
+        rb.entry(bt).or_insert(json!(model));
     }
     data["running_backends"] = Value::Object(rb);
 }
