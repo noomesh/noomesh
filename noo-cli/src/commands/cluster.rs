@@ -1155,6 +1155,23 @@ pub(crate) fn removed_engine_refusal(node: &str, backend: &str, model: &str, ima
     }
 }
 
+/// The role a `place` of `backend` sends. A reranker (llama.cpp
+/// `--reranking`) serves the rerank role only: a bare place, the documented
+/// `noo cluster place <node> reranker <file>.gguf`, means `rerank`, and any
+/// other `--role` is refused with the gateway's own message. Until
+/// 0.6.30-rc.6 the bare form stored `chat` and the reranker never routed.
+/// Every other backend keeps what was given (none = the chat default; an
+/// llamacpp or ollama may still be placed `--role rerank`).
+pub(crate) fn reranker_role(backend: &str, role: Option<&str>) -> Result<Option<String>, String> {
+    if backend != "reranker" {
+        return Ok(role.map(str::to_string));
+    }
+    match role.map(str::trim).filter(|r| !r.is_empty()) {
+        None | Some("rerank") => Ok(Some("rerank".to_string())),
+        Some(other) => Err(format!("a reranker serves the rerank role only, not {other:?}: place it with no role (or role rerank)")),
+    }
+}
+
 /// `noo cluster place NODE BACKEND MODEL [--on cpu|gpu] [--env KEY=VALUE]... [--port P] [--tls]
 /// [--image IMG] [--stopped]` — PUT /api/cluster/nodes/{node}/placements/{backend}.
 /// Declares that NODE should run BACKEND with MODEL; the node-agent
@@ -1199,6 +1216,11 @@ pub fn cluster_place(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                 "the harness has no --role: `noo cluster place <node> harness <model|auto>`", None),
         }
     }
+    match reranker_role(backend, role.as_deref()) {
+        Ok(r) => role = r,
+        Err(why) => crate::output::fail(g.json, crate::output::ExitCode::Usage, "bad_role", &why,
+            Some(&format!("noo cluster place {node} reranker {model}"))),
+    }
     if let Some(r) = &role {
         if !matches!(r.as_str(), "chat" | "embed" | "rerank" | "harness") {
             crate::output::fail(g.json, crate::output::ExitCode::Usage, "bad_role",
@@ -1225,7 +1247,8 @@ pub fn cluster_place(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     } else {
         serde_json::Value::Null
     };
-    // A bare `place` means the chat role (#837). If this node already runs
+    // A bare `place` means the chat role (#837; a reranker's is rerank, set
+    // above, so it never reaches this guard). If this node already runs
     // THIS model on THIS backend under another role, re-placing it without
     // --role would add a CHAT row serving that model (an embedder answering
     // chat). The operator meant the existing role: refuse and name it.
@@ -1738,6 +1761,34 @@ mod placement_env_tests {
         // an old row with no role is chat
         let legacy = serde_json::json!([{"backend": "ollama", "model": "harrier"}]);
         assert_eq!(other_role_for_same_model(&legacy, "ollama", "harrier"), None);
+    }
+
+    /// The documented `noo cluster place <node> reranker <file>.gguf` (no
+    /// --role) sends role rerank; `--role rerank` is the same.
+    #[test]
+    fn a_bare_reranker_place_sends_the_rerank_role() {
+        assert_eq!(super::reranker_role("reranker", None).unwrap().as_deref(), Some("rerank"));
+        assert_eq!(super::reranker_role("reranker", Some("rerank")).unwrap().as_deref(), Some("rerank"));
+        assert_eq!(super::reranker_role("reranker", Some("")).unwrap().as_deref(), Some("rerank"));
+    }
+
+    /// `--role chat|embed` on a reranker is refused, with the gateway's text.
+    #[test]
+    fn a_reranker_with_another_role_is_refused() {
+        for r in ["chat", "embed"] {
+            let e = super::reranker_role("reranker", Some(r)).expect_err(r);
+            assert_eq!(e, format!("a reranker serves the rerank role only, not {r:?}: place it with no role (or role rerank)"));
+        }
+    }
+
+    /// Every other backend is untouched: a bare place is the chat default
+    /// (None), and an llamacpp may still be placed for rerank.
+    #[test]
+    fn other_backends_keep_the_role_they_were_given() {
+        assert_eq!(super::reranker_role("llamacpp", None).unwrap(), None);
+        assert_eq!(super::reranker_role("llamacpp", Some("rerank")).unwrap().as_deref(), Some("rerank"));
+        assert_eq!(super::reranker_role("ollama", Some("embed")).unwrap().as_deref(), Some("embed"));
+        assert_eq!(super::reranker_role("harness", Some("harness")).unwrap().as_deref(), Some("harness"));
     }
 
     use super::{capabilities_cell, chat_context_line, current_env_for, merge_placement_env, other_role_for_same_model, parse_env_change, removed_engine_refusal, render_fit, role_capabilities_section, role_capabilities_section_with, target_cell, usage_cell, memory_limit_line, mem_cell, harness_cell, harness_show_cell, vendor_kinds_row};

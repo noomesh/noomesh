@@ -129,6 +129,33 @@ where
     .await
 }
 
+/// Correct a reranker a 0.6.30 release candidate stored under role chat:
+/// `placement_put` runs this for backend `reranker` only, in its transaction,
+/// before the upsert, so the upsert hits one `(node, reranker, rerank)` row.
+/// One stored row (the chat one first) becomes the rerank row (env, target
+/// and keep_warm kept; `ctid` keeps it to one row, so two old rows cannot
+/// collide on the key); every other non-rerank reranker row then goes. DML
+/// on an explicit place only: nothing rewrites rows at startup.
+pub async fn normalise_reranker_rows(conn: &mut sqlx::PgConnection, node_id: &str) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE noo_backend_placements SET role = 'rerank' \
+         WHERE node_id = $1 AND backend = 'reranker' AND role <> 'rerank' \
+           AND NOT EXISTS (SELECT 1 FROM noo_backend_placements \
+                           WHERE node_id = $1 AND backend = 'reranker' AND role = 'rerank') \
+           AND ctid = (SELECT ctid FROM noo_backend_placements \
+                       WHERE node_id = $1 AND backend = 'reranker' AND role <> 'rerank' \
+                       ORDER BY (role = 'chat') DESC, role, model LIMIT 1)",
+    )
+    .bind(node_id)
+    .execute(&mut *conn)
+    .await?;
+    sqlx::query("DELETE FROM noo_backend_placements WHERE node_id = $1 AND backend = 'reranker' AND role <> 'rerank'")
+        .bind(node_id)
+        .execute(&mut *conn)
+        .await?;
+    Ok(())
+}
+
 /// Does `node_id` have a RUNNING placement declared for `role`?
 ///
 /// The gateway's own answer to "is this node an embedder", independent of what
