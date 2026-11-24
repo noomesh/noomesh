@@ -16,16 +16,17 @@ import secret_check as sc  # noqa: E402
 
 TOKEN = "tok-0123456789abcdef"
 SECRET = "sec-fedcba9876543210"
+GW_NATS = "Ab3dE5gH7jK9mN1pQ3sT5vW7yZ9bC1dF"  # 32 chars: under the shape scan's 40-character floor
+GW_JWT = "jwt-secret-from-a-mounted-file-42"
 
 
-def _envs(monkeypatch, files: dict[str, bytes | None]):
-    import harness_e2e
+def _envs(monkeypatch, files: dict[str, bytes | None], gateway=([], [])):
     read = lambda p: files.get(p)  # noqa: E731
     monkeypatch.setattr(sc, "root_read", read)
-    monkeypatch.setattr(harness_e2e, "root_read", read)  # agent_secret follows a KEY_FILE pointer with it
+    monkeypatch.setattr(sc, "gateway_env", lambda: gateway)
 
 
-def test_a_log_with_a_credential_or_its_hash_is_refused_and_a_clean_one_passes(tmp_path, monkeypatch, capsys):
+def test_node_credentials_by_name_a_file_pointer_and_a_hash_are_refused(tmp_path, monkeypatch, capsys):
     env = f"NODE_ID=n1\nNOO_NODE_AGENT_TOKEN={TOKEN}\nNOO_CLUSTER_SECRET_FILE=/run/s\n".encode()
     _envs(monkeypatch, {"/etc/noo-node-agent.env": env, "/run/s": SECRET.encode() + b"\n"})
     clean, raw, hashed, viafile = (tmp_path / n for n in ("clean.log", "raw.log", "hashed.log", "viafile.log"))
@@ -40,19 +41,40 @@ def test_a_log_with_a_credential_or_its_hash_is_refused_and_a_clean_one_passes(t
     assert TOKEN not in out and SECRET not in out, "the check never prints a value"
 
 
+def test_a_gateway_only_credential_is_refused_and_a_gateway_file_is_followed_through_its_mount(tmp_path, monkeypatch, capsys):
+    gw = ([f"NATS_GATEWAY_PASSWORD={GW_NATS}", "NOO_JWT_SECRET_FILE=/run/secrets/jwt", "NOO_TLS_KEY=/app/pki/gateway/key.pem", "PATH=/usr/bin"],
+          [{"Destination": "/run/secrets", "Source": "/srv/noo/secrets"}])
+    _envs(monkeypatch, {"/etc/noo-node-agent.env": b"NODE_ID=n1\n", "/srv/noo/secrets/jwt": GW_JWT.encode()}, gw)
+    nats, jwt, path = (tmp_path / n for n in ("nats.log", "jwt.log", "path.log"))
+    nats.write_text(f"nats connect failed: tls://gateway:{GW_NATS}@localhost:4222\n")
+    jwt.write_text(f"signing with {GW_JWT}\n")
+    path.write_text("TLS key loaded from /app/pki/gateway/key.pem\n")
+    assert sc.main([str(nats)]) == 3 and sc.main([str(jwt)]) == 3
+    assert sc.main([str(path)]) == 0, "a path is not a credential"
+    out = capsys.readouterr().out
+    assert GW_NATS not in out and GW_JWT not in out and "nats.log" in out
+
+
 def test_unreadable_credentials_are_not_a_pass(tmp_path, monkeypatch):
-    _envs(monkeypatch, {})
     f = tmp_path / "x.log"
     f.write_text("anything\n")
-    assert sc.main([str(f)]) == 2, "not checked is not clean: the caller keeps only the stamps"
+    _envs(monkeypatch, {})
+    assert sc.main([str(f)]) == 2, "no node env: not checked"
+    _envs(monkeypatch, {"/etc/noo-node-agent.env": b"NODE_ID=n1\n"}, None)
+    assert sc.main([str(f)]) == 2, "no gateway env: not checked, so the gateway window is withheld"
 
 
-def test_stamps_keep_only_the_time_and_the_level():
+def test_stamps_keep_only_a_real_timestamp_and_a_level_word():
     lines = ('2026-11-24T16:38:51+0000 host noo-harness[1]: {"level":"WARN","fields":{"message":"x","token":"abc"}}\n'
-             "2026-11-24T16:38:52+0000 host ollama[2]: time=t level=INFO msg=\"load\" secret=xyz\n"
-             "2026-11-24T16:38:53+0000 host x: plain text with a secret\n")
+             "2026-11-24T16:38:52.123456789Z time=t level=INFO msg=\"load\" secret=xyz\n"
+             "2026-11-24T16:38:53+0000 host x: plain text\n"
+             f"{GW_NATS} a line with no timestamp, its first word a credential\n"
+             f"    {TOKEN} an indented continuation line\n"
+             "2026-11-24T16:38:54Z level=hunter2secret not a level word\n")
     out = subprocess.run([sys.executable, "-I", str(HERE / "stamps.py")], input=lines, capture_output=True, text=True).stdout
-    assert out.splitlines() == ["2026-11-24T16:38:51+0000 WARN", "2026-11-24T16:38:52+0000 INFO", "2026-11-24T16:38:53+0000 -"]
+    assert out.splitlines() == ["2026-11-24T16:38:51+0000 WARN", "2026-11-24T16:38:52.123456789Z INFO", "2026-11-24T16:38:53+0000 -",
+                                "- -", "- -", "2026-11-24T16:38:54Z -"], out
+    assert GW_NATS not in out and TOKEN not in out and "hunter2" not in out
 
 
 def test_the_capture_follows_harness_e2e_and_keeps_a_file_only_on_both_checks():
@@ -66,3 +88,4 @@ def test_the_capture_follows_harness_e2e_and_keeps_a_file_only_on_both_checks():
         guard = block.rindex("if python3", 0, block.index(kept))
         assert "&& python3 -I" in block[guard:block.index(kept)], kept
     assert "abandon" not in run, "no abandoned-turn step in the real matrix"
+    assert block.count("logs --timestamps --since") == 2, "docker logs lines carry real timestamps (the stamps keep only those)"

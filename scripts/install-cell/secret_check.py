@@ -1,38 +1,111 @@
 #!/usr/bin/env python3
-"""secret_check.py FILE...: exit 3 when any of this node's own credentials,
-or its sha256, occurs in a FILE; 0 when none does; 2 when the credentials
-cannot be read. A companion to the upload scan (`cell.py scan`, which finds
-secret-SHAPED text): this one knows the actual values. They are read from the
-node agent's and the harness's env files (a `KEY_FILE` pointer is followed),
-compared in memory, and never printed: the output names only the file."""
+"""secret_check.py FILE...: exit 3 when any credential of this node or of its
+gateway, or its sha256, occurs in a FILE; 0 when none does; 2 when the
+credentials cannot be read (not checked is never clean). A companion to the
+upload scan (`cell.py scan`, which finds secret-SHAPED text): this one knows
+the actual values.
+
+Values are chosen by key NAME, the redactor's own `SECRET_NAME`
+(…PASSWORD, …PASSPHRASE, …TOKEN, …SECRET, …KEY), from every `KEY=value` in
+the node agent's and the harness's env files and in the gateway container's
+environment. A `…_FILE` pointer is followed (a gateway path through the
+container's mounts to the host file). A value shorter than 8 characters, or
+an absolute path, is not a credential. They are compared in memory and never
+printed: the output names only the file."""
 import hashlib
+import json
 import os
+import subprocess
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from harness_e2e import agent_secret, root_read  # noqa: E402
+from cell import SECRET_NAME  # noqa: E402
+from harness_e2e import root_read  # noqa: E402
 
-KEYS = ("NOO_NODE_AGENT_TOKEN", "NOO_CLUSTER_SECRET", "NATS_NODE_PASSWORD", "NATS_PASSWORD")
 ENVS = ("/etc/noo-node-agent.env", "/etc/noo-harness.env")
 
 
+def env_pairs(text: str) -> list[tuple[str, str]]:
+    out = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):]
+        k, v = line.split("=", 1)
+        v = v.strip()
+        if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+            v = v[1:-1]
+        out.append((k.strip(), v))
+    return out
+
+
+def gateway_env() -> tuple[list[str], list[dict]] | None:
+    """The gateway container's Env and Mounts, in memory; None if unreadable."""
+    for docker in (["docker"], ["sudo", "-n", "docker"]):
+        try:
+            p = subprocess.run(docker + ["inspect", "-f", "{{json .Config.Env}}\t{{json .Mounts}}", "noo-gateway"],
+                               capture_output=True, text=True, timeout=30)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if p.returncode == 0 and "\t" in p.stdout:
+            env, mounts = p.stdout.strip().split("\t", 1)
+            try:
+                return json.loads(env) or [], json.loads(mounts) or []
+            except ValueError:
+                return None
+    return None
+
+
+def host_path(path: str, mounts: list[dict]) -> str | None:
+    """A container path's file on the host, through the bind mounts."""
+    best = None
+    for m in mounts:
+        dst, src = m.get("Destination", ""), m.get("Source", "")
+        if dst and src and (path == dst or path.startswith(dst.rstrip("/") + "/")):
+            if best is None or len(dst) > len(best[0]):
+                best = (dst, src)
+    if best is None:
+        return None
+    return best[1] + path[len(best[0]):]
+
+
+def pick(pairs: list[tuple[str, str]], resolve) -> list[str]:
+    vals = []
+    for k, v in pairs:
+        if not SECRET_NAME.match(k) or not v:
+            continue
+        if k.endswith("_FILE"):
+            p = resolve(v)
+            b = root_read(p) if p else None
+            v = b.decode(errors="replace").strip() if b else ""
+        if len(v) >= 8 and not v.startswith("/"):
+            vals.append(v)
+    return vals
+
+
 def values() -> list[str] | None:
-    found: list[str] = []
+    vals: list[str] = []
     readable = False
     for path in ENVS:
         b = root_read(path)
         if b is None:
             continue
         readable = True
-        text = b.decode(errors="replace")
-        found += [v for v in (agent_secret(text, k) for k in KEYS) if len(v) >= 8]
-    return found if readable else None
+        vals += pick(env_pairs(b.decode(errors="replace")), lambda p: p)
+    gw = gateway_env()
+    if gw is None or not readable:
+        return None
+    env, mounts = gw
+    vals += pick([tuple(e.split("=", 1)) for e in env if "=" in e], lambda p: host_path(p, mounts))
+    return vals
 
 
 def main(paths: list[str]) -> int:
     secrets = values()
     if secrets is None:
-        print("secret-check: the node's env files are not readable here (sudo -n); not checked")
+        print("secret-check: this node's or its gateway's credentials are not readable here; not checked")
         return 2
     hashes = [hashlib.sha256(s.encode()).hexdigest() for s in secrets]
     bad = []
@@ -41,7 +114,7 @@ def main(paths: list[str]) -> int:
         if any(s in blob for s in secrets) or any(h in blob for h in hashes):
             bad.append(os.path.basename(p))
     if bad:
-        print("secret-check: a credential of this node occurs in " + ", ".join(bad) + "; withheld")
+        print("secret-check: a credential of this node or its gateway occurs in " + ", ".join(bad) + "; withheld")
         return 3
     return 0
 
