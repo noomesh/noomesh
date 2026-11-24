@@ -114,6 +114,10 @@ noo cluster verify <node>
   Otherwise: set `services.gateway_url` to the new address, restart the
   gateway, and enroll each node again with a fresh token (the steps above).
   Not yet run end to end on 0.6.29.
+- **Jobs wait after a worker's address changes.** After a worker's address
+  changes, jobs sent to it through the job queue can wait several minutes
+  before it takes them again; the alert that suggests restarting the node
+  agent does not shorten that: it clears by itself.
 
 ### Check which path traffic takes
 
