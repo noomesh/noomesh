@@ -191,10 +191,12 @@ argument, so upgrade the binary first (`noo upgrade`), then run
 `noo upgrade --stack --recreate`.
 `--nodes` ends `bundles staged for all N node(s) — each applies on its next
 fetch tick`. Nodes that callers fail over between (the candidates of one
-model class, the pool of one embedding space) are never all restarting at
+model class, the pool of one embedding space) are never all upgrading at
 once: before staging a node, the roll checks that each of its groups keeps
 one other serving candidate (two for a group of four or more), and otherwise
-waits, saying what it waits for. Serving is what the router itself needs:
+waits, saying what it waits for. Backends move to the new image when it is
+ready on each node, not in this order, so a class can be unanswered for a
+few seconds during a roll; a retry succeeds. Serving is what the router itself needs:
 the candidate is placed or available, healthy (a fresh heartbeat, the
 controller reaches its agent, the engine answers) and its lane serving or
 on demand, as `noo cluster class list` shows it; being listed in the class
@@ -202,7 +204,7 @@ is not enough. A node staged earlier counts again once it has applied, serves
 in every class it served before, and the controller's reachability probe has
 reached it since it restarted. The wait is bounded: 10 min for that node to
 apply, then 15 min for it to serve. When a bound runs out the node phase
-stops instead of leaving a class with nothing serving: the node and every
+stops instead of staging the last serving candidate of a class: the node and every
 node after it are not staged (the nodes already staged are still waited for),
 and the roll names who is not serving what. Once it serves again,
 `noo upgrade --nodes` resumes. `noo upgrade --nodes --allow-unserved` (or

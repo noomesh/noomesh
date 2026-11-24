@@ -492,10 +492,17 @@ information" when the knowledge base already holds the fact
   and that a retrieval tool is offered from the next step on if it is not enough (`mark_kb_shown` in
   `context.rs`). With no knowledge-base layer the persona is unchanged.
   When this turn's context already carries the knowledge-base results, the
-  first iteration is offered every tool except `noo_rag_query` and answers
-  from them; the tool is offered from the next iteration on, so a different
-  query can still run (`offered_tools` in `agent_loop.rs`, logged as
-  `coordinator.kb_tool_deferred`).
+  first iteration is offered every tool except `noo_rag_query`; a
+  first-iteration call to it anyway is not run, and the model is told the
+  results are already in its context. The tool is offered from the next
+  iteration on, so a different query can still run (`offered_tools` and
+  `kb_deferred_result` in `agent_loop.rs`, logged as
+  `coordinator.kb_tool_deferred`; a deferred call logs it with `called=true`).
+  A model can still make that first-step call, the default chat model in
+  some turns; its next step can then come back empty and be nudged
+  (`loop.stall_detected_empty_response`), which costs two further model
+  calls before the answer. A very small model (0.5B class) may instead reach
+  for another tool on its first step, which costs it a further model turn.
 - **A post-tool answer that ignores the result is a stall.** After a turn that
   ran a retrieval tool (`noo_rag_query`, `noo_memory_search`,
   `noo_recall_search`, `noo_graph_semantic_search`), the loop re-nudges ONCE

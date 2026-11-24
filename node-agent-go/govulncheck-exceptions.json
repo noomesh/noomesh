@@ -1,0 +1,9 @@
+[
+  {
+    "id": "GO-2026-6278",
+    "module": "github.com/gorilla/websocket",
+    "found_version": "v1.5.3",
+    "expires": "2026-12-15",
+    "reason": "reachable, but harmless: the agent's only websocket is the tunnel client (internal/tunnel/client.go): wss only (client.go:91-92 refuses a non-https controller, :113 builds wss://), mutually authenticated TLS pinned to the controller (client.go:278-291), Dialer Proxy nil (client.go:312). The mask key protects intermediaries on cleartext paths; inside TLS none sees or shapes the frames. Bump to the fixed version first in 0.6.31 (the fix is an untagged upstream snapshot that adds golang.org/x/net)."
+  }
+]

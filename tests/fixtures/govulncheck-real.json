@@ -1,0 +1,756 @@
+{
+  "config": {
+    "protocol_version": "v1.0.0",
+    "scanner_name": "govulncheck",
+    "scanner_version": "v1.1.4",
+    "db": "https://vuln.go.dev",
+    "db_last_modified": "2026-11-23T20:05:14Z",
+    "go_version": "go1.26.11",
+    "scan_level": "symbol",
+    "scan_mode": "source"
+  }
+}
+{
+  "osv": {
+    "schema_version": "1.3.1",
+    "id": "GO-2026-5932",
+    "modified": "2026-11-02T22:01:43Z",
+    "published": "2026-07-07T22:15:29Z",
+    "summary": "The golang.org/x/crypto/openpgp package is unmaintained, unsafe by design, and has known security issues",
+    "details": "The golang.org/x/crypto/openpgp package is unsafe by design, has numerous known security issues, is not maintained, and should not be used.\n\nIf you are required to interoperate with OpenPGP systems and need a maintained package, consider github.com/ProtonMail/go-crypto/openpgp which is a maintained fork that aims to be a drop-in replacement for this package.",
+    "affected": [
+      {
+        "package": {
+          "name": "golang.org/x/crypto",
+          "ecosystem": "Go"
+        },
+        "ranges": [
+          {
+            "type": "SEMVER",
+            "events": [
+              {
+                "introduced": "0"
+              },
+              {
+                "fixed": "0.58.1-0.20261009181718-2f1f834330b2"
+              }
+            ]
+          }
+        ],
+        "ecosystem_specific": {
+          "imports": [
+            {
+              "path": "golang.org/x/crypto/openpgp"
+            },
+            {
+              "path": "golang.org/x/crypto/openpgp/packet"
+            },
+            {
+              "path": "golang.org/x/crypto/openpgp/armor"
+            },
+            {
+              "path": "golang.org/x/crypto/openpgp/clearsign"
+            },
+            {
+              "path": "golang.org/x/crypto/openpgp/errors"
+            },
+            {
+              "path": "golang.org/x/crypto/openpgp/elgamal"
+            },
+            {
+              "path": "golang.org/x/crypto/openpgp/s2k"
+            }
+          ]
+        }
+      },
+      {
+        "package": {
+          "name": "golang.org/x/crypto/openpgp",
+          "ecosystem": "Go"
+        },
+        "ranges": [
+          {
+            "type": "SEMVER",
+            "events": [
+              {
+                "introduced": "0"
+              }
+            ]
+          }
+        ],
+        "ecosystem_specific": {
+          "imports": [
+            {
+              "path": "golang.org/x/crypto/openpgp"
+            },
+            {
+              "path": "golang.org/x/crypto/openpgp/packet"
+            },
+            {
+              "path": "golang.org/x/crypto/openpgp/armor"
+            },
+            {
+              "path": "golang.org/x/crypto/openpgp/clearsign"
+            },
+            {
+              "path": "golang.org/x/crypto/openpgp/errors"
+            },
+            {
+              "path": "golang.org/x/crypto/openpgp/elgamal"
+            },
+            {
+              "path": "golang.org/x/crypto/openpgp/s2k"
+            }
+          ]
+        }
+      }
+    ],
+    "references": [
+      {
+        "type": "REPORT",
+        "url": "https://go.dev/issue/44226"
+      },
+      {
+        "type": "WEB",
+        "url": "https://go.dev/issue/81227"
+      }
+    ],
+    "database_specific": {
+      "url": "https://pkg.go.dev/vuln/GO-2026-5932",
+      "review_status": "REVIEWED"
+    }
+  }
+}
+{
+  "osv": {
+    "schema_version": "1.3.1",
+    "id": "GO-2026-6278",
+    "modified": "2026-11-23T20:03:32Z",
+    "published": "2026-08-25T15:00:08Z",
+    "aliases": [
+      "GHSA-w67g-5rqw-f597"
+    ],
+    "summary": "Gorilla WebSocket Uses Cryptographically Weak PRNG for WebSocket Mask Key in github.com/gorilla/websocket",
+    "details": "Gorilla WebSocket Uses Cryptographically Weak PRNG for WebSocket Mask Key in github.com/gorilla/websocket",
+    "affected": [
+      {
+        "package": {
+          "name": "github.com/gorilla/websocket",
+          "ecosystem": "Go"
+        },
+        "ranges": [
+          {
+            "type": "SEMVER",
+            "events": [
+              {
+                "introduced": "0"
+              },
+              {
+                "fixed": "1.5.1"
+              },
+              {
+                "introduced": "1.5.3"
+              },
+              {
+                "fixed": "1.5.4-0.20240701034025-d67f41855da4"
+              }
+            ]
+          }
+        ],
+        "ecosystem_specific": {
+          "imports": [
+            {
+              "path": "github.com/gorilla/websocket",
+              "symbols": [
+                "Conn.Close",
+                "Conn.NextReader",
+                "Conn.NextWriter",
+                "Conn.ReadJSON",
+                "Conn.ReadMessage",
+                "Conn.WriteControl",
+                "Conn.WriteJSON",
+                "Conn.WriteMessage",
+                "Conn.WritePreparedMessage",
+                "Dialer.Dial",
+                "Dialer.DialContext",
+                "NewClient",
+                "NewPreparedMessage",
+                "ReadJSON",
+                "Subprotocols",
+                "Upgrade",
+                "Upgrader.Upgrade",
+                "WriteJSON",
+                "flateReadWrapper.Read",
+                "flateWriteWrapper.Close",
+                "flateWriteWrapper.Write",
+                "httpProxyDialer.Dial",
+                "joinReader.Read",
+                "messageReader.Read",
+                "messageWriter.Close",
+                "messageWriter.ReadFrom",
+                "messageWriter.Write",
+                "messageWriter.WriteString",
+                "netDialerFunc.Dial",
+                "newMaskKey",
+                "proxy_direct.Dial",
+                "proxy_envOnce.Get",
+                "proxy_socks5.Dial",
+                "truncWriter.Write"
+              ]
+            }
+          ]
+        }
+      }
+    ],
+    "references": [
+      {
+        "type": "ADVISORY",
+        "url": "https://github.com/canolgun-commits/websocket/security/advisories/GHSA-w67g-5rqw-f597"
+      },
+      {
+        "type": "FIX",
+        "url": "https://github.com/gorilla/websocket/commit/d67f41855da42d7bccd9ef050c49f7e54e783b95"
+      },
+      {
+        "type": "WEB",
+        "url": "https://github.com/gorilla/websocket/releases/tag/v1.5.3"
+      }
+    ],
+    "database_specific": {
+      "url": "https://pkg.go.dev/vuln/GO-2026-6278",
+      "review_status": "REVIEWED"
+    }
+  }
+}
+{
+  "finding": {
+    "osv": "GO-2026-6278",
+    "fixed_version": "v1.5.4-0.20240701034025-d67f41855da4",
+    "trace": [
+      {
+        "module": "github.com/gorilla/websocket",
+        "version": "v1.5.3"
+      }
+    ]
+  }
+}
+{
+  "finding": {
+    "osv": "GO-2026-6278",
+    "fixed_version": "v1.5.4-0.20240701034025-d67f41855da4",
+    "trace": [
+      {
+        "module": "github.com/gorilla/websocket",
+        "version": "v1.5.3",
+        "package": "github.com/gorilla/websocket"
+      }
+    ]
+  }
+}
+{
+  "finding": {
+    "osv": "GO-2026-6278",
+    "fixed_version": "v1.5.4-0.20240701034025-d67f41855da4",
+    "trace": [
+      {
+        "module": "github.com/gorilla/websocket",
+        "version": "v1.5.3",
+        "package": "github.com/gorilla/websocket",
+        "function": "Write",
+        "receiver": "*truncWriter",
+        "position": {
+          "filename": "compression.go",
+          "offset": 1626,
+          "line": 64,
+          "column": 23
+        }
+      },
+      {
+        "module": "stdlib",
+        "version": "v1.26.11",
+        "package": "compress/flate",
+        "function": "write",
+        "receiver": "*huffmanBitWriter",
+        "position": {
+          "filename": "src/compress/flate/huffman_bit_writer.go",
+          "offset": 3607,
+          "line": 136,
+          "column": 27
+        }
+      },
+      {
+        "module": "stdlib",
+        "version": "v1.26.11",
+        "package": "compress/flate",
+        "function": "flush",
+        "receiver": "*huffmanBitWriter",
+        "position": {
+          "filename": "src/compress/flate/huffman_bit_writer.go",
+          "offset": 3474,
+          "line": 128,
+          "column": 9
+        }
+      },
+      {
+        "module": "stdlib",
+        "version": "v1.26.11",
+        "package": "compress/flate",
+        "function": "close",
+        "receiver": "*compressor",
+        "position": {
+          "filename": "src/compress/flate/deflate.go",
+          "offset": 17572,
+          "line": 644,
+          "column": 11
+        }
+      },
+      {
+        "module": "stdlib",
+        "version": "v1.26.11",
+        "package": "compress/flate",
+        "function": "Close",
+        "receiver": "*Writer",
+        "position": {
+          "filename": "src/compress/flate/deflate.go",
+          "offset": 20464,
+          "line": 729,
+          "column": 18
+        }
+      },
+      {
+        "module": "stdlib",
+        "version": "v1.26.11",
+        "package": "compress/gzip",
+        "function": "Close",
+        "receiver": "*Writer",
+        "position": {
+          "filename": "src/compress/gzip/gzip.go",
+          "offset": 6240,
+          "line": 242,
+          "column": 28
+        }
+      },
+      {
+        "module": "github.com/noomesh/noomesh/node-agent-go",
+        "package": "github.com/noomesh/noomesh/node-agent-go/internal/heartbeat",
+        "function": "gzipBytes",
+        "position": {
+          "filename": "internal/heartbeat/beatgzip.go",
+          "offset": 2489,
+          "line": 77,
+          "column": 20
+        }
+      },
+      {
+        "module": "github.com/noomesh/noomesh/node-agent-go",
+        "package": "github.com/noomesh/noomesh/node-agent-go/internal/heartbeat",
+        "function": "postBeat",
+        "receiver": "*Reporter",
+        "position": {
+          "filename": "internal/heartbeat/heartbeat.go",
+          "offset": 30863,
+          "line": 815,
+          "column": 23
+        }
+      },
+      {
+        "module": "github.com/noomesh/noomesh/node-agent-go",
+        "package": "github.com/noomesh/noomesh/node-agent-go/internal/heartbeat",
+        "function": "SendHeartbeat",
+        "receiver": "*Reporter",
+        "position": {
+          "filename": "internal/heartbeat/heartbeat.go",
+          "offset": 29675,
+          "line": 780,
+          "column": 32
+        }
+      }
+    ]
+  }
+}
+{
+  "finding": {
+    "osv": "GO-2026-6278",
+    "fixed_version": "v1.5.4-0.20240701034025-d67f41855da4",
+    "trace": [
+      {
+        "module": "github.com/gorilla/websocket",
+        "version": "v1.5.3",
+        "package": "github.com/gorilla/websocket",
+        "function": "WriteMessage",
+        "receiver": "*Conn",
+        "position": {
+          "filename": "conn.go",
+          "offset": 19104,
+          "line": 758,
+          "column": 16
+        }
+      },
+      {
+        "module": "github.com/noomesh/noomesh/node-agent-go",
+        "package": "github.com/noomesh/noomesh/node-agent-go/internal/tunnel",
+        "function": "handshake",
+        "receiver": "*Client",
+        "position": {
+          "filename": "internal/tunnel/client.go",
+          "offset": 13833,
+          "line": 394,
+          "column": 29
+        }
+      },
+      {
+        "module": "github.com/noomesh/noomesh/node-agent-go",
+        "package": "github.com/noomesh/noomesh/node-agent-go/internal/tunnel",
+        "function": "session",
+        "receiver": "*Client",
+        "position": {
+          "filename": "internal/tunnel/client.go",
+          "offset": 11127,
+          "line": 332,
+          "column": 27
+        }
+      },
+      {
+        "module": "github.com/noomesh/noomesh/node-agent-go",
+        "package": "github.com/noomesh/noomesh/node-agent-go/internal/tunnel",
+        "function": "Run",
+        "receiver": "*Client",
+        "position": {
+          "filename": "internal/tunnel/client.go",
+          "offset": 5414,
+          "line": 166,
+          "column": 30
+        }
+      }
+    ]
+  }
+}
+{
+  "finding": {
+    "osv": "GO-2026-6278",
+    "fixed_version": "v1.5.4-0.20240701034025-d67f41855da4",
+    "trace": [
+      {
+        "module": "github.com/gorilla/websocket",
+        "version": "v1.5.3",
+        "package": "github.com/gorilla/websocket",
+        "function": "Close",
+        "receiver": "*Conn",
+        "position": {
+          "filename": "conn.go",
+          "offset": 10025,
+          "line": 344,
+          "column": 16
+        }
+      },
+      {
+        "module": "github.com/noomesh/noomesh/node-agent-go",
+        "package": "github.com/noomesh/noomesh/node-agent-go/internal/tunnel",
+        "function": "session",
+        "receiver": "*Client",
+        "position": {
+          "filename": "internal/tunnel/client.go",
+          "offset": 11082,
+          "line": 331,
+          "column": 2
+        }
+      },
+      {
+        "module": "github.com/noomesh/noomesh/node-agent-go",
+        "package": "github.com/noomesh/noomesh/node-agent-go/internal/tunnel",
+        "function": "Run",
+        "receiver": "*Client",
+        "position": {
+          "filename": "internal/tunnel/client.go",
+          "offset": 5414,
+          "line": 166,
+          "column": 30
+        }
+      }
+    ]
+  }
+}
+{
+  "finding": {
+    "osv": "GO-2026-6278",
+    "fixed_version": "v1.5.4-0.20240701034025-d67f41855da4",
+    "trace": [
+      {
+        "module": "github.com/gorilla/websocket",
+        "version": "v1.5.3",
+        "package": "github.com/gorilla/websocket",
+        "function": "DialContext",
+        "receiver": "*Dialer",
+        "position": {
+          "filename": "client.go",
+          "offset": 5859,
+          "line": 160,
+          "column": 18
+        }
+      },
+      {
+        "module": "github.com/noomesh/noomesh/node-agent-go",
+        "package": "github.com/noomesh/noomesh/node-agent-go/internal/tunnel",
+        "function": "dial",
+        "receiver": "*Client",
+        "position": {
+          "filename": "internal/tunnel/client.go",
+          "offset": 10532,
+          "line": 316,
+          "column": 22
+        }
+      },
+      {
+        "module": "github.com/noomesh/noomesh/node-agent-go",
+        "package": "github.com/noomesh/noomesh/node-agent-go/internal/tunnel",
+        "function": "session",
+        "receiver": "*Client",
+        "position": {
+          "filename": "internal/tunnel/client.go",
+          "offset": 10766,
+          "line": 322,
+          "column": 27
+        }
+      },
+      {
+        "module": "github.com/noomesh/noomesh/node-agent-go",
+        "package": "github.com/noomesh/noomesh/node-agent-go/internal/tunnel",
+        "function": "Run",
+        "receiver": "*Client",
+        "position": {
+          "filename": "internal/tunnel/client.go",
+          "offset": 5414,
+          "line": 166,
+          "column": 30
+        }
+      }
+    ]
+  }
+}
+{
+  "finding": {
+    "osv": "GO-2026-6278",
+    "fixed_version": "v1.5.4-0.20240701034025-d67f41855da4",
+    "trace": [
+      {
+        "module": "github.com/gorilla/websocket",
+        "version": "v1.5.3",
+        "package": "github.com/gorilla/websocket",
+        "function": "Read",
+        "receiver": "*messageReader",
+        "position": {
+          "filename": "conn.go",
+          "offset": 26405,
+          "line": 1038,
+          "column": 25
+        }
+      },
+      {
+        "module": "stdlib",
+        "version": "v1.26.11",
+        "package": "io",
+        "function": "ReadAll",
+        "position": {
+          "filename": "src/io/io.go",
+          "offset": 22388,
+          "line": 722,
+          "column": 19
+        }
+      },
+      {
+        "module": "github.com/noomesh/noomesh/node-agent-go",
+        "package": "github.com/noomesh/noomesh/node-agent-go/internal/docker",
+        "function": "PushBlob",
+        "receiver": "*ollamaHTTP",
+        "position": {
+          "filename": "internal/docker/ollama_mirror.go",
+          "offset": 15818,
+          "line": 437,
+          "column": 22
+        }
+      }
+    ]
+  }
+}
+{
+  "finding": {
+    "osv": "GO-2026-6278",
+    "fixed_version": "v1.5.4-0.20240701034025-d67f41855da4",
+    "trace": [
+      {
+        "module": "github.com/gorilla/websocket",
+        "version": "v1.5.3",
+        "package": "github.com/gorilla/websocket",
+        "function": "ReadMessage",
+        "receiver": "*Conn",
+        "position": {
+          "filename": "conn.go",
+          "offset": 27584,
+          "line": 1091,
+          "column": 16
+        }
+      },
+      {
+        "module": "github.com/noomesh/noomesh/node-agent-go",
+        "package": "github.com/noomesh/noomesh/node-agent-go/internal/tunnel",
+        "function": "handshake",
+        "receiver": "*Client",
+        "position": {
+          "filename": "internal/tunnel/client.go",
+          "offset": 11883,
+          "line": 354,
+          "column": 36
+        }
+      },
+      {
+        "module": "github.com/noomesh/noomesh/node-agent-go",
+        "package": "github.com/noomesh/noomesh/node-agent-go/internal/tunnel",
+        "function": "session",
+        "receiver": "*Client",
+        "position": {
+          "filename": "internal/tunnel/client.go",
+          "offset": 11127,
+          "line": 332,
+          "column": 27
+        }
+      },
+      {
+        "module": "github.com/noomesh/noomesh/node-agent-go",
+        "package": "github.com/noomesh/noomesh/node-agent-go/internal/tunnel",
+        "function": "Run",
+        "receiver": "*Client",
+        "position": {
+          "filename": "internal/tunnel/client.go",
+          "offset": 5414,
+          "line": 166,
+          "column": 30
+        }
+      }
+    ]
+  }
+}
+{
+  "finding": {
+    "osv": "GO-2026-6278",
+    "fixed_version": "v1.5.4-0.20240701034025-d67f41855da4",
+    "trace": [
+      {
+        "module": "github.com/gorilla/websocket",
+        "version": "v1.5.3",
+        "package": "github.com/gorilla/websocket",
+        "function": "Read",
+        "receiver": "*flateReadWrapper",
+        "position": {
+          "filename": "compression.go",
+          "offset": 2705,
+          "line": 126,
+          "column": 28
+        }
+      },
+      {
+        "module": "stdlib",
+        "version": "v1.26.11",
+        "package": "io",
+        "function": "ReadAll",
+        "position": {
+          "filename": "src/io/io.go",
+          "offset": 22388,
+          "line": 722,
+          "column": 19
+        }
+      },
+      {
+        "module": "github.com/noomesh/noomesh/node-agent-go",
+        "package": "github.com/noomesh/noomesh/node-agent-go/internal/docker",
+        "function": "PushBlob",
+        "receiver": "*ollamaHTTP",
+        "position": {
+          "filename": "internal/docker/ollama_mirror.go",
+          "offset": 15818,
+          "line": 437,
+          "column": 22
+        }
+      }
+    ]
+  }
+}
+{
+  "finding": {
+    "osv": "GO-2026-6278",
+    "fixed_version": "v1.5.4-0.20240701034025-d67f41855da4",
+    "trace": [
+      {
+        "module": "github.com/gorilla/websocket",
+        "version": "v1.5.3",
+        "package": "github.com/gorilla/websocket",
+        "function": "WriteControl",
+        "receiver": "*Conn",
+        "position": {
+          "filename": "conn.go",
+          "offset": 11411,
+          "line": 413,
+          "column": 16
+        }
+      },
+      {
+        "module": "github.com/noomesh/noomesh/node-agent-go",
+        "package": "github.com/noomesh/noomesh/node-agent-go/internal/tunnel",
+        "function": "serve$5",
+        "position": {
+          "filename": "internal/tunnel/session.go",
+          "offset": 2537,
+          "line": 107,
+          "column": 34
+        }
+      },
+      {
+        "module": "github.com/noomesh/noomesh/node-agent-go",
+        "package": "github.com/noomesh/noomesh/node-agent-go/internal/tunnel",
+        "function": "serve",
+        "receiver": "*session",
+        "position": {
+          "filename": "internal/tunnel/session.go",
+          "offset": 2387,
+          "line": 100,
+          "column": 2
+        }
+      },
+      {
+        "module": "github.com/noomesh/noomesh/node-agent-go",
+        "package": "github.com/noomesh/noomesh/node-agent-go/internal/tunnel",
+        "function": "session",
+        "receiver": "*Client",
+        "position": {
+          "filename": "internal/tunnel/client.go",
+          "offset": 11397,
+          "line": 341,
+          "column": 15
+        }
+      },
+      {
+        "module": "github.com/noomesh/noomesh/node-agent-go",
+        "package": "github.com/noomesh/noomesh/node-agent-go/internal/tunnel",
+        "function": "Run",
+        "receiver": "*Client",
+        "position": {
+          "filename": "internal/tunnel/client.go",
+          "offset": 5414,
+          "line": 166,
+          "column": 30
+        }
+      }
+    ]
+  }
+}
+{
+  "finding": {
+    "osv": "GO-2026-5932",
+    "fixed_version": "v0.58.1-0.20261009181718-2f1f834330b2",
+    "trace": [
+      {
+        "module": "golang.org/x/crypto",
+        "version": "v0.58.0"
+      }
+    ]
+  }
+}
