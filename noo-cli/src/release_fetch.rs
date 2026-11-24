@@ -1040,6 +1040,10 @@ mod docker_pull_tests {
         let stderr = "failed to copy: httpReadSeeker: failed open: failed to do request: Get \"https://ghcr.io/v2/noomesh/harrier/blobs/sha256:d2ecfbef7a3504e89ece4976462dd8c84b5f2306067fc5a2798505e644b7484d\": net/http: timeout awaiting response headers";
         assert_eq!(classify_docker_pull(stderr), (FetchClass::Network, None), "{stderr}");
         assert!(FetchClass::Network.transient());
+        // A refusal on another line still wins: the new segment never makes a
+        // permanent failure transient.
+        let both = format!("{stderr}\nError response from daemon: received unexpected HTTP status: 401 Unauthorized");
+        assert_eq!(classify_docker_pull(&both), (FetchClass::Auth, Some(401)), "{both}");
     }
 
     /// The substring trap: "500" (or a timeout word) elsewhere in the text is
