@@ -7263,9 +7263,11 @@ fn agent_protect_remedy(node: &str, key: &str) -> String {
 /// hold (scripts/noo-apply.sh). A certificate or single-kind bundle
 /// (`security pki push-nodes`, a key or CA rotation, a single push) applies
 /// without it and says nothing about the hold. A report with no `applied:`
-/// line (a refused or failed apply) is not this case.
+/// line (a refused or failed apply) is not this case. The LAST `applied:` is
+/// the applier's summary (`echo "applied:$applied"`, the end of its run); an
+/// earlier log line that happens to contain the word is not.
 fn applied_without_agent_config(msg: &str) -> bool {
-    let Some(at) = msg.find("applied:") else { return false };
+    let Some(at) = msg.rfind("applied:") else { return false };
     let line = msg[at + "applied:".len()..].lines().next().unwrap_or("");
     !line.split_whitespace().any(|t| t == "agent-env" || t.starts_with("agent-env="))
 }
@@ -15667,6 +15669,22 @@ mod tests {
         assert!(c.detail.contains("not re-reported until its next full provision"), "{}", c.detail);
         assert!(!c.detail.contains("not held") && !c.detail.contains("never applied"), "{}", c.detail);
         assert!(c.remedy.as_deref().is_some_and(|r| r.contains("noo cluster provision node_a --wait")), "{:?}", c.remedy);
+    }
+
+    /// The report as the gateway stores it: the applier's tail, line breaks
+    /// folded, so `release-check:` and `binary-sha:` follow the summary on
+    /// one line. They do not flip the reading: certificates only is still
+    /// unknown. And the summary is the LAST `applied:`: an earlier log line
+    /// containing the word, without the agent's config, does not make a full
+    /// apply (`agent-env`, no tag) read unknown.
+    #[test]
+    fn the_agent_protect_row_reads_the_folded_summary_and_only_the_last_applied() {
+        let folded = "applied: ca.crt node.crt node.key verified-by: signing-key release-check: generation=2 release=0.6.30 stack=v0.6.30 binary-sha: agent-binary=ab12";
+        let c = agent_protect_check(&[("node_a".to_string(), false)], &[("node_a".to_string(), Some(0), folded.to_string())]).expect("a row");
+        assert!(c.detail.contains("hold unknown on node_a:"), "{}", c.detail);
+        let two = "noo-apply: the previous run applied: ca.crt node.crt\napplied: ca.crt node.crt node.key agent-env verified-by: signing-key";
+        let c = agent_protect_check(&[("node_a".to_string(), false)], &[("node_a".to_string(), Some(0), two.to_string())]).expect("a row");
+        assert!(c.detail.contains("no hold reported on node_a (installed by onboard, or never applied)") && !c.detail.contains("hold unknown"), "{}", c.detail);
     }
 
     /// A report that carried the agent's config and no tag keeps today's
