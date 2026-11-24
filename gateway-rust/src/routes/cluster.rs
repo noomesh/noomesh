@@ -6153,7 +6153,7 @@ async fn placement_put(
     // corrected in place by this place of it (rerank), so the upsert below
     // hits that one row, keeping its env, target and keep_warm.
     if backend == "reranker" {
-        crate::repo::cluster::normalise_reranker_rows(&mut *tx, &node_id)
+        crate::repo::cluster::normalise_reranker_rows(&mut tx, &node_id)
             .await
             .map_err(|e| AppError::Internal(format!("placement upsert: reranker role: {e}")))?;
     }
@@ -9656,7 +9656,7 @@ mod placement_role_tests {
         let own = crate::test_src::own_code(include_str!("cluster.rs"));
         let put = crate::test_src::fn_body(&own, "async fn placement_put(");
         let begin = put.find("let mut tx = state.db.begin()").expect("the transaction");
-        let fix = put.find("crate::repo::cluster::normalise_reranker_rows(&mut *tx, &node_id)").expect("the normalisation");
+        let fix = put.find("crate::repo::cluster::normalise_reranker_rows(&mut tx, &node_id)").expect("the normalisation");
         assert!(begin < fix && fix < put.find("(PLACEMENT_UPSERT)").expect("the write"), "in the transaction, before the write");
         assert!(put[begin..fix].contains("if backend == \"reranker\" {"), "only for the reranker");
     }
@@ -9828,7 +9828,7 @@ mod placement_role_tests {
         let env = json!({"N_PARALLEL": "1"});
         upsert(&db, "reranker", Some(gguf), Some(env.clone()), "chat").await;
         let mut conn = db.acquire().await.unwrap();
-        crate::repo::cluster::normalise_reranker_rows(&mut *conn, "host6").await.unwrap();
+        crate::repo::cluster::normalise_reranker_rows(&mut conn, "host6").await.unwrap();
         drop(conn);
         upsert(&db, "reranker", Some(gguf), None, &resolve_role("reranker", None).unwrap()).await;
         let r = rows(&db).await;
@@ -9839,7 +9839,7 @@ mod placement_role_tests {
         upsert(&db, "reranker", Some(gguf), None, "chat").await;
         assert_eq!(rows(&db).await.len(), 2);
         let mut conn = db.acquire().await.unwrap();
-        crate::repo::cluster::normalise_reranker_rows(&mut *conn, "host6").await.unwrap();
+        crate::repo::cluster::normalise_reranker_rows(&mut conn, "host6").await.unwrap();
         drop(conn);
         upsert(&db, "reranker", Some(gguf), None, "rerank").await;
         let r = rows(&db).await;
@@ -9848,7 +9848,7 @@ mod placement_role_tests {
         // Another backend's chat row on the node is never touched.
         upsert(&db, "llamacpp", Some("chat.gguf"), None, "chat").await;
         let mut conn = db.acquire().await.unwrap();
-        crate::repo::cluster::normalise_reranker_rows(&mut *conn, "host6").await.unwrap();
+        crate::repo::cluster::normalise_reranker_rows(&mut conn, "host6").await.unwrap();
         drop(conn);
         assert_eq!(rows(&db).await.len(), 2);
         drop_db(&admin, db, "mrp_reranker_roll_test").await;
