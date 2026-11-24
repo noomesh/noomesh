@@ -169,7 +169,28 @@ def self_record(node: str) -> dict | None:
     return None
 
 
+# Every attempt that failed at the connection (not an
+# HTTP status), by the reason's class and errno only (no values).
+ATTEMPTS: list[dict] = []
+
+
 def http(method: str, path: str, body: bytes | None = None, ctype: str = "application/json", timeout: float = 120):
+    for attempt in (1, 2):
+        try:
+            return _http(method, path, body, ctype, timeout)
+        except urllib.error.HTTPError:
+            raise
+        except urllib.error.URLError as e:
+            r = getattr(e, "reason", None)
+            ATTEMPTS.append({"attempt": attempt, "method": method, "path": path.split("?")[0],
+                             "class": type(r).__name__ if r is not None else type(e).__name__,
+                             "errno": getattr(r, "errno", None)})
+            if attempt == 2:
+                raise
+            time.sleep(10)
+
+
+def _http(method: str, path: str, body: bytes | None = None, ctype: str = "application/json", timeout: float = 120):
     ctx = ssl.create_default_context(cafile=ws_chat.cluster_ca())
 
     def once():
@@ -524,6 +545,11 @@ def main() -> int:
     if E["leaked"]:
         ev, E = ["evidence withheld: a secret value would have been written"], {"leaked": True}
     verdict_state, why = verdict(E)
+    if ATTEMPTS:
+        E["connection_attempts"] = ATTEMPTS
+        ev += [f"connection attempt {a['attempt']} failed: {a['method']} {a['path']}: {a['class']} errno={a['errno']}" for a in ATTEMPTS]
+        if verdict_state == "PASS":
+            verdict_state, why = "NOTE", f"passed only after a retry (attempt 1: {ATTEMPTS[0]['class']} errno={ATTEMPTS[0]['errno']}): {why}"
     lines = ["  " + l for l in ev] + [f"HARNESS-E2E {verdict_state}: {why}"]
     if not E.get("leaked") and leaked(lines):
         ev, E = ["evidence withheld: a secret value would have been written"], {"leaked": True}
