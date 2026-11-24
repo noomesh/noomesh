@@ -872,7 +872,7 @@ pub(crate) fn model_stores_check(id: &str, n: &Value) -> Option<Check> {
     let guard = |store: &str| match store {
         "hf_cache" => "HF weights are verified against the controller's manifest at each backend start, on a placed node only",
         "models" => "GGUF files are hashed against the controller's manifest at each start on a placed node, only when it has one",
-        "ollama" => "Ollama models are checked against the controller's record about every 10 minutes and at backend start, when it holds one (the `ollama models` row); a hand pull is not",
+        "ollama" => "Ollama models are checked against the controller's record every 10 to 15 minutes (on the agent's 5-minute reconcile tick, once 10 minutes have passed since the model's last check) and at backend start, when it holds one (the `ollama models` row); a hand pull is not",
         _ => "anyone can rename or replace the stores under it",
     };
     let mut parts = Vec::new();
@@ -7257,6 +7257,19 @@ fn agent_protect_remedy(node: &str, key: &str) -> String {
     }
 }
 
+/// Did this apply report come from a bundle that carried no agent config?
+/// The applier names `agent-env` (or `agent-env=unchanged`) on its
+/// `applied:` line whenever the bundle carried one, and only then reports the
+/// hold (scripts/noo-apply.sh). A certificate or single-kind bundle
+/// (`security pki push-nodes`, a key or CA rotation, a single push) applies
+/// without it and says nothing about the hold. A report with no `applied:`
+/// line (a refused or failed apply) is not this case.
+fn applied_without_agent_config(msg: &str) -> bool {
+    let Some(at) = msg.find("applied:") else { return false };
+    let line = msg[at + "applied:".len()..].lines().next().unwrap_or("");
+    !line.split_whitespace().any(|t| t == "agent-env" || t.starts_with("agent-env="))
+}
+
 /// The `agent protect` row (proposal 61 phase 0b): from each node's last
 /// apply report, whether the node agent's unit is held to the paths it
 /// writes. `nodes` is every node with whether its noo-hostd reports macOS
@@ -7273,8 +7286,16 @@ pub(crate) fn agent_protect_check(nodes: &[(String, bool)], reports: &[(String, 
     let mut held: Vec<String> = Vec::new();
     let mut held_nodes: Vec<&str> = Vec::new();
     let mut refused: Vec<(String, String)> = Vec::new();
+    // Nodes whose last apply carried no agent config: their hold is not
+    // re-reported, which is not the same as no hold.
+    let mut not_rereported: Vec<&str> = Vec::new();
     for (node, _, msg) in reports {
-        let Some(at) = msg.find(AGENT_PROTECT_TAG) else { continue };
+        let Some(at) = msg.find(AGENT_PROTECT_TAG) else {
+            if applied_without_agent_config(msg) {
+                not_rereported.push(node.as_str());
+            }
+            continue;
+        };
         let val = msg[at + AGENT_PROTECT_TAG.len()..].split_whitespace().next().unwrap_or("");
         if let Some(key) = val.strip_prefix("REFUSED:") {
             refused.push((node.clone(), key.to_string()));
@@ -7302,19 +7323,33 @@ pub(crate) fn agent_protect_check(nodes: &[(String, bool)], reports: &[(String, 
     if due.is_empty() {
         return None;
     }
-    let unheld: Vec<&str> = due.iter().copied().filter(|n| !held_nodes.contains(n)).collect();
-    if !unheld.is_empty() {
-        let mut detail = format!(
-            "no hold reported on {} (installed by onboard, or never applied): its node agent is not held to the paths it writes",
-            unheld.join(", ")
-        );
+    let unknown: Vec<&str> = due.iter().copied().filter(|n| !held_nodes.contains(n) && not_rereported.contains(n)).collect();
+    let unheld: Vec<&str> = due.iter().copied().filter(|n| !held_nodes.contains(n) && !not_rereported.contains(n)).collect();
+    if !unheld.is_empty() || !unknown.is_empty() {
+        let mut parts: Vec<String> = Vec::new();
+        if !unheld.is_empty() {
+            parts.push(format!(
+                "no hold reported on {} (installed by onboard, or never applied): its node agent is not held to the paths it writes",
+                unheld.join(", ")
+            ));
+        }
+        if !unknown.is_empty() {
+            parts.push(format!(
+                "hold unknown on {}: its last apply carried no agent config (a certificate or single-kind bundle); \
+                 the hold it had is not re-reported until its next full provision",
+                unknown.join(", ")
+            ));
+        }
+        let mut detail = parts.join("; ");
         if !held.is_empty() {
             detail.push_str(&format!("; held: {}", held.join(", ")));
         }
+        let mut to_provision = unheld.clone();
+        to_provision.extend(unknown.iter().copied());
         return Some(warn(
             "agent protect",
             detail,
-            Some(provision_each(&unheld)),
+            Some(provision_each(&to_provision)),
         ));
     }
     Some(ok("agent protect", format!("the node agent writes only where it must on {}", held.join(", "))))
@@ -15619,6 +15654,55 @@ mod tests {
         assert!(c.remedy.as_deref().is_some_and(|r| r.contains("noo cluster provision node_a --wait")), "{:?}", c.remedy);
     }
 
+    /// A certificate-only bundle (push-nodes, a rotation) applies without the
+    /// agent's config, so its report says nothing about the hold: the node
+    /// reads unknown until its next full provision, never "not held" and
+    /// never "never applied".
+    #[test]
+    fn the_agent_protect_row_reads_a_cert_only_apply_as_unknown() {
+        let certs = [("node_a".to_string(), Some(0), "applied: ca.crt node.crt node.key verified-by: signing-key".to_string())];
+        let c = agent_protect_check(&[("node_a".to_string(), false)], &certs).expect("a row");
+        assert_eq!(c.verdict, Verdict::Warn, "{}", c.detail);
+        assert!(c.detail.contains("hold unknown on node_a: its last apply carried no agent config (a certificate or single-kind bundle)"), "{}", c.detail);
+        assert!(c.detail.contains("not re-reported until its next full provision"), "{}", c.detail);
+        assert!(!c.detail.contains("not held") && !c.detail.contains("never applied"), "{}", c.detail);
+        assert!(c.remedy.as_deref().is_some_and(|r| r.contains("noo cluster provision node_a --wait")), "{:?}", c.remedy);
+    }
+
+    /// A report that carried the agent's config and no tag keeps today's
+    /// reading (an applier older than the hold), whether the env changed
+    /// (`agent-env`) or not (`agent-env=unchanged`); so does a failed apply
+    /// (no `applied:` line).
+    #[test]
+    fn the_agent_protect_row_reads_agent_env_without_a_tag_and_a_failed_apply_as_today() {
+        for msg in ["applied: agent-env=unchanged verified-by: signing-key", "applied: ca.crt node.crt node.key agent-env nats-creds",
+                    "noo-apply: REFUSED — the bundle's signature does not verify"] {
+            let r = [("node_a".to_string(), Some(0), msg.to_string())];
+            let c = agent_protect_check(&[("node_a".to_string(), false)], &r).expect("a row");
+            assert!(c.detail.contains("no hold reported on node_a (installed by onboard, or never applied)"), "{msg}: {}", c.detail);
+            assert!(!c.detail.contains("hold unknown"), "{msg}: {}", c.detail);
+        }
+    }
+
+    /// A tagged report is held whatever else the line names; a fleet with a
+    /// held, an unknown and an unreported node names each, and the remedy
+    /// provisions both that are not held.
+    #[test]
+    fn the_agent_protect_row_names_held_unknown_and_unreported_together() {
+        let nodes = [("host6".to_string(), false), ("host7".to_string(), false), ("host8".to_string(), false)];
+        let reports = [
+            ("host6".to_string(), Some(0), "applied: agent-env=unchanged agent-protect=unchanged:6 verified-by: signing-key".to_string()),
+            ("host7".to_string(), Some(0), "applied: ca.crt node.crt node.key verified-by: signing-key".to_string()),
+        ];
+        let c = agent_protect_check(&nodes, &reports).expect("a row");
+        assert_eq!(c.verdict, Verdict::Warn, "{}", c.detail);
+        assert!(c.detail.contains("no hold reported on host8 (installed by onboard, or never applied)"), "{}", c.detail);
+        assert!(c.detail.contains("hold unknown on host7:"), "{}", c.detail);
+        assert!(c.detail.contains("held: host6 (6 writable paths)"), "{}", c.detail);
+        let r = c.remedy.unwrap_or_default();
+        assert!(r.contains("noo cluster provision host8 --wait") && r.contains("noo cluster provision host7 --wait") && !r.contains("host6"), "{r}");
+    }
+
     /// A Mac (no systemd) owes no hold: never listed, and a Mac-only fleet
     /// has no row at all.
     #[test]
@@ -18643,7 +18727,7 @@ mod model_stores_tests {
         assert_eq!(c.verdict, Verdict::Warn);
         for want in ["2 world-writable", "/data/noo/hf-cache (mode 0777, owner 1000:1000",
             "HF weights are verified against the controller's manifest at each backend start, on a placed node only", "/data/noo/ollama",
-            "Ollama models are checked against the controller's record about every 10 minutes"] {
+            "Ollama models are checked against the controller's record every 10 to 15 minutes (on the agent's 5-minute reconcile tick"] {
             assert!(c.detail.contains(want), "{want}: {}", c.detail);
         }
         let r = c.remedy.unwrap();
