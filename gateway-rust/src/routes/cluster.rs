@@ -5557,6 +5557,10 @@ pub(crate) fn fit_specs(existing: &[StoredPlacement], replacing: Option<(&str, &
         .iter()
         .filter(|e| e.desired_state == "running" && e.backend != "harness")
         .filter(|e| replacing.map(|(b, r, m)| !same_placement_slot(e, b, r, m)).unwrap_or(true))
+        // A reranker place replaces EVERY reranker row on the node
+        // (`normalise_reranker_rows` folds a release candidate's chat-stored
+        // row into the one rerank row), so none of them is counted twice.
+        .filter(|e| !(e.backend == "reranker" && replacing.is_some_and(|(b, _, _)| b == "reranker")))
         .filter_map(spec_of)
         .collect();
     if let Some(n) = new.filter(|n| n.desired_state == "running" && n.backend != "harness") {
@@ -9696,6 +9700,25 @@ mod placement_role_tests {
         let specs = fit_specs(&existing, Some(("ollama", "embed", Some("harrier"))), Some(&new));
         let names: Vec<_> = specs.iter().map(|s| format!("{}/{}", s.role, s.model)).collect();
         assert_eq!(names, vec!["chat/gemma4:26b-a4b-it-qat", "embed/bge-m3"], "harness holds no model memory");
+    }
+
+    #[test]
+    fn a_reranker_place_counts_no_old_reranker_row_beside_the_new_one() {
+        // A release candidate stored the reranker under role chat; placing it
+        // again folds that row into the rerank row (normalise_reranker_rows),
+        // so the fit set holds the new reranker once, not old + new.
+        let existing = vec![
+            stored("ollama", "chat", "gemma4:26b-a4b-it-qat", json!({})),
+            stored("reranker", "chat", "bge-reranker-v2-m3-Q8_0.gguf", json!({})),
+        ];
+        let new = stored("reranker", "rerank", "bge-reranker-v2-m3-Q8_0.gguf", json!({}));
+        let specs = fit_specs(&existing, Some(("reranker", "rerank", Some("bge-reranker-v2-m3-Q8_0.gguf"))), Some(&new));
+        let names: Vec<_> = specs.iter().map(|s| format!("{}/{}/{}", s.backend, s.role, s.model)).collect();
+        assert_eq!(names, vec!["ollama/chat/gemma4:26b-a4b-it-qat", "reranker/rerank/bge-reranker-v2-m3-Q8_0.gguf"]);
+        // Placing another backend still counts the reranker.
+        let other = stored("ollama", "embed", "harrier", json!({}));
+        let specs = fit_specs(&existing, Some(("ollama", "embed", Some("harrier"))), Some(&other));
+        assert!(specs.iter().any(|s| s.backend == "reranker"), "a non-reranker place keeps the reranker in the fit set");
     }
 
     #[test]
