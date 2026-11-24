@@ -12020,6 +12020,23 @@ mod listing_backends_tests {
     }
 
     #[test]
+    fn the_fence_is_the_node_class_offline_threshold() {
+        let now = 1_000_000.0;
+        let kept = |tier: u64, age: f64| {
+            let mut n = node(age, now);
+            n["tier"] = json!(tier);
+            merge_gossip_backends(&mut n, gossip(), now);
+            n["running_backends"].as_object().unwrap().contains_key("reranker")
+        };
+        // A worker: 120 s.
+        assert!(kept(2, 119.0), "a worker beat 119 s old is current");
+        assert!(!kept(2, 121.0), "a worker beat 121 s old is stale");
+        // An edge node: 300 s.
+        assert!(kept(4, 200.0), "an edge beat 200 s old is current");
+        assert!(!kept(4, 301.0), "an edge beat 301 s old is stale");
+    }
+
+    #[test]
     fn the_listing_merges_gossip_into_the_heartbeat_map_and_never_replaces_it() {
         let src = include_str!("cluster.rs");
         let own = crate::test_src::own_code(src);
