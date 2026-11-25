@@ -614,6 +614,9 @@ monitoring_remove_when_lean() {
         printf '%s\n' "$_active" | grep -qx "$_s" && continue
         _ids="$(docker ps -aq --filter "label=com.docker.compose.project=${COMPOSE_PROJECT_NAME:-noomesh}" \
             --filter "label=com.docker.compose.service=$_s" 2>/dev/null)"
+        if declare -F noo_not_held_ids >/dev/null && [ -n "${NOO_HELD_IDS:-}" ]; then
+            _ids="$(printf '%s\n' "$_ids" | noo_not_held_ids)"
+        fi
         [ -n "$_ids" ] || continue
         if declare -F addons_note_intended_stop >/dev/null; then
             # shellcheck disable=SC2086

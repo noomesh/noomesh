@@ -310,6 +310,9 @@ if [ ${#SERVICES[@]} -eq 0 ]; then
         fi
         # Held add-on services (GPU, Docker socket, privileged) never start.
         ACTIVE_SVCS="$(addon_drop_held "$ACTIVE_SVCS")"
+        # What this restart brings up: the held path's staged up starts
+        # nothing outside it (lib-stuck-container.sh).
+        NOO_STACK_ACTIVE_SERVICES="$ACTIVE_SVCS"
         restart_require_lock || exit 1
         # Retired services (config/retired-services.txt): remove a stale container of
         # one BEFORE the up, one line each; nothing else is removed (186b step 4).
@@ -335,7 +338,8 @@ if [ ${#SERVICES[@]} -eq 0 ]; then
             noo_created_guard $(noo_stack_ps_ids)
         # A lean install's Grafana, Loki or Tempo left from a full start goes.
         monitoring_remove_when_lean "$ACTIVE_SVCS"
-        [ "${_up_rc:-0}" -eq "$NOO_EXIT_STACK_PARTIAL" ] && exit "$NOO_EXIT_STACK_PARTIAL"
+        # Exit 75 comes AFTER the add-on stop and its refused-add-on report below.
+        [ "${_up_rc:-0}" -eq "$NOO_EXIT_STACK_PARTIAL" ] && _partial_names="${NOO_ISOLATED_SERVICES:-a held service}${NOO_EXCLUDED_SERVICES:+ $NOO_EXCLUDED_SERVICES}"
     else
         # A container Docker does not answer for would hang `compose restart`
         # as it hung the 2026-11-25 one: it and the services linked to it are
@@ -349,14 +353,14 @@ if [ ${#SERVICES[@]} -eq 0 ]; then
                 ui_close_failed "compose failed (exit $_rc) restarting the stack"
                 exit "$_rc"
             }
-            ui_close_warned "Stack restarted WITHOUT ${NOO_ISOLATED_SERVICES}${NOO_EXCLUDED_SERVICES:+ and ${NOO_EXCLUDED_SERVICES}}: NOT running"
-            exit "$NOO_EXIT_STACK_PARTIAL"
+            _partial_names="${NOO_ISOLATED_SERVICES}${NOO_EXCLUDED_SERVICES:+ $NOO_EXCLUDED_SERVICES}"
+        else
+            docker compose $COMPOSE_FILES $PROFILE_ARGS restart || {
+                _rc=$?
+                ui_close_failed "compose failed (exit $_rc) restarting the stack"
+                exit "$_rc"
+            }
         fi
-        docker compose $COMPOSE_FILES $PROFILE_ARGS restart || {
-            _rc=$?
-            ui_close_failed "compose failed (exit $_rc) restarting the stack"
-            exit "$_rc"
-        }
     fi
     # Add-ons refused this start (require_addon_pins): a container left from
     # an earlier start must not keep running. Only services the add-on OWNS
@@ -488,8 +492,14 @@ EOF_HELD
     fi
 fi
 
-if [ -n "${_dropped:-}" ]; then
-    ui_close_warned "Services restarted WITHOUT ${_dropped}: held or linked to a held container, NOT restarted"
+if [ -n "${_dropped:-}${_partial_names:-}" ]; then
+    # Held or linked to a held container (lib-stuck-container.sh): said last,
+    # after the add-on report, then exit 75 ("up except ...").
+    ui_close_warned "Restarted WITHOUT ${_dropped:-}${_partial_names:-}: held, or linked to a held container; NOT running"
+    if [ -n "${NOO_ADDONS_REFUSED:-}" ]; then
+        ui_warned "add-on(s) ${NOO_ADDONS_REFUSED//,/, } were refused: NOT running"
+        addons_report_refused
+    fi
     exit "$NOO_EXIT_STACK_PARTIAL"
 fi
 if [ -n "${NOO_ADDONS_REFUSED:-}" ]; then

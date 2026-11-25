@@ -64,6 +64,10 @@ _reown_host_paths() {  # <host dir>  (stdin: paths)
 # was written by the old root image. chown only: nothing is deleted or moved.
 reown_nonroot_path() {
     local dir="$1" svc="$2" found n left
+    if declare -F noo_service_is_left_out >/dev/null && noo_service_is_left_out "$svc"; then
+        echo "NOTE: not re-owning $dir: $svc is held (Docker does not answer for it or a container it is linked to); after a reboot of this host: noo stack start" >&2
+        return 0
+    fi
     if ! found="$(_reown_run "$dir" "$_REOWN_PROBE" 2>/dev/null)"; then
         echo "NOTE: could not inspect ownership under $dir (throwaway helper container failed); $svc runs as uid $NOO_REOWN_UID and \
 may fail with 'permission denied'. To fix: sudo chown -R $NOO_REOWN_UID:$NOO_REOWN_UID $dir" >&2
@@ -98,6 +102,10 @@ reown_nonroot_dirs() {
     for svc in "$@"; do
         dir="$root/$svc"
         [ -d "$dir" ] || continue
+        if declare -F noo_service_is_left_out >/dev/null && noo_service_is_left_out "$svc"; then
+            echo "NOTE: not re-owning $dir: $svc is held (Docker does not answer for it or a container it is linked to); after a reboot of this host: noo stack start" >&2
+            continue
+        fi
         if ! found="$(_reown_run "$dir" "$_REOWN_PROBE" 2>/dev/null)"; then
             echo "NOTE: could not inspect ownership under $dir (throwaway helper container failed); $svc runs as uid $NOO_REOWN_UID (i64) and \
 may fail with 'permission denied'. To fix: sudo chown -R $NOO_REOWN_UID:$NOO_REOWN_UID $dir" >&2
@@ -141,7 +149,8 @@ reown_ollama_stores() {
         vol="$(docker volume ls -q 2>/dev/null | grep -E '(^|_)ollama-embed-data$' | head -1 || true)"
         if [ -n "$vol" ]; then
             # one volume, two services: stop the cpu twin by hand, the helper stops the other
-            if declare -F reown_stop_service >/dev/null && printf '%s\n' "$active" | grep -qx 'ollama-embed-cpu'; then
+            if declare -F reown_stop_service >/dev/null && printf '%s\n' "$active" | grep -qx 'ollama-embed-cpu' \
+                && ! { declare -F noo_service_is_left_out >/dev/null && noo_service_is_left_out ollama-embed; }; then
                 reown_stop_service ollama-embed-cpu || true
             fi
             reown_nonroot_path "$vol" ollama-embed || return 1

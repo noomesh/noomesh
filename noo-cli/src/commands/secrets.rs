@@ -4321,10 +4321,13 @@ pub(crate) fn container_routable_host(name: &str) -> Option<String> {
 /// Docker assigns a new one on recreate and never on restart, which is exactly
 /// the distinction `rotate` has to prove: a restart keeps the old environment.
 fn container_created(name: &str) -> Option<String> {
-    let out = Command::new("docker")
-        .args(["inspect", "-f", "{{.Created}}", name])
-        .output()
-        .ok()?;
+    // Bounded: a container Docker does not answer for (a process that
+    // survived SIGKILL) would hold this call, and so the whole rotation,
+    // forever. No answer in time reads as "unknown", like a failed inspect.
+    let out = match crate::bounded::docker(&["inspect", "-f", "{{.Created}}", name], std::time::Duration::from_secs(10)) {
+        crate::bounded::Bounded::Answered(out) => out,
+        _ => return None,
+    };
     if !out.status.success() {
         return None;
     }
@@ -5635,8 +5638,9 @@ pub fn secrets_rotate(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         if stale.is_empty() {
             ui::close_done("every running consumer was recreated with the new values");
         } else {
+            let said = if partial { "the launcher exited 75 (a container was left out) and" } else { "the launcher exited 0 but" };
             ui::close_failed(
-                &format!("the launcher exited 0 but {} consumer(s) still hold the old value: {}", stale.len(), stale.join(", ")),
+                &format!("{said} {} consumer(s) still hold the old value: {}", stale.len(), stale.join(", ")),
                 Some("noo stack restart --force <service>   (if it is profile-gated, the launcher must select its profile)"),
             );
             return Ok(1);
