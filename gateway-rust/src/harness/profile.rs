@@ -206,6 +206,47 @@ pub fn chat_context_for(model: &str) -> Option<u64> {
     CHAT_CONTEXTS.read().unwrap_or_else(|p| p.into_inner()).as_ref().and_then(|t| t.get(&key).copied())
 }
 
+/// The most a decided engine window may be before it is read as garbage
+/// rather than a window (4,194,304 tokens: far past any model served here).
+const MAX_ENGINE_WINDOW: u64 = 4_194_304;
+
+/// The controller's engine window per vLLM / llama.cpp chat model on this
+/// node (the agent's `/harness/placement` `chat_windows`, from
+/// desired-config), keyed by the model name as placed (trimmed). Zero,
+/// negative, non-numbers and absurd values are dropped; `None` when the
+/// agent sent none (an older agent or gateway, nothing readable).
+pub fn chat_windows_of(placement: &Value) -> Option<std::collections::HashMap<String, u64>> {
+    let m = placement.get("chat_windows")?.as_object()?;
+    let out: std::collections::HashMap<String, u64> = m
+        .iter()
+        .filter_map(|(k, v)| {
+            let key = k.trim();
+            let n = v.as_u64().filter(|n| *n > 0 && *n <= MAX_ENGINE_WINDOW)?;
+            (!key.is_empty()).then(|| (key.to_string(), n))
+        })
+        .collect();
+    (!out.is_empty()).then_some(out)
+}
+
+static CHAT_WINDOWS: std::sync::RwLock<Option<std::collections::HashMap<String, u64>>> = std::sync::RwLock::new(None);
+
+/// Install the engine-window table this harness process fits its turns to
+/// (same cadence as [`set_chat_contexts`]). Returns whether it changed.
+pub fn set_chat_windows(table: Option<std::collections::HashMap<String, u64>>) -> bool {
+    let mut held = CHAT_WINDOWS.write().unwrap_or_else(|p| p.into_inner());
+    let changed = *held != table;
+    *held = table;
+    changed
+}
+
+/// The engine window for the vLLM / llama.cpp chat `model` on this node, as
+/// the controller works it out for its own in-process chats. `None` when
+/// the controller sent none for that model: the loop then keeps its global
+/// window.
+pub fn chat_window_for(model: &str) -> Option<u64> {
+    CHAT_WINDOWS.read().unwrap_or_else(|p| p.into_inner()).as_ref().and_then(|t| t.get(model.trim()).copied())
+}
+
 /// The window a CLI with a `launch.context_window_env` is told, and where it
 /// came from: an explicit value (the probe's `--context-tokens`), else the
 /// node agent's `model_context`, else `None`: the variable stays unset and
@@ -222,6 +263,21 @@ pub fn resolve_context_window(explicit: Option<u64>, agent: Option<u64>) -> (Opt
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// The engine windows, read off the placement: zero, negative,
+    /// non-numbers, blank names and absurd values dropped; no key or an
+    /// empty table is "none" (an older agent). The model name is as placed.
+    #[test]
+    fn the_engine_windows_read_off_the_placement() {
+        let t = chat_windows_of(&json!({"chat_windows": {"win-read-a": 4096, " win-read-b ": 8192, "zero": 0, "neg": -5, "str": "x", "huge": 9_000_000_000u64, "": 4096}})).unwrap();
+        assert_eq!(t.len(), 2, "{t:?}");
+        assert_eq!(t.get("win-read-a"), Some(&4096));
+        assert_eq!(t.get("win-read-b"), Some(&8192));
+        assert_eq!(chat_windows_of(&json!({"placed": true})), None, "an older agent sends no key");
+        assert_eq!(chat_windows_of(&json!({"chat_windows": {}})), None);
+        assert_eq!(chat_windows_of(&json!({"chat_windows": {"zero": 0}})), None, "only unusable values: none");
+        assert_eq!(chat_windows_of(&json!({"chat_windows": [4096]})), None, "not an object");
+    }
 
     /// The agent's table, read as the agent keys it (a bare tag is
     /// `:latest`); zero, negative and non-numbers dropped; no key or an

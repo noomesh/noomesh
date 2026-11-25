@@ -90,7 +90,8 @@ pub(crate) trait HarnessRuntime: Sync {
     }
     /// The window one request gets on a vLLM or llama.cpp `backend`
     /// (i802 PR-2, `chat_context::window_for`). `None` = unknown: the loop
-    /// keeps its global `VLLM_MAX_MODEL_LEN` window, as a node harness does.
+    /// keeps its global `VLLM_MAX_MODEL_LEN` window (a node harness reads it
+    /// from its agent's `chat_windows`, `RemoteRuntime::chat_window`).
     async fn chat_window(&self, _backend: &ResolvedBackend) -> Option<u64> {
         None
     }
