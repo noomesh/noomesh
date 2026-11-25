@@ -440,6 +440,9 @@ func TestNewOllamaGuardRecordsTheWantedEnvUnderTheNodeHome(t *testing.T) {
 	if want := filepath.Join(home, "noomesh", OllamaWantedEnvFile); g.WantedFile != want {
 		t.Fatalf("WantedFile = %q, want %q", g.WantedFile, want)
 	}
+	if g.TuningKnown == nil {
+		t.Fatal("production guard has no TuningKnown: the wanted file would never be written")
+	}
 }
 
 // The file follows the wanted set whether or not the plist drifted: a key

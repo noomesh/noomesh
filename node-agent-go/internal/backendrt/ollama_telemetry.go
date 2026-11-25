@@ -141,10 +141,11 @@ type OllamaGuard struct {
 func NewOllamaGuard() *OllamaGuard {
 	home, _ := os.UserHomeDir()
 	return &OllamaGuard{Home: home, UID: os.Getuid(), Run: ExecCommand,
-		Exists:     func(p string) bool { _, err := os.Stat(p); return err == nil },
-		Tuning:     OllamaTuning,
-		WantedFile: filepath.Join(home, "noomesh", OllamaWantedEnvFile),
-		ModelsDir:  func() string { return strings.TrimSpace(os.Getenv("OLLAMA_DATA_DIR")) },
+		Exists:      func(p string) bool { _, err := os.Stat(p); return err == nil },
+		Tuning:      OllamaTuning,
+		TuningKnown: OllamaTuningKnown,
+		WantedFile:  filepath.Join(home, "noomesh", OllamaWantedEnvFile),
+		ModelsDir:   func() string { return strings.TrimSpace(os.Getenv("OLLAMA_DATA_DIR")) },
 		HasModels: func(d string) bool {
 			entries, err := os.ReadDir(filepath.Join(d, "manifests"))
 			return err == nil && len(entries) > 0
