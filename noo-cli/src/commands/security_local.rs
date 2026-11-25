@@ -1501,6 +1501,16 @@ fn parse_docker_state(out: &str) -> DockerState {
     }
 }
 
+/// The state a `docker inspect` run says: `None` when it could not be
+/// spawned, else (exit succeeded, stdout). A failed inspect says nothing
+/// about the container, so it is Unknown, never "not running".
+fn docker_state_of(ran: Option<(bool, &str)>) -> DockerState {
+    match ran {
+        Some((true, stdout)) => parse_docker_state(stdout),
+        _ => DockerState::Unknown,
+    }
+}
+
 fn docker_state_word(s: DockerState) -> &'static str {
     match s {
         DockerState::NotRunning => "not running",
@@ -1826,14 +1836,8 @@ fn probe_health_gate(containers: &[String], timeout_secs: u64) -> GateOutcome {
                         c,
                     ])
                     .output();
-                // A failed inspect says nothing about the container.
-                let state = match out {
-                    Ok(o) if o.status.success() => {
-                        parse_docker_state(&String::from_utf8_lossy(&o.stdout))
-                    }
-                    _ => DockerState::Unknown,
-                };
-                (c.clone(), state)
+                let ran = out.ok().map(|o| (o.status.success(), String::from_utf8_lossy(&o.stdout).into_owned()));
+                (c.clone(), docker_state_of(ran.as_ref().map(|(ok, text)| (*ok, text.as_str()))))
             })
             .collect();
         let gw = match (&target, has_gateway) {
@@ -7480,7 +7484,7 @@ mod rotate_gate_tests {
     use super::{
         bind_target, decide_gate, docker_summary, gate_action, health_probe_url, host_is_this_machine,
         launcher_env_value, parse_docker_state, BindTarget, DockerState, GateAction, GateOutcome, GwHealth,
-        copy_back_command, gw_from_probe, mask_userinfo, ProbeError,
+        copy_back_command, docker_state_of, gw_from_probe, mask_userinfo, ProbeError,
     };
     use crate::envfile::GatewaySource;
 
@@ -7814,5 +7818,26 @@ mod rotate_gate_tests {
         let spaced = copy_back_command("/a b/backup", "/a b/pki", &c, "galaxy");
         assert!(spaced.starts_with("cp -a '/a b/backup'/. '/a b/pki'/ && noo --instance galaxy security pki fix-modes"), "{spaced}");
         assert!(spaced.find("fix-modes").unwrap() < spaced.find("docker restart").unwrap());
+    }
+
+    /// The mapping from a `docker inspect` run to a state, the code the gate
+    /// loop calls: a spawn error, a non-zero exit, empty or unparseable
+    /// output is Unknown (never a revert); only an explicit `false` is
+    /// not running.
+    #[test]
+    fn an_inspect_run_maps_to_a_state() {
+        assert_eq!(docker_state_of(None), DockerState::Unknown, "spawn error");
+        assert_eq!(docker_state_of(Some((false, "true healthy"))), DockerState::Unknown, "non-zero exit");
+        assert_eq!(docker_state_of(Some((false, ""))), DockerState::Unknown);
+        assert_eq!(docker_state_of(Some((true, ""))), DockerState::Unknown, "empty stdout");
+        assert_eq!(docker_state_of(Some((true, "  \n"))), DockerState::Unknown);
+        assert_eq!(docker_state_of(Some((true, "Error: No such object"))), DockerState::Unknown, "unparseable");
+        assert_eq!(docker_state_of(Some((true, "false"))), DockerState::NotRunning);
+        assert_eq!(docker_state_of(Some((true, "false unhealthy\n"))), DockerState::NotRunning);
+        assert_eq!(docker_state_of(Some((true, "true healthy\n"))), DockerState::Healthy);
+        assert_eq!(docker_state_of(Some((true, "true starting"))), DockerState::Starting);
+        assert_eq!(docker_state_of(Some((true, "true unhealthy"))), DockerState::Unhealthy);
+        assert_eq!(docker_state_of(Some((true, "true "))), DockerState::NoCheck);
+        assert_eq!(docker_state_of(Some((true, "true"))), DockerState::NoCheck);
     }
 }
