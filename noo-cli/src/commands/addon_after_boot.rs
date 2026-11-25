@@ -305,7 +305,8 @@ fn yaml_restart_is_no(def: &serde_yaml::Value) -> bool {
 /// running is `down`. A running container whose health is `unhealthy` is
 /// listed in `unhealthy`. `held` names are neither. A service with
 /// `deploy.replicas: 0` or `scale: 0` has no container by design and is not
-/// expected. Profiles the operator enables through `COMPOSE_PROFILES` are
+/// expected, unless the add-on declares it in `x-noo-addon: containers` (a
+/// declared name is always expected). Profiles the operator enables through `COMPOSE_PROFILES` are
 /// not read here: a profiled service is expected only when it is named in
 /// `x-noo-addon: containers`.
 pub fn judge_containers(
@@ -842,12 +843,56 @@ pub(crate) fn down_containers_at(root: &Path, addon: &str) -> Result<Containers,
     // The stack runs every add-on overlay in the install's own compose project.
     let project = crate::envfile::compose_project();
     let held = held_containers(&text, crate::addons::resolve::third_party(addon))?;
-    let seen = match read_states_via(&project, &mut |args| crate::bounded::docker(args, DOCKER_LIMIT)) {
-        Ok(seen) => seen,
+    // One deadline for all of this add-on's reads, not one per call.
+    let deadline = std::time::Instant::now() + DOCKER_LIMIT;
+    let mut run = |args: &[&str], limit: Duration| crate::bounded::docker(args, limit);
+    let mut c = match read_states_via(&project, deadline, &mut run)
+        .and_then(|seen| judge_containers(&decl.containers, &text, &project, &seen, &held, crate::oneshots::declared()).map_err(StatesError::Failed))
+    {
+        Ok(c) => c,
         Err(StatesError::TimedOut(what)) => return Ok(Containers { docker_timeout: Some(what), ..Default::default() }),
         Err(StatesError::Failed(e)) => return Err(format!("could not list containers: {e}")),
     };
-    judge_containers(&decl.containers, &text, &project, &seen, &held, crate::oneshots::declared())
+    match drop_running_elsewhere(&mut c, deadline, &mut run) {
+        Ok(()) => Ok(c),
+        Err(StatesError::TimedOut(what)) => Ok(Containers { docker_timeout: Some(what), ..Default::default() }),
+        Err(StatesError::Failed(e)) => Err(format!("could not list containers: {e}")),
+    }
+}
+
+/// What a bounded docker call may still take: the time left to `deadline`.
+/// `None` once it has passed.
+fn remaining(deadline: std::time::Instant) -> Option<Duration> {
+    let left = deadline.saturating_duration_since(std::time::Instant::now());
+    (!left.is_zero()).then_some(left)
+}
+
+/// A declared container is matched by its name wherever it runs, as
+/// after-boot always did: a declared name running under another compose
+/// project is not down for `boot_down` (verify's own view stays per project).
+/// One bounded `docker ps` of the running names, only when a declared name
+/// is missing from this project.
+fn drop_running_elsewhere(
+    c: &mut Containers,
+    deadline: std::time::Instant,
+    docker: &mut dyn FnMut(&[&str], Duration) -> crate::bounded::Bounded,
+) -> Result<(), StatesError> {
+    use crate::bounded::Bounded;
+    if c.boot_down.is_empty() {
+        return Ok(());
+    }
+    let Some(left) = remaining(deadline) else { return Err(StatesError::TimedOut("docker ps after 20s".into())) };
+    let out = match docker(&["ps", "--format", "{{.Names}}"], left) {
+        Bounded::Answered(o) => o,
+        Bounded::TimedOut { secs } => return Err(StatesError::TimedOut(format!("docker ps after {secs}s"))),
+        Bounded::SpawnFailed(e) => return Err(StatesError::Failed(format!("docker ps: {e}"))),
+    };
+    if !out.status.success() {
+        return Err(StatesError::Failed(format!("docker ps: {}", String::from_utf8_lossy(&out.stderr).trim())));
+    }
+    let names: Vec<String> = String::from_utf8_lossy(&out.stdout).split_whitespace().map(|n| n.trim_start_matches('/').to_string()).collect();
+    c.boot_down.retain(|d| !names.contains(d));
+    Ok(())
 }
 
 /// What after-boot sees: only the names `x-noo-addon: containers` declares,
@@ -873,17 +918,20 @@ pub(crate) enum StatesError {
 /// This project's containers in any state: `docker ps -aq` filtered on the
 /// compose project label, then one inspect of [`STATE_FORMAT`] of just those.
 /// A container removed between the two fails the inspect; read once more
-/// before calling it an error. `docker` runs one bounded call (the real one
-/// is `bounded::docker`; a test injects its own).
+/// before calling it an error. `docker` runs one bounded call within the
+/// time left to `deadline`, shared by every call of one add-on's read (the
+/// real one is `bounded::docker`; a test injects its own).
 pub(crate) fn read_states_via(
     project: &str,
-    docker: &mut dyn FnMut(&[&str]) -> crate::bounded::Bounded,
+    deadline: std::time::Instant,
+    docker: &mut dyn FnMut(&[&str], Duration) -> crate::bounded::Bounded,
 ) -> Result<Vec<Seen>, StatesError> {
     use crate::bounded::Bounded;
     let mut last = String::new();
     for _ in 0..2 {
         let filter = format!("label=com.docker.compose.project={project}");
-        let ps = match docker(&["ps", "-aq", "--no-trunc", "--filter", &filter]) {
+        let Some(left) = remaining(deadline) else { return Err(StatesError::TimedOut("docker ps after 20s".into())) };
+        let ps = match docker(&["ps", "-aq", "--no-trunc", "--filter", &filter], left) {
             Bounded::Answered(o) => o,
             Bounded::TimedOut { secs } => return Err(StatesError::TimedOut(format!("docker ps after {secs}s"))),
             Bounded::SpawnFailed(e) => return Err(StatesError::Failed(format!("docker ps: {e}"))),
@@ -897,7 +945,8 @@ pub(crate) fn read_states_via(
         }
         let mut args: Vec<&str> = vec!["inspect", "--type", "container", "--format", STATE_FORMAT];
         args.extend(ids.iter().map(String::as_str));
-        let out = match docker(&args) {
+        let Some(left) = remaining(deadline) else { return Err(StatesError::TimedOut("docker inspect after 20s".into())) };
+        let out = match docker(&args, left) {
             Bounded::Answered(o) => o,
             Bounded::TimedOut { secs } => return Err(StatesError::TimedOut(format!("docker inspect after {secs}s"))),
             Bounded::SpawnFailed(e) => return Err(StatesError::Failed(format!("docker inspect: {e}"))),
@@ -1523,12 +1572,48 @@ mod tests {
         crate::bounded::Bounded::Answered(std::process::Output { status: std::process::ExitStatus::from_raw(0), stdout: stdout.as_bytes().to_vec(), stderr: Vec::new() })
     }
 
+    /// A declared name running under another project is not down for
+    /// after-boot (matched by container name wherever it runs, as before);
+    /// one running nowhere still is. Verify's per-project view is unchanged.
+    #[test]
+    fn a_declared_name_running_under_another_project_is_not_down_for_after_boot() {
+        let decl = vec!["noo-rhaddon".to_string()];
+        let overlay = "services:\n  web:\n    container_name: noo-rhaddon\n";
+        let mut c = judge_containers(&decl, overlay, "p", &[], &[], &[]).unwrap();
+        assert_eq!(c.boot_down, vec!["noo-rhaddon".to_string()]);
+        let far = std::time::Instant::now() + Duration::from_secs(60);
+        drop_running_elsewhere(&mut c, far, &mut |_, _| answered("noo-rhaddon\nother\n")).unwrap();
+        assert!(c.boot_down.is_empty(), "{c:?}");
+        assert_eq!(c.down, vec!["noo-rhaddon".to_string()], "verify still reads it per project");
+        let mut c = judge_containers(&decl, overlay, "p", &[], &[], &[]).unwrap();
+        drop_running_elsewhere(&mut c, far, &mut |_, _| answered("other\n")).unwrap();
+        assert_eq!(c.boot_down, vec!["noo-rhaddon".to_string()]);
+        let past = std::time::Instant::now();
+        assert!(matches!(drop_running_elsewhere(&mut c, past, &mut |_, _| answered("")), Err(StatesError::TimedOut(_))), "an expired deadline makes no call");
+    }
+
+    /// One add-on's reads share one deadline: a call is given only the time
+    /// that is left, never a fresh 20 s.
+    #[test]
+    fn the_reads_of_one_add_on_share_one_deadline() {
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let mut limits: Vec<Duration> = Vec::new();
+        let _ = read_states_via("proj", deadline, &mut |args, limit| {
+            limits.push(limit);
+            std::thread::sleep(Duration::from_millis(30));
+            if args[0] == "ps" { answered("abc\n") } else { answered("/noo-a\tproj\tweb\trunning\t0\t\n") }
+        });
+        assert_eq!(limits.len(), 2);
+        assert!(limits[0] <= Duration::from_secs(20) && limits[1] < limits[0], "{limits:?}");
+    }
+
     /// The listing is filtered on this project and only its ids are
     /// inspected; a docker that hangs is a timeout, never an empty answer.
     #[test]
     fn docker_is_asked_about_this_project_only_and_a_hang_is_not_a_pass() {
         let mut calls: Vec<Vec<String>> = Vec::new();
-        let r = read_states_via("proj", &mut |args| {
+        let far = std::time::Instant::now() + Duration::from_secs(60);
+        let r = read_states_via("proj", far, &mut |args, _| {
             calls.push(args.iter().map(|a| a.to_string()).collect());
             if args[0] == "ps" { answered("abc\n") } else { answered("/noo-a\tproj\tweb\trunning\t0\t\n") }
         });
@@ -1536,7 +1621,7 @@ mod tests {
         assert!(calls[0].contains(&"label=com.docker.compose.project=proj".to_string()), "{calls:?}");
         assert_eq!(calls[1].last().map(String::as_str), Some("abc"), "{calls:?}");
         for hang_on in ["ps", "inspect"] {
-            let r = read_states_via("proj", &mut |args| {
+            let r = read_states_via("proj", far, &mut |args, _| {
                 if args[0] == hang_on { crate::bounded::Bounded::TimedOut { secs: 20 } } else { answered("abc\n") }
             });
             assert!(matches!(r, Err(StatesError::TimedOut(ref w)) if w.contains(hang_on)), "{r:?}");
