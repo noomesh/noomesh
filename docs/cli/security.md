@@ -223,8 +223,21 @@ CA**: it scans, confirms, backs up to `pki/.rotate-backup-<ts>`,
 re-issues every leaf expiring within `--warn-days`, delivers node certs
 on the pull rail (no fallback — a node with no birth cert on record must
 be re-enrolled first), restarts the consumers with the
-gateway last, health-probes, and on failure restores the backup and
-restarts again (exit 1). A node that did not take its cert makes the
+gateway last, and health-probes: Docker must report every restarted
+container running and healthy, and the gateway's `/health` must answer at
+the address the gateway is bound to (`NOO_BIND_ADDR`, else `NOO_BIND_MODE`:
+the tailnet address on a tailnet controller, localhost only when the bind
+is local or `all`), with the certificate verified. When a container is not
+running or unhealthy, or `/health` answers with a failure, `rotate-all`
+restores the backup and restarts again (exit 1). When Docker says the
+containers are fine but the probe cannot tell (no address to probe, no
+trust anchor, or nothing answering at an address taken from the configured
+gateway URL), it does **not** revert: the new certificates stay, the
+command exits 1 with `rotation_unconfirmed`, and it prints the URL probed,
+the error, `noo cluster verify --wait` to confirm, and the exact copy-back
+from the backup if you want it. Certificate scans (`status`, `rotate-all`,
+`cluster verify`) skip the dot-directories of the PKI dir
+(`.rotate-backup-*`, `.forgotten-*`). A node that did not take its cert makes the
 exit code 1 too; `--no-deliver`/`--no-reload` skip those steps and say
 so. Nothing expiring prints `no certificates expiring within N days`.
 Leaf rotation also runs unattended from the `cert_auto_rotate` autonomy
