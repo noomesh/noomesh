@@ -274,6 +274,7 @@ pub(crate) fn recreate_service(service: &str) -> Result<(), String> {
         .status();
     match status {
         Ok(s) if s.success() => Ok(()),
+        Ok(s) if s.code() == Some(75) => Err(format!("noomesh-restart.sh --force {service} left {service} out: Docker does not answer for it or a container it is linked to (named above); a reboot of this host clears it")),
         Ok(s) => Err(format!("noomesh-restart.sh --force {service} exited {}", s.code().unwrap_or(1))),
         Err(e) => Err(format!("could not run noomesh-restart.sh: {e}")),
     }

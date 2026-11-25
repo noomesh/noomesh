@@ -5588,7 +5588,14 @@ pub fn secrets_rotate(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             .current_dir(&root)
             .env("NOO_CLI_BIN", &cli_bin)
             .status();
-        if !matches!(st, Ok(s) if s.success()) {
+        // Exit 75: the launcher left out a container Docker does not answer
+        // for (lib-stuck-container.sh) and recreated the rest. The verdicts
+        // below say which consumers did get the new value.
+        let partial = matches!(&st, Ok(s) if s.code() == Some(75));
+        if partial && !g.json {
+            println!("{}", ui::muted("the launcher recreated the stack EXCEPT a container Docker does not answer for (named above): a consumer left out still holds the old value until the host is rebooted"));
+        }
+        if !partial && !matches!(st, Ok(s) if s.success()) {
             if !g.json {
                 ui::close_failed("stack recreate failed — the store IS rotated", Some("noo stack restart --force"));
             }

@@ -487,6 +487,11 @@ _addons_running_facts() {
     local _arf_ids _arf_s _arf_id _arf_rc _arf_st _arf_t
     _arf_ids="$(docker ps -q --no-trunc --filter "label=com.docker.compose.project=${COMPOSE_PROJECT_NAME:-noomesh}" \
         --filter status=running 2>/dev/null)"
+    # A container Docker did not answer for (lib-stuck-container.sh) is never
+    # inspected: one hung inspect would hold the launcher here.
+    if declare -F noo_not_held_ids >/dev/null && [ -n "${NOO_HELD_IDS:-}" ]; then
+        _arf_ids="$(printf '%s\n' "$_arf_ids" | noo_not_held_ids)"
+    fi
     [ -n "$_arf_ids" ] || return 0
     # shellcheck disable=SC2086
     docker inspect -f '{{index .Config.Labels "com.docker.compose.service"}} {{.Id}} {{.RestartCount}} {{.State.StartedAt}}' \

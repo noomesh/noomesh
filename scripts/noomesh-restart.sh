@@ -280,6 +280,11 @@ if [ ${#SERVICES[@]} -eq 0 ]; then
     # The gateway's own dirs on noo-data (uid 65532), as noomesh-start.sh
     # makes them: a restart can be the first start of a new gateway image.
     noo_prepare_gateway_data_dirs $DATA_WARNED_ARG || { echo "aborting: the noo-data volume could not be made as compose declares it (above)" >&2; exit 1; }
+    # Before anything inspects a container: ask Docker about each one, bounded.
+    # One it does not answer for is named and left out of everything below
+    # (lib-stuck-container.sh); no answer at all stops the restart here.
+    # shellcheck disable=SC2086
+    noo_hold_hung "" compose $COMPOSE_FILES $PROFILE_ARGS || { ui_close_failed "Docker is not answering: nothing was restarted"; exit 1; }
     if [ "$FORCE_RECREATE" = true ]; then
         # Same service arithmetic as noomesh-start.sh: the profile's set,
         # minus the GPU-only exporter when this daemon has no NVIDIA
@@ -333,24 +338,18 @@ if [ ${#SERVICES[@]} -eq 0 ]; then
         [ "${_up_rc:-0}" -eq "$NOO_EXIT_STACK_PARTIAL" ] && exit "$NOO_EXIT_STACK_PARTIAL"
     else
         # A container Docker does not answer for would hang `compose restart`
-        # as it hung the 2026-11-25 one: name it, restart everything else
-        # (the data stores first), exit $NOO_EXIT_STACK_PARTIAL after.
-        # shellcheck disable=SC2086
-        noo_hold_hung "" compose $COMPOSE_FILES $PROFILE_ARGS
+        # as it hung the 2026-11-25 one: it and the services linked to it are
+        # left out, everything else is restarted by stage (the data stores
+        # and the bus first, each waited for, then the rest by dependency
+        # layer), and the launcher exits $NOO_EXIT_STACK_PARTIAL after.
         if [ -n "$NOO_ISOLATED_SERVICES" ]; then
-            _others=()
             # shellcheck disable=SC2086
-            for _s in $(_noo_core_first $(docker compose $COMPOSE_FILES $PROFILE_ARGS config --services 2>/dev/null)); do
-                case " $NOO_ISOLATED_SERVICES " in *" $_s "*) ;; *) _others+=("$_s") ;; esac
-            done
-            if [ ${#_others[@]} -gt 0 ]; then
-                docker compose $COMPOSE_FILES $PROFILE_ARGS restart "${_others[@]}" || {
-                    _rc=$?
-                    ui_close_failed "compose failed (exit $_rc) restarting the stack"
-                    exit "$_rc"
-                }
-            fi
-            ui_close_warned "Stack restarted WITHOUT ${NOO_ISOLATED_SERVICES}: stuck, NOT running"
+            noo_staged_restart $(docker compose $COMPOSE_FILES $PROFILE_ARGS config --services 2>/dev/null) || {
+                _rc=$?
+                ui_close_failed "compose failed (exit $_rc) restarting the stack"
+                exit "$_rc"
+            }
+            ui_close_warned "Stack restarted WITHOUT ${NOO_ISOLATED_SERVICES}${NOO_EXCLUDED_SERVICES:+ and ${NOO_EXCLUDED_SERVICES}}: NOT running"
             exit "$NOO_EXIT_STACK_PARTIAL"
         fi
         docker compose $COMPOSE_FILES $PROFILE_ARGS restart || {
@@ -393,14 +392,21 @@ else
 $(addon_drop_held "$(printf '%s\n' "${SERVICES[@]}")")
 EOF_HELD
     SERVICES=(${_kept[@]+"${_kept[@]}"})
-    # A named service whose container Docker does not answer for is named and
-    # left out (lib-stuck-container.sh); the rest restart, exit 75 after.
+    # A named service whose container Docker does not answer for, one linked
+    # to it (compose would restart or join it), or one that needs it is named
+    # and left out (lib-stuck-container.sh); the rest restart, exit 75 after.
     # shellcheck disable=SC2086
-    noo_hold_hung "${SERVICES[*]}" compose $COMPOSE_FILES $PROFILE_ARGS
+    noo_hold_hung "" compose $COMPOSE_FILES $PROFILE_ARGS || { ui_close_failed "Docker is not answering: nothing was restarted"; exit 1; }
+    _dropped=""
     if [ -n "$NOO_ISOLATED_SERVICES" ]; then
         _kept=()
         for _s in "${SERVICES[@]}"; do
-            case " $NOO_ISOLATED_SERVICES " in *" $_s "*) ;; *) _kept+=("$_s") ;; esac
+            if noo_service_is_left_out "$_s" || noo_depends_on_held "$_s"; then
+                _dropped="${_dropped:+$_dropped }$_s"
+                ui_warned "not restarting $_s: it is held, linked to a held container, or needs one"
+            else
+                _kept+=("$_s")
+            fi
         done
         SERVICES=(${_kept[@]+"${_kept[@]}"})
         [ ${#SERVICES[@]} -gt 0 ] || exit "$NOO_EXIT_STACK_PARTIAL"
@@ -482,8 +488,8 @@ EOF_HELD
     fi
 fi
 
-if [ -n "${NOO_ISOLATED_SERVICES:-}" ]; then
-    ui_close_warned "Services restarted WITHOUT ${NOO_ISOLATED_SERVICES}: stuck, NOT running"
+if [ -n "${_dropped:-}" ]; then
+    ui_close_warned "Services restarted WITHOUT ${_dropped}: held or linked to a held container, NOT restarted"
     exit "$NOO_EXIT_STACK_PARTIAL"
 fi
 if [ -n "${NOO_ADDONS_REFUSED:-}" ]; then

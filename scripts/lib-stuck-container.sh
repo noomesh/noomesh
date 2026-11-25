@@ -60,20 +60,42 @@
 
 NOO_EXIT_STACK_PARTIAL=75
 NOO_ISOLATED_SERVICES=""
-# Seconds one probe of one container may take before it counts as stuck.
+# Seconds one probe of one container may take before it is asked again, and
+# how long the second, longer probe waits (a slow Docker is not a stuck one).
 NOO_DOCKER_PROBE_SECS="${NOO_DOCKER_PROBE_SECS:-10}"
+NOO_DOCKER_REPROBE_SECS="${NOO_DOCKER_REPROBE_SECS:-30}"
+# How long a start stage waits for its services to be healthy/running.
+NOO_STAGE_WAIT_SECS="${NOO_STAGE_WAIT_SECS:-120}"
+# The data stores and the bus: started and waited for before everything else.
+NOO_STACK_CORE_SERVICES="${NOO_STACK_CORE_SERVICES:-postgres redis nats}"
+# What the probe found (set by noo_hold_hung; the snapshot, the guard and the
+# add-on helpers read them so no call of theirs names a held container):
+NOO_HELD_IDS=""            # container ids Docker did not answer for
+NOO_HELD_NAMES=""          # their names
+NOO_EXCLUDED_SERVICES=""   # services compose would touch the held one through
+NOO_PROBE_DONE=""          # 1 once noo_hold_hung ran for this launch
+_NOO_CFG_JSON=""
 
 # _noo_bounded <secs> cmd args... — run cmd with a deadline that HOLDS (the
 # same shape as _noo_nvidia_smi_bounded in lib-compose.sh: the child runs in
-# the background with its output in a file, nothing waits on it past the
-# deadline). Prints cmd's output and returns its status; 124 = no answer in
-# time (the child is sent KILL and left; it may never die).
+# the background with its output in files, nothing waits on it past the
+# deadline). Prints cmd's stdout, its stderr on stderr, and returns its
+# status; 124 = no answer in time (the child's whole group is sent KILL and
+# left; it may never die). The temp dir is removed on every path, and on
+# INT/TERM while waiting.
 _noo_bounded() {
-    local secs="$1" d ticks rc child sub
+    local secs="$1" d ticks rc child sub oldint oldterm
     shift
     d="$(mktemp -d "${TMPDIR:-/tmp}/noo-bounded.XXXXXX" 2>/dev/null)" || { "$@"; return $?; }
+    oldint="$(trap -p INT)"; oldterm="$(trap -p TERM)"
+    # shellcheck disable=SC2064
+    trap "rm -rf '$d'; exit 143" INT TERM
     (
-        "$@" >"$d/out" 2>&1 </dev/null &
+        if command -v setsid >/dev/null 2>&1; then
+            setsid "$@" >"$d/out" 2>"$d/err" </dev/null &
+        else
+            "$@" >"$d/out" 2>"$d/err" </dev/null &
+        fi
         child=$!
         echo "$child" >"$d/pid"
         wait "$child"
@@ -88,15 +110,23 @@ _noo_bounded() {
     if [ -f "$d/rc" ]; then
         rc="$(cat "$d/rc")"
         cat "$d/out" 2>/dev/null
-        rm -rf "$d"
-        wait "$sub" 2>/dev/null
-        return "$rc"
+        cat "$d/err" >&2 2>/dev/null
+        rc="${rc:-1}"
+    else
+        child="$(cat "$d/pid" 2>/dev/null)"
+        if [ -n "$child" ]; then
+            kill -KILL -- "-$child" 2>/dev/null
+            kill -KILL "$child" 2>/dev/null
+        fi
+        kill -KILL "$sub" 2>/dev/null
+        rc=124
     fi
-    child="$(cat "$d/pid" 2>/dev/null)"
-    [ -n "$child" ] && kill -KILL "$child" 2>/dev/null
-    kill -KILL "$sub" 2>/dev/null
     rm -rf "$d"
-    return 124
+    trap - INT TERM
+    [ -n "$oldint" ] && eval "$oldint"
+    [ -n "$oldterm" ] && eval "$oldterm"
+    [ "$rc" -eq 124 ] || wait "$sub" 2>/dev/null
+    return "$rc"
 }
 
 # What stops working while a service is down, in the operator's words.
@@ -115,76 +145,202 @@ _noo_service_role() {
     esac
 }
 
-# _noo_core_first <services...> — one per line: the data stores the gateway
-# needs first, then the rest in the order given.
+# _noo_core_first <services...> — one per line: the data stores and the bus
+# first, then the rest in the order given.
 _noo_core_first() {
     local s c
-    for c in postgres redis nats; do
+    for c in $NOO_STACK_CORE_SERVICES; do
         for s in "$@"; do [ "$s" = "$c" ] && printf '%s\n' "$s"; done
     done
     for s in "$@"; do
-        case "$s" in postgres|redis|nats) ;; *) printf '%s\n' "$s" ;; esac
+        case " $NOO_STACK_CORE_SERVICES " in *" $s "*) ;; *) printf '%s\n' "$s" ;; esac
     done
 }
 
+# _noo_rel <mode> args... — the compose relations, read from the rendered
+# config (never a list of names): `excluded <held...>` prints "service<TAB>why"
+# for each service compose would touch the held one through: a service that
+# shares a held service's network namespace (network_mode: service:<held>),
+# the door a held service joins, and the services a held one depends on with
+# `restart: true` (compose restarts the held one with them). `closure
+# <svc...>` prints the services and everything they depend_on. `layers
+# <svc...>` prints the services as dependency layers, one per line.
+# Without python3 or a readable config it prints nothing, and the callers
+# degrade (no exclusion, one layer) and say so.
+_noo_rel() {
+    [ -n "$_NOO_CFG_JSON" ] && command -v python3 >/dev/null 2>&1 || return 1
+    printf '%s' "$_NOO_CFG_JSON" | python3 -c '
+import json, sys
+try:
+    cfg = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+svcs = cfg.get("services", {}) or {}
+mode, args = sys.argv[1], sys.argv[2:]
+def deps(s):
+    d = (svcs.get(s) or {}).get("depends_on") or {}
+    if isinstance(d, list):
+        return {x: {} for x in d}
+    return d
+def netdep(s):
+    n = (svcs.get(s) or {}).get("network_mode") or ""
+    return n[8:] if n.startswith("service:") else ""
+if mode == "excluded":
+    held = set(args)
+    out = {}
+    for s in svcs:
+        if s not in held and netdep(s) in held:
+            out[s] = "it shares the network namespace of " + netdep(s)
+    for h in held:
+        nd = netdep(h)
+        if nd and nd not in held:
+            out.setdefault(nd, h + " joins its network namespace")
+        for d, c in deps(h).items():
+            if isinstance(c, dict) and c.get("restart") and d not in held:
+                out.setdefault(d, "compose restarts " + h + " with it")
+    for k in sorted(out):
+        print(k + "\t" + out[k])
+elif mode == "closure":
+    seen, todo = [], list(args)
+    while todo:
+        s = todo.pop(0)
+        if s in seen or s not in svcs:
+            continue
+        seen.append(s)
+        todo.extend(sorted(deps(s)))
+    print(" ".join(seen))
+elif mode == "layers":
+    sel, done, left = list(args), set(), list(args)
+    while left:
+        layer = [s for s in left if all(d in done or d not in sel for d in deps(s))] or list(left)
+        print(" ".join(layer))
+        done |= set(layer)
+        left = [s for s in left if s not in done]
+' "$@"
+}
+
 # _noo_hung_services <docker compose args before up> — "service id name" per
-# stack container that exists and whose `docker inspect` gets no answer within
-# the bound. Empty when every container answers. Listing uses `docker ps`
-# (which does not touch each container); if even that does not answer, say so
-# and probe nothing: compose will meet the same wall and there is no name to give.
+# stack container that exists and whose `docker inspect` got no answer within
+# the bound, asked a second time with the longer one (NOO_DOCKER_REPROBE_SECS).
+# Listing uses `docker ps` (which does not touch each container). Returns 3
+# when even that gets no answer: the caller must not run compose then.
 _noo_hung_services() {
-    local all rows id name svc st rc project=()
+    local all rows id name svc rc project=()
     all="$(docker "$@" config --services 2>/dev/null)" || return 0
     [ -n "${COMPOSE_PROJECT_NAME:-}" ] && project=(--filter "label=com.docker.compose.project=$COMPOSE_PROJECT_NAME")
     rows="$(_noo_bounded "$NOO_DOCKER_PROBE_SECS" docker ps -a --filter label=com.docker.compose.service \
         ${project[@]+"${project[@]}"} --format '{{.ID}} {{.Names}} {{.Label "com.docker.compose.service"}}')"
     rc=$?
     if [ "$rc" -eq 124 ]; then
-        ui_failed "Docker does not list containers within ${NOO_DOCKER_PROBE_SECS}s: it is not answering; nothing here can start the stack until it does." >&2
-        return 0
+        ui_failed "Docker did not list containers within ${NOO_DOCKER_PROBE_SECS}s: it is not answering. Nothing was started or restarted; try again once Docker answers (systemctl status docker)." >&2
+        return 3
     fi
     printf '%s\n' "$rows" | while read -r id name svc; do
         [ -n "$id" ] && [ -n "$svc" ] || continue
         printf '%s\n' "$all" | grep -qx "$svc" || continue
-        st="$(_noo_bounded "$NOO_DOCKER_PROBE_SECS" docker inspect -f '{{.State.Status}}' "$id")"
+        _noo_bounded "$NOO_DOCKER_PROBE_SECS" docker inspect -f '{{.State.Status}}' "$id" >/dev/null 2>&1
+        [ "$?" -eq 124 ] || continue
+        # Slow is not stuck: one more try, with the longer bound.
+        _noo_bounded "$NOO_DOCKER_REPROBE_SECS" docker inspect -f '{{.State.Status}}' "$id" >/dev/null 2>&1
         [ "$?" -eq 124 ] && printf '%s %s %s\n' "$svc" "$id" "$name"
     done
     return 0
 }
 
 # _noo_report_hung <service> <container id> <container name> — the one plain
-# statement, and the report file line the callers read.
+# statement per held container, worded as what is known, and the report line.
 _noo_report_hung() {
-    ui_failed "$3 ($1) is stuck: its process did not exit and Docker cannot remove it (docker inspect gets no answer in ${NOO_DOCKER_PROBE_SECS}s). Starting the rest of the stack without it; $(_noo_service_role "$1") until then. Only a reboot of this host removes it."
+    local what
+    what="$(_noo_service_role "$1")"
+    case "$1" in
+        gateway|postgres)
+            ui_failed "THE CONTROLLER IS NOT UP: $3 ($1) is held, and $what." ;;
+    esac
+    ui_failed "Docker did not answer for $3 ($1) in ${NOO_DOCKER_PROBE_SECS}s, and not again in ${NOO_DOCKER_REPROBE_SECS}s. If it still does not answer, its process most likely did not exit and Docker cannot remove it; only a reboot of this host removes it. Starting the rest of the stack without it; $what until then."
     if [ -n "${NOO_STUCK_REPORT:-}" ]; then
         printf '%s\n%s\n' "$1" "$2" >> "$NOO_STUCK_REPORT" 2>/dev/null || true
     fi
 }
 
-# noo_hold_hung "<services>" <docker compose args before up> — probe the stack
-# (or only the services named, space-separated; "" = all), report each stuck
-# one, and put them in NOO_ISOLATED_SERVICES. For callers that do not go
-# through noo_compose_up_isolating_stuck (restart, named services).
+# noo_hold_hung "<ignored>" <docker compose args before up> — probe EVERY
+# stack container first (before anything inspects them), report each held one,
+# then work out which other services compose would touch it through. Sets
+# NOO_ISOLATED_SERVICES (held), NOO_HELD_IDS, NOO_HELD_NAMES,
+# NOO_EXCLUDED_SERVICES and NOO_PROBE_DONE. Returns 3 when Docker does not
+# list containers at all (the caller stops), else 0.
 noo_hold_hung() {
-    local only="$1" svc id name held=""
+    local svc id name held="" rows rc svcname why
     shift
-    NOO_ISOLATED_SERVICES=""
+    NOO_ISOLATED_SERVICES=""; NOO_HELD_IDS=""; NOO_HELD_NAMES=""
+    NOO_EXCLUDED_SERVICES=""; NOO_PROBE_DONE=1; _NOO_CFG_JSON=""
+    rows="$(_noo_hung_services "$@")"
+    rc=$?
+    [ "$rc" -eq 0 ] || return "$rc"
     while read -r svc id name; do
         [ -n "$svc" ] || continue
-        if [ -n "$only" ]; then case " $only " in *" $svc "*) ;; *) continue ;; esac; fi
-        case " $held " in *" $svc "*) continue ;; esac
         _noo_report_hung "$svc" "$id" "$name"
-        held="${held:+$held }$svc"
+        case " $held " in *" $svc "*) ;; *) held="${held:+$held }$svc" ;; esac
+        NOO_HELD_IDS="${NOO_HELD_IDS:+$NOO_HELD_IDS }$id"
+        NOO_HELD_NAMES="${NOO_HELD_NAMES:+$NOO_HELD_NAMES }${name#/}"
     done <<EOF_HUNG
-$(_noo_hung_services "$@")
+$rows
 EOF_HUNG
     NOO_ISOLATED_SERVICES="$held"
+    [ -n "$held" ] || return 0
+    _NOO_CFG_JSON="$(_noo_bounded 30 docker "$@" config --format json 2>/dev/null)" || _NOO_CFG_JSON=""
+    # shellcheck disable=SC2046
+    rows="$(_noo_rel excluded $held)" || rows=""
+    if [ -z "$_NOO_CFG_JSON" ] || ! command -v python3 >/dev/null 2>&1; then
+        ui_warned "could not read the compose relations (no python3 or no config): services linked to $held cannot be told apart, so none are left out"
+    fi
+    while IFS="$(printf '\t')" read -r svcname why; do
+        [ -n "$svcname" ] || continue
+        ui_warned "not touching $svcname ($why): compose would act on the held container"
+        NOO_EXCLUDED_SERVICES="${NOO_EXCLUDED_SERVICES:+$NOO_EXCLUDED_SERVICES }$svcname"
+    done <<EOF_EXC
+$rows
+EOF_EXC
+    return 0
+}
+
+# noo_service_is_left_out <service> — held, or linked to a held one.
+noo_service_is_left_out() {
+    case " ${NOO_ISOLATED_SERVICES:-} ${NOO_EXCLUDED_SERVICES:-} " in *" $1 "*) return 0 ;; esac
+    return 1
+}
+
+# noo_depends_on_held <service> — true when the service needs (depends_on, any
+# depth) a held one: starting it alone would only make it fail.
+noo_depends_on_held() {
+    local c h
+    c="$(_noo_rel closure "$1")" || return 1
+    for h in ${NOO_ISOLATED_SERVICES:-}; do
+        [ "$h" = "$1" ] && continue
+        case " $c " in *" $h "*) return 0 ;; esac
+    done
+    return 1
+}
+
+# noo_not_held_ids — stdin: container ids (short or full), one per line; stdout:
+# those that are not held. The snapshot and the add-on helpers filter through
+# it so no `docker inspect` they run names a held container.
+noo_not_held_ids() {
+    local id h keep
+    while read -r id; do
+        [ -n "$id" ] || continue
+        keep=1
+        for h in ${NOO_HELD_IDS:-}; do
+            case "$id" in "$h"*) keep=0 ;; esac
+            case "$h" in "$id"*) keep=0 ;; esac
+        done
+        [ "$keep" = 1 ] && printf '%s\n' "$id"
+    done
     return 0
 }
 
 # noo_stack_ps_ids [service...] — the container ids for noo_created_guard,
-# never asking Docker about a service held above (a compose `ps` that meets
-# the stuck container hangs with it). Uses $COMPOSE_FILES and $PROFILE_ARGS.
+# never asking Docker about a service left out above (a compose `ps` that
+# meets the held container hangs with it). Uses $COMPOSE_FILES and $PROFILE_ARGS.
 noo_stack_ps_ids() {
     local svcs="$*" s keep=""
     if [ -z "${NOO_ISOLATED_SERVICES:-}" ]; then
@@ -195,12 +351,147 @@ noo_stack_ps_ids() {
     # shellcheck disable=SC2086
     [ -n "$svcs" ] || svcs="$(docker compose $COMPOSE_FILES $PROFILE_ARGS config --services 2>/dev/null)"
     for s in $svcs; do
-        case " $NOO_ISOLATED_SERVICES " in *" $s "*) continue ;; esac
+        noo_service_is_left_out "$s" && continue
         keep="${keep:+$keep }$s"
     done
     [ -n "$keep" ] || return 0
     # shellcheck disable=SC2086
-    _noo_bounded "$NOO_DOCKER_PROBE_SECS" docker compose $COMPOSE_FILES $PROFILE_ARGS ps -aq $keep
+    _noo_bounded "$NOO_DOCKER_PROBE_SECS" docker compose $COMPOSE_FILES $PROFILE_ARGS ps -aq $keep | noo_not_held_ids
+}
+
+# _noo_wait_ready <seconds> <compose args...> -- <service>... — wait, bounded,
+# for each service's container to be healthy (when it has a healthcheck) or
+# running. A service that is not ready in time is said and the start goes on.
+_noo_wait_ready() {
+    local secs="$1" cargs=() s id st deadline
+    shift
+    while [ $# -gt 0 ] && [ "$1" != "--" ]; do cargs+=("$1"); shift; done
+    shift
+    for s in "$@"; do
+        deadline=$((SECONDS + secs))
+        while :; do
+            id="$(_noo_bounded "$NOO_DOCKER_PROBE_SECS" docker "${cargs[@]}" ps -aq "$s" 2>/dev/null | head -1)"
+            st=""
+            [ -n "$id" ] && st="$(_noo_bounded "$NOO_DOCKER_PROBE_SECS" docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$id" 2>/dev/null)"
+            case "$st" in healthy|running) break ;; esac
+            if [ "$SECONDS" -ge "$deadline" ]; then
+                ui_warned "$s was not ready after ${secs}s (${st:-no container}); continuing with the rest"
+                break
+            fi
+            sleep 2
+        done
+    done
+}
+
+# _noo_sweep_created <compose args...> — after the last stage: any container
+# of this stack still in Created (never started) that is not held or left out
+# is started by name, bounded, and said. Never `docker start` on a held one.
+_noo_sweep_created() {
+    local rows id name svc project=()
+    [ -n "${COMPOSE_PROJECT_NAME:-}" ] && project=(--filter "label=com.docker.compose.project=$COMPOSE_PROJECT_NAME")
+    rows="$(_noo_bounded "$NOO_DOCKER_PROBE_SECS" docker ps -a --filter status=created --filter label=com.docker.compose.service \
+        ${project[@]+"${project[@]}"} --format '{{.ID}} {{.Names}} {{.Label "com.docker.compose.service"}}')" || return 0
+    printf '%s\n' "$rows" | while read -r id name svc; do
+        [ -n "$id" ] || continue
+        printf '%s\n' "$id" | noo_not_held_ids | grep -q . || continue
+        noo_service_is_left_out "$svc" && continue
+        if _noo_bounded "$NOO_DOCKER_PROBE_SECS" docker start "$name" >/dev/null 2>&1; then
+            ui_warned "$name ($svc) was left in Created by the start: started it"
+        else
+            ui_failed "$name ($svc) was left in Created and docker start did not bring it up: start it with: docker start $name"
+        fi
+    done
+    return 0
+}
+
+# _noo_staged_up <docker compose args before up> -- <up flags> -- <service>... —
+# the services (and, unless --no-deps was asked for, everything they depend
+# on that is not held or left out) are brought up in explicit stages, each its
+# own `up -d --no-deps` call, so the answer to "does compose order services
+# under --no-deps" does not matter: (1) the data stores and the bus, then a
+# bounded wait for them; (2..) the rest in dependency layers read from the
+# compose config, each followed by the same wait; then the Created sweep.
+# Returns the worst compose status of the stages, else 0.
+_noo_staged_up() {
+    local base=() flags=() want=() sel=() layer s rc=0 r c core="" rest=() layers closure
+    while [ $# -gt 0 ] && [ "$1" != "--" ]; do base+=("$1"); shift; done
+    shift
+    while [ $# -gt 0 ] && [ "$1" != "--" ]; do flags+=("$1"); shift; done
+    shift
+    want=("$@")
+    if closure="$(_noo_rel closure "${want[@]}")" && [ -n "$closure" ]; then
+        # shellcheck disable=SC2206
+        want=($closure)
+    fi
+    for s in "${want[@]}"; do
+        noo_service_is_left_out "$s" || sel+=("$s")
+    done
+    [ "${#sel[@]}" -gt 0 ] || return 0
+    for s in "${sel[@]}"; do
+        case " $NOO_STACK_CORE_SERVICES " in *" $s "*) core="${core:+$core }$s" ;; *) rest+=("$s") ;; esac
+    done
+    if [ -n "$core" ]; then
+        # shellcheck disable=SC2086
+        docker "${base[@]}" up --no-deps "${flags[@]}" $core || { r=$?; [ "$r" -gt "$rc" ] && rc=$r; }
+        # shellcheck disable=SC2086
+        _noo_wait_ready "$NOO_STAGE_WAIT_SECS" "${base[@]}" -- $core
+    fi
+    if [ "${#rest[@]}" -gt 0 ]; then
+        layers="$(_noo_rel layers "${rest[@]}")" || layers="${rest[*]}"
+        while IFS= read -r layer; do
+            [ -n "$layer" ] || continue
+            # shellcheck disable=SC2086
+            docker "${base[@]}" up --no-deps "${flags[@]}" $layer || { r=$?; [ "$r" -gt "$rc" ] && rc=$r; }
+            # shellcheck disable=SC2086
+            _noo_wait_ready "$NOO_STAGE_WAIT_SECS" "${base[@]}" -- $layer
+        done <<EOF_LAYERS
+$layers
+EOF_LAYERS
+    fi
+    _noo_sweep_created
+    return "$rc"
+}
+
+# noo_staged_up <up flags...> -- <service>... — the same, for the launchers'
+# named starts (uses $COMPOSE_FILES and $PROFILE_ARGS).
+noo_staged_up() {
+    local flags=(-d)
+    while [ $# -gt 0 ] && [ "$1" != "--" ]; do flags+=("$1"); shift; done
+    shift
+    # shellcheck disable=SC2086
+    _noo_staged_up compose $COMPOSE_FILES $PROFILE_ARGS -- "${flags[@]}" -- "$@"
+}
+
+# noo_staged_restart <service>... — `compose restart`, by stage, for the
+# services that are not held or left out (the whole-stack restart with a held
+# container). Uses $COMPOSE_FILES and $PROFILE_ARGS.
+noo_staged_restart() {
+    local sel=() s layers layer rc=0 r core="" rest=()
+    for s in "$@"; do noo_service_is_left_out "$s" || sel+=("$s"); done
+    [ "${#sel[@]}" -gt 0 ] || return 0
+    for s in "${sel[@]}"; do
+        case " $NOO_STACK_CORE_SERVICES " in *" $s "*) core="${core:+$core }$s" ;; *) rest+=("$s") ;; esac
+    done
+    if [ -n "$core" ]; then
+        # shellcheck disable=SC2086
+        docker compose $COMPOSE_FILES $PROFILE_ARGS restart $core || { r=$?; [ "$r" -gt "$rc" ] && rc=$r; }
+        # shellcheck disable=SC2086
+        _noo_wait_ready "$NOO_STAGE_WAIT_SECS" compose $COMPOSE_FILES $PROFILE_ARGS -- $core
+    fi
+    if [ "${#rest[@]}" -gt 0 ]; then
+        layers="$(_noo_rel layers "${rest[@]}")" || layers="${rest[*]}"
+        while IFS= read -r layer; do
+            [ -n "$layer" ] || continue
+            # shellcheck disable=SC2086
+            docker compose $COMPOSE_FILES $PROFILE_ARGS restart $layer || { r=$?; [ "$r" -gt "$rc" ] && rc=$r; }
+            # shellcheck disable=SC2086
+            _noo_wait_ready "$NOO_STAGE_WAIT_SECS" compose $COMPOSE_FILES $PROFILE_ARGS -- $layer
+        done <<EOF_LAYERS
+$layers
+EOF_LAYERS
+    fi
+    _noo_sweep_created
+    return "$rc"
 }
 
 # The daemon's words for a GPU that did not answer at container start.
@@ -231,7 +522,7 @@ _gpu_failure_ids() {
 #   noo_compose_up_isolating_stuck compose $COMPOSE_FILES $PROFILE_ARGS up -d --force-recreate
 noo_compose_up_isolating_stuck() {
     local errf rc
-    NOO_ISOLATED_SERVICES=""
+    [ "${NOO_PROBE_DONE:-}" = 1 ] || NOO_ISOLATED_SERVICES=""
     errf="$(mktemp)" || { docker "$@"; return $?; }
 
     # Split the args at `up`: base = compose + files + profiles.
@@ -248,29 +539,31 @@ noo_compose_up_isolating_stuck() {
     # One round per failure: a second GPU service (the exporter, a second
     # backend) can fail the retry the same way. Bounded: the services held
     # by name only grow.
-    local isolated="" round ids id gpu name svc why all hid hname
+    local isolated="" round ids id gpu name svc why all
     if [ "$seen_up" = 1 ]; then
         # Ask about every container first (the 2026-11-25 shape: no error to
-        # read, Docker simply never answers about one of them).
-        while read -r svc hid hname; do
-            [ -n "$svc" ] || continue
-            case " $isolated " in *" $svc "*) continue ;; esac
-            _noo_report_hung "$svc" "$hid" "$hname"
-            isolated="${isolated:+$isolated }$svc"
-        done <<EOF_HUNG
-$(_noo_hung_services "${base[@]}")
-EOF_HUNG
+        # read, Docker simply never answers about one of them). A caller that
+        # already probed (start_inputs_full_up, before its snapshot) is not
+        # asked to again.
+        if [ "${NOO_PROBE_DONE:-}" != 1 ]; then
+            noo_hold_hung "" "${base[@]}" || { rm -f "$errf"; return 1; }
+        fi
+        isolated="$NOO_ISOLATED_SERVICES"
         if [ -n "$isolated" ]; then
-            NOO_ISOLATED_SERVICES="$isolated"
             all="$(docker "${base[@]}" config --services 2>/dev/null)" || all=""
             others=()
             for svc in $(_noo_core_first $all); do
-                case " $isolated " in *" $svc "*) continue ;; esac
-                others+=("$svc")
+                noo_service_is_left_out "$svc" || others+=("$svc")
             done
-            [ "${#others[@]}" -gt 0 ] || { rm -f "$errf"; return "$NOO_EXIT_STACK_PARTIAL"; }
-            argv=("${base[@]}" up --no-deps "${upflags[@]}" "${others[@]}")
+            rm -f "$errf"
+            NOO_PROBE_DONE=""
+            [ "${#others[@]}" -gt 0 ] || return "$NOO_EXIT_STACK_PARTIAL"
+            rc=0
+            _noo_staged_up "${base[@]}" -- "${upflags[@]}" -- "${others[@]}" || rc=$?
+            [ "$rc" -eq 0 ] || return "$rc"
+            return "$NOO_EXIT_STACK_PARTIAL"
         fi
+        NOO_PROBE_DONE=""
     fi
     for round in 1 2 3 4; do
         : > "$errf"

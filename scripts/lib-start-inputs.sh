@@ -152,6 +152,18 @@ start_inputs_snapshot() {
     _proj="$(_compose_project_name . 2>/dev/null || true)"
     : > "$1"
     [ -n "$_proj" ] || return 0
+    # Never an inspect that names a container Docker did not answer for
+    # (noo_hold_hung ran first), and every call bounded: one hung inspect would
+    # hold the whole start before the first `up`.
+    if declare -F _noo_bounded >/dev/null; then
+        local _ids
+        _ids="$(_noo_bounded "${NOO_DOCKER_PROBE_SECS:-10}" docker ps -aq --filter "label=com.docker.compose.project=$_proj" 2>/dev/null | noo_not_held_ids | tr '\n' ' ')"
+        [ -n "${_ids// /}" ] || return 0
+        # shellcheck disable=SC2086
+        _noo_bounded "$(( ${NOO_DOCKER_REPROBE_SECS:-30} ))" docker inspect -f '{{index .Config.Labels "com.docker.compose.service"}} {{.Id}} {{.State.Status}}' $_ids \
+            >> "$1" 2>/dev/null || true
+        return 0
+    fi
     docker ps -aq --filter "label=com.docker.compose.project=$_proj" 2>/dev/null \
         | xargs -r docker inspect -f '{{index .Config.Labels "com.docker.compose.service"}} {{.Id}} {{.State.Status}}' \
         >> "$1" 2>/dev/null || true
@@ -214,6 +226,12 @@ start_inputs_discard_state() {
 start_inputs_full_up() {
     local _b _a _rc=0
     start_inputs_prepare || return 1
+    # Ask Docker about every container BEFORE anything inspects them: the
+    # snapshot below names every container of the project, a held one included.
+    if declare -F noo_hold_hung >/dev/null && [ "${NOO_PROBE_DONE:-}" != 1 ]; then
+        # shellcheck disable=SC2086
+        noo_hold_hung "" compose $COMPOSE_FILES $PROFILE_ARGS || return 1
+    fi
     _b="$(mktemp)"; _a="$(mktemp)"
     start_inputs_snapshot "$_b"
     # shellcheck disable=SC2086  # word lists by design
@@ -235,10 +253,15 @@ start_inputs_named_up() {
     _b="$(mktemp)"; _a="$(mktemp)"
     start_inputs_snapshot "$_b"
     # shellcheck disable=SC2086
-    # --no-deps while a service is held (lib-stuck-container.sh): compose must
-    # not walk into the container Docker does not answer for.
-    [ -z "${NOO_ISOLATED_SERVICES:-}" ] || START_UP_FORCE="$START_UP_FORCE --no-deps"
-    docker compose $COMPOSE_FILES $PROFILE_ARGS up -d $START_UP_FORCE "$@" || _rc=$?
+    if [ -n "${NOO_ISOLATED_SERVICES:-}" ]; then
+        # A service is held (lib-stuck-container.sh): the named ones, and what
+        # they need that is not held, start by stage; compose is never asked
+        # to walk into the held container.
+        # shellcheck disable=SC2086
+        noo_staged_up $START_UP_FORCE -- "$@" || _rc=$?
+    else
+        docker compose $COMPOSE_FILES $PROFILE_ARGS up -d $START_UP_FORCE "$@" || _rc=$?
+    fi
     if [ "$_rc" -ne 0 ]; then rm -f "$_b" "$_a"; return "$_rc"; fi
     start_inputs_snapshot "$_a"
     start_inputs_report "$_b" "$_a"
