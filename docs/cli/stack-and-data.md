@@ -191,14 +191,20 @@ written by an agent or the MCP door, is filed as a proposal instead:
 `heartbeat proposals [<id>]` lists them and `approve` / `reject` decide them
 at a terminal (people only). `remove` asks for confirmation.
 
-A scheduled LLM action runs unattended, so its prompt says that nobody can
-answer a question. If its answer declines the task or ends by asking leave
-("Shall I proceed?"), the gateway retries once with a corrective line. A
-second such answer is recorded as an `error` run with the reason
-`unattended_non_answer: declined` or `unattended_non_answer: asked_to_proceed`,
-is not delivered to any channel, and raises the usual failed-task operator
-alert (at most one per hour per task). A summary's operator alert record now
-follows the task in the prompt and is written into the summary.
+A scheduled summary or report action (`daily_briefing`, `chat_digest`,
+`conversation_summarize`, `news_scan`, `goal_review`, `research_report`,
+`research_and_send`) runs unattended, so its prompt says that nobody can
+answer a question. If its answer opens by declining the task, or is short and
+ends by asking leave ("Shall I proceed?"), the gateway retries once with a
+corrective line. A second such answer is recorded as an `error` run with the
+reason `unattended_non_answer: declined` or `unattended_non_answer: asked_to_proceed`
+and is not delivered to any channel. For a scheduled run it raises the usual
+failed-task operator alert (at most one per hour per task); a manual
+`noo heartbeat run` returns the error to the caller instead. A long result
+that merely ends with a courtesy question is delivered without that last line.
+The check is English-only and deliberately narrow. `channel_message` and
+`custom_prompt` are not checked. A summary's operator alert record now follows
+the task in the prompt and is written into the summary.
 
 ### Find errors across the stack
 

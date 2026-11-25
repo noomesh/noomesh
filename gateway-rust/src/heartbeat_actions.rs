@@ -586,6 +586,30 @@ pub(crate) fn load_skill_body(name: &str) -> Option<String> {
     None
 }
 
+/// Said to every scheduled summary/report action ([`is_summary_action`]): a
+/// scheduled run has no one to ask.
+/// A model that offers "Shall I proceed?" or declines to start has produced
+/// nothing; the run is then judged by [`detect_non_answer`].
+pub const UNATTENDED_NOTE: &str = "This runs unattended: no one can answer a question. Do the \
+     task with what you have and the tools offered; never ask to proceed.";
+
+/// The scheduled summary/report actions: their output is a document, so a
+/// refusal or a closing "Shall I proceed?" is never a legitimate result.
+/// `channel_message` and `custom_prompt` are excluded on purpose: their
+/// output may rightly be a question or an invitation.
+pub fn is_summary_action(action: &str) -> bool {
+    matches!(
+        action,
+        "daily_briefing"
+            | "chat_digest"
+            | "conversation_summarize"
+            | "news_scan"
+            | "goal_review"
+            | "research_report"
+            | "research_and_send"
+    )
+}
+
 /// Build a prompt for the coordinator from a heartbeat task action.
 /// Single source of truth — both the cron-tick loop and the manual
 /// run-now route call this.
@@ -594,17 +618,11 @@ pub(crate) fn load_skill_body(name: &str) -> Option<String> {
 /// skill's body is loaded from `prompts/skills/` and prepended to the
 /// action's own prompt. This lets tasks opt into shared quality rules
 /// without baking them into each per-action template.
-/// Said to every unattended LLM action: a scheduled run has no one to ask.
-/// A model that offers "Shall I proceed?" or declines to start has produced
-/// nothing; the run is then judged by [`detect_non_answer`].
-pub const UNATTENDED_NOTE: &str = "This runs unattended: no one can answer a question. Do the \
-     task with what you have and the tools offered; never ask to proceed.";
-
-/// The task, then (for an LLM action) the unattended note. The alert record
+/// The task, then (for a summary/report action) the unattended note. The alert record
 /// of a summary is appended after both (`alert_digest::enrich_prompt`).
 pub fn build_action_prompt(action: &str, task_name: &str, config: &Value) -> String {
     let prompt = build_action_prompt_base(action, task_name, config);
-    if matches!(action_path(action), ActionPath::RustLlm) {
+    if is_summary_action(action) {
         format!("{prompt}\n\n{UNATTENDED_NOTE}")
     } else {
         prompt
@@ -2000,6 +2018,9 @@ async fn run_llm_action_inner(
     .await;
     // A refusal or a question is not a result: one corrective retry, then a
     // failed run (nothing delivered; the loop alerts through operator_alert).
+    if !is_summary_action(action) {
+        return Ok(text);
+    }
     gate_unattended_answer(action, text, |hit| {
         non_answer_retry(state, prompt, conversation_id, max_iterations, config, hit)
     })
@@ -2025,23 +2046,33 @@ impl NonAnswer {
     }
 }
 
-/// A non-answer is short: a long text is a real report with a stray phrase.
-const NON_ANSWER_MAX_CHARS: usize = 2500;
+/// A trailing leave-asking line costs a retry only when little else is there.
+const ASK_SHORT_TEXT_CHARS: usize = 600;
+const ASK_SHORT_REST_CHARS: usize = 300;
+const LEAD_INS: &[&str] = &[
+    "unfortunately", "i'm sorry", "i am sorry", "sorry", "i apologize", "apologies", "but",
+    "as an ai language model", "as an ai",
+];
 const DECLINE_OPENERS: &[&str] = &[
-    "i cannot", "i can not", "i can't", "i'm unable", "i am unable", "i'm not able", "i am not able",
-    "i won't", "i will not", "i'm sorry, but i", "sorry, but i", "i apologize, but i",
+    "i cannot", "i can not", "i can't", "i'm unable to", "i am unable to", "i'm not able to",
+    "i am not able to", "i won't", "i will not",
 ];
-/// The opener must be about the task ("I cannot fulfill the request"), not a
-/// finding ("I cannot reach node_a").
-const DECLINE_OBJECTS: &[&str] = &[
-    "fulfill", "comply", "complete", "generate", "provide", "produce", "create", "write", "proceed",
-    "do that", "do this", "help with", "assist", "perform", "the request", "this request", "the task",
-    "as instructed",
+/// Whole words, within four words after the opener: the refusal is about the
+/// task itself ("I cannot fulfill the request"), not a finding ("I cannot
+/// reach node_a, so its data is incomplete").
+const DECLINE_TASK_WORDS: &[&str] = &[
+    "fulfill", "comply", "complete", "proceed", "generate", "provide", "produce", "create", "write",
+    "help", "assist", "perform", "request", "task", "briefing", "report", "summary",
 ];
+const NO_ACCESS_OPENERS: &[&str] = &["i do not have access", "i don't have access"];
 const LEAVE_PHRASES: &[&str] = &[
     "shall i", "should i", "would you like", "do you want me", "want me to", "like me to", "may i",
     "can i proceed", "ready to proceed",
 ];
+
+fn words(s: &str) -> Vec<&str> {
+    s.split(|c: char| !(c.is_alphanumeric() || c == '\'' || c == '_')).filter(|w| !w.is_empty()).collect()
+}
 
 fn first_sentence(s: &str) -> String {
     let end = s
@@ -2054,36 +2085,83 @@ fn first_sentence(s: &str) -> String {
     s[..end].chars().take(300).collect()
 }
 
+/// Does the text OPEN by refusing the task? English only, deliberately narrow.
+fn opens_with_decline(text: &str) -> bool {
+    let norm = text.replace('\u{2019}', "'").to_lowercase();
+    // leading markdown heading lines do not hide a refusal under them
+    let body: String = norm
+        .lines()
+        .skip_while(|l| {
+            let l = l.trim();
+            l.is_empty() || l.starts_with('#')
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut head = body.trim_start_matches(|c: char| !c.is_alphanumeric());
+    for _ in 0..3 {
+        match LEAD_INS.iter().find_map(|li| head.strip_prefix(li).filter(|r| !r.starts_with(|c: char| c.is_alphanumeric()))) {
+            Some(rest) => head = rest.trim_start_matches(|c: char| !c.is_alphanumeric()),
+            None => break,
+        }
+    }
+    if let Some(rest) = DECLINE_OPENERS.iter().find_map(|o| head.strip_prefix(o)) {
+        if !rest.starts_with(|c: char| c.is_alphanumeric()) {
+            return words(rest).iter().take(4).any(|w| DECLINE_TASK_WORDS.contains(w));
+        }
+    }
+    if NO_ACCESS_OPENERS.iter().any(|o| head.starts_with(o)) {
+        let first = first_sentence(head);
+        return ["i cannot", "i can't", "i am unable", "i'm unable"].iter().any(|p| first.contains(p));
+    }
+    false
+}
+
+/// Byte index where the last line starts, when that line asks leave
+/// ("Shall I proceed?", "Would you like more detail?"). `text` is trimmed.
+fn trailing_ask_start(text: &str) -> Option<usize> {
+    let start = text.rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let line = text[start..].replace('\u{2019}', "'").to_lowercase();
+    let line = line.trim().trim_end_matches(|c: char| matches!(c, '*' | '_' | '"' | '\'' | ')' | ' '));
+    let body = line.strip_suffix('?')?;
+    let sentence = match body.rfind(|c: char| matches!(c, '.' | '!' | ':')) {
+        Some(i) => &body[i + 1..],
+        None => body,
+    };
+    LEAVE_PHRASES.iter().any(|p| sentence.contains(p)).then_some(start)
+}
+
 /// Is `text` a refusal or a request for leave rather than the task's result?
-/// Pure. Conservative: only the START (declines, about the task) and the END
-/// (a final line that asks leave and ends in `?`) count, and only for a short
-/// text. A question mid-text, "node_a cannot reach node_b", an empty text
-/// (the usability gate's) and a long report are not hits.
+/// Pure; English only and deliberately narrow.
+/// - Declined: the text opens (after any heading, at any length) by refusing
+///   the task. "I cannot reach node_a" is a finding, not a refusal.
+/// - AskedToProceed: the last line asks leave, and the text is short (under
+///   600 chars) or what precedes that line is under 300 chars. A long
+///   briefing with a courtesy closing question is a result: see
+///   [`strip_trailing_ask`].
+/// Empty text is the usability gate's, and a question mid-text is never a hit.
 pub fn detect_non_answer(text: &str) -> Option<NonAnswer> {
     let t = text.trim();
-    if t.is_empty() || t.chars().count() > NON_ANSWER_MAX_CHARS {
+    if t.is_empty() {
         return None;
     }
-    let norm = t.replace('\u{2019}', "'").to_lowercase();
-    let head = norm.trim_start_matches(|c: char| !c.is_alphanumeric());
-    if DECLINE_OPENERS.iter().any(|o| head.starts_with(o)) {
-        let first = first_sentence(head);
-        if DECLINE_OBJECTS.iter().any(|o| first.contains(o)) {
-            return Some(NonAnswer::Declined);
-        }
+    if opens_with_decline(t) {
+        return Some(NonAnswer::Declined);
     }
-    let last = norm.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("");
-    let last = last.trim().trim_end_matches(|c: char| matches!(c, '*' | '_' | '"' | '\'' | ')' | ' '));
-    if let Some(body) = last.strip_suffix('?') {
-        let sentence = match body.rfind(|c: char| matches!(c, '.' | '!' | ':')) {
-            Some(i) => &body[i + 1..],
-            None => body,
-        };
-        if LEAVE_PHRASES.iter().any(|p| sentence.contains(p)) {
-            return Some(NonAnswer::AskedToProceed);
-        }
+    let start = trailing_ask_start(t)?;
+    if t.chars().count() < ASK_SHORT_TEXT_CHARS || t[..start].trim().chars().count() < ASK_SHORT_REST_CHARS {
+        return Some(NonAnswer::AskedToProceed);
     }
     None
+}
+
+/// The text to deliver once it is not a non-answer: a courtesy closing line
+/// that asks leave is dropped (nobody can answer it); everything else stays.
+pub fn strip_trailing_ask(text: &str) -> String {
+    let t = text.trim();
+    match trailing_ask_start(t) {
+        Some(start) => t[..start].trim_end().to_string(),
+        None => t.to_string(),
+    }
 }
 
 fn non_answer_correction(hit: NonAnswer) -> &'static str {
@@ -2112,12 +2190,12 @@ where
     Fut: std::future::Future<Output = Option<String>>,
 {
     let Some(hit) = detect_non_answer(&first) else {
-        return Ok(first);
+        return Ok(strip_trailing_ask(&first));
     };
     tracing::warn!(action, reason = hit.reason(), "heartbeat_non_answer_retrying");
     if let Some(second) = retry(hit).await {
         match detect_non_answer(&second) {
-            None => return Ok(second),
+            None => return Ok(strip_trailing_ask(&second)),
             Some(again) => anyhow::bail!("{}", again.reason()),
         }
     }
@@ -2133,7 +2211,7 @@ async fn non_answer_retry(
     config: &Value,
     hit: NonAnswer,
 ) -> Option<String> {
-    let retry_prompt = format!("{base_prompt}\n\n{}", non_answer_correction(hit));
+    let retry_prompt = non_answer_retry_prompt(base_prompt, hit);
     let model = task_model(config);
     match crate::bus_principal::with_principal(
         crate::bus_principal::unattended_principal(crate::heartbeat_actions::HEARTBEAT_CONVERSATION_OWNER),
@@ -2163,8 +2241,17 @@ async fn non_answer_retry(
             );
             Some(sanitize_result_text(&cr.response))
         }
-        Err(_) => None,
+        Err(e) => {
+            tracing::warn!(error = %e, reason = hit.reason(), "heartbeat_non_answer_retry_failed");
+            None
+        }
     }
+}
+
+/// The retry sees the SAME enriched prompt (task, note, alert record), then
+/// the correction.
+fn non_answer_retry_prompt(base_prompt: &str, hit: NonAnswer) -> String {
+    format!("{base_prompt}\n\n{}", non_answer_correction(hit))
 }
 
 /// Single corrective retry for a research action whose first output failed
@@ -6406,6 +6493,87 @@ mod non_answer_tests {
         assert_eq!(detect_non_answer(REFUSAL), Some(NonAnswer::Declined));
         assert_eq!(NonAnswer::Declined.reason(), "unattended_non_answer: declined");
         assert_eq!(detect_non_answer("**I can\u{2019}t complete this task.**"), Some(NonAnswer::Declined));
+        for t in [
+            "Unfortunately, I'm not able to generate the briefing.",
+            "I'm sorry, I can't provide that report.",
+            "As an AI, I cannot complete this request.",
+            "# Daily briefing\n\nI cannot fulfill the request as instructed.",
+            "I do not have access to the node data, so I cannot write the briefing.",
+        ] {
+            assert_eq!(detect_non_answer(t), Some(NonAnswer::Declined), "{t}");
+        }
+        let long = format!("I cannot fulfill the request. {}", "More text. ".repeat(400));
+        assert_eq!(detect_non_answer(&long), Some(NonAnswer::Declined), "a decline opener counts at any length");
+    }
+
+    #[test]
+    fn a_finding_that_opens_with_i_cannot_is_not_a_refusal() {
+        for t in [
+            "I cannot reach node_a, so its data is incomplete.\n\n## Cluster\nctrl is healthy. Cache 41%.",
+            "I can't see cache performance data for node_a.\n\n## Cluster\nctrl is healthy.",
+            "I cannot tell which assistant wrote it; the log is written daily.\nAll else is healthy.",
+        ] {
+            assert_eq!(detect_non_answer(t), None, "{t}");
+        }
+    }
+
+    #[test]
+    fn a_long_briefing_with_a_courtesy_question_is_delivered_without_it() {
+        let body = format!("## Daily briefing\n{}\nAll nodes healthy.", "Cluster line with detail.\n".repeat(30));
+        let with = format!("{body}\n\nWould you like more detail on any node?");
+        assert_eq!(detect_non_answer(&with), None);
+        assert_eq!(strip_trailing_ask(&with), body);
+        assert_eq!(strip_trailing_ask(&body), body, "no question, nothing stripped");
+        let short = "node_a is offline.\n\nWould you like more detail on any node?";
+        assert_eq!(detect_non_answer(short), Some(NonAnswer::AskedToProceed), "short text: the ask is most of it");
+    }
+
+    #[tokio::test]
+    async fn the_gate_delivers_a_long_briefing_minus_its_courtesy_line_with_no_retry() {
+        let body = format!("## Daily briefing\n{}\nAll nodes healthy.", "Cluster line with detail.\n".repeat(30));
+        let calls = Cell::new(0);
+        let out = gate_unattended_answer("daily_briefing", format!("{body}\n\nShall I proceed?"), |_| {
+            calls.set(calls.get() + 1);
+            async { None }
+        })
+        .await
+        .unwrap();
+        assert_eq!(out, body);
+        assert_eq!(calls.get(), 0);
+    }
+
+    #[test]
+    fn only_summary_actions_are_gated_and_told_they_run_unattended() {
+        for a in ["daily_briefing", "chat_digest", "conversation_summarize", "news_scan", "goal_review", "research_report", "research_and_send"] {
+            assert!(is_summary_action(a), "{a}");
+        }
+        for a in ["channel_message", "custom_prompt", "database_backup"] {
+            assert!(!is_summary_action(a), "{a}");
+        }
+        let cfg = json!({"prompt": "Would you like to join us at noon?"});
+        let p = build_action_prompt("channel_message", "t", &cfg);
+        assert_eq!(p, "Would you like to join us at noon?", "no unattended note");
+        let cp = build_action_prompt("custom_prompt", "t", &json!({"prompt": "Do the thing"}));
+        assert!(!cp.contains(UNATTENDED_NOTE), "{cp}");
+        // the gate is skipped for them: run_llm_action_inner returns the text untouched
+        let src = include_str!("heartbeat_actions.rs");
+        let inner = &src[src.find("async fn run_llm_action_inner(").unwrap()..];
+        let inner = &inner[..inner.find("\n}\n").unwrap()];
+        assert!(inner.contains("if !is_summary_action(action) {\n        return Ok(text);\n    }"), "{inner}");
+        assert!(inner.contains("gate_unattended_answer(action, text,"), "the gate must be called");
+        assert!(inner.contains("non_answer_retry(state, prompt, conversation_id"), "retry uses the same enriched prompt");
+        // and a question reply from channel_message passes the detector's scope: it is never gated
+        assert_eq!(detect_non_answer(&cfg["prompt"].as_str().unwrap().to_string()), Some(NonAnswer::AskedToProceed), "the detector alone would flag it: the scope is what protects it");
+    }
+
+    #[test]
+    fn the_retry_prompt_is_the_enriched_prompt_plus_the_correction() {
+        let base = "TASK\n\nnote\n\n## Operator alert record";
+        let p = non_answer_retry_prompt(base, NonAnswer::Declined);
+        assert!(p.starts_with(base) && p.ends_with(non_answer_correction(NonAnswer::Declined)), "{p}");
+        let src = include_str!("heartbeat_actions.rs");
+        let f = &src[src.find("async fn non_answer_retry(").unwrap()..];
+        assert!(f[..f.find("\n}\n").unwrap()].contains("non_answer_retry_prompt(base_prompt, hit)"));
     }
 
     #[test]
@@ -6421,7 +6589,7 @@ mod non_answer_tests {
         assert_eq!(detect_non_answer("node_a cannot reach node_b over the mesh.\nCache 41%."), None);
         assert_eq!(detect_non_answer("I cannot reach node_a; it is offline.\nCache 41%."), None, "a finding, not a refusal");
         let long_tail = format!("{}\nShall I proceed?", "Section.\n".repeat(400));
-        assert_eq!(detect_non_answer(&long_tail), None, "a long report is not judged by a closing phrase");
+        assert_eq!(detect_non_answer(&long_tail), None, "a long report is not failed for a closing phrase");
     }
 
     #[test]
@@ -6434,14 +6602,13 @@ mod non_answer_tests {
     }
 
     #[test]
-    fn the_unattended_note_follows_the_task_for_llm_actions_only() {
+    fn the_unattended_note_follows_the_task_for_summary_actions() {
         let p = build_action_prompt("daily_briefing", "Daily", &json!({}));
         assert!(p.starts_with("Generate a daily briefing"), "{p}");
         assert!(p.ends_with(UNATTENDED_NOTE), "{p}");
         assert!(UNATTENDED_NOTE.contains("no one can answer a question") && UNATTENDED_NOTE.contains("never ask to proceed"));
-        let c = build_action_prompt("custom_prompt", "t", &json!({"prompt": "Do the thing"}));
-        assert!(c.contains("Do the thing") && c.ends_with(UNATTENDED_NOTE), "{c}");
-        assert!(!matches!(action_path("database_backup"), ActionPath::RustLlm));
+        let c = build_action_prompt("research_report", "t", &json!({"topic": "x"}));
+        assert!(c.ends_with(UNATTENDED_NOTE), "{c}");
         assert!(!build_action_prompt("database_backup", "t", &json!({})).contains(UNATTENDED_NOTE));
     }
 

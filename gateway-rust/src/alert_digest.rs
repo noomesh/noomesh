@@ -263,6 +263,15 @@ mod tests {
     }
 
     #[test]
+    fn enrich_prompt_puts_the_task_first() {
+        let src = include_str!("alert_digest.rs");
+        let f = &src[src.find("pub async fn enrich_prompt(").unwrap()..];
+        let f = &f[..f.find("\n}\n").unwrap()];
+        assert!(f.contains("compose_prompt(&prompt, &record)"), "{f}");
+        assert!(!f.contains("format!(\"{record}"), "the record must not lead the prompt: {f}");
+    }
+
+    #[test]
     fn open_conditions_and_maintenance_are_stated() {
         let open = [PersistState {
             kind: "node_unreachable".into(), target: "alpha".into(),
