@@ -83,3 +83,21 @@ func TestPlacementStatesTheWindowOfAuto(t *testing.T) {
 		t.Fatal("nothing known: no auto entry")
 	}
 }
+
+// A placement whose window is unknown is ignored by `auto`: never 0, never
+// the reason the key is absent when another placement's window is known.
+func TestAutoIgnoresAPlacementWithNoKnownWindow(t *testing.T) {
+	r := &Reconciler{}
+	r.chatModels = []ChatModel{{"vllm", "org/known"}, {"llamacpp", "unknown.gguf"}, {"ollama", "nodecided:1b"}}
+	r.recordChatWindows(map[string]int{"org/known": 8192})
+	w := r.ChatWindows()
+	if w["auto"] != 8192 {
+		t.Fatalf("auto must be the known window, got %v", w)
+	}
+	if _, ok := w["unknown.gguf"]; ok || len(w) != 2 {
+		t.Fatalf("the unknown model stays unstated: %v", w)
+	}
+	if got := autoWindow(r.chatModels, r.chatWindows, nil); got != 8192 {
+		t.Fatalf("autoWindow = %d, want 8192", got)
+	}
+}

@@ -520,8 +520,8 @@ placements (an engine window or an Ollama decided context); the proxy picks
 one backend per request and the harness cannot see which, so the smallest
 cannot overflow. The harness looks its window up by its pin as given, so a
 4096-token llama.cpp placement gets a prompt budget inside 4096 rather than
-the global window. Both are absent when nothing is known or the agent is
-older; zero or implausibly large values are ignored; the loop then keeps
+the global window. Each key is absent when its own table is empty or the
+agent is older; zero or implausibly large values are ignored; the loop then keeps
 the global `VLLM_MAX_MODEL_LEN` window.
 
 `noo-gateway harness probe --kind <kind>` runs steps 1, 3, 4 and 5 once,
