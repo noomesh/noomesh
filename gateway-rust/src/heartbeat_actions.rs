@@ -618,8 +618,10 @@ pub fn is_summary_action(action: &str) -> bool {
 /// skill's body is loaded from `prompts/skills/` and prepended to the
 /// action's own prompt. This lets tasks opt into shared quality rules
 /// without baking them into each per-action template.
-/// The task, then (for a summary/report action) the unattended note. The alert record
-/// of a summary is appended after both (`alert_digest::enrich_prompt`).
+///
+/// The task comes first; a summary/report action then gets the unattended
+/// note, and a summary's alert record is appended after both
+/// (`alert_digest::enrich_prompt`).
 pub fn build_action_prompt(action: &str, task_name: &str, config: &Value) -> String {
     let prompt = build_action_prompt_base(action, task_name, config);
     if is_summary_action(action) {
@@ -2016,11 +2018,12 @@ async fn run_llm_action_inner(
         text,
     )
     .await;
-    // A refusal or a question is not a result: one corrective retry, then a
-    // failed run (nothing delivered; the loop alerts through operator_alert).
+    // channel_message and custom_prompt may rightly answer with a question.
     if !is_summary_action(action) {
         return Ok(text);
     }
+    // A refusal or a question is not a result: one corrective retry, then a
+    // failed run (nothing delivered; the loop alerts through operator_alert).
     gate_unattended_answer(action, text, |hit| {
         non_answer_retry(state, prompt, conversation_id, max_iterations, config, hit)
     })
@@ -2085,18 +2088,40 @@ fn first_sentence(s: &str) -> String {
     s[..end].chars().take(300).collect()
 }
 
-/// Does the text OPEN by refusing the task? English only, deliberately narrow.
+/// A markdown heading or list/table line: the sign of a report.
+fn is_report_line(line: &str) -> bool {
+    let l = line.trim_start();
+    l.starts_with(['#', '|', '\u{2022}'])
+        || l.starts_with("- ")
+        || l.starts_with("* ")
+        || (l.starts_with(|c: char| c.is_ascii_digit())
+            && l.trim_start_matches(|c: char| c.is_ascii_digit()).starts_with(['.', ')']))
+}
+
+/// After an opener ("i cannot"), is a task word within four whole words?
+fn task_word_after_opener(s: &str) -> bool {
+    DECLINE_OPENERS.iter().filter_map(|o| s.find(o).map(|i| &s[i + o.len()..])).any(|rest| {
+        !rest.starts_with(|c: char| c.is_alphanumeric()) && words(rest).iter().take(4).any(|w| DECLINE_TASK_WORDS.contains(w))
+    })
+}
+
+/// Does the text OPEN by refusing the task, with no report after it? English
+/// only, deliberately narrow. A refusal that is followed by a heading or list
+/// line is a briefing that opens with a limitation, and is delivered.
 fn opens_with_decline(text: &str) -> bool {
     let norm = text.replace('\u{2019}', "'").to_lowercase();
     // leading markdown heading lines do not hide a refusal under them
-    let body: String = norm
+    let lines: Vec<&str> = norm
         .lines()
         .skip_while(|l| {
             let l = l.trim();
             l.is_empty() || l.starts_with('#')
         })
-        .collect::<Vec<_>>()
-        .join("\n");
+        .collect();
+    if lines.iter().skip(1).any(|l| is_report_line(l)) {
+        return false;
+    }
+    let body = lines.join("\n");
     let mut head = body.trim_start_matches(|c: char| !c.is_alphanumeric());
     for _ in 0..3 {
         match LEAD_INS.iter().find_map(|li| head.strip_prefix(li).filter(|r| !r.starts_with(|c: char| c.is_alphanumeric()))) {
@@ -2104,30 +2129,25 @@ fn opens_with_decline(text: &str) -> bool {
             None => break,
         }
     }
-    if let Some(rest) = DECLINE_OPENERS.iter().find_map(|o| head.strip_prefix(o)) {
-        if !rest.starts_with(|c: char| c.is_alphanumeric()) {
-            return words(rest).iter().take(4).any(|w| DECLINE_TASK_WORDS.contains(w));
-        }
+    if DECLINE_OPENERS.iter().any(|o| head.starts_with(o)) {
+        return task_word_after_opener(&first_sentence(head));
     }
     if NO_ACCESS_OPENERS.iter().any(|o| head.starts_with(o)) {
-        let first = first_sentence(head);
-        return ["i cannot", "i can't", "i am unable", "i'm unable"].iter().any(|p| first.contains(p));
+        return task_word_after_opener(&first_sentence(head));
     }
     false
 }
 
-/// Byte index where the last line starts, when that line asks leave
-/// ("Shall I proceed?", "Would you like more detail?"). `text` is trimmed.
+/// Byte index where the trailing asking SENTENCE starts, when the last line
+/// ends in a question that asks leave ("Shall I proceed?", "Would you like
+/// more detail?"). `text` is trimmed.
 fn trailing_ask_start(text: &str) -> Option<usize> {
-    let start = text.rfind('\n').map(|i| i + 1).unwrap_or(0);
-    let line = text[start..].replace('\u{2019}', "'").to_lowercase();
-    let line = line.trim().trim_end_matches(['*', '_', '"', '\'', ')', ' ']);
+    let line_start = text.rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let line = text[line_start..].trim_end_matches(['*', '_', '"', '\'', ')', ' ']);
     let body = line.strip_suffix('?')?;
-    let sentence = match body.rfind(['.', '!', ':']) {
-        Some(i) => &body[i + 1..],
-        None => body,
-    };
-    LEAVE_PHRASES.iter().any(|p| sentence.contains(p)).then_some(start)
+    let sentence_at = body.rfind(['.', '!', ':']).map(|i| i + 1).unwrap_or(0);
+    let sentence = format!(" {} ", words(&body[sentence_at..].replace('\u{2019}', "'").to_lowercase()).join(" "));
+    LEAVE_PHRASES.iter().any(|p| sentence.contains(&format!(" {p} "))).then_some(line_start + sentence_at)
 }
 
 /// Is `text` a refusal or a request for leave rather than the task's result?
@@ -2154,14 +2174,14 @@ pub fn detect_non_answer(text: &str) -> Option<NonAnswer> {
     None
 }
 
-/// The text to deliver once it is not a non-answer: a courtesy closing line
-/// that asks leave is dropped (nobody can answer it); everything else stays.
+/// The text to deliver once it is not a non-answer: a courtesy closing
+/// sentence or line that asks leave is dropped (nobody can answer it); everything else stays.
 pub fn strip_trailing_ask(text: &str) -> String {
-    let t = text.trim();
-    match trailing_ask_start(t) {
-        Some(start) => t[..start].trim_end().to_string(),
-        None => t.to_string(),
+    let mut t = text.trim();
+    while let Some(start) = trailing_ask_start(t) {
+        t = t[..start].trim_end();
     }
+    t.to_string()
 }
 
 fn non_answer_correction(hit: NonAnswer) -> &'static str {
@@ -6515,6 +6535,38 @@ mod non_answer_tests {
         ] {
             assert_eq!(detect_non_answer(t), None, "{t}");
         }
+    }
+
+    #[test]
+    fn a_briefing_that_opens_with_a_limitation_is_delivered_but_a_prose_refusal_is_not() {
+        let briefing = "I cannot create a summary for node_a because it is offline.\n\n## Cluster\n- ctrl: healthy\n- cache 41%\n";
+        assert_eq!(detect_non_answer(briefing), None);
+        let numbered = "I cannot generate the report for node_a.\n1. ctrl is healthy\n2. cache 41%";
+        assert_eq!(detect_non_answer(numbered), None);
+        // all-prose and long: still a refusal (there is no report after it)
+        let long = format!("I cannot fulfill the request as instructed. {}", "It needs data I do not have. ".repeat(90));
+        assert!(long.chars().count() > 2500);
+        assert_eq!(detect_non_answer(&long), Some(NonAnswer::Declined));
+        assert_eq!(detect_non_answer(REFUSAL), Some(NonAnswer::Declined));
+    }
+
+    #[test]
+    fn no_access_needs_a_task_word_and_leave_phrases_are_whole_words() {
+        assert_eq!(detect_non_answer("I don't have access to node_a's metrics, so I can't show its cache."), None);
+        assert_eq!(detect_non_answer("I do not have access to the data, so I cannot generate the briefing."), Some(NonAnswer::Declined));
+        assert_eq!(detect_non_answer("Backups failed.\nWhat may impact node_a?"), None);
+        assert_eq!(detect_non_answer("Backups failed.\nMay I proceed?"), Some(NonAnswer::AskedToProceed));
+    }
+
+    #[test]
+    fn only_the_asking_sentence_is_stripped() {
+        let one = "Backups failed twice overnight. Would you like more detail?";
+        assert_eq!(strip_trailing_ask(one), "Backups failed twice overnight.");
+        let only = "## Briefing\nAll nodes healthy.\nWould you like more detail?";
+        assert_eq!(strip_trailing_ask(only), "## Briefing\nAll nodes healthy.");
+        let two = "## Briefing\nAll nodes healthy.\nWould you like more detail?\nShall I proceed?";
+        assert_eq!(strip_trailing_ask(two), "## Briefing\nAll nodes healthy.");
+        assert_eq!(strip_trailing_ask("What may impact node_a?"), "What may impact node_a?");
     }
 
     #[test]
