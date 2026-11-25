@@ -921,13 +921,13 @@ func TestBootRestoreWritesFilesThenStartsOnlyBoundContainers(t *testing.T) {
 	e, fr := testEngine(t)
 	e.BootRestore(context.Background())
 	got := strings.Join(fr.joined(), "\n")
-	for _, want := range []string{"lib-secrets.sh", "secret_rundir", "load_secrets", "--filter status=created", "docker start", `grep -q "^$d/"`, "is populated; nothing to do"} {
+	for _, want := range []string{"lib-secrets.sh", "secret_rundir", "load_secrets", "--filter status=created", `start "$id"`, `grep -q "^$d/"`, "is populated; nothing to do"} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("boot-restore script lacks %q:\n%s", want, got)
 		}
 	}
 	// the populated check comes BEFORE the write, and the start after it
-	if !(strings.Index(got, "populated") < strings.Index(got, "load_secrets >/dev/null") && strings.Index(got, "load_secrets >/dev/null") < strings.Index(got, "docker start")) {
+	if !(strings.Index(got, "populated") < strings.Index(got, "load_secrets >/dev/null") && strings.Index(got, "load_secrets >/dev/null") < strings.Index(got, `start "$id"`)) {
 		t.Fatalf("wrong order:\n%s", got)
 	}
 	if strings.Contains(got, "up -d") || strings.Contains(got, "pull") || strings.Contains(got, "--force-recreate") {
@@ -947,7 +947,7 @@ func TestBootRestoreRunsTheNamespaceRestoreAfterItsStarts(t *testing.T) {
 	if call < 0 {
 		t.Fatalf("boot-restore does not run the namespace restore:\n%s", got)
 	}
-	if !(strings.Index(got, "docker start") < call && call < strings.Index(got, "wrote the secret files and started")) {
+	if !(strings.Index(got, `start "$id"`) < call && call < strings.Index(got, "wrote the secret files and started")) {
 		t.Fatalf("the namespace restore must run after the starts and before the report:\n%s", got)
 	}
 }
@@ -996,7 +996,7 @@ func TestBootRestoreChecksTheStateVolumeBeforeStarting(t *testing.T) {
 	if !strings.Contains(got, "lib-state-volume.sh") || check < 0 {
 		t.Fatalf("boot-restore does not check the state volume:\n%s", got)
 	}
-	if !(strings.Index(got, "populated") < check && check < strings.Index(got, "load_secrets >/dev/null") && check < strings.Index(got, "docker start")) {
+	if !(strings.Index(got, "populated") < check && check < strings.Index(got, "load_secrets >/dev/null") && check < strings.Index(got, `start "$id"`)) {
 		t.Fatalf("the volume check must come before the write and the start:\n%s", got)
 	}
 	if !strings.Contains(got, "exit 3") {
