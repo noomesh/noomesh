@@ -124,3 +124,131 @@ def test_both_launchers_use_it_and_the_rust_code_agrees():
         assert '"$NOO_EXIT_STACK_PARTIAL"' in t
     assert "NOO_EXIT_STACK_PARTIAL=75" in (SCRIPTS / "lib-stuck-container.sh").read_text()
     assert "lib-stuck-container.sh" in (REPO_ROOT / "noo-cli" / "build.rs").read_text()
+
+
+# ---------------------------------------------------------------------------
+# The third shape (2026-11-25, 0.6.30): the container's process survived
+# SIGKILL, containerd could not delete the task, and from then on every docker
+# call naming that one container (`docker inspect` included) never returned.
+# No compose error text to read: the launcher asks first, with a bound.
+# ---------------------------------------------------------------------------
+
+HUNG_ID = "9f3e1d2c" + "0" * 56
+HUNG_SLEEP = 25  # past the bound; the test's own deadline is below this
+
+FAKE_DOCKER_HUNG = r"""#!/bin/bash
+echo "$*" >> "$FAKE_LOG"
+case "$*" in
+  *"config --services"*) printf '%s\n' gateway postgres redis ollama-embed ;;
+  "ps -a "*)
+    printf '%s\n' "aaa111 noo-gateway gateway" "bbb222 noo-postgres postgres" \
+        "ccc333 noo-redis redis" "$HUNG_ID noo-ollama-embed ollama-embed" ;;
+  "inspect -f {{.State.Status}} $HUNG_ID") sleep 25; echo exited ;;
+  "inspect -f {{.State.Status}} "*) echo running ;;
+  *"ps -aq"*) echo "ps-ok" ;;
+  *" up "*) exit 0 ;;
+  *) exit 0 ;;
+esac
+"""
+
+
+def _run_hung(tmp_path: Path, body: str, hung: bool = True):
+    import time
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    d = bin_dir / "docker"
+    d.write_text(FAKE_DOCKER_HUNG if hung else FAKE_DOCKER_HUNG.replace(
+        '"inspect -f {{.State.Status}} $HUNG_ID") sleep 25; echo exited ;;', ""))
+    d.chmod(0o755)
+    log = tmp_path / "docker.log"
+    report = tmp_path / "report"
+    script = textwrap.dedent(f"""
+        . {SCRIPTS}/lib-ui.sh
+        . {SCRIPTS}/lib-stuck-container.sh
+        COMPOSE_FILES="-f a.yml"; PROFILE_ARGS="--profile controller"
+        {body}
+    """)
+    env = {
+        "PATH": f"{bin_dir}:/usr/bin:/bin",
+        "FAKE_LOG": str(log),
+        "HUNG_ID": HUNG_ID,
+        "NOO_DOCKER_PROBE_SECS": "1",
+        "NOO_STUCK_REPORT": str(report),
+        "NO_COLOR": "1",
+        "LC_ALL": "C",
+    }
+    t0 = time.time()
+    # The launcher must finish well inside the fake's sleep: a hung probe
+    # makes this raise TimeoutExpired and the test fails.
+    p = subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True, timeout=HUNG_SLEEP - 10)
+    took = time.time() - t0
+    calls = log.read_text().splitlines() if log.exists() else []
+    return p, calls, report, took
+
+
+def test_a_container_docker_cannot_inspect_is_named_and_the_rest_starts_in_order(tmp_path):
+    p, calls, report, took = _run_hung(tmp_path, textwrap.dedent("""
+        noo_compose_up_isolating_stuck compose $COMPOSE_FILES $PROFILE_ARGS up -d --force-recreate --scale node-agent=0
+        echo "RC=$?"
+        echo "ISO=$NOO_ISOLATED_SERVICES"
+    """))
+    out = p.stdout + p.stderr
+    assert "RC=75" in out, out
+    assert "ISO=ollama-embed" in out
+    assert took < 15, took
+    ups = [c for c in calls if " up " in f" {c} "]
+    assert ups == [
+        "compose -f a.yml --profile controller up --no-deps -d --force-recreate --scale node-agent=0 postgres redis gateway"
+    ], ups
+    # the stuck service is never named in any compose call
+    assert not any(c.startswith("compose") and "ollama-embed" in c.replace("config --services", "") for c in calls), calls
+    assert out.count("is stuck") == 1, out
+    assert "noo-ollama-embed (ollama-embed) is stuck: its process did not exit and Docker cannot remove it" in out
+    assert "Starting the rest of the stack without it" in out
+    assert "GPU embeddings stop" in out
+    assert "Only a reboot of this host removes it." in out
+    assert report.read_text().split() == ["ollama-embed", HUNG_ID]
+    assert not any(x.startswith("rename") or " kill" in x or x.startswith("rm") for x in calls)
+
+
+def test_when_every_container_answers_nothing_is_held_and_up_runs_once(tmp_path):
+    p, calls, report, _ = _run_hung(tmp_path, textwrap.dedent("""
+        noo_compose_up_isolating_stuck compose $COMPOSE_FILES $PROFILE_ARGS up -d
+        echo "RC=$?"
+    """), hung=False)
+    out = p.stdout + p.stderr
+    assert "RC=0" in out, out
+    assert "is stuck" not in out
+    ups = [c for c in calls if " up " in f" {c} "]
+    assert ups == ["compose -f a.yml --profile controller up -d"], ups
+    assert not report.exists()
+
+
+def test_restart_and_named_services_hold_it_and_never_ask_compose_about_it(tmp_path):
+    p, calls, report, took = _run_hung(tmp_path, textwrap.dedent("""
+        noo_hold_hung "" compose $COMPOSE_FILES $PROFILE_ARGS
+        echo "ISO=$NOO_ISOLATED_SERVICES"
+        noo_stack_ps_ids
+        noo_hold_hung "gateway postgres" compose $COMPOSE_FILES $PROFILE_ARGS
+        echo "NAMED_ISO=[$NOO_ISOLATED_SERVICES]"
+    """))
+    out = p.stdout + p.stderr
+    assert "ISO=ollama-embed" in out, out
+    assert "NAMED_ISO=[]" in out, "naming only healthy services holds nothing"
+    assert took < 15, took
+    ps = [c for c in calls if "ps -aq" in c]
+    assert ps == ["compose -f a.yml --profile controller ps -aq gateway postgres redis"], ps
+
+
+def test_both_launchers_probe_before_restart_and_named_start():
+    stuck = (SCRIPTS / "lib-stuck-container.sh").read_text()
+    assert "NOO_DOCKER_PROBE_SECS" in stuck and "_noo_bounded" in stuck
+    # the inspect of each container is the bounded one
+    assert re.search(r'_noo_bounded "\$NOO_DOCKER_PROBE_SECS" docker inspect -f', stuck)
+    restart = (SCRIPTS / "noomesh-restart.sh").read_text()
+    start = (SCRIPTS / "noomesh-start.sh").read_text()
+    assert restart.count("noo_hold_hung") >= 2, "whole-stack restart and named restart"
+    assert "noo_hold_hung" in start
+    for t in (restart, start):
+        assert "noo_stack_ps_ids" in t
+        assert "ps -aq" not in re.sub(r"#.*", "", t), "guard ids come from noo_stack_ps_ids"

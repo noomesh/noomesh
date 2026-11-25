@@ -327,11 +327,32 @@ if [ ${#SERVICES[@]} -eq 0 ]; then
         # container outside that set (a stale leftover, or the scaled-out
         # exporter) is removed, not started.
         NOO_CREATED_GUARD_SERVICES="$(printf '%s\n' "$ACTIVE_SVCS" | tr '\n' ' ')" \
-            noo_created_guard $(docker compose $COMPOSE_FILES $PROFILE_ARGS ps -aq)
+            noo_created_guard $(noo_stack_ps_ids)
         # A lean install's Grafana, Loki or Tempo left from a full start goes.
         monitoring_remove_when_lean "$ACTIVE_SVCS"
         [ "${_up_rc:-0}" -eq "$NOO_EXIT_STACK_PARTIAL" ] && exit "$NOO_EXIT_STACK_PARTIAL"
     else
+        # A container Docker does not answer for would hang `compose restart`
+        # as it hung the 2026-11-25 one: name it, restart everything else
+        # (the data stores first), exit $NOO_EXIT_STACK_PARTIAL after.
+        # shellcheck disable=SC2086
+        noo_hold_hung "" compose $COMPOSE_FILES $PROFILE_ARGS
+        if [ -n "$NOO_ISOLATED_SERVICES" ]; then
+            _others=()
+            # shellcheck disable=SC2086
+            for _s in $(_noo_core_first $(docker compose $COMPOSE_FILES $PROFILE_ARGS config --services 2>/dev/null)); do
+                case " $NOO_ISOLATED_SERVICES " in *" $_s "*) ;; *) _others+=("$_s") ;; esac
+            done
+            if [ ${#_others[@]} -gt 0 ]; then
+                docker compose $COMPOSE_FILES $PROFILE_ARGS restart "${_others[@]}" || {
+                    _rc=$?
+                    ui_close_failed "compose failed (exit $_rc) restarting the stack"
+                    exit "$_rc"
+                }
+            fi
+            ui_close_warned "Stack restarted WITHOUT ${NOO_ISOLATED_SERVICES}: stuck, NOT running"
+            exit "$NOO_EXIT_STACK_PARTIAL"
+        fi
         docker compose $COMPOSE_FILES $PROFILE_ARGS restart || {
             _rc=$?
             ui_close_failed "compose failed (exit $_rc) restarting the stack"
@@ -372,6 +393,18 @@ else
 $(addon_drop_held "$(printf '%s\n' "${SERVICES[@]}")")
 EOF_HELD
     SERVICES=(${_kept[@]+"${_kept[@]}"})
+    # A named service whose container Docker does not answer for is named and
+    # left out (lib-stuck-container.sh); the rest restart, exit 75 after.
+    # shellcheck disable=SC2086
+    noo_hold_hung "${SERVICES[*]}" compose $COMPOSE_FILES $PROFILE_ARGS
+    if [ -n "$NOO_ISOLATED_SERVICES" ]; then
+        _kept=()
+        for _s in "${SERVICES[@]}"; do
+            case " $NOO_ISOLATED_SERVICES " in *" $_s "*) ;; *) _kept+=("$_s") ;; esac
+        done
+        SERVICES=(${_kept[@]+"${_kept[@]}"})
+        [ ${#SERVICES[@]} -gt 0 ] || exit "$NOO_EXIT_STACK_PARTIAL"
+    fi
     if [ ${#SERVICES[@]} -eq 0 ]; then
         ui_close_failed "every service named is held (GPU, Docker socket or privileged): nothing to start"
         exit 1
@@ -401,7 +434,7 @@ EOF_HELD
         if [ "$RESTART_RC" -eq 0 ]; then start_inputs_commit_state; else start_inputs_discard_state; fi
         if [ "$RESTART_RC" -eq 0 ]; then
             NOO_CREATED_GUARD_SERVICES="${SERVICES[*]}" \
-                noo_created_guard $(docker compose $COMPOSE_FILES $PROFILE_ARGS ps -aq "${SERVICES[@]}")
+                noo_created_guard $(noo_stack_ps_ids "${SERVICES[@]}")
         fi
     else
         # A named service with NO container: `compose restart` does nothing
@@ -426,7 +459,7 @@ EOF_HELD
             if [ "$RESTART_RC" -eq 0 ]; then
                 # shellcheck disable=SC2086
                 NOO_CREATED_GUARD_SERVICES="${MISSING% }" \
-                    noo_created_guard $(docker compose $COMPOSE_FILES $PROFILE_ARGS ps -aq $MISSING)
+                    noo_created_guard $(noo_stack_ps_ids $MISSING)
             fi
         fi
         if [ "$RESTART_RC" -eq 0 ] && [ ${#_present[@]} -gt 0 ]; then
@@ -449,6 +482,10 @@ EOF_HELD
     fi
 fi
 
+if [ -n "${NOO_ISOLATED_SERVICES:-}" ]; then
+    ui_close_warned "Services restarted WITHOUT ${NOO_ISOLATED_SERVICES}: stuck, NOT running"
+    exit "$NOO_EXIT_STACK_PARTIAL"
+fi
 if [ -n "${NOO_ADDONS_REFUSED:-}" ]; then
     # Never a plain "restarted": the outcome names what did NOT start.
     ui_close_warned "Services restarted WITHOUT add-on(s) ${NOO_ADDONS_REFUSED//,/, }: refused, NOT running"

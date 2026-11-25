@@ -1041,7 +1041,7 @@ require_compose_v2 || exit 1
     # container (e.g. noo-ollama left by an earlier `noo models switch`
     # while running the `standalone` profile) is removed, not `docker
     # start`-ed as if it were the wedge this guard exists for.
-    NOO_CREATED_GUARD_SERVICES="$ACTIVE_SVCS" noo_created_guard $(docker compose $COMPOSE_FILES $PROFILE_ARGS ps -aq)
+    NOO_CREATED_GUARD_SERVICES="$ACTIVE_SVCS" noo_created_guard $(noo_stack_ps_ids)
     [ "${_up_rc:-0}" -eq "$NOO_EXIT_STACK_PARTIAL" ] && exit "$NOO_EXIT_STACK_PARTIAL"
 
     # Opt-out enforcement: stop a leftover trellion from a previous
@@ -1103,11 +1103,24 @@ else
         noo_voice_model_dirs
     fi
     addon_refuse_held "${SERVICES[@]}" || exit 1
+    # A named service whose container Docker does not answer for (a process
+    # that survived SIGKILL, lib-stuck-container.sh) is named and left out;
+    # the others start, and the launcher exits $NOO_EXIT_STACK_PARTIAL.
+    noo_hold_hung "${SERVICES[*]}" compose $COMPOSE_FILES $PROFILE_ARGS
+    if [ -n "$NOO_ISOLATED_SERVICES" ]; then
+        _kept=()
+        for _s in "${SERVICES[@]}"; do
+            case " $NOO_ISOLATED_SERVICES " in *" $_s "*) ;; *) _kept+=("$_s") ;; esac
+        done
+        SERVICES=(${_kept[@]+"${_kept[@]}"})
+        [ ${#SERVICES[@]} -gt 0 ] || exit "$NOO_EXIT_STACK_PARTIAL"
+    fi
     check_bind_sources "${SERVICES[@]}" || exit 1
     # The same `noo.inputs` labels as a full start, so naming a service does
     # not drop its label (and recreate it again on the next full start).
     start_inputs_named_up "${SERVICES[@]}"
-    NOO_CREATED_GUARD_SERVICES="${SERVICES[*]}" noo_created_guard $(docker compose $COMPOSE_FILES $PROFILE_ARGS ps -aq "${SERVICES[@]}")
+    NOO_CREATED_GUARD_SERVICES="${SERVICES[*]}" noo_created_guard $(noo_stack_ps_ids "${SERVICES[@]}")
+    [ -n "$NOO_ISOLATED_SERVICES" ] && exit "$NOO_EXIT_STACK_PARTIAL"
 fi
 
 # Pre-pull the Ollama inference model if Ollama is running. Default
