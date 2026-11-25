@@ -739,43 +739,75 @@ pub(crate) fn reconcile_refusals_check(id: &str, n: &Value) -> Option<Check> {
         Some(format!("noo cluster show {id}   # the reason names its own fix"))))
 }
 
-/// A node whose last bundle poll is older than this is late.
+/// A node whose last fetch receipt is older than this is late.
 const BUNDLE_FETCH_WARN_SECS: i64 = 900;
-/// Older than this, its fetcher has stopped.
+/// Older than this, with receipts expected, its fetcher has stopped.
 const BUNDLE_FETCH_FAIL_SECS: i64 = 3600;
-/// For this long after the gateway started, no node's poll is judged: a
+/// For this long after the gateway started, no node's receipt is judged: a
 /// controller outage stops every poll, so the silence says nothing yet.
 const BUNDLE_FETCH_GATEWAY_GRACE_SECS: i64 = 900;
+/// A stamp this far ahead of this machine's clock is clock skew, said as such.
+const BUNDLE_FETCH_CLOCK_SKEW_SECS: i64 = 60;
+/// The first release whose fetchers send a receipt on every poll, a 304 too;
+/// before it `fetched_at` moved only when a new bundle was collected.
+const BUNDLE_RECEIPT_MIN_VERSION: (u64, u64, u64) = (0, 6, 0);
 
-/// The `bundle fetch` row: when the node's fetcher last asked the controller
-/// for its provision bundle. The node's receipt stamps `fetched_at` on every
-/// successful poll (a 304 too) and a restage clears it, so the age is
-/// `fetched_at`, else `staged_at`. OK under 15 minutes, WARN to an hour, FAIL
-/// past it: pushes and upgrades ride that fetcher. No row on the
-/// controller's own node, for a node that is not online with a recent
-/// heartbeat (the `online` row speaks), or with no bundle status. Not judged
-/// for the first 15 minutes after the gateway started.
+/// `v0.6.30`, `0.6.0-rc.1`, `v0.2.70` → major, minor, patch.
+fn version_triple(v: &str) -> Option<(u64, u64, u64)> {
+    let mut parts = v.trim_start_matches('v').split('.').map(|p| p.split(['-', '+']).next().unwrap_or("").parse::<u64>().ok());
+    Some((parts.next()??, parts.next()??, parts.next()??))
+}
+
+/// Whether the `bundle fetch` row judges this node at all, and so whether
+/// verify reads its bundle status: not the controller's own node, and only a
+/// node that is online with a heartbeat inside [`HEARTBEAT_MAX_AGE_SECS`]
+/// (the `online` row speaks for the rest).
+fn bundle_row_applies(n: &Value, now: i64) -> bool {
+    n["self_node"].as_bool() != Some(true)
+        && n["status"].as_str() == Some("online")
+        && n["last_heartbeat"].as_str().and_then(parse_rfc3339_unix).is_some_and(|t| now - t <= HEARTBEAT_MAX_AGE_SECS)
+}
+
+/// The `bundle fetch` row: when the controller last got a fetch receipt from
+/// the node's fetcher. The receipt is the node's signed, best-effort note
+/// that it collected (or confirmed) its bundle, sent on every poll, a 304
+/// too; a restage clears it, so the age is `fetched_at`, else `staged_at`.
+/// OK under 15 minutes. Past that a WARN; past an hour a FAIL only when the
+/// node has sent a receipt since this bundle was staged and its agent is one
+/// that sends them on every poll: a node that never receipts (an agent too
+/// old, or a node that is pushed to rather than polling) is a WARN, never a
+/// FAIL. No row when [`bundle_row_applies`] is false or the controller has
+/// no bundle for the node; a status read that failed is a WARN. Not judged
+/// for the first 15 minutes after the gateway started. A stamp ahead of this
+/// machine's clock is said as clocks that disagree, not clamped.
 pub(crate) fn bundle_fetch_check(id: &str, n: &Value, now: i64) -> Option<Check> {
     const NAME: &str = "bundle fetch";
-    if n["self_node"].as_bool() == Some(true) || n["status"].as_str() != Some("online") {
-        return None;
-    }
-    let beat = n["last_heartbeat"].as_str().and_then(parse_rfc3339_unix)?;
-    if now - beat > HEARTBEAT_MAX_AGE_SECS {
+    if !bundle_row_applies(n, now) {
         return None;
     }
     let st = n.get(BUNDLE_STATUS_KEY).filter(|v| v.is_object())?;
+    if st["unreadable"].as_bool() == Some(true) {
+        return Some(warn(NAME, "could not read the bundle status: the controller did not answer in time, so the node's fetcher was not judged",
+            Some(format!("noo cluster verify {id}   # asks again"))));
+    }
     let stamp = |k: &str| st[k].as_str().and_then(parse_rfc3339_unix);
     let (since, polled) = match stamp("fetched_at") {
         Some(t) => (t, true),
         None => (stamp("staged_at")?, false),
     };
-    let age = (now - since).max(0);
     if let Some(up) = n[GATEWAY_UPTIME_KEY].as_i64().filter(|u| (0..BUNDLE_FETCH_GATEWAY_GRACE_SECS).contains(u)) {
         return Some(ok(NAME, format!("the controller started {} ago; a controller outage stops every poll, so nothing is judged yet", compact_secs(up))));
     }
+    let age = now - since;
+    if age < -BUNDLE_FETCH_CLOCK_SKEW_SECS {
+        return Some(warn(NAME, format!(
+            "the clocks disagree: the controller stamped this node's {} {}s ahead of this machine's clock, so its age cannot be judged",
+            if polled { "last fetch receipt" } else { "staged bundle" }, -age),
+            Some("check time sync on the controller and on this machine".into())));
+    }
+    let age = age.max(0);
     let when = compact_secs(age);
-    let seen = if polled { format!("last asked {when} ago") } else { format!("has not asked since the bundle was staged {when} ago") };
+    let seen = if polled { format!("last fetch receipt {when} ago") } else { format!("no fetch receipt since the bundle was staged {when} ago") };
     if age < BUNDLE_FETCH_WARN_SECS {
         return Some(ok(NAME, seen));
     }
@@ -784,11 +816,20 @@ pub(crate) fn bundle_fetch_check(id: &str, n: &Value, now: i64) -> Option<Check>
         Some("linux") => bundle_fetch_remedy_linux(id),
         _ => format!("{}; {}", bundle_fetch_remedy_linux(id), bundle_fetch_remedy_mac(id)),
     };
-    if age < BUNDLE_FETCH_FAIL_SECS {
-        return Some(warn(NAME, format!("{seen}: its fetcher polls every few minutes"), Some(remedy)));
+    let sends_receipts = n["app_version"].as_str()
+        .and_then(agent_version_tag)
+        .and_then(|(_, v)| version_triple(&v))
+        .is_some_and(|v| v >= BUNDLE_RECEIPT_MIN_VERSION);
+    if age >= BUNDLE_FETCH_FAIL_SECS && polled && sends_receipts {
+        return Some(fail(NAME, format!(
+            "this node's fetcher has not asked the controller for its bundle for {when}: pushes and upgrades will not reach it ({seen})"), remedy));
     }
-    Some(fail(NAME, format!(
-        "this node's fetcher has not asked the controller for its bundle for {when}: pushes and upgrades will not reach it ({seen})"), remedy))
+    let why = if age >= BUNDLE_FETCH_FAIL_SECS {
+        "this node's agent does not send a receipt, or its receipt is failing"
+    } else {
+        "its fetcher polls every few minutes"
+    };
+    Some(warn(NAME, format!("{seen}: {why}"), Some(remedy)))
 }
 
 fn bundle_fetch_remedy_linux(id: &str) -> String {
@@ -1212,6 +1253,10 @@ pub(crate) fn harness_egress_check(id: &str, n: &Value) -> Option<Check> {
     /// A harness check this soon after the gateway started ran while it could
     /// not yet answer.
     const HARNESS_RECHECK_GRACE_SECS: i64 = 120;
+    /// Past this uptime the gateway has had time to be asked again: a check
+    /// loop that stopped shows as uptime and check age growing together, and
+    /// that is a FAIL, never a wait.
+    const HARNESS_STARTING_MAX_UPTIME_SECS: i64 = 300;
     const NAME: &str = "harness egress";
     if n["self_node"].as_bool() == Some(true) {
         return None;
@@ -1246,7 +1291,7 @@ pub(crate) fn harness_egress_check(id: &str, n: &Value) -> Option<Check> {
         // self-test (it re-checks every 60 s): the check ran while the
         // controller was down, so the verdict waits for the next one.
         Some("stale") => match (n[GATEWAY_UPTIME_KEY].as_i64(), e["checked_age_secs"].as_i64()) {
-            (Some(up), Some(checked)) if up - checked < HARNESS_RECHECK_GRACE_SECS => Check {
+            (Some(up), Some(checked)) if up < HARNESS_STARTING_MAX_UPTIME_SECS && up - checked < HARNESS_RECHECK_GRACE_SECS => Check {
                 name: NAME,
                 verdict: Verdict::Starting,
                 detail: format!("the controller started {up}s ago; the harness's last check ({checked}s ago) ran while it was down; the harness re-checks every 60 s"),
@@ -2984,6 +3029,28 @@ pub(crate) fn data_root_missing_remedy(id: &str, root: &str, meant: Option<&str>
     }
 }
 
+/// Seconds since the gateway started, from its `/metrics` text. A start time
+/// ahead of this machine's clock (skew) is no uptime at all, never a
+/// negative one.
+fn uptime_from_metrics(metrics: Option<&str>, now: i64) -> Option<i64> {
+    metrics.map(parse_legacy_lane_metrics).and_then(|m| m.start_unix).map(|start| now - start).filter(|up| *up >= 0)
+}
+
+/// The bundle status of one node for the `bundle fetch` row: its stamps, or
+/// `unreadable` when the controller did not answer (a timeout is a WARN row,
+/// not silence). `None` when no bundle is staged (404).
+fn read_bundle_status(g: &Globals, id: &str) -> Option<Value> {
+    let unreadable = || Some(serde_json::json!({"unreadable": true}));
+    match crate::http::get_raw_opt(g, &format!("/api/cluster/provision-bundle/{}/status", crate::commands::urlencode(id)), true, 10) {
+        Some((404, _)) => None,
+        Some((status, text)) if (200..300).contains(&status) => match serde_json::from_str::<Value>(&text) {
+            Ok(st) if st.is_object() => Some(serde_json::json!({"staged_at": st["staged_at"], "fetched_at": st["fetched_at"]})),
+            _ => unreadable(),
+        },
+        _ => unreadable(),
+    }
+}
+
 /// The gateway's `/metrics` text, when it answers 2xx.
 fn read_gateway_metrics(g: &Globals) -> Option<String> {
     crate::http::get_raw_opt(g, "/metrics", true, 10)
@@ -2993,15 +3060,16 @@ fn read_gateway_metrics(g: &Globals) -> Option<String> {
 
 /// The node record plus the gateway's answer on the harness (and the
 /// declared data root), for node_checks.
-fn with_harness_wanted(g: &Globals, n: &Value) -> Value {
+fn with_harness_wanted(g: &Globals, n: &Value, gateway_uptime: Option<i64>) -> Value {
     let mut n = n.clone();
     let id = n["id"].as_str().unwrap_or_default().to_string();
     let desired = get_json_opt(g, &format!("/api/cluster/nodes/{}/desired-config", crate::commands::urlencode(&id)), true, 10);
     let wanted = desired.as_ref().and_then(harness_wanted_in);
     // The `bundle fetch` row: when the node's fetcher last asked for its bundle.
-    let bundle = get_json_opt(g, &format!("/api/cluster/provision-bundle/{}/status", crate::commands::urlencode(&id)), true, 10)
-        .filter(|st| st.is_object())
-        .map(|st| serde_json::json!({"staged_at": st["staged_at"], "fetched_at": st["fetched_at"]}));
+    // Read only for a node the row judges (never the controller's own node or
+    // one that is offline): on a cold gateway the status route hashes the
+    // staged blob once per node.
+    let bundle = if bundle_row_applies(&n, now_unix()) { read_bundle_status(g, &id) } else { None };
     let declared = desired.as_ref()
         .and_then(|d| d["node"]["data_root"].as_str())
         .filter(|s| s.starts_with('/') && s.len() > 1)
@@ -3086,6 +3154,9 @@ fn with_harness_wanted(g: &Globals, n: &Value) -> Value {
         }
         if let Some(b) = bundle {
             obj.insert(BUNDLE_STATUS_KEY.into(), b);
+        }
+        if let Some(up) = gateway_uptime {
+            obj.insert(GATEWAY_UPTIME_KEY.into(), up.into());
         }
         if let Some(d) = declared {
             obj.insert("declared_data_root".into(), Value::String(d));
@@ -9745,13 +9816,7 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         let tag = if here == Vantage::Controller { controller_stack_tag() } else { stack_tag_from_gateway(&body) };
         let now = now_unix();
         let roll = crate::commands::upgrade::last_roll();
-        let gateway_uptime = gateway_metrics
-            .insert(read_gateway_metrics(g))
-            .as_deref()
-            .map(parse_legacy_lane_metrics)
-            .and_then(|m| m.start_unix)
-            .map(|start| now - start)
-            .filter(|up| *up >= 0);
+        let gateway_uptime = uptime_from_metrics(gateway_metrics.insert(read_gateway_metrics(g)).as_deref(), now);
         // The tally closes the text and fills `summary` under --json alike.
         tally.context = format!(" — {} node(s) on {tag}", selected.len());
         if g.json {
@@ -9764,7 +9829,7 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         // tunnel probes) are independent of every other node's: run them
         // side by side, then judge and print in the listed order.
         let reads_from = Instant::now();
-        let enriched = par_map(&selected, |n| with_harness_wanted(g, n));
+        let enriched = par_map(&selected, |n| with_harness_wanted(g, n, gateway_uptime));
         laps.push((format!("node reads ({} node(s), side by side)", selected.len()), reads_from.elapsed()));
         let mut sections: Vec<(String, Vec<Check>)> = Vec::new();
         for (n, wanted) in selected.iter().zip(&enriched) {
@@ -9772,9 +9837,6 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             let mut record = wanted.clone();
             if let (Some(age), Some(obj)) = (rolled_ago(roll, now), record.as_object_mut()) {
                 obj.insert(ROLLED_AGO_KEY.into(), age.into());
-            }
-            if let (Some(up), Some(obj)) = (gateway_uptime, record.as_object_mut()) {
-                obj.insert(GATEWAY_UPTIME_KEY.into(), up.into());
             }
             let checks = node_checks(&record, &tag, env!("CARGO_PKG_VERSION"), now, signing_adopted_for(id));
             let node_ok = checks.iter().all(|c| c.verdict != Verdict::Fail && c.verdict != Verdict::Starting);
@@ -11215,7 +11277,7 @@ pub(crate) fn verify_node_after_apply(g: &Globals, node: &str) -> bool {
         ui::say(&ui::status_line(Glyph::Warn, &format!(
             "{node}: no heartbeat from the new build within {POST_APPLY_WAIT_SECS}s — judging the last record it sent; `noo cluster verify {node}` re-checks")));
     }
-    let checks = node_checks(&with_harness_wanted(g, &n), &controller_stack_tag(), env!("CARGO_PKG_VERSION"), now_unix(), signing_adopted_for(node));
+    let checks = node_checks(&with_harness_wanted(g, &n, uptime_from_metrics(read_gateway_metrics(g).as_deref(), now_unix())), &controller_stack_tag(), env!("CARGO_PKG_VERSION"), now_unix(), signing_adopted_for(node));
     // A `starting` row is not a pass: the caller's note
     // says the invariant does not hold YET, and `cluster verify` re-checks.
     // Under --quiet/--json the table stays off stdout (the caller's JSON
@@ -12160,7 +12222,7 @@ mod tests {
     fn the_wait_loop_uses_the_tested_predicate() {
         let own = crate::test_src::own_code(include_str!("cluster_verify/warmup.rs"));
         let body = crate::test_src::fn_body(&own, "pub(crate) fn wait_for_node_warmup(");
-        assert!(body.contains(".any(|n| node_still_starting(n, now))"), "{body}");
+        assert!(body.contains("node_still_starting(&n, now)") && body.contains("super::GATEWAY_UPTIME_KEY"), "{body}");
     }
 
     // ── i276: what a fresh one-box install must not FAIL on ───────────
@@ -17894,7 +17956,7 @@ mod speed_tests {
     fn independent_reads_stay_side_by_side() {
         let own = crate::test_src::own_code(include_str!("cluster_verify.rs"));
         let run = crate::test_src::fn_body(&own, "pub fn cluster_verify(");
-        assert!(run.contains("par_map(&selected, |n| with_harness_wanted(g, n))"), "node reads run side by side");
+        assert!(run.contains("par_map(&selected, |n| with_harness_wanted(g, n, gateway_uptime))"), "node reads run side by side");
         assert!(run.contains("par_map(&reads, |w| self_json(g, w))"), "the security/doctor verbs run side by side");
         assert!(run.contains("par_map(&fit_ids,"), "the per-node fit reads run side by side");
         assert!(run.contains("par_map(&bundle_ids,"), "the per-node apply reports run side by side");
@@ -20371,7 +20433,7 @@ mod bundle_fetch_and_refusal_rows_tests {
 
     /// An online node that last asked `fetched_ago` seconds ago.
     fn polling(fetched_ago: i64) -> Value {
-        json!({"id": "node-a", "status": "online", "last_heartbeat": stamp(NOW - 20),
+        json!({"id": "node-a", "status": "online", "last_heartbeat": stamp(NOW - 20), "app_version": "stack-v0.6.30+abc",
                "hostd": {"host": {"os": "linux"}},
                BUNDLE_STATUS_KEY: {"staged_at": stamp(NOW - 86_400), "fetched_at": stamp(NOW - fetched_ago)}})
     }
@@ -20384,7 +20446,7 @@ mod bundle_fetch_and_refusal_rows_tests {
     fn a_recent_poll_is_ok_and_says_when() {
         let c = row(&polling(120)).unwrap();
         assert_eq!(c.verdict, Verdict::Ok);
-        assert_eq!(c.detail, "last asked 2m ago");
+        assert_eq!(c.detail, "last fetch receipt 2m ago");
     }
 
     #[test]
@@ -20399,6 +20461,68 @@ mod bundle_fetch_and_refusal_rows_tests {
         let f = row(&polling(BUNDLE_FETCH_FAIL_SECS)).unwrap();
         assert_eq!(f.verdict, Verdict::Fail);
         assert!(f.detail.contains("has not asked the controller for its bundle for 60m: pushes and upgrades will not reach it"), "{}", f.detail);
+        assert!(f.detail.contains("last fetch receipt 60m ago"), "{}", f.detail);
+    }
+
+    #[test]
+    fn an_agent_that_sends_no_receipt_is_never_failed_for_it() {
+        let mut old = polling(7200);
+        old["app_version"] = "stack-v0.2.70+abc".into();
+        let c = row(&old).unwrap();
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.contains("this node's agent does not send a receipt, or its receipt is failing"), "{}", c.detail);
+        let mut unknown = polling(7200);
+        unknown.as_object_mut().unwrap().remove("app_version");
+        assert_eq!(row(&unknown).unwrap().verdict, Verdict::Warn);
+        assert_eq!(version_triple("v0.6.30"), Some((0, 6, 30)));
+        assert_eq!(version_triple("0.6.0-rc.1"), Some((0, 6, 0)));
+        assert_eq!(version_triple("v0.6"), None);
+    }
+
+    #[test]
+    fn an_unreadable_status_is_a_warn_not_silence() {
+        let mut n = polling(7200);
+        n[BUNDLE_STATUS_KEY] = json!({"unreadable": true});
+        let c = row(&n).unwrap();
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.starts_with("could not read the bundle status"), "{}", c.detail);
+    }
+
+    #[test]
+    fn a_stamp_ahead_of_this_clock_says_the_clocks_disagree() {
+        let c = row(&polling(-600)).unwrap();
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.contains("the clocks disagree") && c.detail.contains("600s ahead"), "{}", c.detail);
+        // A few seconds of skew is not worth a row's attention.
+        let c = row(&polling(-30)).unwrap();
+        assert_eq!((c.verdict, c.detail.as_str()), (Verdict::Ok, "last fetch receipt 0s ago"));
+    }
+
+    #[test]
+    fn a_gateway_start_ahead_of_this_clock_is_no_uptime() {
+        let text = format!("noo_gateway_start_time_seconds {}\n", NOW - 90);
+        assert_eq!(uptime_from_metrics(Some(&text), NOW), Some(90));
+        let ahead = format!("noo_gateway_start_time_seconds {}\n", NOW + 90);
+        assert_eq!(uptime_from_metrics(Some(&ahead), NOW), None);
+        assert_eq!(uptime_from_metrics(None, NOW), None);
+        assert_eq!(uptime_from_metrics(Some("nothing here\n"), NOW), None);
+    }
+
+    #[test]
+    fn the_status_is_read_only_for_a_node_the_row_judges() {
+        assert!(bundle_row_applies(&polling(0), NOW));
+        let mut ctl = polling(0);
+        ctl["self_node"] = true.into();
+        assert!(!bundle_row_applies(&ctl, NOW));
+        let mut off = polling(0);
+        off["status"] = "offline".into();
+        assert!(!bundle_row_applies(&off, NOW));
+        let mut quiet = polling(0);
+        quiet["last_heartbeat"] = stamp(NOW - 600).into();
+        assert!(!bundle_row_applies(&quiet, NOW));
+        let own = crate::test_src::own_code(include_str!("cluster_verify.rs"));
+        let inject = crate::test_src::fn_body(&own, "fn with_harness_wanted(");
+        assert!(inject.contains("if bundle_row_applies(&n, now_unix()) { read_bundle_status(g, &id) }"));
     }
 
     #[test]
@@ -20418,8 +20542,8 @@ mod bundle_fetch_and_refusal_rows_tests {
         let mut n = polling(0);
         n[BUNDLE_STATUS_KEY] = json!({"staged_at": stamp(NOW - 7200), "fetched_at": null});
         let c = row(&n).unwrap();
-        assert_eq!(c.verdict, Verdict::Fail);
-        assert!(c.detail.contains("staged 2h ago"), "{}", c.detail);
+        assert_eq!(c.verdict, Verdict::Warn, "a node that never sent a receipt since the restage is not failed");
+        assert!(c.detail.contains("no fetch receipt since the bundle was staged 2h ago"), "{}", c.detail);
         n[BUNDLE_STATUS_KEY] = json!({"staged_at": stamp(NOW - 60), "fetched_at": null});
         assert_eq!(row(&n).unwrap().verdict, Verdict::Ok);
     }
@@ -20432,7 +20556,7 @@ mod bundle_fetch_and_refusal_rows_tests {
         assert_eq!(c.verdict, Verdict::Ok);
         assert!(c.detail.starts_with("the controller started 5m ago"), "{}", c.detail);
         n[GATEWAY_UPTIME_KEY] = BUNDLE_FETCH_GATEWAY_GRACE_SECS.into();
-        assert_eq!(row(&n).unwrap().verdict, Verdict::Fail, "past the grace the poll age speaks");
+        assert_eq!(row(&n).unwrap().verdict, Verdict::Fail, "past the grace the receipt age speaks");
     }
 
     #[test]
@@ -20553,7 +20677,8 @@ mod bundle_fetch_and_refusal_rows_tests {
 
     #[test]
     fn a_stale_egress_check_made_after_the_gateway_was_up_still_fails() {
-        for (up, checked) in [(400, Some(40)), (170, Some(50)), (90, None)] {
+        // 400/300: a check loop that died shows uptime and age growing together.
+        for (up, checked) in [(400, Some(40)), (170, Some(50)), (90, None), (400, Some(300)), (300, Some(250))] {
             let c = harness_egress_check("node-a", &stale_egress(Some(up), checked)).unwrap();
             assert_eq!(c.verdict, Verdict::Fail, "uptime {up}, checked {checked:?}");
             assert!(c.detail.contains("cannot reach the gateway at 10.0.0.5:8443"), "{}", c.detail);
@@ -20561,17 +20686,31 @@ mod bundle_fetch_and_refusal_rows_tests {
         }
         let unknown_uptime = harness_egress_check("node-a", &stale_egress(None, Some(50))).unwrap();
         assert_eq!(unknown_uptime.verdict, Verdict::Fail);
+        assert_eq!(harness_egress_check("node-a", &stale_egress(Some(299), Some(250))).unwrap().verdict, Verdict::Starting, "just under the cap");
+    }
+
+    #[test]
+    fn wait_keeps_polling_while_the_egress_row_is_starting() {
+        let mut n = stale_egress(Some(90), Some(50));
+        n["status"] = "online".into();
+        assert!(warmup::node_still_starting(&n, NOW));
+        n[GATEWAY_UPTIME_KEY] = 400.into();
+        assert!(!warmup::node_still_starting(&n, NOW), "past the cap the wait ends and the row fails");
+        n.as_object_mut().unwrap().remove(GATEWAY_UPTIME_KEY);
+        assert!(!warmup::node_still_starting(&n, NOW));
     }
 
     #[test]
     fn the_fleet_run_injects_the_uptime_and_the_bundle_status() {
         let own = crate::test_src::own_code(include_str!("cluster_verify.rs"));
         let run = crate::test_src::fn_body(&own, "pub fn cluster_verify(");
-        assert!(run.contains("obj.insert(GATEWAY_UPTIME_KEY.into(), up.into());"));
+        assert!(run.contains("par_map(&selected, |n| with_harness_wanted(g, n, gateway_uptime))"));
+        assert!(own.contains("with_harness_wanted(g, &n, uptime_from_metrics(read_gateway_metrics(g).as_deref(), now_unix()))"), "the single-node path injects the uptime too");
         let metrics = run.find("read_gateway_metrics(g)").expect("the metrics read");
         let node_loop = run.find("for (n, wanted) in selected.iter().zip(&enriched)").expect("the node loop");
         assert!(metrics < node_loop, "the gateway start time must be read before the node loop");
         let inject = crate::test_src::fn_body(&own, "fn with_harness_wanted(");
         assert!(inject.contains("obj.insert(BUNDLE_STATUS_KEY.into(), b);"));
+        assert!(inject.contains("obj.insert(GATEWAY_UPTIME_KEY.into(), up.into());"));
     }
 }

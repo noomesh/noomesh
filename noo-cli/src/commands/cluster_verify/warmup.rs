@@ -360,10 +360,13 @@ pub(crate) fn judge_node_doors(check: Check, warm: &[String], n: &Value, now_uni
 
 /// What `--wait` waits on for one node record: a backend door still warming
 /// up, or (i677 #17) a gateway that just started and has not heard this
-/// node's gossip yet.
+/// node's gossip yet, or a `harness egress` stale verdict that only reflects
+/// a check made while the controller was down (needs the record's
+/// `gateway_uptime_secs`, which the poller below adds).
 pub(crate) fn node_still_starting(n: &serde_json::Value, now: i64) -> bool {
     super::backend_doors_row(n, now).verdict == Verdict::Starting
         || n["status_reason"].as_str() == Some("gateway_settling")
+        || super::harness_egress_check(n["id"].as_str().unwrap_or("?"), n).is_some_and(|c| c.verdict == Verdict::Starting)
 }
 
 /// `cluster verify <node>... --wait`: poll the node records until no
@@ -375,9 +378,16 @@ pub(crate) fn wait_for_node_warmup(g: &Globals, ids: &[String]) {
             return false; // unreachable: the caller reports it
         };
         let now = super::now_unix();
+        let uptime = super::uptime_from_metrics(super::read_gateway_metrics(g).as_deref(), now);
         body["nodes"].as_array().is_some_and(|ns| ns.iter()
             .filter(|n| ids.is_empty() || ids.iter().any(|w| n["id"].as_str() == Some(w.as_str())))
-            .any(|n| node_still_starting(n, now)))
+            .any(|n| {
+                let mut n = (*n).clone();
+                if let (Some(up), Some(obj)) = (uptime, n.as_object_mut()) {
+                    obj.insert(super::GATEWAY_UPTIME_KEY.into(), up.into());
+                }
+                node_still_starting(&n, now)
+            }))
     };
     let settled = wait_until_settled(&mut starting, WAIT_CAP_SECS, &super::now_unix, &mut |s| {
         std::thread::sleep(std::time::Duration::from_secs(s))
