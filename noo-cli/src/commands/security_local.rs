@@ -1448,8 +1448,13 @@ enum GwHealth {
     Ok,
     /// Something answered, with a status other than 200.
     Answered(u16),
-    /// The probe never got an answer: refused, timed out, or no trust anchor.
-    Unreachable(String),
+    /// Nothing answered (refused, reset, unreachable, timed out): the error.
+    NothingAnswered(String),
+    /// Something answered, but not as a healthy gateway does (a TLS or
+    /// protocol failure): the error.
+    BadAnswer(String),
+    /// No trust anchor to verify with: the probe could not even be made.
+    NoTrust(String),
     /// No address to probe could be determined (see [`health_probe_url`]).
     NoAddress(String),
 }
@@ -1461,9 +1466,31 @@ enum GateOutcome {
     /// Docker says a restarted container is not running or is unhealthy, or
     /// the gateway answered with an error status.
     Unhealthy(String),
-    /// Docker is content but the probe could not reach `/health`: the gate
-    /// is blind, which is not the same as the gateway failing.
+    /// Docker is content but the probe could not tell: the gate is blind,
+    /// which is not the same as the gateway failing.
     Blind(String),
+}
+
+/// What `rotate-all` does with a gate's verdict.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum GateAction {
+    /// Keep the rotation, report it applied.
+    Accept,
+    /// Restore the backup and restart the consumers.
+    Revert,
+    /// Keep the rotated certificates, touch nothing more, exit non-zero and
+    /// tell the operator how to confirm or go back. A gate that could not
+    /// see is no evidence against the new certificates.
+    KeepUnconfirmed,
+}
+
+/// The decision, pure: only an Unhealthy gate reverts. A blind one never does.
+fn gate_action(outcome: &GateOutcome) -> GateAction {
+    match outcome {
+        GateOutcome::Healthy(_) => GateAction::Accept,
+        GateOutcome::Unhealthy(_) => GateAction::Revert,
+        GateOutcome::Blind(_) => GateAction::KeepUnconfirmed,
+    }
 }
 
 /// Where the gateway is bound, as far as the configuration says.
@@ -1515,32 +1542,36 @@ fn bind_target(addr: &str, mode: &str, tailnet_ip: Option<&str>) -> BindTarget {
 /// gateway answers there. When the bind is not known, the CLI's configured
 /// gateway URL (`CONTROLLER_URL` / `NOO_GATEWAY_URL`) is used if one is set;
 /// otherwise there is no address and the caller says so.
+///
+/// The bool is true when the URL comes from the real bind (an address or
+/// localhost the configuration names), false for the configured-URL fallback:
+/// a refusal at a fallback address proves nothing about the gateway.
 fn health_probe_url(
     configured: &str,
     source: &crate::envfile::GatewaySource,
     target: &BindTarget,
     port_offset: u32,
-) -> Result<String, String> {
+) -> Result<(String, bool), String> {
     let port = 8080 + port_offset;
     match target {
         BindTarget::Address(a) => {
             let bare = a.trim_matches(|c| c == '[' || c == ']');
             let host = if bare.contains(':') { format!("[{bare}]") } else { bare.to_string() };
-            Ok(format!("https://{host}:{port}/health"))
+            Ok((format!("https://{host}:{port}/health"), true))
         }
-        BindTarget::Local => Ok(format!("https://localhost:{port}/health")),
+        BindTarget::Local => Ok((format!("https://localhost:{port}/health"), true)),
         BindTarget::Unknown(why) => {
             if matches!(source, crate::envfile::GatewaySource::Default) {
                 Err(format!("{why}, and no gateway URL is configured"))
             } else {
-                Ok(format!("{}/health", configured.trim_end_matches('/')))
+                Ok((format!("{}/health", configured.trim_end_matches('/')), false))
             }
         }
     }
 }
 
 /// [`health_probe_url`] on this host's own settings.
-fn gateway_health_url() -> Result<String, String> {
+fn gateway_health_url() -> Result<(String, bool), String> {
     let offset = crate::envfile::port_offset();
     let (configured, source) = crate::envfile::gateway_url_source(&None);
     let env_file = crate::envfile::repo_root().join(".env");
@@ -1562,33 +1593,53 @@ fn gw_note(gw: &GwHealth, url: &str) -> String {
     match gw {
         GwHealth::NotApplicable | GwHealth::Ok => String::new(),
         GwHealth::Answered(st) => format!("; gateway /health at {url} answered HTTP {st}"),
-        GwHealth::Unreachable(e) => format!("; could not reach /health at {url}: {e}"),
+        GwHealth::NothingAnswered(e) | GwHealth::BadAnswer(e) | GwHealth::NoTrust(e) => {
+            format!("; could not reach /health at {url}: {e}")
+        }
         GwHealth::NoAddress(why) => format!("; /health was not probed: {why}"),
     }
 }
 
-/// How a gate that ran out of time ended. Pure, so the wording is tested:
-/// a container docker calls bad is `Unhealthy`; docker content but `/health`
-/// unreachable is `Blind` and names the URL probed and the error class.
-fn gate_outcome(timeout_secs: u64, bad: &[String], gw: &GwHealth, url: &str) -> GateOutcome {
+/// How a gate that ran out of time ended. Pure, so the wording and the
+/// mapping are tested. Unhealthy: a container docker calls bad; `/health`
+/// answered with a failure status; it answered something a healthy gateway
+/// does not (TLS or protocol failure); or NOTHING answered at an address
+/// derived from the real bind (`from_bind`), after the full timeout, while
+/// docker says the container is up. Blind (docker content, the probe cannot
+/// tell): no address, no trust anchor, or nothing answered at a fallback
+/// address. The text names the URL probed and the error class.
+fn gate_outcome(timeout_secs: u64, bad: &[String], gw: &GwHealth, url: &str, from_bind: bool) -> GateOutcome {
     if !bad.is_empty() {
         return GateOutcome::Unhealthy(format!(
             "unhealthy after {timeout_secs}s: {bad:?}{}",
             gw_note(gw, url)
         ));
     }
+    let blind = |why: String| {
+        GateOutcome::Blind(format!(
+            "docker reports the restarted containers running and healthy, but {why}"
+        ))
+    };
     match gw {
         GwHealth::NotApplicable | GwHealth::Ok => GateOutcome::Healthy("all consumers healthy".into()),
         GwHealth::Answered(st) => GateOutcome::Unhealthy(format!(
             "gateway /health at {url} answered HTTP {st} after {timeout_secs}s"
         )),
-        GwHealth::Unreachable(e) => GateOutcome::Blind(format!(
-            "docker reports the restarted containers running and healthy, but the probe could not \
-             reach /health at {url} after {timeout_secs}s: {e}"
+        GwHealth::BadAnswer(e) => GateOutcome::Unhealthy(format!(
+            "gateway /health at {url} answered, but not as a healthy gateway does: {e}"
         )),
-        GwHealth::NoAddress(why) => GateOutcome::Blind(format!(
-            "docker reports the restarted containers running and healthy, but /health was not \
-             probed: no address to probe ({why})"
+        GwHealth::NothingAnswered(e) if from_bind => GateOutcome::Unhealthy(format!(
+            "nothing answered /health at {url} (the address the gateway is bound to) for {timeout_secs}s: {e}"
+        )),
+        GwHealth::NothingAnswered(e) => blind(format!(
+            "the CLI could not reach /health at {url} (an address taken from the configured gateway URL, \
+             not from the bind) after {timeout_secs}s: {e}"
+        )),
+        GwHealth::NoTrust(e) => blind(format!(
+            "the CLI could not reach /health at {url}: {e}"
+        )),
+        GwHealth::NoAddress(why) => blind(format!(
+            "/health was not probed: no address to probe ({why})"
         )),
     }
 }
@@ -1600,8 +1651,9 @@ fn gate_outcome(timeout_secs: u64, bad: &[String], gw: &GwHealth, url: &str) -> 
 fn probe_health_gate(containers: &[String], timeout_secs: u64) -> GateOutcome {
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
     let has_gateway = containers.iter().any(|c| c.ends_with("-gateway"));
-    let url = if has_gateway { gateway_health_url() } else { Ok(String::new()) };
-    let shown_url = url.clone().unwrap_or_default();
+    let target = if has_gateway { gateway_health_url() } else { Ok((String::new(), false)) };
+    let shown_url = target.clone().map(|(u, _)| u).unwrap_or_default();
+    let from_bind = target.as_ref().is_ok_and(|(_, b)| *b);
     loop {
         let mut bad: Vec<String> = Vec::new();
         for c in containers {
@@ -1620,9 +1672,9 @@ fn probe_health_gate(containers: &[String], timeout_secs: u64) -> GateOutcome {
                 bad.push(c.clone());
             }
         }
-        let gw = match (&url, has_gateway) {
+        let gw = match (&target, has_gateway) {
             (_, false) => GwHealth::NotApplicable,
-            (Ok(u), true) => https_health_check(u),
+            (Ok((u, _)), true) => https_health_check(u),
             (Err(why), true) => GwHealth::NoAddress(why.clone()),
         };
         if bad.is_empty() && matches!(gw, GwHealth::NotApplicable | GwHealth::Ok) {
@@ -1631,7 +1683,7 @@ fn probe_health_gate(containers: &[String], timeout_secs: u64) -> GateOutcome {
         // No address will not appear by waiting: say so now, once docker is content.
         let out_of_time = Instant::now() >= deadline;
         if out_of_time || (bad.is_empty() && matches!(gw, GwHealth::NoAddress(_))) {
-            return gate_outcome(timeout_secs, &bad, &gw, &shown_url);
+            return gate_outcome(timeout_secs, &bad, &gw, &shown_url, from_bind);
         }
         std::thread::sleep(Duration::from_secs(5));
     }
@@ -1655,7 +1707,7 @@ fn probe_health(containers: &[String], timeout_secs: u64) -> (bool, String) {
 fn https_health_check(url: &str) -> GwHealth {
     let agent = match crate::http::agent_for(url, 4) {
         Ok(a) => a,
-        Err(e) => return GwHealth::Unreachable(format!("no trust anchor to verify it with: {e}")),
+        Err(e) => return GwHealth::NoTrust(format!("no trust anchor to verify it with: {e}")),
     };
     match agent.get(url).call() {
         Ok(resp) => match resp.status().as_u16() {
@@ -1667,7 +1719,13 @@ fn https_health_check(url: &str) -> GwHealth {
                 crate::http::SendFailure::SlowAnswer => "timed out after connecting",
                 crate::http::SendFailure::Unreachable => "connection failed",
             };
-            GwHealth::Unreachable(format!("{class}: {e}"))
+            // Nothing answered vs. something answered wrongly (TLS, protocol):
+            // the same split the upgrade gates use.
+            if crate::http::nothing_answered(&e) {
+                GwHealth::NothingAnswered(format!("{class}: {e}"))
+            } else {
+                GwHealth::BadAnswer(format!("{class}: {e}"))
+            }
         }
     }
 }
@@ -4852,7 +4910,8 @@ pub fn pki_rotate_all(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     }
 
     let gate = probe_health_gate(&to_restart, 150);
-    if let GateOutcome::Healthy(detail) = &gate {
+    let action = gate_action(&gate);
+    if let (GateAction::Accept, GateOutcome::Healthy(detail)) = (action, &gate) {
         let mut all_reloaded = reloaded_units.clone();
         all_reloaded.extend(to_restart.iter().cloned());
         if g.json {
@@ -4869,15 +4928,34 @@ pub fn pki_rotate_all(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         return Ok(exit_for_deliveries(0));
     }
 
-    // ── Revert: restore backed-up certs, restart again ──
-    match &gate {
-        GateOutcome::Blind(detail) => ui::close_failed(
-            &format!("could not verify the consumers after rotation ({detail}): reverting"),
+    // ── Blind gate: keep the rotation, change nothing more ──
+    // Docker says the restarted consumers are up; the probe could not tell
+    // anything else. That is no evidence against the new certificates, and a
+    // revert on it would undo a good rotation (and restart everything again).
+    if let (GateAction::KeepUnconfirmed, GateOutcome::Blind(detail)) = (action, &gate) {
+        let restore = format!(
+            "cp -a {}/. {}/ && docker restart {}",
+            backup_dir.display(),
+            ca.dir.display(),
+            to_restart.join(" ")
+        );
+        fail(
+            g.json,
+            ExitCode::Generic,
+            "rotation_unconfirmed",
+            &format!(
+                "The certificates were rotated and the consumers restarted; {detail}. \
+                 Nothing was reverted. Confirm with `noo cluster verify --wait`. \
+                 The backup is at {}; to go back, run: {restore}",
+                backup_dir.display()
+            ),
             None,
-        ),
-        GateOutcome::Unhealthy(detail) | GateOutcome::Healthy(detail) => {
-            ui::close_failed(&format!("consumers unhealthy after rotation ({detail}): reverting"), None);
-        }
+        );
+    }
+
+    // ── Revert: restore backed-up certs, restart again ──
+    if let GateOutcome::Unhealthy(detail) | GateOutcome::Healthy(detail) = &gate {
+        ui::close_failed(&format!("consumers unhealthy after rotation ({detail}): reverting"), None);
     }
     if let Err(e) = copy_tree(&backup_dir, &ca.dir) {
         fail(
@@ -7149,11 +7227,17 @@ mod push_vetting_tests {
 }
 
 /// The health gate behind `pki rotate-all` and the CA rotation: where it
-/// probes, and what it says when it cannot tell.
+/// probes, what it says when it cannot tell, and when it may revert.
 #[cfg(test)]
 mod rotate_gate_tests {
-    use super::{bind_target, gate_outcome, health_probe_url, BindTarget, GateOutcome, GwHealth};
+    use super::{
+        bind_target, gate_action, gate_outcome, health_probe_url, BindTarget, GateAction, GateOutcome, GwHealth,
+    };
     use crate::envfile::GatewaySource;
+
+    fn url_of(configured: &str, source: &GatewaySource, t: &BindTarget, offset: u32) -> String {
+        health_probe_url(configured, source, t, offset).unwrap().0
+    }
 
     /// A controller onboarded on a tailnet binds its gateway to the tailnet
     /// IP only; `localhost` refuses there. The probe goes to the address the
@@ -7162,23 +7246,21 @@ mod rotate_gate_tests {
     fn the_probe_url_is_the_bound_address_not_localhost() {
         let t = bind_target("", "tailnet", Some("100.64.0.7"));
         assert_eq!(t, BindTarget::Address("100.64.0.7".into()));
-        let url = health_probe_url("https://localhost:8080", &GatewaySource::Default, &t, 0).unwrap();
-        assert_eq!(url, "https://100.64.0.7:8080/health");
+        assert_eq!(
+            health_probe_url("https://localhost:8080", &GatewaySource::Default, &t, 0).unwrap(),
+            ("https://100.64.0.7:8080/health".to_string(), true)
+        );
         // An instance port offset moves the port with it.
-        let url = health_probe_url("https://localhost:9080", &GatewaySource::Default, &t, 1000).unwrap();
-        assert_eq!(url, "https://100.64.0.7:9080/health");
+        assert_eq!(
+            url_of("https://localhost:9080", &GatewaySource::Default, &t, 1000),
+            "https://100.64.0.7:9080/health"
+        );
         // An explicit NOO_BIND_ADDR wins over the mode (the launcher's order).
         let pinned = bind_target("100.64.0.9", "local", None);
-        assert_eq!(
-            health_probe_url("", &GatewaySource::Default, &pinned, 0).unwrap(),
-            "https://100.64.0.9:8080/health"
-        );
+        assert_eq!(url_of("", &GatewaySource::Default, &pinned, 0), "https://100.64.0.9:8080/health");
         // An IPv6 address is bracketed.
         let v6 = bind_target("fd7a::1", "", None);
-        assert_eq!(
-            health_probe_url("", &GatewaySource::Default, &v6, 0).unwrap(),
-            "https://[fd7a::1]:8080/health"
-        );
+        assert_eq!(url_of("", &GatewaySource::Default, &v6, 0), "https://[fd7a::1]:8080/health");
     }
 
     /// Localhost is probed when, and only when, the configuration says the
@@ -7190,25 +7272,22 @@ mod rotate_gate_tests {
             assert_eq!(t, BindTarget::Local, "{addr:?} {mode:?}");
             assert_eq!(
                 health_probe_url("https://100.64.0.7:8080", &GatewaySource::Default, &t, 0).unwrap(),
-                "https://localhost:8080/health"
+                ("https://localhost:8080/health".to_string(), true)
             );
         }
     }
 
-    /// No bind recorded: the configured gateway URL is used if there is one;
-    /// with none, the gate has no address and says so instead of guessing.
+    /// No bind recorded: the configured gateway URL is used if there is one
+    /// (and is marked as a fallback, not the real bind); with none, the gate
+    /// has no address and says so instead of guessing.
     #[test]
     fn an_unknown_bind_uses_the_configured_url_or_says_there_is_none() {
         let none = bind_target("", "", None);
         assert!(matches!(none, BindTarget::Unknown(_)));
-        let url = health_probe_url(
-            "https://ctrl.example.ts.net/",
-            &GatewaySource::Env("NOO_GATEWAY_URL"),
-            &none,
-            0,
-        )
-        .unwrap();
-        assert_eq!(url, "https://ctrl.example.ts.net/health");
+        assert_eq!(
+            health_probe_url("https://ctrl.example.ts.net/", &GatewaySource::Env("NOO_GATEWAY_URL"), &none, 0).unwrap(),
+            ("https://ctrl.example.ts.net/health".to_string(), false)
+        );
         let err = health_probe_url("https://localhost:8080", &GatewaySource::Default, &none, 0).unwrap_err();
         assert!(err.contains("NOO_BIND_MODE") && err.contains("no gateway URL"), "{err}");
         // tailnet mode with tailscale silent is unknown too, never localhost.
@@ -7216,49 +7295,88 @@ mod rotate_gate_tests {
         assert!(matches!(bind_target("", "tailnet", Some("  ")), BindTarget::Unknown(_)));
     }
 
-    /// A gateway the probe cannot reach, with docker content, is a blind
-    /// gate: the text names the URL and the error, and is not a failure
-    /// verdict. A container docker calls bad is the failure.
+    const URL: &str = "https://100.64.0.7:8080/health";
+
+    fn out(bad: &[&str], gw: GwHealth, from_bind: bool) -> GateOutcome {
+        let bad: Vec<String> = bad.iter().map(|s| s.to_string()).collect();
+        gate_outcome(150, &bad, &gw, URL, from_bind)
+    }
+
+    /// The state table. Unhealthy: a container docker calls bad; an error
+    /// status; a TLS/protocol failure; nothing answering at the real bind.
+    /// Blind: no address, no trust anchor, nothing answering at a fallback.
     #[test]
-    fn the_gate_names_the_url_and_tells_blind_from_failing() {
-        let url = "https://100.64.0.7:8080/health";
-        let blind = gate_outcome(150, &[], &GwHealth::Unreachable("connection failed: refused".into()), url);
-        match blind {
+    fn the_gate_state_table() {
+        assert!(matches!(out(&[], GwHealth::Ok, true), GateOutcome::Healthy(_)));
+        assert!(matches!(out(&[], GwHealth::NotApplicable, false), GateOutcome::Healthy(_)));
+        assert!(matches!(out(&["noo-gateway"], GwHealth::Ok, true), GateOutcome::Unhealthy(_)));
+        assert!(matches!(out(&[], GwHealth::Answered(503), true), GateOutcome::Unhealthy(_)));
+        assert!(matches!(out(&[], GwHealth::BadAnswer("tls".into()), true), GateOutcome::Unhealthy(_)));
+        assert!(matches!(out(&[], GwHealth::BadAnswer("tls".into()), false), GateOutcome::Unhealthy(_)));
+        assert!(matches!(out(&[], GwHealth::NothingAnswered("refused".into()), true), GateOutcome::Unhealthy(_)));
+        assert!(matches!(out(&[], GwHealth::NothingAnswered("refused".into()), false), GateOutcome::Blind(_)));
+        assert!(matches!(out(&[], GwHealth::NoTrust("no anchor".into()), true), GateOutcome::Blind(_)));
+        assert!(matches!(out(&[], GwHealth::NoAddress("no bind".into()), false), GateOutcome::Blind(_)));
+    }
+
+    /// The decision, state to action: only Unhealthy reverts; a blind gate
+    /// never does.
+    #[test]
+    fn blind_never_reverts() {
+        assert_eq!(gate_action(&GateOutcome::Healthy(String::new())), GateAction::Accept);
+        assert_eq!(gate_action(&GateOutcome::Unhealthy(String::new())), GateAction::Revert);
+        assert_eq!(gate_action(&GateOutcome::Blind(String::new())), GateAction::KeepUnconfirmed);
+        for gw in [
+            GwHealth::NothingAnswered("refused".into()),
+            GwHealth::NoTrust("x".into()),
+            GwHealth::NoAddress("x".into()),
+        ] {
+            let o = out(&[], gw.clone(), false);
+            assert_ne!(gate_action(&o), GateAction::Revert, "{gw:?} -> {o:?}");
+        }
+    }
+
+    /// The failure text names the URL and the error class, and a blind
+    /// gate's text says docker is content.
+    #[test]
+    fn the_gate_text_names_the_url_and_the_error() {
+        match out(&[], GwHealth::NothingAnswered("connection failed: refused".into()), false) {
             GateOutcome::Blind(t) => {
-                assert!(t.contains(url), "{t}");
+                assert!(t.contains(URL), "{t}");
                 assert!(t.contains("could not reach /health"), "{t}");
                 assert!(t.contains("connection failed: refused"), "{t}");
                 assert!(t.contains("running and healthy"), "{t}");
             }
-            other => panic!("docker content + unreachable /health is Blind, got {other:?}"),
+            other => panic!("{other:?}"),
         }
-        let bad = vec!["noo-gateway".to_string()];
-        match gate_outcome(150, &bad, &GwHealth::Unreachable("connection failed".into()), url) {
-            GateOutcome::Unhealthy(t) => {
-                assert!(t.contains("noo-gateway") && t.contains(url), "{t}");
-            }
-            other => panic!("a container docker calls bad is Unhealthy, got {other:?}"),
+        match out(&["noo-gateway"], GwHealth::NothingAnswered("connection failed".into()), true) {
+            GateOutcome::Unhealthy(t) => assert!(t.contains("noo-gateway") && t.contains(URL), "{t}"),
+            other => panic!("{other:?}"),
         }
-        match gate_outcome(150, &[], &GwHealth::Answered(503), url) {
-            GateOutcome::Unhealthy(t) => assert!(t.contains(url) && t.contains("503"), "{t}"),
-            other => panic!("an error status is Unhealthy, got {other:?}"),
+        match out(&[], GwHealth::Answered(503), true) {
+            GateOutcome::Unhealthy(t) => assert!(t.contains(URL) && t.contains("503"), "{t}"),
+            other => panic!("{other:?}"),
         }
-        match gate_outcome(150, &[], &GwHealth::NoAddress("no bind".into()), "") {
+        match out(&[], GwHealth::NoAddress("no bind".into()), false) {
             GateOutcome::Blind(t) => assert!(t.contains("no address to probe") && t.contains("no bind"), "{t}"),
-            other => panic!("no address is Blind, got {other:?}"),
+            other => panic!("{other:?}"),
         }
-        assert!(matches!(gate_outcome(150, &[], &GwHealth::Ok, url), GateOutcome::Healthy(_)));
     }
 
-    /// The revert's last word comes from `gate_outcome`: only an Unhealthy
-    /// gate may print "REVERT DID NOT RECOVER".
+    /// rotate-all acts on the decision: the blind arm keeps the rotation and
+    /// names the exact copy-back, and "REVERT DID NOT RECOVER" is printed
+    /// only for an Unhealthy revert gate.
     #[test]
-    fn the_revert_failure_text_is_not_printed_for_a_blind_gate() {
+    fn rotate_all_acts_on_the_decision() {
         let src = crate::test_src::own_code(include_str!("security_local.rs"));
         let body = crate::test_src::fn_body(&src, "pub fn pki_rotate_all(");
+        let keep = body.split("GateAction::KeepUnconfirmed").nth(1).expect("a keep arm");
+        let keep = keep.split("if let GateOutcome::Unhealthy(detail) | GateOutcome::Healthy(detail)").next().unwrap();
+        assert!(keep.contains("rotation_unconfirmed") && keep.contains("noo cluster verify --wait"), "{keep}");
+        assert!(keep.contains("cp -a") && keep.contains("docker restart"), "{keep}");
+        assert!(!keep.contains("copy_tree") && !keep.contains("REVERT DID NOT RECOVER"), "{keep}");
         let blind_arm = body.split("GateOutcome::Blind(detail2)").nth(1).expect("a Blind arm for the revert gate");
         let blind_arm = blind_arm.split("GateOutcome::Unhealthy(detail2)").next().unwrap();
         assert!(!blind_arm.contains("REVERT DID NOT RECOVER"), "{blind_arm}");
-        assert!(body.contains("GateOutcome::Unhealthy(detail2) => fail("), "{body}");
     }
 }
