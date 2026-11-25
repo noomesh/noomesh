@@ -17632,8 +17632,25 @@ export interface operations {
                     "application/json": {
                         results?: {
                             index?: number;
-                            score?: number;
+                            /** @description The reranker's relevance score. Null when nothing was ranked: the chat-model fallback scored every document 0 or could not be asked, so `results` is the input order and `noo.degraded` is `identity`. */
+                            score?: number | null;
                         }[];
+                        /** @description What served the request. */
+                        noo?: {
+                            /** @description A node id, or `llm` for the chat-model fallback. */
+                            served_by?: string;
+                            model?: string;
+                            /** @description True when the requested model or the reranker tier was unmet. */
+                            fallback?: boolean;
+                            requested_model?: string;
+                            /**
+                             * @description Present only when nothing was ranked: `results` is the input order with `score: null`.
+                             * @enum {string}
+                             */
+                            degraded?: "identity";
+                            /** @description Why nothing was ranked; present with `degraded`. */
+                            degraded_reason?: string;
+                        };
                     };
                 };
             };

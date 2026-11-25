@@ -28,11 +28,16 @@
 //! the signed `model-set.json` and its detached signature, and the manifest
 //! itself carries each file's sha256 (see [`modelset_manifest`]).
 //!
-//! Digests are cached in `/data/artifact-digests.json` keyed by
+//! Digests are cached in `/data/cache/artifact-digests.json` keyed by
 //! (kind/name → size, mtime, sha256): hashing a 15 GB GGUF takes real time,
 //! and the answer only changes when the file does. A (size, mtime) match
 //! serves the cached hash; any mismatch re-hashes. The cache file riding the
 //! existing `noo-data` volume means no new mount and it survives restarts.
+//! The file lives in `/data/cache/`, a directory the launchers make and hand to
+//! the gateway's uid (`noo_prepare_gateway_data_dirs`, scripts/lib-instance.sh):
+//! the noo-data root itself is not the gateway's to write. A cache the old
+//! location wrote (`/data/artifact-digests.json`) is read once as a seed and
+//! never deleted.
 //! An in-memory copy sits in front of it, so a cache file that cannot be
 //! written (a read-only or wrongly-owned `/data`) costs one hash per process,
 //! not one per request.
@@ -140,11 +145,73 @@ fn ollama_mirror_name_ok(kind: &str, name: &str) -> bool {
     }
 }
 
+/// Where the digest cache lives unless `NOO_ARTIFACT_DIGEST_CACHE` says
+/// otherwise. Its directory is one `noo_prepare_gateway_data_dirs` creates and
+/// chowns to the gateway's uid (pinned by a test).
+const DEFAULT_DIGEST_CACHE: &str = "/data/cache/artifact-digests.json";
+/// The earlier home, at the noo-data root: read as a seed when the file above
+/// does not exist yet, never written or deleted.
+const LEGACY_DIGEST_CACHE: &str = "/data/artifact-digests.json";
+
 fn digest_cache_path() -> PathBuf {
-    PathBuf::from(
-        std::env::var("NOO_ARTIFACT_DIGEST_CACHE")
-            .unwrap_or_else(|_| "/data/artifact-digests.json".into()),
+    PathBuf::from(std::env::var("NOO_ARTIFACT_DIGEST_CACHE").unwrap_or_else(|_| DEFAULT_DIGEST_CACHE.into()))
+}
+
+/// The legacy seed path, only when the cache is at its default location.
+fn legacy_seed_path() -> Option<PathBuf> {
+    if std::env::var_os("NOO_ARTIFACT_DIGEST_CACHE").is_some() {
+        return None;
+    }
+    Some(PathBuf::from(LEGACY_DIGEST_CACHE))
+}
+
+/// Startup line: how many digests the cache file holds. Sync (std::fs) because
+/// it runs before the gateway spawns threads.
+pub(crate) fn log_digest_cache_at_startup() {
+    let path = digest_cache_path();
+    let read = std::fs::read(&path).ok().or_else(|| legacy_seed_path().and_then(|p| std::fs::read(p).ok()));
+    let n = read
+        .and_then(|b| serde_json::from_slice::<HashMap<String, DigestEntry>>(&b).ok())
+        .map_or(0, |m| m.len());
+    tracing::info!("{}", digest_cache_loaded_line(n, &path));
+}
+
+/// The exact startup INFO text (the rehearsal greps it).
+fn digest_cache_loaded_line(n: usize, path: &Path) -> String {
+    format!("artifact digest cache: loaded {n} entries from {}", path.display())
+}
+
+/// The exact INFO text after a successful write (the rehearsal greps it).
+fn digest_cache_wrote_line(n: usize, path: &Path) -> String {
+    format!("artifact digest cache: wrote {n} entries to {}", path.display())
+}
+
+/// Owner uid:gid and mode of the cache file's directory, for the write-failure WARN.
+fn parent_dir_facts(path: &Path) -> String {
+    use std::os::unix::fs::MetadataExt;
+    let parent = path.parent().unwrap_or_else(|| Path::new("/"));
+    match std::fs::metadata(parent) {
+        Ok(md) => format!("{} owner {}:{} mode {:04o}", parent.display(), md.uid(), md.gid(), md.mode() & 0o7777),
+        Err(e) => format!("{} not statable: {e}", parent.display()),
+    }
+}
+
+/// The exact WARN text for a cache that cannot be written.
+fn digest_cache_write_failed_line(path: &Path, why: &str) -> String {
+    format!(
+        "artifact digest cache: cannot write {}: {why}; parent dir {}; digests stay in memory and every restart re-hashes",
+        path.display(),
+        parent_dir_facts(path)
     )
+}
+
+/// WARN once per process (`flag` is the process-wide latch). True when it fired.
+fn warn_cache_write_failed_once(flag: &std::sync::atomic::AtomicBool, path: &Path, why: &str) -> bool {
+    if flag.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    tracing::warn!("{}", digest_cache_write_failed_line(path, why));
+    true
 }
 
 /// The name rules mirror the agent side (preseedGGUF refuses '/', and image
@@ -247,7 +314,14 @@ fn file_meta(path: &Path) -> Option<FileStamp> {
 async fn load_cache() -> std::collections::HashMap<String, DigestEntry> {
     match tokio::fs::read(digest_cache_path()).await {
         Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
-        Err(_) => Default::default(),
+        Err(_) => match legacy_seed_path() {
+            // The new file does not exist yet: seed from the old location.
+            Some(old) => match tokio::fs::read(old).await {
+                Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
+                Err(_) => Default::default(),
+            },
+            None => Default::default(),
+        },
     }
 }
 
@@ -258,8 +332,14 @@ async fn store_cache(cache: &std::collections::HashMap<String, DigestEntry>) -> 
     let path = digest_cache_path();
     let tmp = path.with_extension("json.tmp");
     let bytes = serde_json::to_vec_pretty(cache).map_err(|e| format!("serialise: {e}"))?;
+    if let Some(dir) = path.parent() {
+        // Best effort: the launchers make the default dir; an override may not exist.
+        let _ = tokio::fs::create_dir_all(dir).await;
+    }
     tokio::fs::write(&tmp, bytes).await.map_err(|e| format!("write {}: {e}", tmp.display()))?;
-    tokio::fs::rename(&tmp, &path).await.map_err(|e| format!("rename to {}: {e}", path.display()))
+    tokio::fs::rename(&tmp, &path).await.map_err(|e| format!("rename to {}: {e}", path.display()))?;
+    tracing::info!("{}", digest_cache_wrote_line(cache.len(), &path));
+    Ok(())
 }
 
 /// Hash the file in a blocking task — a 15 GB GGUF takes tens of seconds and
@@ -344,8 +424,9 @@ async fn remember_digest(key: &str, e: DigestEntry) {
     cache.insert(key.to_string(), e);
     if let Err(why) = store_cache(&cache).await {
         // Not fatal (the memory copy serves this process), but a restart
-        // re-hashes everything, so say where and why.
-        tracing::warn!(path = %digest_cache_path().display(), error = %why, "artifacts.digest.cache_write_failed");
+        // re-hashes everything, so say where and why, once per process.
+        static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        warn_cache_write_failed_once(&WARNED, &digest_cache_path(), &why);
     }
 }
 
@@ -411,6 +492,41 @@ fn hashing_response(kind: &str, name: &str, size: u64) -> Response {
         Json(body),
     )
         .into_response()
+}
+
+/// True when a hash failure is the file not being readable (`sha256_file`
+/// words an open or read error "open: ..." / "read: ..."), as opposed to the
+/// hash task itself failing.
+fn hash_error_is_unreadable(e: &str) -> bool {
+    e.starts_with("open: ") || e.starts_with("read: ")
+}
+
+/// The body of the 409 a node gets when the store holds the file and this
+/// process cannot read it. `stat` is the file's (uid, gid, mode) when it could
+/// be read; `owner` and `mode` are left out when it could not.
+fn unreadable_body(kind: &str, name: &str, path: &Path, stat: Option<(u32, u32, u32)>, error: &str) -> serde_json::Value {
+    let mut body = json!({
+        "status": "unreadable",
+        "kind": kind,
+        "name": name,
+        "path": path.display().to_string(),
+        "path_is": "the gateway container's view (/artifacts/models)",
+        "error": error,
+        "fix": "run `noo cluster verify` on the controller: the `model store readable` row names this file's host path and the command to make it readable",
+    });
+    if let Some((uid, gid, mode)) = stat {
+        body["owner"] = json!(format!("{uid}:{gid}"));
+        body["mode"] = json!(format!("{:04o}", mode & 0o7777));
+    }
+    body
+}
+
+/// The 409 for an unreadable store file.
+fn unreadable_response(kind: &str, name: &str, path: &Path, error: &str) -> Response {
+    use std::os::unix::fs::MetadataExt;
+    let stat = std::fs::metadata(path).ok().map(|m| (m.uid(), m.gid(), m.mode()));
+    tracing::warn!(artifact = %format!("{kind}/{name}"), path = %path.display(), error = %error, "artifacts.manifest.unreadable");
+    (StatusCode::CONFLICT, Json(unreadable_body(kind, name, path, stat, error))).into_response()
 }
 
 /// The refusal for the retired `binary` kind. It was the
@@ -564,8 +680,8 @@ async fn modelset_manifest(name: &str) -> Result<Response, AppError> {
 // to it (preseed.MirrorHFRepo).
 //
 // The gateway does not take the controller's HF cache on faith either: it is
-// written by huggingface_hub (and by the controller's own vllm/TEI, which
-// mount it read-write), not by a verified fetch. In an HF cache every
+// written by huggingface_hub (and by the controller's own vllm, which
+// mounts it read-write), not by a verified fetch. In an HF cache every
 // snapshot file is a link to `blobs/<oid>`, where the oid IS a content
 // digest: an LFS blob is named by the sha256 of its bytes, a git blob by its
 // git object id (sha1 over `blob <len>\0` + the bytes). So each blob is
@@ -923,6 +1039,9 @@ async fn manifest(
             let rx = hash_in_background(&key, path.clone(), stamp);
             match await_hash(rx, std::time::Duration::from_secs(HASH_WAIT_SECS)).await {
                 Some(Ok(sha256)) => DigestEntry::new(stamp, sha256),
+                Some(Err(e)) if hash_error_is_unreadable(&e) => {
+                    return Ok(unreadable_response(&kind, &name, &path, &e));
+                }
                 Some(Err(e)) => return Err(AppError::Internal(format!("hashing {name}: {e}"))),
                 None => return Ok(hashing_response(&kind, &name, size)),
             }
@@ -1517,6 +1636,37 @@ mod tests {
     }
 
     #[test]
+    fn an_unreadable_store_file_is_a_typed_409_body_naming_owner_and_mode() {
+        let p = Path::new("/artifacts/models/m.gguf");
+        let b = unreadable_body("gguf", "m.gguf", p, Some((1000, 1000, 0o100600)), "open: Permission denied (os error 13)");
+        assert_eq!(b["status"], "unreadable");
+        assert_eq!(b["kind"], "gguf");
+        assert_eq!(b["name"], "m.gguf");
+        assert_eq!(b["path"], "/artifacts/models/m.gguf");
+        assert_eq!(b["owner"], "1000:1000");
+        assert_eq!(b["mode"], "0600");
+        assert_eq!(b["error"], "open: Permission denied (os error 13)");
+        assert_eq!(b["path_is"], "the gateway container's view (/artifacts/models)");
+        assert_eq!(b["fix"], "run `noo cluster verify` on the controller: the `model store readable` row names this file's host path and the command to make it readable");
+        assert!(!b.to_string().contains("chmod"), "no host command is printed from the container's path: {b}");
+        // A file that could not be stat'ed omits owner and mode.
+        let b = unreadable_body("gguf", "m.gguf", p, None, "open: x");
+        assert!(b.get("owner").is_none() && b.get("mode").is_none(), "{b}");
+        assert!(hash_error_is_unreadable("open: Permission denied (os error 13)"));
+        assert!(hash_error_is_unreadable("read: Input/output error"));
+        assert!(!hash_error_is_unreadable("hash task ended without a result"));
+    }
+
+    #[test]
+    fn the_manifest_handler_answers_an_unreadable_file_with_409_not_500() {
+        let code = crate::test_src::own_code(include_str!("artifacts.rs"));
+        let body = crate::test_src::fn_body(&code, "async fn manifest(");
+        assert!(body.contains("unreadable_response(&kind, &name, &path, &e)"), "{body}");
+        let resp = unreadable_response("gguf", "no-such.gguf", Path::new("/nonexistent/no-such.gguf"), "open: Permission denied");
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+    }
+
+    #[test]
     fn the_manifest_handler_decides_its_target_before_reading_the_store() {
         let code = crate::test_src::own_code(include_str!("artifacts.rs"));
         let body = crate::test_src::fn_body(&code, "async fn manifest(");
@@ -1888,6 +2038,89 @@ mod tests {
         let got = await_hash(rx, std::time::Duration::from_secs(10)).await.expect("finished").expect("hashed");
         assert_eq!(hex::encode(got), sha256_hex(b"abc"));
         let _ = std::fs::remove_file(&p);
+    }
+
+    // ---- digest cache home (see scripts/lib-instance.sh) ----
+
+    /// The default cache path's directory is made AND handed to 65532 by the
+    /// launchers' data-dir prepare step.
+    #[test]
+    fn the_default_cache_dir_is_the_one_the_prepare_list_creates() {
+        let dir = Path::new(DEFAULT_DIGEST_CACHE).parent().unwrap();
+        let rel = dir.strip_prefix("/data").expect("under the noo-data mount").to_str().unwrap();
+        // Read at test time (not include_str!: the gateway image's build
+        // context does not carry scripts/). The prepare step's one line makes
+        // the gateway's dirs and hands them to 65532.
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../scripts/lib-instance.sh");
+        let sh = std::fs::read_to_string(&path).expect("scripts/lib-instance.sh");
+        let line = sh
+            .lines()
+            .find(|l| l.contains("mkdir -p") && l.contains("chown -R 65532:65532") && l.contains("/d/audit-archive"))
+            .expect("the gateway data-dir prepare line");
+        let want = format!("/d/{rel}");
+        let tok = |w: &str| w.trim_matches(|c| c == '\'' || c == ';').to_string();
+        let (mk, chown) = line.split_once("chown -R 65532:65532").expect("chown list");
+        assert!(mk.split_whitespace().any(|w| tok(w) == want), "mkdir list lacks {want}: {line}");
+        assert!(chown.split_whitespace().any(|w| tok(w) == want), "chown list lacks {want}: {line}");
+    }
+
+    #[test]
+    fn the_log_lines_are_exact() {
+        let p = Path::new("/data/cache/artifact-digests.json");
+        assert_eq!(digest_cache_loaded_line(3, p), "artifact digest cache: loaded 3 entries from /data/cache/artifact-digests.json");
+        assert_eq!(digest_cache_wrote_line(4, p), "artifact digest cache: wrote 4 entries to /data/cache/artifact-digests.json");
+    }
+
+    #[test]
+    fn the_write_failure_warns_once_naming_the_dir_owner_and_mode() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if unsafe { libc::geteuid() } == 0 {
+            // root writes into a 0555 dir: the failure cannot be provoked.
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("noo-digest-home-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let path = dir.join("artifact-digests.json");
+        let tmp = path.with_extension("json.tmp");
+        let why = std::fs::write(&tmp, b"x").map_err(|e| format!("write {}: {e}", tmp.display())).unwrap_err();
+        let uid = std::fs::metadata(&dir).unwrap().uid();
+        let line = digest_cache_write_failed_line(&path, &why);
+        assert!(line.contains(&path.display().to_string()), "{line}");
+        assert!(line.contains(&why), "{line}");
+        assert!(line.contains(&format!("owner {uid}:")), "{line}");
+        assert!(line.contains("mode 0555"), "{line}");
+        let flag = std::sync::atomic::AtomicBool::new(false);
+        // Capture what is really emitted, not just what the fn returns.
+        #[derive(Clone, Default)]
+        struct Buf(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Buf {
+            type Writer = Buf;
+            fn make_writer(&'a self) -> Buf {
+                self.clone()
+            }
+        }
+        let buf = Buf::default();
+        let sub = tracing_subscriber::fmt().with_writer(buf.clone()).with_ansi(false).finish();
+        tracing::subscriber::with_default(sub, || {
+            assert!(warn_cache_write_failed_once(&flag, &path, &why), "the first failure warns");
+            assert!(!warn_cache_write_failed_once(&flag, &path, &why), "the second does not");
+            assert!(!warn_cache_write_failed_once(&flag, &path, &why), "nor the third");
+        });
+        let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        assert_eq!(out.matches("artifact digest cache: cannot write").count(), 1, "exactly one WARN emitted: {out}");
+        assert!(out.contains("WARN"), "{out}");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn temp_file(bytes: &[u8]) -> PathBuf {

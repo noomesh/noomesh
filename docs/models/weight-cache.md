@@ -165,10 +165,6 @@ When the node-agent is asked to start a backend:
   controller cannot be reached, the local copy must verify against the last
   manifest the node verified; a snapshot directory that merely exists is not
   enough. No helper container is involved: the agent is a host process.
-  TEI (`embedding`, the TEI `reranker`) reads the same verified tree: its
-  spec sets `HUGGINGFACE_HUB_CACHE=/data/hub` (the image default `/data`
-  would read `HF_CACHE_DIR/models--…`, outside what the agent verifies), so a
-  node that ran TEI online before re-downloads its embedder once into `hub/`.
 - **Controller roll note:** the gateway now mounts `HF_CACHE_DIR/hub`
   read-only at `/artifacts/hf/hub` (it was not mounted before) — only `hub/`,
   never the HF_HOME with its `token`. A missing `hub/` is created before
@@ -369,7 +365,7 @@ registry credential is ever sent to a node, by design: a node without
 the staged image fails with a clear refusal rather than an `unauthorized`
 registry error.
 
-Third-party backend images (vLLM, ollama, TEI) are pinned the same way. The
+Third-party backend images (vLLM, ollama) are pinned the same way. The
 controller sends each node the digest-pinned ref from the release-signed
 `stack.lock` (`vllm/vllm-openai:v0.25.0@sha256:...`) in its start request. A
 node refuses `:latest` and untagged refs outright, and on a dist node
@@ -474,11 +470,24 @@ its image through one function (`EnsureImage`):
    manifest without `size_bytes` (an older gateway) skips the check.
 3. **Local, nothing to compare** (not staged, an older gateway, controller
    unreachable) → used, and reported as `local`.
-4. **Absent and not staged** → for our images (`$NOO_IMAGE_PREFIX/*`, the
+4. **Controller still hashing** → the image is staged, so this is not a
+   "not staged" refusal: `<image>: the controller is still hashing its image
+   tar; the start is retried on the next reconcile pass`. No registry
+   fallback and no `sync-images` advice. For a **pinned** start (a roll)
+   the start is a wait, not a refusal: `the controller is still hashing
+   <tar>; keeping the running image; retrying in <n>s`. The old container
+   keeps serving, the agent nudges itself after the gateway's Retry-After
+   (5 to 30 s) up to 12 times, and records no `backend_start` refusal (so
+   no operator alert) in that window. `noo upgrade` also waits, after the new
+   gateway is up and before the node phase, until the gateway has hashed every
+   tar the release staged (up to 20 minutes; it prints `hashing <tar> on the
+   controller (<size>)… <n>s`, and goes on with a warning if the budget runs
+   out).
+5. **Absent and not staged** → for our images (`$NOO_IMAGE_PREFIX/*`, the
    release namespaces, `noomesh/*`, `pai-assistant/*`, `noo-*`) a refusal:
    `image X not staged on the controller — run noo cluster sync-images
    <node> -i X or noo upgrade`. A **public third-party** image (upstream
-   vLLM, TEI, the alpine sidecar fallback; never our llamacpp or ollama, which are refused with no upstream stand-in) may come from its
+   vLLM, the alpine sidecar fallback; never our llamacpp or ollama, which are refused with no upstream stand-in) may come from its
    registry only while `NOO_IMAGE_REGISTRY_FALLBACK=public` (the default),
    logged at WARN as `image.registry_fallback`; `off` makes the node
    rail-only. Prefer staging those too (`noo cluster sync-images <node> -i

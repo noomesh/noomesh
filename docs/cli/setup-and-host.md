@@ -147,7 +147,10 @@ token is burned (`this machine is already enrolled in a DIFFERENT mesh`,
 exit 78). On macOS the agent arrives through the `net.noomesh.fetch`
 LaunchDaemon, which runs `noo node fetch` every minute; `noo enroll
 --resume` re-runs only that arming step. `noo node fetch` refuses to run on
-Linux (nodes there use the systemd `noo-fetch` timer). The daemon's copy is
+Linux (nodes there use the systemd `noo-fetch` timer: a bundle transfer gives
+up after 120 s below 1 KiB/s or 60 minutes in all, the unit after 2 hours, and
+the next tick tries again; a node enrolled before that bound gets it from its
+applier as `noo-fetch.service.d/10-timeout.conf`, with a reload and no restart). The daemon's copy is
 `/usr/local/bin/noo`, maintained by the rail: a bundle that carries a different
 CLI installs it (verified against the signed manifest, never an older applier
 generation) and re-runs the apply under it before judging any kind or env key,
@@ -162,6 +165,7 @@ noo upgrade                  # swap the binary (verifies the .sha256 and the rel
 noo upgrade --stack          # then move a standalone controller's stack to the paired release tag
 noo upgrade --nodes          # then restage every pull-enrolled node's agent bundle
 noo upgrade --all            # binary + stack + nodes, waiting for gateway health in between
+noo upgrade --stack --recreate   # the roll, recreating every stack container (the escape)
 ```
 
 The binary swap prints `noo upgraded 0.3.9 → 0.3.11` (or `no change: noo
@@ -169,14 +173,47 @@ The binary swap prints `noo upgraded 0.3.9 → 0.3.11` (or `no change: noo
 after it, so `--stack` always uses the new release's assets and its baked
 stack tag (`--tag vX.Y.Z` overrides the pairing). `--stack` manages
 standalone installs only; on a checkout use `noo stack start`/`rebuild`.
+The roll recreates only the containers that are out of line, the same
+way a plain `noo stack start` does: every first-party service (its image
+carries the stack tag), and any service whose image, env, secret or
+mounted config file changed. The rest keep running, so nats, redis,
+model-cache and the monitoring set stay up when the release did not move
+them, and the nodes keep their bus link. The roll says what it did:
+`12 recreated (gateway, …), 7 kept (nats, redis, …); --recreate restarts
+everything`, after the launcher's own `recreated <service>: its inputs
+changed (…)` lines. A re-apply of the tag already running
+(`noo upgrade --stack --tag <current>`) works the same way and recreates
+nothing when nothing changed. `--recreate` (with `--stack` or `--all`)
+recreates every container; a container started by noo 0.6.28 or earlier
+carries no input label, so the first roll from it recreates everything
+once. The flag is new in 0.6.30: an older `noo` refuses it as an unknown
+argument, so upgrade the binary first (`noo upgrade`), then run
+`noo upgrade --stack --recreate`.
 `--nodes` ends `bundles staged for all N node(s) — each applies on its next
 fetch tick`. Nodes that callers fail over between (the candidates of one
-model class, the pool of one embedding space) are never all restarting at
+model class, the pool of one embedding space) are never all upgrading at
 once: before staging a node, the roll checks that each of its groups keeps
-one other offered candidate (two for a group of four or more), and otherwise
-waits, at most 150 s once the restarting node has applied, saying what it
-waits for. A wait that runs out is said with the command to check
-(`noo cluster verify --wait`) and the roll goes on. An enrolled node upgrades its own binary from the controller's
+one other serving candidate (two for a group of four or more), and otherwise
+waits, saying what it waits for. Backends move to the new image when it is
+ready on each node, not in this order, so a class can be unanswered for a
+few seconds during a roll; a retry succeeds. Serving is what the router itself needs:
+the candidate is placed or available, healthy (a fresh heartbeat, the
+controller reaches its agent, the engine answers) and its lane serving or
+on demand, as `noo cluster class list` shows it; being listed in the class
+is not enough. A node staged earlier counts again once it has applied, serves
+in every class it served before, and the controller's reachability probe has
+reached it since it restarted. The wait is bounded: 10 min for that node to
+apply, then 15 min for it to serve. When a bound runs out the node phase
+stops instead of staging the last serving candidate of a class: the node and every
+node after it are not staged (the nodes already staged are still waited for),
+and the roll names who is not serving what. Once it serves again,
+`noo upgrade --nodes` resumes. `noo upgrade --nodes --allow-unserved` (or
+`--all --allow-unserved`) stages the rest after the bound anyway, saying so. Before it changes anything, `--stack`/`--nodes`/`--all` stat every network mount
+(NFS, SMB, sshfs) under `NOO_DATA_ROOT`, `MODELS_DIR` and `HF_CACHE_DIR`, and ask
+docker about the gateway, each with a deadline (5 s, 30 s); a hung mount stops the
+upgrade with one line naming it (the `network mount` row of `noo cluster verify`
+says the same), and the fix is to bring the storage back, never to force-unmount
+it: see [data root recovery](../operating/runbooks/data-root-recovery.md). An enrolled node upgrades its own binary from the controller's
 mirror (`/bootstrap/cli`), so nodes need no GitHub access. From the mirror it
 downloads only when the mirror's signed manifest names a different version or
 binary than the one running; an unverified manifest never counts as current. Private release
@@ -212,6 +249,14 @@ with `noo security entitlement install <token>`) and does **not** switch an
 add-on on; `--dry-run` previews both verbs. `systems disable` clears intent
 only — role, schema and rows stay. The gateway provisions the role and
 schema on its next boot. See [add-ons.md](../getting-started/add-ons.md).
+
+`noo addons after-boot` runs from `noo-addons-after-boot.service`, the oneshot
+`noo onboard` installs on a controller. The unit gives up after an hour
+(`TimeoutStartSec=3600`) and sets `DefaultDependencies=no`, so
+`multi-user.target` does not wait for it. A controller onboarded before those
+bounds gets them from its applier as
+`noo-addons-after-boot.service.d/10-bounds.conf`, with a reload and no
+restart; nobody has to run `noo onboard --only addons` for it.
 
 ### Move the controller to another device
 
@@ -319,7 +364,7 @@ the other nodes first: [Start over](../getting-started/start-over.md).
 ### `noo upgrade` — Self-update the CLI; --stack/--nodes/--controller roll the rest
 | Command | Arguments | What it does |
 |---|---|---|
-| `noo upgrade` | `[--check] [--version <X.Y.Z>] [--stack] [--nodes] [--seats\|--no-seats] [--all] [--tag <vX.Y.Z>] [--controller] [--allow-unsigned] [--force] [--skip-gateway-key-check] [--allow-downgrade] [--stage2] [--channel <public\|rollback\|custom>] [--release-repo <owner/repo>] [--image-prefix <registry/path>] [--base-registry <registry/path>] [--yes]` | Self-update noo, optionally stack, nodes and kiosk seats; --channel moves release channel |
+| `noo upgrade` | `[--check] [--version <X.Y.Z>] [--stack] [--nodes] [--seats\|--no-seats] [--all] [--tag <vX.Y.Z>] [--controller] [--allow-unsigned] [--force] [--skip-gateway-key-check] [--allow-downgrade] [--recreate] [--allow-unserved] [--stage2] [--channel <public\|rollback\|custom>] [--release-repo <owner/repo>] [--image-prefix <registry/path>] [--base-registry <registry/path>] [--yes]` | Self-update noo, optionally stack, nodes and kiosk seats; --channel moves release channel |
 
 ### `noo doctor` — Host-plane health checks with guided recovery
 | Command | Arguments | What it does |

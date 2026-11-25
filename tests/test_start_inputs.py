@@ -920,3 +920,26 @@ def test_label_for_up_never_forces_and_appends_the_override(tmp_path: Path) -> N
     assert "--recreate" not in out.stdout, "a restart's label pass never says it forces every container"
     assert "committed" in out.stdout
     assert '"a":' in (tmp_path / "o.yml").read_text()
+
+
+def test_an_unlabelled_container_from_an_older_noo_is_recreated_never_kept(tmp_path: Path) -> None:
+    """i1122: since 0.6.30 `noo upgrade` runs the plain, label-driven start.
+    Containers that noo 0.6.28 or earlier started carry no `noo.inputs`. Each
+    one must be recreated once by the first roll and never kept. That holds
+    because the override puts a non-empty label on EVERY service, including
+    one with no file input (redis here). Compose's config hash covers labels,
+    so the hash of an unlabelled container differs. And no launcher path keeps
+    a container: none passes `--no-recreate`, and the override is appended to
+    the files of every labelled start."""
+    i = Install(tmp_path)
+    r, labels, _ = i.fingerprint()
+    assert r.returncode == 0, r.stderr
+    assert set(labels) == set(i.config()["services"]), "every service is labelled"
+    assert all(labels.values()), labels
+    assert i.config()["services"]["redis"] == {} and labels["redis"], "a service with no input is labelled too"
+    assert SI.LABEL == "noo.inputs"
+    for script in (LIB, START):
+        code = "\n".join(_code_lines(script))
+        assert "--no-recreate" not in code, f"{script.name}: --no-recreate would keep an unlabelled container"
+    lib = "\n".join(_code_lines(LIB))
+    assert 'COMPOSE_FILES="$COMPOSE_FILES -f $START_INPUTS_OVERRIDE"' in lib, "the override reaches every labelled `up`"

@@ -125,7 +125,8 @@ sudo noo-deenroll                    # add --purge-data to drop its models and c
 Starting over removes noomesh. These things belong to your machine, not to
 noomesh, and are left alone:
 
-- Docker, and its build cache;
+- Docker, and its build cache (`noo offboard` releases the apt holds
+  `noo onboard` placed on a Docker it installed, and only those);
 - the NVIDIA driver and container toolkit;
 - the Tailscale package on the controller;
 - your backups in `~/noo-backups`;

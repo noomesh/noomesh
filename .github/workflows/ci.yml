@@ -2414,7 +2414,10 @@ jobs:
         log-level: warn
 
   # Call-graph based: govulncheck fails only on a vulnerability the agent's
-  # code can actually reach, not on every advisory in go.sum.
+  # code can actually reach, not on every advisory in go.sum. A reachable
+  # finding passes only with a scoped, dated entry (same id, module and found
+  # version) in node-agent-go/govulncheck-exceptions.json; scripts/
+  # govulncheck-gate.py also fails an expired or stale entry.
   go-vulncheck:
     runs-on: ubuntu-latest
     needs: preflight
@@ -2432,5 +2435,9 @@ jobs:
 
     - name: govulncheck (reachable vulnerabilities only)
       run: |
+        set -euo pipefail
         go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
-        "$(go env GOPATH)/bin/govulncheck" ./...
+        # json mode exits 0 even with findings; a non-zero exit is a real
+        # error (set -e fails the step) and the gate decides on the findings.
+        "$(go env GOPATH)/bin/govulncheck" -format json ./... > "$RUNNER_TEMP/govulncheck.json"
+        python3 "$GITHUB_WORKSPACE/scripts/govulncheck-gate.py" "$RUNNER_TEMP/govulncheck.json" govulncheck-exceptions.json

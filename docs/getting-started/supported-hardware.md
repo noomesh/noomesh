@@ -18,6 +18,21 @@ These are the combinations the maintainers test on, on current releases.
 | Ubuntu 24.04 (noble) | aarch64 | Raspberry Pi 4 Model B, 4 GB | Ollama embeddings (CPU) | 4 (edge) |
 | macOS on Apple M4 | arm64 | Mac mini, 24 GB unified memory | Ollama, native via Homebrew (no Docker) | 2 |
 
+On a Mac, `noo enroll` installs Ollama with Homebrew if it is missing and
+registers it as a boot service (a system LaunchDaemon run as the node's user,
+with its model store left where it was), so it comes back after a reboot or a
+power cut without a login. A Mac never runs Ollama in a container: when the
+native Ollama is not running, the node says so (the `native ollama` row of
+`noo cluster verify`, and the node's start refusal) and names the fix:
+`noo enroll --resume`, run once on the Mac as the node's user (it asks for
+sudo and needs no new token).
+
+A Mac enrolled before this keeps its per-user Ollama (it starts only at a
+login) until someone runs `noo enroll --resume` on it once: an upgrade or
+`noo cluster provision` cannot register the boot service, because the Mac's
+applier never runs Homebrew as root. Until then the `native ollama` row
+warns "not a boot service yet".
+
 The tier is derived from the facts a node reports; see
 [../cli/fleet.md](../cli/fleet.md) for the rule and the override.
 
@@ -86,14 +101,14 @@ capability cannot be read (an agent older than 0.6.18, no heartbeat yet, or
 nvidia-smi failed), the place goes ahead with a warning, the verify row
 warns, and onboarding offers vLLM without recommending it.
 
-Text Embeddings Inference (TEI: the opt-in `embedding` backend and the
-`RERANK_ENGINE=tei` reranker) runs one image on CPU nodes and another on GPU
-nodes. CPU nodes run `cpu-1.9.4`, which needs no driver. GPU nodes stay on
-the CUDA `1.6` image for now. TEI 1.9.4's CUDA image will need an NVIDIA
-driver that reports CUDA 12.9 or newer (about driver 575 and up): the image
-requires `cuda>=12.9` and exempts no GeForce driver. That floor is
-**inferred from the image, to be confirmed** on a GPU node before GPU TEI
-moves to 1.9.4.
+Embedding runs on an Ollama embedder (`noo cluster place <node> ollama <model>
+--role embed`; the controller's own `ollama-embed` and `ollama-embed-cpu`
+services are the static ones) and reranking on the llama.cpp GGUF reranker
+(`noo cluster place <node> reranker <file>.gguf`, with the file shipped by
+`noo cluster sync-model-files`). Both run on CPU or on a GPU the backend
+already supports, so neither adds a hardware floor of its own. Text Embeddings
+Inference (TEI) was removed in 0.6.30; a node that still has a TEI placement
+is handled as described in [the fleet CLI](../cli/fleet.md).
 
 ### Check a machine before you enroll it
 

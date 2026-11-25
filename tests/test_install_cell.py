@@ -492,7 +492,7 @@ def test_the_rag_probe_asks_the_pages_query_then_three_chat_paths_and_is_never_j
     wait = probe.index('if noo rag query "$RAG_QUERY_LINE" 2>&1 | grep -qiE "$fact"; then indexed=yes')
     ask = probe.index("for path in chat agent console; do")
     assert ingest < wait < ask
-    assert 'chat) out="$(noo chat --message "$RAG_CHAT_LINE" 2>&1)"' in probe
+    assert 'chat) c0="$(date +%s)"; out="$(noo chat --message "$RAG_CHAT_LINE" 2>&1)"' in probe
     assert 'agent) a0="$(date +%s)"; out="$(timeout 300 noo inference agent "$RAG_CHAT_LINE" 2>&1)"; arc=$?' in probe
     assert 'console) out="$(timeout 330 python3 -I "$RAG_WS_CHAT" "$RAG_CHAT_LINE" 2>&1)"' in probe
     assert 'fact="14(th)? (of )?march|ZIRCON-4471|kestrel"' in probe
@@ -521,6 +521,9 @@ def test_the_literal_pass_types_what_the_install_doc_says_and_enter_elsewhere():
         "Join your tailnet now? (runs `tailscale up`; opens a login link where you sign in) [Y/n]:":
             ("n", "typed n (the install doc's table)"),
         "Admin username [admin]:": ("", "enter"),
+        # Documented with Enter as its answer: the cell explains the Docker hold
+        # (#1555), and none of its words may be read as text to type.
+        "Install the missing prerequisites now? (uses sudo) [Y/n]:": ("", "enter"),
         "Anthropic API key (blank to skip):": ("", "enter"),
         # Documented, and Enter is its answer: a new install is lean (No).
         "Install dashboards, log search and request traces (Grafana, Loki, Tempo; about 250 MiB idle)? [y/N]:":
@@ -530,6 +533,19 @@ def test_the_literal_pass_types_what_the_install_doc_says_and_enter_elsewhere():
         assert d.answer(prompt, "literal", "PW", rows) == expected, prompt
     # The attentive pass is unchanged and does not read the doc.
     assert d.answer("Admin password:", "attentive", "PW") == ("PW", "typed <password>")
+
+
+def test_every_answer_the_install_doc_table_gives_is_y_n_or_a_password():
+    # rc.2's stranger-24.04-literal looped six times: a row whose answer is
+    # Enter gained a backticked command in its explanation, and the literal
+    # pass reads the first backticked token of an answer cell as the text to
+    # type. An answer cell may name only `y`, `n` or a password; anything else
+    # it explains goes in plain words or below the table.
+    d = _pty()
+    rows = d.doc_answers((ROOT / "docs/getting-started/install.md").read_text())
+    assert rows, "the install doc's prompt table was not found"
+    odd = [(frag, ans) for frag, ans in rows if ans not in ("y", "n", "<password>")]
+    assert not odd, f"an answer cell's first backticked token is not y, n or a password: {odd}"
 
 
 def test_a_literal_pass_without_the_doc_table_stops_with_a_driver_error(tmp_path):
@@ -1251,3 +1267,15 @@ def test_another_cell_never_rotates_and_says_where_it_runs(tmp_path):
     assert r.returncode == 0 and calls == "", calls
     assert v["START-AFTER-PROVISION"] == f"START-AFTER-PROVISION NOTE: runs in the {ROTATION_CELL} cell only (it rotates the worker NATS credential and recreates the stack)"
     assert v["START-AFTER-FORCED-RESTART"] == f"START-AFTER-FORCED-RESTART NOTE: runs in the {ROTATION_CELL} cell only"
+
+
+def test_the_rag_evidence_file_goes_through_the_redactor_and_the_upload_scan(tmp_path):
+    sse = f"data: {{\"type\":\"tool_result\",\"output\":\"Authorization: Bearer {JWT}\"}}"
+    red = _redact("RAG-CHAT EVIDENCE: x\n  sse: " + sse + "\n  gw: NOO_CLUSTER_TOKEN=s3cr3t-value-123\n")
+    assert JWT not in red and "s3cr3t-value-123" not in red
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    (logs / "rag-chat-evidence.log").write_text(red)
+    assert C.cmd_scan([str(tmp_path)]) == 0
+    (logs / "rag-chat-evidence.log").write_text("  sse: " + sse + "\n")
+    assert C.cmd_scan([str(tmp_path)]) == 3

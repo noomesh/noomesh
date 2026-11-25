@@ -250,10 +250,6 @@ NOT_MIRRORED = {
         "the vLLM backend: opt-in (a GPU backend the wizard asks about), multi-GB per tag, pulled "
         "only when vLLM is placed; still Docker Hub by the release lead's decision, pinned by the "
         "lock (row vllm)",
-    # Not Docker Hub at all: listed only because it is not OURS either.
-    "ghcr.io/huggingface/text-embeddings-inference":
-        "TEI: GitHub's registry (ghcr.io/huggingface), not Docker Hub; pinned by the lock "
-        "(rows tei, tei-cpu)",
 }
 
 

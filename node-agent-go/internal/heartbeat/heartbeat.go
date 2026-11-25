@@ -13,6 +13,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"github.com/noomesh/noomesh/node-agent-go/internal/ctrlreach"
 	"github.com/noomesh/noomesh/node-agent-go/internal/modelstats"
 	"github.com/noomesh/noomesh/node-agent-go/internal/stopdrain"
 	"io"
@@ -163,6 +164,12 @@ type Reporter struct {
 	// the controller's store, sent as `ollama_verify`. nil = not wired, and a
 	// provider answering nil (nothing checked yet) omits the key.
 	ollamaVerify atomic.Pointer[func() any]
+
+	// ggufUnverified reports the GGUF backends started on a local file
+	// without the controller's manifest (docker/gguf_unvouched.go), sent as
+	// `gguf_unverified`: [{backend, model, reason, since}]. nil = not wired;
+	// a provider answering nil (none) omits the key.
+	ggufUnverified atomic.Pointer[func() any]
 
 	// nodeLocal reports the node's own declarations file (nodelocal): which
 	// keys it declares, which it refused and why, sent as `node_local`.
@@ -460,6 +467,18 @@ func (r *Reporter) llamacppOffloadReport() any {
 	return (*f)()
 }
 
+// SetGGUFUnverified installs the provider of `gguf_unverified`: [{backend,
+// model, reason, since}].
+func (r *Reporter) SetGGUFUnverified(f func() any) { r.ggufUnverified.Store(&f) }
+
+func (r *Reporter) ggufUnverifiedReport() any {
+	f := r.ggufUnverified.Load()
+	if f == nil || *f == nil {
+		return nil
+	}
+	return (*f)()
+}
+
 func (r *Reporter) ollamaVerifyReport() any {
 	f := r.ollamaVerify.Load()
 	if f == nil || *f == nil {
@@ -608,10 +627,21 @@ func (r *Reporter) register(caps hardware.Capabilities, hostIP string) bool {
 
 	resp, err := r.client.Do(req)
 	if err != nil {
+		if ctrlreach.Unreachable(err) {
+			// The controller is away: ctrlreach says so once for the whole
+			// node (the same line the heartbeat and reconcile share), and
+			// each retry is debug. An agent that starts during an outage
+			// logs it once and again when the controller answers.
+			ctrlreach.Failed("register", r.cfg.ControllerURL, err, time.Now())
+			slog.Debug("registration: the controller cannot be reached", "error", err)
+			return false
+		}
 		slog.Error("registration error", "error", err)
 		return false
 	}
 	defer resp.Body.Close()
+	// Any answer, even a refusal, means the controller is there.
+	ctrlreach.Answered("register", time.Now())
 
 	if resp.StatusCode == 200 {
 		slog.Info("registered with controller")
@@ -845,6 +875,19 @@ func (r *Reporter) noteOutcome(clk *stageClock, err error) {
 			r.silentSince = clk.start
 		}
 		r.failStreak++
+		// The controller could not be reached at all: ONE outage line for
+		// the whole node (ctrlreach, shared with the reconcile), the beats
+		// at debug. An ANSWER that is an error is a different story (the
+		// controller is there and refusing): it keeps its own WARN.
+		if ctrlreach.Unreachable(err) {
+			ctrlreach.Failed("heartbeat", r.cfg.ControllerURL, err, time.Now())
+			slog.Debug("heartbeat not delivered",
+				"error", err,
+				"streak", r.failStreak,
+				"silent_for", time.Since(r.silentSince).Round(time.Second),
+				"controller", r.cfg.ControllerURL)
+			return
+		}
 		if r.failStreak == 1 || r.failStreak%10 == 0 {
 			slog.Warn("heartbeat not delivered",
 				"error", err,
@@ -855,8 +898,9 @@ func (r *Reporter) noteOutcome(clk *stageClock, err error) {
 		return
 	}
 	r.lastStopDelivered()
+	ctrlreach.Answered("heartbeat", time.Now())
 	if r.failStreak > 0 {
-		slog.Info("heartbeat delivery resumed",
+		slog.Debug("heartbeat delivery resumed",
 			"after_failures", r.failStreak,
 			"silent_for", time.Since(r.silentSince).Round(time.Second))
 		r.failStreak = 0
@@ -1115,9 +1159,11 @@ func (r *Reporter) availableModels() []string {
 		}
 	}
 
-	// 2. GGUF files at the top level of MODELS_DIR.
+	// 2. GGUF files at the top level of MODELS_DIR. Bounded: a hung mount
+	// must not hold the beat (dataroots.ReadDirBounded); on timeout this
+	// beat lists none, and data_roots says the root is not answering.
 	if dir := os.Getenv("MODELS_DIR"); dir != "" {
-		if entries, err := os.ReadDir(dir); err == nil {
+		if entries, err := dataroots.ReadDirBounded(dir); err == nil {
 			for _, e := range entries {
 				if !e.IsDir() && strings.HasSuffix(strings.ToLower(e.Name()), ".gguf") {
 					add(strings.TrimSuffix(e.Name(), ".gguf"))

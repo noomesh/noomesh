@@ -20,6 +20,7 @@ command to run next.
 |---|---|
 | `docker compose version` fails, or the wizard's prerequisites step stops on Compose | The Compose v2 plugin is required. Ubuntu's `docker.io` ships without it: add `docker-compose-v2` from Ubuntu, or `docker-compose-plugin` from Docker's own apt repository (newer, preferred). |
 | Every container is `Exited (255)` after a reboot, usually on WSL2 | `noo doctor docker`, follow the recovery recipe it prints, then `noo stack start`. It never repairs on its own. |
+| After a reboot the stack stays down until you log in to the controller | noo-hostd (a user unit) starts only at login without linger. `noo cluster verify` shows the `hostd at boot` row; run the `sudo loginctl enable-linger <user>` it prints. |
 | On WSL2 the controller stops by itself after a while with no terminal open (everything down, nodes lose the controller) | WSL2 idled its VM out. Set `vmIdleTimeout=-1` under `[wsl2]` in `%UserProfile%\.wslconfig` (Windows 11), run `wsl --shutdown` once, then `noo stack start`. See [install.md](install.md). |
 
 ### Ports

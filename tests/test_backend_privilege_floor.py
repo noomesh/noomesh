@@ -21,8 +21,7 @@ import yaml
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SERVICES = yaml.safe_load((REPO_ROOT / "docker-compose.cluster.yml").read_text())["services"]
 
-BACKENDS = ["vllm", "vllm-secondary", "llamacpp", "airllm", "ollama", "ollama-embed", "ollama-embed-cpu",
-            "tei", "tei-gpu", "reranker"]
+BACKENDS = ["vllm", "vllm-secondary", "llamacpp", "airllm", "ollama", "ollama-embed", "ollama-embed-cpu"]
 AGENT_CAPS = {"CHOWN", "DAC_OVERRIDE", "FOWNER", "SETGID", "SETUID"}
 DOORS = sorted(n for n in SERVICES if n.startswith("stunnel-"))
 
@@ -50,7 +49,7 @@ def test_the_agent_floor_is_the_same_set():
 
 
 def test_every_door_is_non_root_capless_and_read_only():
-    assert len(DOORS) == 9, DOORS
+    assert len(DOORS) == 6, DOORS
     bad = []
     for name in DOORS:
         s = _floor(name)

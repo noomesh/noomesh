@@ -188,7 +188,7 @@ logins are audited and lock the account after repeated failures.
 
 | Method | Path | Purpose |
 |---|---|---|
-| POST | `/api/identity/token` | RFC 8693 token exchange: a provisioning service key (the bearer, the *actor*) trades a `subject_token` naming a mesh account for a short-lived user JWT for that account, carrying an `act` claim that names the key. The result is an ordinary user token; it is refused `403` on anything an `act` credential may not do (for example starting `graph.entity_cleanup`) |
+| POST | `/api/identity/token` | RFC 8693 token exchange: a provisioning service key (the bearer, the *actor*) trades a `subject_token` naming a mesh account for a short-lived user JWT for that account, carrying an `act` claim that names the key. The result is an ordinary user token; it is refused `403` on anything an `act` credential may not do (for example starting `graph.entity_cleanup`). The minted tier is capped at operator, so a key bound to an admin account gets an operator token (and `scope` reports operator); admin actions need a person, see [who changes access](../security/who-changes-access.md) |
 | GET | `/.well-known/oauth-authorization-server`, `/.well-known/jwks.json` | exchange metadata and the signing keys (public) |
 | POST | `/api/security/operator-certs/register`, `/revoke`; `/api/security/operator-token` | operator client certificates: register a leaf's thumbprint, revoke it, and mint an Admin token bound to a registered leaf (5 min). Posture writes need such a bound token |
 
@@ -247,6 +247,23 @@ add-on service key with the `metrics` scope; at most 256 series per source,
 | PUT | `/api/external/embedding-spaces/{space}/migration` | consumer key (scope `embeddings`): trellion's progress report `{next_model, tables: {<table>: {done, total, unsourced?}}, cutover_done}`; 409 with no migration, a `pending` one (not started: no node serves the model) or another next model; in `cutover`, `cutover_done: true` swaps the space to its next model in one UPDATE. Embeds with `model: "<space>@next"` on `/api/external/embeddings` use the next model (409 without a migration or while `pending`) |
 | POST | `/api/external/embeddings/jobs` | consumer key (scope `embeddings`): a bulk embedding batch as a job. `{input: [..], space?, model?}` (`space` wins; both mean what `model` means on `/api/external/embeddings`, so `<space>@next` works) answers `202 {job_id, path, model}`. `path: pull`: a node that serves the model claims the batch from the `WORK_EMBED` work queue when it has a free embed slot (one slot per node stays free for query-time embeds); `path: push`: no node is pulling, so the gateway embeds it itself, two batches at a time. At most 64 texts per job and the encoded result must fit 600 KiB (`413`, the message names the cap); `429` + `Retry-After` when the model's queue holds over 5000 batches; `503` when no node serves the model. A pull job nobody claims within 2 minutes, or whose worker goes quiet, is run by the gateway once, then failed. Opt-in: the synchronous route never queues. Vectors are kept 15 minutes |
 | GET | `/api/external/embeddings/jobs/{job_id}` | consumer key (scope `embeddings`): the caller's own embedding job (`404` for anyone else's); `?vectors=1` on a completed job adds `vectors` (one float32 row per input, in order). `410` once the 15 minutes are up: resubmit. The same job is readable at `GET /api/jobs/{job_id}?vectors=1` by a caller that reaches the scheduler routes |
+
+### What a rerank answer says
+
+`POST /api/external/rerank` answers `{results: [{index, score}], noo}`. A
+placed reranker (a GGUF cross-encoder on llama.cpp) serves it; with none
+placed, the cluster's chat model does (`noo.served_by: "llm"`,
+`noo.fallback: true`), and `GET /api/external/capabilities` says
+`rerank.available: false`. `available` is true only when a reranker can answer
+now: while one is placed but its model is still loading, it is false with
+`state: loading` and a `reason` naming the node (`state` is `ready`,
+`loading` or `none`). When the chat model ranks nothing (it scores
+every document 0, or cannot be asked), the answer is the input order with
+every `score` **null**, and `noo` carries `degraded: "identity"` and
+`degraded_reason`. A caller that needs a ranking checks `degraded`, or
+`rerank.available` first. `noo cluster verify`'s `reranker` row reads OK
+with none placed (reranking is optional; it names the fallback and how to
+place one) and warns for a placed reranker that is not serving yet.
 
 ### Model classes, failover and what the answer says
 
@@ -450,13 +467,23 @@ Give reasoning models room: a 16-token budget can go entirely to reasoning, and
 | `prompt` | string | required |
 | `conversation_id` | string | continue a session |
 | `channel` | string | `api`, `dashboard`, `telegram`, … |
-| `max_iterations` | int | cap on agentic rounds |
+| `max_iterations` | int | cap on agentic rounds, clamped to `coordinator.max_iterations_limit` (15) |
 | `model` | string | override; `claude-*` / `gpt-*` / `gemini-*` go to a cloud provider when enabled |
 | `stream` | bool | if true the response is a hint to use `/api/inference/stream` |
 | `user_id` | string | ignored when a JWT identifies the caller — the token's subject wins |
 | `node` | string | pin to one node id (bypasses model routing; what `noo inference run --node` uses) |
 | `context` | bool | default `true`. `false` is a raw model call: no coordinator, no memory/document context, no conversation row — `prompt` is the only message, sent through the same resolver and usage accounting as `/v1/chat/completions` (a one-line prompt costs tens of prompt tokens instead of thousands). Honours `model`, `max_tokens`, `temperature`; the response has the same shape with `conversation_id: null`. A user-door JWT opens it; no `chat` consumer scope needed |
 | `max_tokens`, `temperature` | number | sampling controls, honoured when `context` is `false` |
+
+This route answers once, when the turn ends: nothing is sent while it works.
+A turn longer than `coordinator.api_turn_secs` (240 s) answers **504** with
+`code: "turn_deadline"`, the `iterations` and `tool_calls` it got through, any
+`partial_response`, and the `request_id` and `conversation_id` to find its log
+lines; a tool call longer than the tool timeout (120 s) is told to the model as
+a failed call. A long turn belongs on `POST /api/inference/chat`, which runs the
+same turn as Server-Sent Events with progress. Every answer carries an
+`X-Request-Id` header: the caller's own (1-128 chars of `A-Za-z0-9._:-`) or a
+fresh one.
 
 ### Codex CLI on a mesh model (`POST /v1/responses`)
 

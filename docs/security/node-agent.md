@@ -39,6 +39,7 @@ an allow-list.
 | Preseed a model weight from the controller's store | Only against a **digest the controller states in its artifact manifest** |
 | Benchmark the running chat model (`POST /bench`) | Controller identity required, one bench at a time, 600 s in all — see [Harness profile](#harness-profile) |
 | Set the node's harness profile (desired-config `harness_profile`) | Numbers and enums the agent applies to its own bounds; the env on the box still wins — see [Harness profile](#harness-profile) |
+| Have a backend container removed after an explicit unplace (desired-config `unplaced`) | Only that node's own record, at most 24 h old, seen on two consecutive good reads, for a container the agent labelled and named, created before the unplace — see [Removing a backend after an unplace](#removing-a-backend-after-an-unplace) |
 
 ### The controller MAY NOT
 
@@ -437,14 +438,151 @@ enrolled without a tailnet address gets its leaf for the address the gateway
 saw at enrollment. Behind a reverse proxy, Docker Desktop's forwarder or a
 hairpin that is not the node's own, and every call to it then fails TLS.
 `noo cluster verify`'s `agent certificate` row:
-- **FAIL:** the leaf misses the dialled address. The remedy is
-  `noo security pki push-nodes <node>`, and the row says which address that
-  would certify.
+- **FAIL:** the leaf misses the dialled address. `push-nodes` mints only
+  vetted addresses (below), and an address the leaf misses is not one, so the
+  remedy is `noo security pki push-nodes <node> --prove`: the controller first
+  dials that address and accepts only a TLS 1.3 server holding the node's own
+  current key (pinned to its leaf, never matched by name), checks again that
+  no other node has claimed the address meanwhile, and only then issues a
+  leaf, with a fresh key, for exactly that address. It needs the node's
+  `agent_url` to name an IP, not a host name, and a leaf that has not
+  expired; otherwise `--prove` refuses and says why. The row says which
+  address it would certify.
 - **FAIL with no remedy:** that address is also another node's (registered,
   dialled, or in its leaf). Investigate first; `push-nodes` refuses it too,
   unless `--allow-shared-address <addr>` names it.
 - **WARN:** the controller cannot read the node's leaf.
 - **No row:** the leaf covers the address.
+
+**`push-nodes` mints only vetted addresses.** A node's dialled address is
+what its own heartbeat reported, so `noo security pki push-nodes` issues a
+leaf for it only when it is one of: the node's enrollment address (seen by
+the controller when the node redeemed its token), its tailnet address, an
+address its current CA-signed leaf already carries, or its own name. Any
+other address is refused with `<addr> is not <node>'s enrollment, tailnet or
+current-leaf address; if <node> moved there, prove it: noo security pki
+push-nodes <node> --prove`. `--allow-shared-address` answers a claim by
+another node, not this check.
+
+## The controller pins the node it dials
+
+Every node leaf names its node (`CN=` and the first DNS SAN are the node id,
+`O=Mesh Cluster Node`). The controller checks that name, not only the
+cluster-CA chain and the dialled address (i1174):
+
+- **The address book.** The gateway keeps which node owns which agent
+  address (`host:port`), written only from what it accepted in that node's
+  heartbeat or registration, and seeded from `mesh_nodes` at start. The newest
+  accepted report owns an address; a forgotten node owns none, and a node not
+  heard from for ten minutes owns none.
+- **At the handshake.** Every client built from the cluster TLS config (the
+  unary, streaming and failover clients and the WebSocket relay) runs webpki's
+  verification, then requires the leaf presented at an address in the book
+  to be a NODE leaf naming a node that owns an agent address on that host.
+  A leaf of another kind at such an address is refused too, except on the
+  controller's own machine (an address of the self node), where the
+  gateway's and the stack services' leaves answer on the same address. No
+  other leaf carries a node's address: node backend doors name only
+  `127.0.0.1`, add-on and role leaves carry no IP. Addresses not in the book
+  and docker service names are verified exactly as before. A mismatch fails
+  the handshake: the call is refused, the error
+  carries `node_identity_mismatch` (the dialled host, the expected node, the
+  names the leaf presented), and the gateway logs `node_identity_mismatch`.
+  The gateway keeps the latest refusal per node for ten minutes;
+  `/api/cluster/nodes` carries it as `node_identity_mismatch`, and `noo
+  cluster verify <node>`'s `node identity` row FAILs with the address, the
+  name it answered with and the next command.
+- **Before the dial.** A link resolved for a node (`noo` verbs, inference,
+  the class table, the per-node container and log lists) is not built towards
+  an address the book gives to another node; the refusal is a `502` naming
+  `node_identity_mismatch`. Inference resolves its backend by node, never by
+  address alone.
+- **A sensor companion** (`<node>-sensors`) presents its machine's node leaf,
+  so the pin accepts that node's name for it. The handshake cannot see the
+  port, so two agents on one host share that host's accepted names; the
+  agent's target check below tells them apart.
+
+The pin is on the node's NAME. It does not pin the leaf's key: a re-issue
+(push-nodes, provision's re-key) mints a fresh key, and the controller dials
+before the node's next heartbeat could report it.
+
+## An agent refuses calls addressed to another node
+
+The gateway sends `X-Noo-Node: <node id>` on every call to a node agent: over
+HTTPS, on calls handed to another consumer (the mesh embed and rerank
+targets, the WebSocket relay), and in the headers the node-held tunnel
+replays. The bus addresses a node by its own subject and needs none.
+
+The agent's HTTPS listener refuses a call whose `X-Noo-Node` names another
+node: `421` with `{"code":"wrong_node"}`, whoever sent it. A call that names
+no node is accepted until the controller says otherwise:
+
+- the agent reports `checks_target_node: true` on registration and every
+  heartbeat;
+- the controller then sets `require_target_node: true` in that node's
+  desired-config, per node;
+- from the agent's next desired-config read, a controller call (the gateway's
+  leaf) that names no node is refused with the same `421`. `GET /health` and
+  `GET /metrics` stay open to a header-less caller.
+
+The agent reports what it applied as `requires_target_node`. An older
+controller sends no field, which the agent reads as false, so it accepts
+header-less calls again (a call naming another node is still refused). The
+normal roll, controller first and then nodes, never strands a node: an older
+agent ignores the header and is never made strict. `noo cluster verify
+<node>`'s `target-node check` row reads `strict`, or WARN `tolerant` with the
+reason: the agent is older than the controller, or it has not been told yet.
+The agent starts tolerant: its listener is up before its first desired-config
+read, and a header-less call in that window is what an older controller
+sends anyway; a call naming another node is refused from the first second.
+Every caller that names another node is refused with `421`, whoever it is.
+An agent records a misaddressed call only when the controller sent it (the
+controller's leaf): it reports that latest refusal for ten minutes as
+`wrong_node_refused` (`target`, `path`, `at`), and the same row then FAILs
+naming the call and the node it was meant for. A misaddressed controller call
+is a controller or routing problem, so it belongs on that row.
+
+A peer's misaddressed call (a node or service leaf) is refused and logged,
+never recorded on the refusing node's row:
+
+- the agent logs `misaddressed_call_refused` with the caller's leaf name (its
+  common name, nothing else from the certificate), the node named and the
+  path, at most once per caller per ten minutes (`earlier_calls` counts the
+  calls since the previous line). It tracks at most 64 callers; the one seen
+  longest ago is dropped first;
+- its heartbeat lists those callers for ten minutes as `misaddressed_from`
+  (`caller`, `count`, `last_at`);
+- the gateway raises the `node.misaddressed_calls` operator alert on the
+  CALLER, phrased as the refusing node's report ("node B reports that A sent
+  calls addressed to another node"), at most once per caller per hour. It
+  marks no node failed: it is one node's account of another.
+
+## A heartbeat cannot claim another node's address
+
+The address a heartbeat or registration reports becomes where the
+controller dials that node. The gateway stores it only when:
+
+- no other node holds it (its registered address or its agent address in the
+  address book), unless the node's own CA-signed leaf, presented on that very
+  heartbeat, carries it: that is how an address that moved (DHCP) is taken
+  over;
+- it is not one of the controller's own addresses (its self node's agent, its
+  self-agent URL, its controller URL), which belong to the self node and its
+  sensor companion only;
+- when the heartbeat arrived from a tailnet address, it is that address. A
+  node reaches the controller from one tailnet address, so a tailnet peer that
+  differs from a tailnet address reported is refused. Behind NAT, a bridge or
+  docker's userland proxy the peer is a router or gateway address and
+  legitimately differs; that is not judged.
+
+A refused address is never stored, whether a heartbeat or a registration
+reported it. The record keeps its last accepted address (dropped instead when
+that one, too, is another node's or the controller's; a first registration
+has none to keep, and the node is reached over its bus or tunnel) and carries
+`ip_address_refused` with the reason; the gateway logs `ip_address_refused`,
+and on a heartbeat raises the `node.ip_address_refused` operator alert, which
+points at `noo cluster verify <node>`. Its `agent address` row FAILs with the
+reason, the address kept (if any), and the next command for it.
 
 ---
 
@@ -528,7 +666,7 @@ Every container the agent creates on a controller's instruction runs with:
   process cap.
 - a read-only root filesystem with a tmpfs `/tmp` for llama.cpp, the
   llama.cpp reranker and every door sidecar (except on the `alpine` fallback
-  image): their write set outside their mounts is empty. vLLM, Ollama and TEI
+  image): their write set outside their mounts is empty. vLLM and Ollama
   keep a writable root until theirs is moved to a cache mount
   ([networks and containers](networks-and-containers.md#container-hardening)).
 
@@ -561,8 +699,7 @@ The backend's own port is never published on the host.
 | vLLM | `https://noo-vllm:8000` | the `noo-stunnel-vllm` sidecar (`verify = 2`, the `vllm` leaf), which joins the bridge under the alias `noo-vllm`: the name every caller already dials and the vllm leaf already carries (door generation 5). The engine serves plain on `127.0.0.1:8000` inside the door's namespace and mounts no PKI; its healthcheck probes that loopback listener. Until generation 5 vLLM served TLS itself (`--ssl-cert-reqs 2`), which admitted any cluster-CA leaf |
 | llama.cpp | `https://noo-stunnel-llamacpp:8085` | a stunnel sidecar the agent runs beside it (`verify = 2`, the `llamacpp` leaf); llama-server has no TLS listener |
 | Ollama | `https://noo-stunnel-ollama:11434` | the same sidecar shape, the `ollama` leaf |
-| TEI (`embedding`) | `https://noo-stunnel-tei:443` | the same, the `tei` leaf — `:443` is what compose's `stunnel-tei.conf` accepts on, so one URL reaches either |
-| reranker | `https://noo-stunnel-reranker:443` | the same, the `reranker` leaf, whichever engine (`llama-server --reranking` on 8085 or TEI on 80) sits behind it |
+| reranker | `https://noo-stunnel-reranker:443` | the same, the `reranker` leaf, `llama-server --reranking` on 8085 sits behind it |
 | airllm | `http://noo-airllm:8000` | **plaintext, by the same named exception as compose**: opt-in, experimental; the deferred private-network step covers it |
 
 The sidecar is one shape reused per backend (`internal/docker/sidecar.go`):
@@ -628,7 +765,7 @@ release's `stunnel@sha256:…` lock row; that costs one vLLM reload.
 
 **What a node must hold.** Each door serves with a service leaf under
 `$NOO_PKI_DIR/services/<x>/service.{crt,key}` (`vllm`, `llamacpp`,
-`ollama`, `tei`, `reranker`) that **names the door** in its SANs
+`ollama`, `reranker`) that **names the door** in its SANs
 (`noo-vllm`, `noo-stunnel-<x>`; the controller's own service leaves carry
 these — `onboard/steps.rs svc_extra_hostnames`). The agent checks the
 leaf, the CA and the SAN **before touching the running container**: a
@@ -656,9 +793,62 @@ spec hash, so the binary roll itself is the trigger — once the leaf is
 there).
 
 **The retired switches.** `NOO_VLLM_TLS`, `NOO_LLAMACPP_TLS`,
-`NOO_OLLAMA_TLS`, `NOO_TEI_TLS`, `NOO_RERANKER_TLS` select nothing.
+`NOO_OLLAMA_TLS`, `NOO_RERANKER_TLS` select nothing (`NOO_TEI_TLS` went with the TEI engine, removed in 0.6.30, and is ignored).
 `provision` renders them empty; a `false`/`0`/`no`/`off` value **refuses
 the agent's start**, naming the line, like `NOO_MTLS_NODES`.
+
+### Removing a backend after an unplace
+
+The agent removes a backend container only after an explicit unplace, never
+because a placement is absent: a controller whose database came up empty or
+was restored from an older backup answers "nothing placed" as confidently as
+a real one. `noo cluster unplace` records the unplace (a `backend_unplaced:`
+record, written only by the unplace, in the same transaction as the placement
+removal; a place of the same backend and role deletes it in its own
+transaction), and desired-config ships the node its own records, at most 24 h
+old, in a separate `unplaced` array that is never part of `placements`. The
+agent stops a backend on one only when all of these hold:
+
+- the read is good: desired-config answered and decoded, it names the node,
+  and the controller is not away; and it is not the first good read since
+  the agent started;
+- the same record (backend, role, time) was in two consecutive good reads;
+- the controller lists `reap_unplaced_backends` in `gateway_features`;
+- no placement of the backend remains;
+- the container carries `noo.managed-by=node-agent-go` and
+  `noo.backend=<backend>` and is named exactly the backend's container (never
+  a native backend, the harness, a compose service, a node workload or an
+  add-on container);
+- Docker created the container before the unplace, so a record replayed from
+  an old backup can never remove a container placed again since.
+
+It then uses the normal stop (a timeout so a serving request drains, then the
+container and its door are removed), logs `reconcile.stopping_unplaced_backend`
+and reports the removal on its heartbeat for 24 h (`reaped_backends`; the
+controller then deletes the record). Model files, volumes, the PKI directory
+and images are not touched. A container the agent owns that no placement wants
+and no record names is reported (`orphan_backends`, the `unplaced backends`
+verify row) and left running; `noo cluster stop-backend <node> <backend>`
+removes it. The generic settings writes refuse the `backend_unplaced:` key
+namespace, so the authority to change a setting is not the authority to have a
+container removed.
+
+**Leftover TEI containers.** The TEI engine was removed in 0.6.30. On its first
+reconcile pass after an upgrade the agent stops and removes the TEI containers
+an older agent made: `noo-tei`, `noo-tei-gpu`, their `noo-stunnel-tei` and
+`noo-stunnel-tei-gpu` doors, and a `noo-reranker` running the TEI image. It
+matches those names exactly and only when the container carries the agent's own
+`noo.managed-by=node-agent-go` label, so a compose-run container or anyone
+else's is never touched. Each removal logs one line naming the replacement. A
+placement still in desired state is refused (`backend_start`, shown by `noo
+cluster show`) with `noo cluster place <node> ollama <model> --role embed` (an
+embedder) or `noo cluster place <node> reranker <file>.gguf` (a reranker).
+`noo cluster verify` shows the placement in its `unsupported engine` row. An
+embedding space whose model was a TEI model keeps serving searches over its
+existing vectors and refuses embed writes until a node serves it or
+`noo cluster embedding-space migrate` moves it. The controller no longer issues a
+`tei` service leaf; a node that still holds one is not refused for it for one
+release.
 
 **The one plaintext hop that stays.** A host-native Ollama — the
 operator's own process outside Docker (macOS Metal, or a Linux install the
@@ -957,7 +1147,7 @@ starts` row shows the refusal until the verified file is shipped (`noo
 cluster sync-model-files <node> -m <model>`); a container already running
 keeps running until its next start; with no manifest, or an unreachable
 controller and no proof of a mismatch, the agent logs a WARN and llama.cpp
-loads the local file; Ollama models are checked about every 10 minutes and at backend start,
+loads the local file; Ollama models are checked every 10 to 15 minutes (on the agent's 5-minute reconcile tick, once 10 minutes have passed since the model's last check) and at backend start,
 repaired from the controller, and refused only when the repair fails (native
 Ollama on a Mac is report-only), a hand pull is not.
 
@@ -1130,7 +1320,7 @@ says "the release's harrier". With no pin in the lock it is not compared.
 
 Every backend the agent starts serves through a door that requires a
 cluster-CA client certificate: vLLM's own listener, a `noo-stunnel-<x>`
-sidecar in front of llama.cpp, ollama, TEI and the reranker. Each door
+sidecar in front of llama.cpp, ollama and the reranker. Each door
 serves with a service leaf at `$NOO_PKI_DIR/services/<x>/service.{crt,key}`
 whose SANs name the host the agent dials it by, and the agent refuses to
 start a backend whose leaf is missing or does not name its door.
@@ -1143,7 +1333,7 @@ Those leaves reach a node on the rail, the same as its node certificate:
 | `svc-<x>.key` | `$NOO_PKI_DIR/nodes/<node>/services/<x>/service.key` (0600, the CLI only) | `/etc/noo/pki/services/<x>/service.key` | 0600, root on Linux (read by root inside the door's container); on a Mac the `~/noomesh` tree belongs to the enrolling user, who runs the agent and Docker Desktop |
 
 `<x>` is one of `vllm` (doors `noo-vllm`, `noo-vllm-secondary`), `llamacpp`,
-`ollama`, `tei`, `reranker` (door `noo-stunnel-<x>`). The table is
+`ollama`, `reranker` (door `noo-stunnel-<x>`). The table is
 `noo-cli/src/commands/node_leaves.rs` `NODE_DOOR_LEAVES`;
 `tests/test_node_backend_leaves_on_the_rail.py` pins it against the
 applier's install loop and the agent's own door table.
@@ -1202,8 +1392,8 @@ DNS SANs and NotAfter (unix seconds):
 
 ```json
 "backend_leaves": {
-  "vllm": {"dns": ["vllm", "localhost", "noo-vllm", "noo-vllm-secondary"], "not_after": 1790000000},
-  "tei":  {"dns": ["tei", "localhost", "noo-stunnel-tei"], "not_after": 1790000000}
+  "vllm":     {"dns": ["vllm", "localhost", "noo-vllm", "noo-vllm-secondary"], "not_after": 1790000000},
+  "reranker": {"dns": ["reranker", "localhost", "noo-stunnel-reranker"], "not_after": 1790000000}
 }
 ```
 
@@ -1644,24 +1834,32 @@ contains, one of those.
 This holds on Linux with systemd and `harness-egress=enforced` only. A Mac
 (launchd) has no egress hold: its harness runs with nothing holding it off
 the internet. A failed pre-check or an old systemd also leaves the harness
-unrestricted (the tag below says so). Where it is held, private, link-local
-and tailnet ranges stay reachable.
+unrestricted (the tag below says so). Where it is held, the harness reaches
+loopback and the controller's own addresses, nothing else. Containers it
+starts through Docker (the jail) are outside this hold: the jail's own
+network policy is their isolation.
 
 The Landlock jail limits files. On Linux the network is limited by the node's applier
 (`scripts/noo-apply.sh`), as root, on every apply that carries the harness
 unit or its env. It renders `/etc/noo/harness-net/` (a `resolv.conf` that
 names only 192.0.2.53, a TEST-NET-1 address that is never allowed, so a name
 lookup fails at once with no packet sent; an `nsswitch.conf` that is the
-host's with `hosts: files dns`; and a `hosts` file that holds only the names
+host's with `hosts: files`, so no lookup asks DNS; and a `hosts` file that holds only the names
 the harness needs, the hosts of `NOO_GATEWAY_URL` and `NATS_URL`, resolved
 by the applier) and the drop-in
 `noo-harness.service.d/50-noomesh-egress.conf`. The drop-in sets
 `IPAddressDeny=0.0.0.0/0 ::/0` (every address; written as prefixes because
-`systemd-run -p`, which the pre-check uses, rejects `any` and `localhost`) and allows only loopback, private, link-local and
-tailnet ranges, `fc00::/7` only on a host that has its own global address
-there, and each controller address outside those ranges as one `/32` or
-`/128`. It also bind-mounts the three files over `/etc` for the unit and its
-CLIs and hides the host's resolver sockets. The files are rewritten only when
+`systemd-run -p`, which the pre-check uses, rejects `any` and `localhost`) and allows exactly `127.0.0.1/32` and `::1/128`
+plus each address of the controller names in the hosts file (and a literal
+controller IP) as one `/32` or `/128`: no range, so no other host on the LAN
+or the tailnet is reachable. The harness needs nothing more: its model
+endpoint is this node's agent on loopback, and it resolves no name at run
+time. The drop-in sets `NOO_HARNESS_EGRESS_HOLD=1`, binds the three files for
+the unit and its CLIs (where the host's resolver file lives in a directory
+of its own, such as systemd-resolved's, the held copy is bound over that
+directory, so a host rewrite of the file does not reach the unit), and hides
+the host's resolver sockets. The allowed addresses are also written to
+`/etc/noo/harness-net/allow`. The files are rewritten only when
 their content changes; a change reloads systemd and restarts the harness the
 applier's usual way. A name that does not resolve is left out of the hosts
 file and is never looked up through a real resolver: the harness then fails
@@ -1674,20 +1872,32 @@ unresolved name. The probe never refuses the harness unit; the node agent
 reports the state and refuses the kinds that need enforcement. A teardown
 removes the drop-in and the directory.
 
+The harness checks its hold from inside its own unit at start and again
+every minute: no internet name resolves, the loopback canary is dropped, no
+allowed address answers DNS, its private `resolv.conf` is still in place,
+and the gateway answers. Under an installed hold, a check that does not hold
+stops the harness taking new work (the gateway runs a turn itself; a task
+waits for this node) until a later check holds again.
+
 Before it installs the hold, the applier runs a pre-check under the hold's own
 settings: every controller name must resolve from the rendered `hosts` file,
 and every controller port must answer. A controller URL that is a literal IPv4
-address is connected to without a lookup, and an address outside the base
-ranges is added to the allowlist. If the pre-check fails, nothing is installed
-and the tag says why:
+address is connected to without a lookup and allowed as itself. If the
+pre-check fails, nothing is installed and the tag says why (the apply output
+names the address that did not answer and the allowed list):
 - `UNENFORCED:selfcheck-<host>-<port>`: this node cannot reach that controller
   address under the hold;
 - `UNENFORCED:selfcheck-unavailable`: no `systemd-run` on this host.
 
-`noo cluster verify`'s `harness egress` row:
-- **OK:** the unit is held and the harness's own self-test confirms it.
-- **FAIL:** not held. Codex placements are refused there.
-- **WARN:** unknown, or the node runs another runtime (launchd).
+`noo cluster verify`'s `harness egress` row reads the harness's latest check
+(no row where no harness runs):
+- **OK:** the unit is held and the harness's own check confirms it, with how
+  long ago it ran.
+- **FAIL:** not held (codex placements are refused there); or held but the
+  gateway does not answer from inside the hold, which a re-apply fixes.
+- **WARN:** unknown (including a check more than three minutes old); the
+  harness's private `resolv.conf` replaced (still held, a restart restores
+  it); or the node runs another runtime (launchd).
 - **The remedy:** `noo cluster provision <node>`. Its apply report carries the
   tag above.
 

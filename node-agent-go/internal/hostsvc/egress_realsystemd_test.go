@@ -16,6 +16,22 @@ import (
 // is skipped unless NOO_REAL_SYSTEMD=1, so a developer machine never runs it.
 // On failure it prints the whole Egress and the raw `systemctl show` output,
 // so a property-format difference between systemd versions is visible.
+// After the host rewrote a plain-file /etc/resolv.conf
+// (tests/ci/harness-egress-systemd.sh, step f3): the live unit reads as
+// enforced, with its private resolver file reported replaced.
+func TestRealSystemdEgressResolvReplaced(t *testing.T) {
+	if os.Getenv("NOO_REAL_SYSTEMD_RESOLV_REPLACED") != "1" {
+		t.Skip("set NOO_REAL_SYSTEMD_RESOLV_REPLACED=1 to run against a real noo-harness unit after a host resolver rewrite")
+	}
+	got := DefaultEgressReader().Read(context.Background())
+	if got.State != EgressEnforced || !got.PIDMatch {
+		t.Fatalf("state = %q (%s), pid_match = %v; want enforced", got.State, got.Reason, got.PIDMatch)
+	}
+	if got.ResolvHeld == nil || *got.ResolvHeld {
+		t.Fatalf("resolv_held = %v, want false (the private resolver file replaced)", got.ResolvHeld)
+	}
+}
+
 func TestRealSystemdEgress(t *testing.T) {
 	if os.Getenv("NOO_REAL_SYSTEMD") != "1" {
 		t.Skip("set NOO_REAL_SYSTEMD=1 to run against a real noo-harness unit")

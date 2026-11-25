@@ -36,6 +36,8 @@ mod gemma_channel;
 mod rail;
 mod remote;
 mod repeat_guard;
+mod retrieval_use;
+pub(crate) mod route_budget;
 pub(crate) mod responses_wire;
 mod runtime;
 mod session;

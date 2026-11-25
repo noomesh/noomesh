@@ -251,7 +251,10 @@ re-onboard, for instance) and remote agents are crash-looping on
 `certificate signed by unknown authority`, `noo security pki push-nodes`
 re-issues each node's cert and stages a bundle carrying it plus `ca.crt`
 on the pull rail for the node's own applier to collect and apply
-(exit 1 if any node fails). A **fresh** node never needs
+(exit 1 if any node fails). It mints only a vetted address for each node:
+its enrollment address, its tailnet address, or one its current leaf already
+carries; any other dialled address is refused with the proof remedy
+(`push-nodes <node> --prove`). A **fresh** node never needs
 `push-nodes` — `noo cluster provision` issues its cert.
 
 ### Trust the CA on this machine
@@ -557,7 +560,7 @@ hardware (decision 2026-10-26).
 | `noo security pki rotate-signing-key` | `[<node>] [--deliver-only] [-y\|--yes]` | Mint the fleet code-signing key and deliver its public half to every node (-y to confirm) |
 | `noo security secrets absorb-files` | `[-y\|--yes]` | Fold file credentials and legacy secrets/*.txt into env.sops; shreds what reads back (-y) |
 | `noo security pki issue-node` | `<node> [<ip>] [--days <n>] [--mint-only]` | Issue a node cert and deliver it, waiting for the node to confirm it applied |
-| `noo security pki push-nodes` | `[<node>] [--days <n>] [--yes] [--allow-shared-address <addr>]` | Re-issue node certs plus ca.crt and stage them on the pull rail for each node |
+| `noo security pki push-nodes` | `[<node>] [--days <n>] [--yes] [--allow-shared-address <addr>] [<node> --prove]` | Re-issue node certs and stage them on the rail; --prove first checks the node's address |
 | `noo security trust-ca` | `[<ca_path>]` | Install the cluster CA into the OS trust store (default $NOO_PKI_DIR/ca.crt) |
 | `noo security untrust-ca` | `[-y\|--yes]` | Remove the cluster CA (by name) from the OS trust store; asks for confirmation (-y) |
 

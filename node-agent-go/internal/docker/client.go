@@ -32,11 +32,10 @@ import (
 // BackendPorts maps backend names to their default ports.
 // Matches Python gateway.constants.BACKEND_PORTS.
 var BackendPorts = map[string]int{
-	"vllm":      8000,
-	"llamacpp":  8085,
-	"ollama":    11434,
-	"airllm":    8000,
-	"embedding": 8082,
+	"vllm":     8000,
+	"llamacpp": 8085,
+	"ollama":   11434,
+	"airllm":   8000,
 }
 
 // BackendURL returns the intra-cluster URL of a backend's DOOR as it is
@@ -56,8 +55,6 @@ func BackendURL(backend, _ string) string {
 			return u
 		}
 		return "https://stunnel-ollama:11434"
-	case "embedding", "tei":
-		return "https://stunnel-tei:443"
 	}
 	return backendDialURL(backend, nil)
 }
@@ -142,7 +139,6 @@ var backendDoors = map[string]backendDoor{
 	"vllm-secondary": {Port: 8000, PlainPort: 8000},
 	"llamacpp":       {Sidecar: "llamacpp", Port: 8085, PlainPort: 8085},
 	"ollama":         {Sidecar: "ollama", Port: 11434, PlainPort: 11434},
-	"embedding":      {Sidecar: "tei", Port: 443, PlainPort: 80},
 	"reranker":       {Sidecar: "reranker", Port: 443, PlainPort: 8085},
 }
 
@@ -179,13 +175,12 @@ func doorDialHost(backend string) string {
 }
 
 // sidecarBackend maps a running sidecar container name back to the backend
-// key it fronts ("" for a name that is not a known sidecar). The compose
-// stack runs `noo-stunnel-tei-gpu` for its GPU TEI: same backend.
+// key it fronts ("" for a name that is not a known sidecar).
 func sidecarBackend(name string) string {
 	if !strings.HasPrefix(name, StunnelContainerPrefix) {
 		return ""
 	}
-	svc := strings.TrimSuffix(strings.TrimPrefix(name, StunnelContainerPrefix), "-gpu")
+	svc := strings.TrimPrefix(name, StunnelContainerPrefix)
 	for backend, d := range backendDoors {
 		if d.Sidecar != "" && d.Sidecar == svc {
 			return backend
@@ -473,20 +468,18 @@ func backendDialURL(backend string, d *declaredTLS) string {
 
 // ProfileMap maps backend names to docker-compose profiles.
 var ProfileMap = map[string]string{
-	"vllm":      "vllm",
-	"llamacpp":  "llamacpp",
-	"ollama":    "ollama",
-	"airllm":    "airllm",
-	"embedding": "embedding",
+	"vllm":     "vllm",
+	"llamacpp": "llamacpp",
+	"ollama":   "ollama",
+	"airllm":   "airllm",
 }
 
 // EnvVarNames maps backend names to model environment variable names.
 var EnvVarNames = map[string]string{
-	"vllm":      "VLLM_MODEL",
-	"llamacpp":  "LLAMACPP_MODEL",
-	"ollama":    "OLLAMA_MODEL",
-	"airllm":    "AIRLLM_MODEL",
-	"embedding": "EMBEDDING_MODEL",
+	"vllm":     "VLLM_MODEL",
+	"llamacpp": "LLAMACPP_MODEL",
+	"ollama":   "OLLAMA_MODEL",
+	"airllm":   "AIRLLM_MODEL",
 }
 
 // Client wraps the Docker Engine API client with node-agent specific operations.
@@ -828,28 +821,11 @@ func (c *Client) RunningBackends(ctx context.Context) (map[string]string, error)
 			}
 			backends["ollama"] = model
 
-		case "embedding":
-			// TEI's --model-id beats its MODEL_ID env: the flag is the
-			// model that runs. An agent before the fix passed the node
-			// default there while MODEL_ID named the placed model; read
-			// back MODEL_ID-first, such a container looked converged and
-			// was never recreated.
-			model := teiModelOf(envMap, cmdArgs)
-			if model == "" {
-				model = "tei"
-			}
-			backends["embedding"] = model
-
 		case "reranker":
-			// Two engines share the noo-reranker name: llamacpp reads
-			// MODEL_PATH (a /models/<file>.gguf path), TEI reads MODEL_ID
-			// (a HuggingFace repo id).
+			// llama.cpp reads MODEL_PATH (a /models/<file>.gguf path).
 			model := envMap["MODEL_PATH"]
 			if idx := strings.LastIndex(model, "/"); idx >= 0 {
 				model = model[idx+1:]
-			}
-			if model == "" {
-				model = teiModelOf(envMap, cmdArgs)
 			}
 			backends["reranker"] = model
 		}
@@ -900,14 +876,12 @@ func backendKeyFromName(name string) string {
 	case strings.Contains(name, "ollama") && !strings.Contains(name, "embed"):
 		return "ollama"
 	case strings.Contains(name, "reranker"):
-		// noo-reranker matches neither "llamacpp" nor "tei" regardless of
-		// which engine is inside. Leaving it unmapped made RunningBackends()
+		// noo-reranker does not match "llamacpp" regardless of which
+		// engine is inside. Leaving it unmapped made RunningBackends()
 		// blind to a healthy reranker: the reconciler recreated it every
 		// tick (was_running=false) and the heartbeat reported it missing,
 		// firing node_placement_drift forever.
 		return "reranker"
-	case strings.Contains(name, "tei"):
-		return "embedding"
 	}
 	return ""
 }
@@ -1027,6 +1001,30 @@ func (c *Client) ListContainers(ctx context.Context) ([]ContainerInfo, error) {
 const logReadBudget = 8 << 20 // 8 MiB
 
 func (c *Client) ContainerLogs(ctx context.Context, containerName string, tail int, since string) ([]string, error) {
+	lines, _, err := c.ContainerLogsWithNotice(ctx, containerName, tail, since)
+	return lines, err
+}
+
+// ContainerLogsWithNotice is ContainerLogs plus a notice when the answer is
+// missing lines Docker could not read (log_notice.go, i1225): "" otherwise.
+func (c *Client) ContainerLogsWithNotice(ctx context.Context, containerName string, tail int, since string) ([]string, string, error) {
+	lines, notice, _, err := c.containerLogs(ctx, containerName, tail, since)
+	return lines, notice, err
+}
+
+// ContainerLogsSinceStart is for a caller that JUDGES from the log rather
+// than shows it: only lines written since the container last started, so a
+// verdict never comes from an earlier run's lines (i1225). unreadable: Docker
+// holds lines from this start that it could not return (the notice above).
+func (c *Client) ContainerLogsSinceStart(ctx context.Context, containerName string, tail int) ([]string, bool, error) {
+	lines, notice, startedAt, err := c.containerLogs(ctx, containerName, tail, "")
+	if err != nil {
+		return nil, false, err
+	}
+	return linesSinceStart(lines, startedAt), notice != "", nil
+}
+
+func (c *Client) containerLogs(ctx context.Context, containerName string, tail int, since string) ([]string, string, time.Time, error) {
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
@@ -1047,23 +1045,49 @@ func (c *Client) ContainerLogs(ctx context.Context, containerName string, tail i
 	// Whether the stream is framed depends on the container's TTY, and
 	// guessing is what broke this before. Ask.
 	tty := false
+	running := false
+	var startedAt time.Time
 	if ins, err := c.docker.ContainerInspect(ctx, containerName, client.ContainerInspectOptions{}); err == nil {
 		if cfg := ins.Container.Config; cfg != nil {
 			tty = cfg.Tty
 		}
+		if st := ins.Container.State; st != nil {
+			running = st.Running
+			startedAt, _ = time.Parse(time.RFC3339Nano, st.StartedAt)
+		}
 	}
 
-	reader, err := c.docker.ContainerLogs(ctx, containerName, opts)
-	if err != nil {
-		return nil, err
+	read := func(opts client.ContainerLogsOptions, tail int) ([]string, error) {
+		reader, err := c.docker.ContainerLogs(ctx, containerName, opts)
+		if err != nil {
+			return nil, err
+		}
+		defer reader.Close()
+		lines, err := logLinesFromStream(reader, tty, tail)
+		if err != nil {
+			return nil, fmt.Errorf("read logs for %s: %w", containerName, err)
+		}
+		return lines, nil
 	}
-	defer reader.Close()
 
-	lines, err := logLinesFromStream(reader, tty, tail)
+	lines, err := read(opts, tail)
 	if err != nil {
-		return nil, fmt.Errorf("read logs for %s: %w", containerName, err)
+		return nil, "", startedAt, err
 	}
-	return lines, nil
+	if !logAnswerLooksCut(lines, running, startedAt) {
+		return lines, "", startedAt, nil
+	}
+	// One more read of only the newest lines, from the end: it starts after
+	// damage that stopped the first read. A failure here leaves the answer
+	// as it was, with nothing claimed.
+	probeOpts := opts
+	probeOpts.Tail = fmt.Sprintf("%d", logProbeTail)
+	probeOpts.Since = ""
+	probe, err := read(probeOpts, logProbeTail)
+	if err != nil {
+		return lines, "", startedAt, nil
+	}
+	return lines, unreadableLogNotice(containerName, lines, probe, startedAt, since, time.Now()), startedAt, nil
 }
 
 // logLinesFromStream turns one container log stream into its last `tail`
@@ -1225,12 +1249,6 @@ func parseEnv(envList []string) map[string]string {
 		}
 	}
 	return m
-}
-
-// teiModelOf is the model a TEI container serves: its --model-id flag (which
-// TEI reads before its MODEL_ID env), else MODEL_ID.
-func teiModelOf(envMap map[string]string, cmdArgs []string) string {
-	return firstNonEmpty(findArgValue(cmdArgs, "--model-id"), envMap["MODEL_ID"])
 }
 
 func findArgValue(args []string, flag string) string {

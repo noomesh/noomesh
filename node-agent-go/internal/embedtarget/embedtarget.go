@@ -4,10 +4,10 @@
 // Package embedtarget records which local backend this node serves
 // embeddings from, as declared by desired state.
 //
-// The /embed proxy used to hardcode http://noo-tei:80. That was fine while
-// TEI was the only embedder, but it silently mis-routes the moment a node
-// serves embeddings from anything else: host8 runs harrier on ollama and
-// ALSO had a stray noo-tei container, so /embed returned 768-dim bge
+// The /embed proxy used to hardcode one embedder container. That was fine
+// while it was the only embedder, but it silently mis-routes the moment a
+// node serves embeddings from anything else: a node running harrier on
+// ollama ALSO had a stray embedder container, so /embed returned 768-dim bge
 // vectors while the placed embedder (harrier) answers at 1024. Nothing
 // errored — the wrong vectors just came back.
 //
@@ -32,13 +32,12 @@ type Target struct {
 	// Backend (docker.BackendDialURL), not by this string, so a pre-door
 	// container is still reached until the reconciler recreates it.
 	BaseURL string
-	// Backend is the placement's backend type ("ollama", "embedding", ...).
-	// The proxy needs it because embedders speak different dialects: TEI
-	// serves OpenAI /v1/embeddings plus native /embed, while ollama serves
-	// OpenAI /v1/embeddings plus native /api/embed.
+	// Backend is the placement's backend type ("ollama", "llamacpp", ...).
+	// The proxy needs it because embedders speak different dialects: ollama
+	// serves OpenAI /v1/embeddings plus native /api/embed.
 	Backend string
 	// Model is the placement's model, injected into requests that omit it.
-	// TEI serves one model and ignores the field; ollama rejects a request
+	// A one-model engine ignores the field; ollama rejects a request
 	// without it — which is how a correctly-routed /embed still returned
 	// "404 page not found" (ollama's own 404, proxied straight through).
 	Model string

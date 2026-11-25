@@ -292,14 +292,26 @@ func installSystemd(vars unitVars, opts InstallOptions) error {
 		scope = ""
 	}
 	fmt.Printf("noo-hostd is running. Logs: journalctl %s-u noo-hostd -f\n", scope)
-	if !opts.System {
-		// Without lingering, the user manager stops at logout and takes the
-		// daemon with it — on a headless controller that means it is dead
-		// between SSH sessions, which looks exactly like "the spool stopped
-		// working for no reason".
-		fmt.Printf("To keep it running when you are logged out: sudo loginctl enable-linger %s\n", os.Getenv("USER"))
+	if user := os.Getenv("USER"); !opts.System && !lingers(user) {
+		// Without lingering, the user manager starts only at login and stops
+		// at logout, taking the daemon with it: on a headless controller it
+		// is dead between SSH sessions and, after a reboot, BootRestore never
+		// runs until someone logs in (i1160). `noo onboard` enables linger
+		// before it runs this install; a by-hand install is told the line.
+		fmt.Printf("After a reboot noo-hostd starts only when %s logs in. To start it at boot: sudo loginctl enable-linger %s\n", user, user)
 	}
 	return nil
+}
+
+// lingers reports whether logind keeps user's manager running without a
+// login: the marker file `loginctl enable-linger` writes. An empty user
+// reads as not lingering, so the hint is printed.
+func lingers(user string) bool {
+	if user == "" {
+		return false
+	}
+	_, err := os.Stat(filepath.Join("/var/lib/systemd/linger", user))
+	return err == nil
 }
 
 func installLaunchd(vars unitVars, dryRun bool) error {

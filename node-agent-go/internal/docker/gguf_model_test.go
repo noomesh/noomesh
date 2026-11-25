@@ -23,22 +23,15 @@ func TestExpectsGGUFModel(t *testing.T) {
 		}
 	})
 
-	t.Run("reranker on TEI legitimately takes a repo id", func(t *testing.T) {
+	t.Run("a retired RERANK_ENGINE=tei changes nothing", func(t *testing.T) {
 		t.Setenv("RERANK_ENGINE", "tei")
-		if ExpectsGGUFModel("reranker") {
-			t.Error("TEI reranker resolves a HuggingFace repo id itself")
-		}
-	})
-
-	t.Run("engine match is case- and space-insensitive", func(t *testing.T) {
-		t.Setenv("RERANK_ENGINE", "  TEI  ")
-		if ExpectsGGUFModel("reranker") {
-			t.Error("RERANK_ENGINE should be trimmed and compared case-insensitively")
+		if !ExpectsGGUFModel("reranker") {
+			t.Error("the reranker is always llama.cpp: it needs a gguf whatever RERANK_ENGINE says")
 		}
 	})
 
 	t.Run("repo-id backends are unaffected", func(t *testing.T) {
-		for _, b := range []string{"embedding", "vllm", "ollama", "airllm"} {
+		for _, b := range []string{"vllm", "ollama", "airllm"} {
 			if ExpectsGGUFModel(b) {
 				t.Errorf("%s does not load a gguf file from the models dir", b)
 			}

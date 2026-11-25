@@ -27,7 +27,6 @@ lists that traffic.
 | **vLLM** (`vllm/vllm-openai`) | Posts a usage report to `stats.vllm.ai` when the engine starts and every 10 minutes after. The report holds a stable UUID, GPU type, count and memory, CPU model, total RAM, OS, a cloud-provider guess, the model architecture and part of the engine config. It also keeps a copy in `/root/.config/vllm/usage_stats.json`. | `VLLM_NO_USAGE_STATS=1`, `VLLM_DO_NOT_TRACK=1`, `DO_NOT_TRACK=1`. Any one of them is enough (vLLM's `is_usage_stats_enabled`); all three are set. `HF_HUB_DISABLE_TELEMETRY=1` covers its Hugging Face downloads. | compose `vllm`, `vllm-secondary`; node agent `vllm` backend spec |
 | **Hugging Face libraries** (`huggingface_hub`, `transformers`, `tokenizers`, `faster-whisper`) | `huggingface_hub` can send usage pings for the libraries built on it, and tags every download with a user-agent describing the library. | `HF_HUB_DISABLE_TELEMETRY=1`, `DO_NOT_TRACK=1` | compose `worker`, `worker-extra`, `trellion`, `trellion-intel`, `noo-evolve`, `whisper`, `piper`, `sandbox`, `sandbox-extra`, `browser`, `airllm`. Also baked into the `deps-core` (worker, sandbox, trellion), whisper, piper, airllm and browser images, so a container started outside compose carries them too. |
 | **onnxruntime** (`trellion` through `markitdown` and `magika`; `whisper` and `piper` directly) | Microsoft's 1DS client, compiled into the Linux wheel too (found 2026-10-19 as a `deviceid` file under `~/.cache/Microsoft/DeveloperTools/.onnxruntime/` in `noo-trellion`). On the first `InferenceSession` it creates a persistent device id and an `onnxruntime.db` event store there and uploads to `mobile.events.data.microsoft.com/OneCollector` over HTTPS. Probed with onnxruntime 1.31.0: without the switch both files appear under `$HOME`; with it nothing is written. | `ORT_DISABLE_TELEMETRY=1` (onnxruntime reads it when it builds its telemetry object; the Python call `onnxruntime.disable_telemetry_events()` is the in-process equivalent). The container also has no writable `HOME` outside a size-capped tmpfs ([networks-and-containers.md](networks-and-containers.md)), so a missed switch could not persist an id across a restart. | compose `trellion` (and `trellion-intel`, which extends it), `whisper`, `piper`; baked into the `deps-core` image `ENV`, so a container started outside compose carries it. |
-| **text-embeddings-inference** (TEI: CPU image cpu-1.9.4 for `tei` and the node `embedding`/`reranker` on CPU nodes; CUDA image 1.6 for `tei-gpu`, `reranker` and GPU nodes) | No usage reporting. Its only exporter is OpenTelemetry, and that sends only to an `--otlp-endpoint` you configure; noomesh configures none. It downloads models from the Hugging Face Hub. | `HF_HUB_DISABLE_TELEMETRY=1`, `DO_NOT_TRACK=1`, set as a precaution | compose `tei`, `tei-gpu`, `reranker`; node agent `embedding` spec and TEI `reranker` spec |
 | **Ollama** | No usage telemetry. It does have cloud features: a `*-cloud` model is run on ollama.com, and the server offers a web-search tool. Both send your prompt off the machine. | `OLLAMA_NO_CLOUD=1` (Ollama: "Disable Ollama cloud features (remote inference and web search)") | compose `ollama`, `ollama-embed`, `ollama-embed-cpu`; node agent `ollama` spec; on a Mac the brew ollama's launchd plist, `~/Library/LaunchAgents/homebrew.mxcl.ollama.plist`, key `EnvironmentVariables:OLLAMA_NO_CLOUD` (set by `noo enroll`, re-applied by the node agent) |
 | **llama.cpp server** (`llamacpp`, llama.cpp reranker) | None. | Nothing to switch off. | — |
 | **AirLLM** | Built on `transformers` and `huggingface_hub`. | `HF_HUB_DISABLE_TELEMETRY=1`, `DO_NOT_TRACK=1` | compose `airllm`; node agent `airllm` spec; image `ENV` |
@@ -348,50 +347,64 @@ tailnet.
 
 ## Checking a Mac
 
-A Mac node runs ollama natively (brew + launchd), not in a container. Check
-the switch in its plist — `sh.brew.ollama` under current Homebrew,
-`homebrew.mxcl.ollama` under older releases — and in the job launchd runs
-(`gui/<uid>` at the Mac's screen, `user/<uid>` on a headless Mac over SSH):
+A Mac node runs ollama natively (brew + launchd), never in a container.
+`noo enroll` registers it as a boot service: a system LaunchDaemon at
+`/Library/LaunchDaemons/sh.brew.ollama.plist` (`homebrew.mxcl.ollama` under
+older Homebrew) that runs as the node's user, so it starts at boot, not at a
+login. Check the switch in that plist and in the job launchd runs:
 
 ```sh
-L=sh.brew.ollama; [ -f ~/Library/LaunchAgents/$L.plist ] || L=homebrew.mxcl.ollama
-plutil -p ~/Library/LaunchAgents/$L.plist | grep -A6 EnvironmentVariables
-launchctl print gui/$(id -u)/$L 2>/dev/null || launchctl print user/$(id -u)/$L
+L=sh.brew.ollama; [ -f /Library/LaunchDaemons/$L.plist ] || L=homebrew.mxcl.ollama
+plutil -p /Library/LaunchDaemons/$L.plist | grep -A8 EnvironmentVariables
+sudo launchctl print system/$L
 ```
 
-`OLLAMA_NO_CLOUD = 1` must be listed. `noo cluster verify <node>` reports the
-same in its `vendor telemetry` row, judged from the plist and the running
-`ollama serve` process's environment.
+`OLLAMA_NO_CLOUD = 1` must be listed, beside `HOME` and `OLLAMA_MODELS` (the
+node user's store, `~/.ollama/models` unless a data root moved it).
+`noo cluster verify <node>` reports the switch in its `vendor telemetry` row,
+judged from the plist and the running `ollama serve` process's environment,
+and whether ollama answers at all in its `native ollama` row.
 
-noomesh manages the native ollama only when it runs as the Homebrew launchd
-service (that plist, loaded at login). If you run Ollama.app, or an
-`ollama serve` you started by hand, noomesh does not touch it, but the node
-agent still reads the running process's environment, so the switch is proven
-rather than guessed: the row passes when the process has `OLLAMA_NO_CLOUD=1`,
-fails when it does not, and names the launcher (`brew-service`, `ollama-app`,
-`manual`) so the remedy fits. Only when the process cannot be read does the row
-say "not managed by noomesh" and stay unproven. The fix for a failing
-Ollama.app or hand-run ollama is to quit it and run `HOMEBREW_NO_ANALYTICS=1 brew services start
-ollama`; the agent then sets the switch within a minute. Turn off Ollama.app's
-own login item as well, or it and the brew service will both try to serve on
-port 11434. Note that `brew services restart ollama` regenerates the plist
-without the key; the node agent puts it back and restarts ollama once, within
-a minute.
+The plist is root's, so the node agent (running as the node user) reads it but
+never writes it. If it lacks a key the agent would set (the switch, a
+placement's tuning, a moved store), the agent records a refusal that names the
+`sudo plutil … ; sudo launchctl bootout system/<label>; sudo launchctl
+bootstrap system <plist>` commands, and re-running `noo enroll` applies them
+too. Never `brew services restart ollama`: every `brew services start` re-copies
+the plist from the formula and drops these keys.
+
+A Mac enrolled before 0.6.30 runs ollama as a per-user LaunchAgent
+(`~/Library/LaunchAgents/<label>.plist`, started at login). The agent still
+manages that one as before; re-running `noo enroll` replaces it with the boot
+service (it unloads and removes the user agent first, so two jobs never fight
+over port 11434).
+
+If you run Ollama.app, or an `ollama serve` you started by hand, noomesh does
+not touch it, but the node agent still reads the running process's
+environment, so the switch is proven rather than guessed: the row passes when
+the process has `OLLAMA_NO_CLOUD=1`, fails when it does not, and names the
+launcher (`brew-service`, `ollama-app`, `manual`) so the remedy fits. Only when
+the process cannot be read does the row say "not managed by noomesh" and stay
+unproven. Turn off Ollama.app's own login item, or it and the brew service
+will both try to serve on port 11434.
 
 ## How the switches stay on
 
 - **Compose.** Every service in `docker-compose.cluster.yml` and the add-on
   overlays carries its switches as literal values. They are not
   `${VAR:-1}`, so no `.env` can turn them off.
-- **Node agent.** The backends the agent starts on every node (vLLM, TEI,
+- **Node agent.** The backends the agent starts on every node (vLLM,
   Ollama, AirLLM) carry the same switches in their backend specs. After
   placement and node-local overrides are applied, the agent sets the
   switches again, so a placement's `env` cannot turn them back on.
 - **Mac node.** The native brew ollama is not a container. `noo enroll` writes
-  the switch into its launchd plist and restarts the job with `launchctl`
-  (never `brew services`, which regenerates the plist from the formula). The
-  agent re-checks every minute, restarts ollama once if it had to add the
-  key, and reports it as `backend_containers.ollama.telemetry_missing`.
+  the switch into its boot-service plist
+  (`/Library/LaunchDaemons/<label>.plist`) and restarts the job with
+  `launchctl` (never `brew services`, which regenerates the plist from the
+  formula). The agent re-checks every minute and reports it as
+  `backend_containers.ollama.telemetry_missing`; it cannot write root's plist,
+  so a missing key becomes a refusal naming the `sudo` commands (an older
+  per-user LaunchAgent it still fixes and restarts itself).
 - **Recreate on upgrade.** The agent's env generation is part of each
   placement's spec hash. The first reconcile after an agent upgrade
   therefore recreates each backend once, and an existing container without
@@ -487,7 +500,7 @@ setting you chose. None of it is a report about you or your machines.
 
 | Traffic | Destination | When |
 |---|---|---|
-| Model downloads | Hugging Face Hub (`huggingface.co`, its CDN) | A vLLM, TEI, AirLLM or `noo models` pull of a model that is not already cached. Whisper and Piper never download: they run `HF_HUB_OFFLINE=1` and the controller stages their model or voice. A placed node (one with `NOO_MODEL_CACHE_URL`) never reaches the Hub: its backends run `HF_HUB_OFFLINE=1` with no Hugging Face token, and a model missing from the controller's store is refused, not downloaded. Only the controller downloads. |
+| Model downloads | Hugging Face Hub (`huggingface.co`, its CDN) | A vLLM, AirLLM or `noo models` pull of a model that is not already cached. Whisper and Piper never download: they run `HF_HUB_OFFLINE=1` and the controller stages their model or voice. A placed node (one with `NOO_MODEL_CACHE_URL`) never reaches the Hub: its backends run `HF_HUB_OFFLINE=1` with no Hugging Face token, and a model missing from the controller's store is refused, not downloaded. Only the controller downloads. |
 | Ollama model pulls | `registry.ollama.ai` (and the CDN it redirects blob downloads to) | `noo models fetch ollama:<tag>` and an Ollama pull, both on the controller, and the manifest read that `noo onboard` and `noo models pull` make just before an Ollama pull, to record what was installed (one GET of the manifest, from the `noo` process, no blobs). With `NOO_OLLAMA_REGISTRY` set to a mirror, that read goes to the mirror while the Ollama container still pulls from `registry.ollama.ai`, so the record compares the mirror's manifest with what upstream served. The fetch checks every blob against the digest in the registry's manifest and stores the model; a placed node then imports it from the controller's store and never contacts `registry.ollama.ai` or `ollama.com`. A placed node refuses a registry tag the controller has not staged, unless `NOO_ALLOW_OLLAMA_REGISTRY_PULL=1` is set on that node |
 | Model catalog browsing | `huggingface.co` API, `ollama.com`, `registry.ollama.ai` | `noo models search`; `noo models list` / `recommended` / `ollama` with `--refresh` or an expired catalog cache |
 | Image pulls | A default install's image pulls reach only `ghcr.io` and its blob host `pkg-containers.githubusercontent.com`: every stack image, the nats and nginx mirrors, the hardened `dhi` bases (from our `ghcr.io/noomesh/dhi` mirror) and the helper container the CLI and launcher run, all by digest. That is exactly what the rehearsal's egress allow-list permits the Docker daemon during install. Opt-in: Docker Hub (`registry-1.docker.io`, `auth.docker.io`) for the `vllm` and `vllm-secondary` profiles (`vllm/vllm-openai`, pinned by digest); `mcr.microsoft.com` when you enable the `browser` profile, whose image is built on your machine from a Playwright base. Build-time only, never reached by an install: `dhi.io` (the default base registry of our Dockerfiles) and Docker Hub's `nvidia/cuda` (the CUDA llama.cpp build), contacted only when images are built from source. | `noo stack start`, `noo upgrade`, provisioning, building images |

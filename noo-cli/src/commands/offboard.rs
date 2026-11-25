@@ -178,7 +178,7 @@ pub fn offboard(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     // deletion — and what still needs its flag.
     if yes {
         println!();
-        ui::warned("--yes: auto-accepting WITHOUT prompts: stack (ALL DATA), stack images, storage root, CA trust, tailnet identity + device record, host node-agent, install home");
+        ui::warned("--yes: auto-accepting WITHOUT prompts: stack (ALL DATA), stack images, storage root, CA trust, tailnet identity + device record, host node-agent, the Docker holds onboard placed, install home");
         let mut held: Vec<&str> = Vec::new();
         if !purge_secrets { held.push("age key + CLI state (add --purge-secrets)"); }
         // A plaintext credential is a leftover. The audit's exit code is the
@@ -370,6 +370,29 @@ pub fn offboard(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             match crate::netns_unit::remove(unsafe { libc::isatty(0) } == 1) {
                 Ok(_) => sub(Glyph::Ok, &format!("{} removed", crate::netns_unit::UNIT_NAME)),
                 Err(e) => sub(Glyph::Warn, &format!("{e} — by hand: {}", crate::netns_unit::manual_removal())),
+            }
+        } else {
+            sub(Glyph::Bullet, "kept (skipped)");
+        }
+    }
+
+    // ── 1c. The Docker holds onboard placed (i1098 row 12) ─────────────
+    // Machine-level, so residue mode releases them too. Docker itself stays
+    // installed (machine prep); exactly the recorded packages are unheld,
+    // never one onboard did not hold.
+    if Path::new(crate::docker_hold::RECORD_PATH).exists() {
+        let recorded = crate::docker_hold::recorded_here();
+        item("docker holds");
+        if yes || ctx_confirm(g, false, &docker_holds_question(&recorded), false) {
+            // SAFETY: isatty has no preconditions.
+            let mut host = crate::docker_hold::LiveHold { may_prompt: unsafe { libc::isatty(0) } == 1 };
+            match crate::docker_hold::release_recorded(&mut host) {
+                crate::docker_hold::ReleaseOutcome::Released(p) => sub(Glyph::Ok, &format!("released: apt-mark unhold {} (Docker stays installed)", p.join(" "))),
+                crate::docker_hold::ReleaseOutcome::Nothing => sub(Glyph::Ok, "the record held nothing; removed"),
+                crate::docker_hold::ReleaseOutcome::Failed(why) => {
+                    sub(Glyph::Warn, &why);
+                    removal_failed.push("docker holds".into());
+                }
             }
         } else {
             sub(Glyph::Bullet, "kept (skipped)");
@@ -728,6 +751,14 @@ pub fn offboard(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     Ok(0)
 }
 
+/// The walk's question for the Docker holds onboard placed. Pure.
+pub(crate) fn docker_holds_question(recorded: &[String]) -> String {
+    format!(
+        "Release the apt holds onboard placed on the Docker it installed ({})? Docker stays installed; apt can then upgrade it",
+        recorded.join(", ")
+    )
+}
+
 /// What the docker gate does to the machine; [`docker_gate`] holds the
 /// decision, so a test drives it with a fake.
 pub(crate) trait GateHost {
@@ -1060,6 +1091,8 @@ fn audit_leftovers(g: &Globals, print: bool) -> Vec<String> {
             || Path::new("/etc/systemd/system/noo-hostd.service").is_file(),
         "binary/unit still installed".into());
     item("namespace restore unit", Path::new(crate::netns_unit::UNIT_PATH).is_file(), crate::netns_unit::UNIT_PATH.into());
+    item("docker holds", Path::new(crate::docker_hold::RECORD_PATH).exists(),
+        format!("onboard's apt holds on {} ({})", crate::docker_hold::recorded_here().join(", "), crate::docker_hold::RECORD_PATH));
     let home = PathBuf::from(std::env::var("HOME").unwrap_or_default());
     let left = self_heal_unit_leftovers(&home);
     item("self-heal user units (host-watcher, noo-hostd)", !left.is_empty(),

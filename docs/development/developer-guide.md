@@ -479,6 +479,45 @@ cross-check source for every platform (a `WARNING … trust-on-first-use`
 line means the vendor published nothing to check against). Both JSON files
 change identically, or the parity tests fail.
 
+## The coordinator turn: retrieved material and the stall guard
+
+Two behaviours keep a small default model from answering "I have no new
+information" when the knowledge base already holds the fact
+(`gateway-rust/src/coordinator/`):
+
+- **No redundant `noo_rag_query`.** The knowledge base is fetched before the
+  model call and attached to the user's message as the
+  `<<<NOOMESH-RETRIEVED-DATA-BEGIN>>>` block. When that block carries a
+  knowledge-base layer, the persona says the material is already shown first
+  and that a retrieval tool is offered from the next step on if it is not enough (`mark_kb_shown` in
+  `context.rs`). With no knowledge-base layer the persona is unchanged.
+  When this turn's context already carries the knowledge-base results, the
+  first iteration is offered every tool except `noo_rag_query`; a
+  first-iteration call to it anyway is not run, and the model is told the
+  results are already in its context. The tool is offered from the next
+  iteration on, so a different query can still run (`offered_tools` and
+  `kb_deferred_result` in `agent_loop.rs`, logged as
+  `coordinator.kb_tool_deferred`; a deferred call logs it with `called=true`).
+  A model can still make that first-step call, the default chat model in
+  some turns; its next step can then come back empty and be nudged
+  (`loop.stall_detected_empty_response`), which costs two further model
+  calls before the answer. A very small model (0.5B class) may instead reach
+  for another tool on its first step, which costs it a further model turn.
+- **A post-tool answer that ignores the result is a stall.** After a turn that
+  ran a retrieval tool (`noo_rag_query`, `noo_memory_search`,
+  `noo_recall_search`, `noo_graph_semantic_search`), the loop re-nudges ONCE
+  ("answer from the retrieved material above") when the answer uses none of
+  the result. Rule (`retrieval_use.rs`): salient tokens are words of 4+
+  characters, lowercased, minus a small stopword set (numbers and codes count);
+  the result is relevant when it shares at least 2 salient tokens with the
+  user's question (1 when the question has 3 or fewer); the answer uses the
+  result when it holds at least 1 salient result token that is not in the
+  question. It stalls only when the result is non-empty and relevant, the
+  answer is non-empty and uses none of it, and no nudge has gone out this
+  turn. A legitimate "the document does not say X" about an unrelated result
+  is never a stall; about a related one it costs one extra model turn and the
+  second answer is accepted.
+
 ## Conventions
 
 - **Python:** `from __future__ import annotations`; Pydantic `BaseModel` for

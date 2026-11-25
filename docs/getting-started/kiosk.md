@@ -28,6 +28,24 @@ noo kiosk status
 `--mode dedicated` hands the box to the display (tty1, no desktop login);
 `--mode shared` leaves a laptop usable and puts the display on its own VT.
 
+A dedicated display comes up by itself after a reboot or a power cut. Its
+unit takes over from the boot splash the way a desktop login screen does,
+and starts whether the box boots to the desktop or to a console. Setup turns
+off the desktop login (gdm3, lightdm, sddm) by its real name, and
+`noo kiosk teardown` turns that same one back on.
+
+A seat enrolled before 0.6.30 keeps its older unit, which waits on the boot
+splash and can leave the display black after a reboot. Its own sync cannot
+replace a root-owned unit. After upgrading to 0.6.30, `noo cluster verify`
+shows a `kiosk unit` warning for each such seat with the one command to run
+once on that seat, for example
+`sudo /home/alex/.local/libexec/noo-seat/noo kiosk seat-sync --migrate`.
+
+If the display is still not up, `noo kiosk status` says why. A start that is
+waiting on another unit shows as
+`inactive: a start job is queued behind <unit>`, and `systemctl list-jobs`
+lists the queue.
+
 ### 2. Enroll it as a seat
 
 On the **controller**, mint a one-time seat token:
@@ -195,6 +213,8 @@ A seat that is off during an upgrade picks up its bundle on the next boot.
 
 | symptom | check |
 |---|---|
+| `kiosk.service` "inactive: a start job is queued behind plymouth-quit-wait.service" | on the seat: `sudo plymouth quit` starts it now; the root step `sudo ~<seat user>/.local/libexec/noo-seat/noo kiosk seat-sync --migrate` (or re-running `noo kiosk setup`) installs this release's unit, which quits the splash itself |
+| the roll says "the seat did not report: its sync may be stuck (a start job queued?)" | on the seat: `systemctl list-jobs`, `journalctl -u noo-seat-sync -n 30` |
 | "never heard from since it enrolled" | on the seat: `systemctl status noo-seat-sync.timer`, `journalctl -u noo-seat-sync -n 30` |
 | `decrypt failed` in the apply report | the seat's birth key changed (re-enrolled elsewhere?); mint a new token and run `noo kiosk enroll` again |
 | `signature does not verify` | the seat's `signing.pub` is older than every key the controller still holds; re-enroll |
@@ -226,6 +246,19 @@ any bundle staged for the old one.
   [reference/verify-rows.md](../reference/verify-rows.md)). `seats` is `[]`
   when no seat is enrolled and `null` when the gateway did not answer the
   list: `null` is unknown, not none.
+- **A start that waits:** every restart of `kiosk.service` (setup,
+  `noo kiosk set`, the seat's sync, `--migrate`, the watchdog) is
+  `--no-block` with a 60 s bound. When the bound passes, the message is
+  `kiosk.service did not start within 60 s: a start job is queued behind <unit>`.
+  `noo kiosk status --json` carries `kiosk_job_queued` and
+  `kiosk_job_blocked_by`. A dedicated unit never orders after
+  `plymouth-quit-wait.service`, and it is `WantedBy=` both
+  `graphical.target` and `multi-user.target`. Setup never changes the box's
+  default target. A dedicated seat reports `kiosk_unit` in its heartbeat
+  (`current`, `needs_migrate`, `shared`, `absent` or `unreadable`); verify's
+  `kiosk unit` row warns on `needs_migrate` and its remedy is the person's
+  one `sudo <seat user's home>/.local/libexec/noo-seat/noo kiosk seat-sync --migrate`.
+  A seat whose `noo` does not report its kiosk unit yet shows the row as OK, "not reported".
 - **Updates reach the displays:** `noo upgrade --seats` (and `--all`,
   `--nodes` unless `--no-seats`) stages a bundle every seat applies on its
   next sync tick (the timer runs once a minute), which may restart the

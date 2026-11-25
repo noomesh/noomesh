@@ -146,8 +146,18 @@ pub fn render_unit(user: &str, exe: &str, root: &str) -> Result<String, String> 
     if !plain_path(root) {
         return Err(format!("the install root {root:?} must be absolute and free of whitespace, quotes, % and $"));
     }
+    // Boot ordering (i1160). A target is ordered After= every unit it Wants=
+    // unless that unit says DefaultDependencies=no, so this oneshot held
+    // multi-user.target (and graphical.target) for its whole run: up to the
+    // 300 s gateway wait on every boot, and for ever on a hung launcher run.
+    // DefaultDependencies=no drops that edge; the lines after it restore the
+    // rest of a service's defaults (sysinit, basic, shutdown) by hand.
+    // TimeoutStartSec bounds the run itself: the gateway wait (300 s) plus,
+    // per add-on, the launcher's compose-lock wait (600 s) and a recreate;
+    // 3600 s covers three add-ons. Nothing waits on it, so a generous
+    // ceiling costs no boot time.
     Ok(format!(
-        "[Unit]\nDescription=noomesh: start enabled add-ons that are down after a boot (once)\nAfter=docker.service network-online.target\nWants=network-online.target\n\n[Service]\nType=oneshot\nUser={user}\nWorkingDirectory={root}\nEnvironment=NOO_REPO_ROOT={root}\nExecStart={exe} addons after-boot\n\n[Install]\nWantedBy=multi-user.target\n"
+        "[Unit]\nDescription=noomesh: start enabled add-ons that are down after a boot (once)\nDefaultDependencies=no\nRequires=sysinit.target\nAfter=sysinit.target basic.target\nAfter=docker.service network-online.target\nWants=network-online.target\nConflicts=shutdown.target\nBefore=shutdown.target\n\n[Service]\nType=oneshot\nTimeoutStartSec=3600\nUser={user}\nWorkingDirectory={root}\nEnvironment=NOO_REPO_ROOT={root}\nExecStart={exe} addons after-boot\n\n[Install]\nWantedBy=multi-user.target\n"
     ))
 }
 
@@ -1256,6 +1266,9 @@ mod tests {
         assert!(u.contains("\nAfter=docker.service network-online.target\n"), "{u}");
         assert!(u.contains("\nWants=network-online.target\n"), "{u}");
         assert!(u.contains("\nWantedBy=multi-user.target\n"), "{u}");
+        // Bounded, and multi-user.target is not ordered after it (i1160).
+        assert!(u.contains("\nTimeoutStartSec=3600\n"), "{u}");
+        assert!(u.contains("\nDefaultDependencies=no\n") && u.contains("\nConflicts=shutdown.target\n"), "{u}");
         // It runs in, and declares, the install onboard configured (a
         // service starts in /, where the CLI would fall back to ~/.noo).
         assert!(u.contains("\nWorkingDirectory=/srv/noomesh\n") && u.contains("\nEnvironment=NOO_REPO_ROOT=/srv/noomesh\n"), "{u}");

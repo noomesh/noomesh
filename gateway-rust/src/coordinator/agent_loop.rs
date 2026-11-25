@@ -1255,12 +1255,29 @@ fn request_size(messages: &[Value], tools: &[Value], data_frame: Option<&str>, w
     }
 }
 
+/// The longest conversation id a log line carries.
+const LOG_CONVERSATION_ID_MAX: usize = 64;
+
+/// A caller's conversation id as the coordinator's log lines carry it:
+/// at most `LOG_CONVERSATION_ID_MAX` characters, and only `[A-Za-z0-9._:-]`
+/// (anything else becomes `_`). The id repeats on every loop line of a turn,
+/// so a caller cannot grow log volume or put control characters into a line
+/// through it. What the coordinator ACCEPTS is unchanged: this is the logged
+/// form only. A UUID or a `cf-<hex>` id is logged as sent.
+fn log_conversation_id(raw: &str) -> String {
+    raw.chars()
+        .take(LOG_CONVERSATION_ID_MAX)
+        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '-') { c } else { '_' })
+        .collect()
+}
+
 /// The line also carries the backend's calibration (i802 PR-2): the ratio
 /// learned so far (1.0 before any sample) and how many samples taught it.
 /// Token counts only, never content.
-fn log_request_size(size: &RequestSize, calib: &crate::chat_context::Calibration, tier: WindowTier, path: &'static str) {
+fn log_request_size(size: &RequestSize, calib: &crate::chat_context::Calibration, tier: WindowTier, path: &'static str, conversation_id: &str) {
     tracing::info!(
         path,
+        conversation_id,
         // Which persona tier the turn sent (Full | Compact): what a judge reads (i802).
         tier = ?tier,
         system = size.system,
@@ -1355,6 +1372,47 @@ fn tier_tools(schemas: Vec<Value>, tier: WindowTier) -> Vec<Value> {
             !CORE_TOOLS.contains(&name) || keep.contains(&name)
         })
         .collect()
+}
+
+/// The one tool the knowledge-base frame already answers: withheld from the
+/// first model call of a turn whose frame carries the KB results.
+const KB_RETRIEVAL_TOOL: &str = "noo_rag_query";
+
+/// The tool list ONE model call is offered. When this turn's frame already
+/// carries the knowledge-base results (`kb_shown`), the first iteration
+/// answers from them: the retrieval tool is offered from the next iteration
+/// on, so a different query can still run later in the turn. Every other
+/// turn, and every other tool, is offered unchanged.
+fn offered_tools(tool_schemas: &[Value], iteration: u32, kb_shown: bool) -> Vec<Value> {
+    if !(kb_shown && iteration == 1) {
+        return tool_schemas.to_vec();
+    }
+    tool_schemas
+        .iter()
+        .filter(|s| s.get("function").and_then(|f| f.get("name")).and_then(|n| n.as_str()) != Some(KB_RETRIEVAL_TOOL))
+        .cloned()
+        .collect()
+}
+
+/// What the model is told when it calls the retrieval tool in the first
+/// iteration of a turn whose frame already carries the knowledge-base results.
+const KB_DEFERRED_TEXT: &str = "The knowledge-base results for this question are already in the context above; answer from them. A retrieval tool is available from your next step if they are not enough.";
+
+/// The result for a first-iteration call to the retrieval tool the frame
+/// makes redundant: the call is not run (no retrieval, no tool audit row).
+/// `None` for every other call, and for this tool from iteration 2 on.
+fn kb_deferred_result(call: &tools::ToolCall, iteration: u32, kb_shown: bool, conversation_id: &str) -> Option<tools::ToolResult> {
+    if !(kb_shown && iteration == 1 && call.name == KB_RETRIEVAL_TOOL) {
+        return None;
+    }
+    tracing::info!(conversation_id, iteration, has_rag = true, called = true, tool = KB_RETRIEVAL_TOOL, "coordinator.kb_tool_deferred");
+    Some(tools::ToolResult {
+        name: call.name.clone(),
+        tool_call_id: call.id.clone(),
+        success: true,
+        output: KB_DEFERRED_TEXT.to_string(),
+        error: None,
+    })
 }
 
 /// The backend's prefill time from a usage object: the node agent's
@@ -1664,6 +1722,7 @@ fn push_nudge_with_escalation(
     session: &mut crate::session::Session,
     nudge_history: &mut Vec<&'static str>,
     nudge: &'static str,
+    conversation_id: &str,
 ) -> Option<String> {
     session.messages.push(json!({
         "role": "user",
@@ -1683,6 +1742,7 @@ fn push_nudge_with_escalation(
     let count = nudge_history.iter().filter(|x| **x == nudge).count();
     let nudge_preview: String = nudge.chars().take(160).collect();
     tracing::warn!(
+        conversation_id,
         consecutive_count = count,
         "loop.same_nudge_3x_escalating"
     );
@@ -1801,7 +1861,7 @@ async fn note_backend_cut<R: HarnessRuntime>(rt: &R, usage: &mut UsageStats, bac
 /// the cut signature, and teach the backend's calibration from a call it
 /// clearly read whole. vLLM is never judged (it refuses an over-long prompt
 /// with a 400); a cloud backend is neither judged nor learned.
-async fn judge_call<R: HarnessRuntime>(rt: &R, usage: &mut UsageStats, backend: &ResolvedBackend, sent_estimate: u64, evaluated: u64, prefill_ms: Option<u64>) {
+async fn judge_call<R: HarnessRuntime>(rt: &R, usage: &mut UsageStats, backend: &ResolvedBackend, sent_estimate: u64, evaluated: u64, prefill_ms: Option<u64>, conversation_id: &str) {
     if evaluated == 0 || super::backend::is_cloud_backend(backend) {
         return;
     }
@@ -1810,6 +1870,7 @@ async fn judge_call<R: HarnessRuntime>(rt: &R, usage: &mut UsageStats, backend: 
     // One line per model call: what was sent, what the backend read, and
     // how long it took to read it (i802: the rc.2 judges' prefill seconds).
     tracing::info!(
+        conversation_id,
         backend = %backend.backend_type,
         // The wire the call went out on: "ollama" is a directly dialled
         // Ollama (no node agent in front), the path whose replayed tool
@@ -2318,6 +2379,11 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
     // and runs this same loop — tools, context, session, usage, hooks.
 
     let start = Instant::now();
+    // The turn's id as the caller sent it, bounded for logging
+    // (`log_conversation_id`), so a log reader can match every loop line to
+    // its turn. The session store keys the coerced form
+    // (`session::coerce_conversation_id`, a UUIDv5 of the raw id).
+    let turn_conv = log_conversation_id(conversation_id);
     let mut usage = UsageStats::default();
 
     // 1. Resolve backend — pass user's model preference for targeted routing
@@ -2532,7 +2598,7 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
         &[
             ("Known facts about the user", temporal_ctx.as_deref()),
             (super::context::CLUSTER_FRAME_LABEL, Some(cluster_ctx.as_str())),
-            ("Knowledge base", rag_ctx.as_deref()),
+            (super::context::KB_FRAME_LABEL, rag_ctx.as_deref()),
             ("Memory", mem_ctx.as_deref()),
             ("Other channels", channel_ctx.as_deref()),
             ("Video recall", video_ctx.as_deref()),
@@ -2541,12 +2607,18 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
             ("Companion devices", companion_ctx.as_deref()),
         ],
     );
+    // The persona was built before the layers were fetched: when THIS turn's
+    // frame carries the knowledge base, tell the model it is already shown
+    // instead of "call noo_rag_query FIRST" (i1178a, half a).
+    super::context::mark_kb_shown(&mut session.messages, data_frame.as_deref(), rag_ctx.as_deref());
+    let kb_shown = super::context::kb_in_frame(data_frame.as_deref(), rag_ctx.as_deref());
     super::context::place_clock(&mut session.messages, chrono::Utc::now());
     if let Some(f) = data_frame.as_deref() {
         record_layer_chars(rt.metrics(), "retrieved_data_frame", f).await;
     }
 
     tracing::info!(
+        conversation_id = %turn_conv,
         has_rag = has_rag,
         has_memory = has_memory,
         has_channel = has_channel,
@@ -2561,7 +2633,7 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
         post_dedup_chars = deduped.len(),
         "context_injected"
     );
-    log_request_size(&request_size(&session.messages, &tool_schemas, data_frame.as_deref(), max_input), &calib, tier, "stream");
+    log_request_size(&request_size(&session.messages, &tool_schemas, data_frame.as_deref(), max_input), &calib, tier, "stream", &turn_conv);
 
     // Instructions and the question alone too large for this backend's
     // context (i802 PR-2, step 5): say so instead of sending a prompt the
@@ -2596,6 +2668,9 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
     // here; helper detects same-nudge-3x to escalate instead of looping
     // forever on a model that can't recover.
     let mut nudge_history: Vec<&'static str> = Vec::new();
+    // What this turn's retrieval tools returned (bounded), for the
+    // "answer ignored the retrieved material" stall rule (`retrieval_use`).
+    let mut retrieved_text = String::new();
 
     // The person's message is saved now, not after the loop: a turn that
     // ends badly (the deadline, a rail token that ran out) must not lose it.
@@ -2614,6 +2689,7 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
             deadline_stopped = true;
             tracing::warn!(
                 iteration,
+                conversation_id = %turn_conv,
                 remaining_secs = ends_at.saturating_duration_since(Instant::now()).as_secs(),
                 "loop.turn_deadline_stop"
             );
@@ -2628,8 +2704,12 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
         }
         // What this call sends, in the loop's estimate, and the backend's
         // count before it: the cut check and the calibration read both (i802).
+        let offered = offered_tools(&tool_schemas, iteration, kb_shown);
+        if offered.len() < tool_schemas.len() {
+            tracing::info!(conversation_id = %turn_conv, iteration, has_rag = true, tool = KB_RETRIEVAL_TOOL, "coordinator.kb_tool_deferred");
+        }
         let (evaluated_before, sent_estimate) =
-            (usage.prompt_tokens, (estimate_tokens(&session.messages) + estimate_tool_tokens(&tool_schemas)) as u64);
+            (usage.prompt_tokens, (estimate_tokens(&session.messages) + estimate_tool_tokens(&offered)) as u64);
         let mut call_prefill_ms: Option<u64> = None;
 
         // Debug: log message roles to diagnose ordering issues
@@ -2646,7 +2726,7 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
         let mut routed_frame: Option<Value> = None;
         let resp = match send_llm_with_fallback(
             rt, &mut backend, &mut failed_backend_urls, effective_model,
-            &session.messages, Some(&tool_schemas), true, enable_thinking, turn_ends,
+            &session.messages, Some(&offered), true, enable_thinking, turn_ends,
             // Its tokens reach the console as they come: never re-sent whole.
             Some((writer, &mut routed_frame)), false,
         ).await {
@@ -2960,7 +3040,7 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
             break;
         }
         let evaluated = u64::from(usage.prompt_tokens.saturating_sub(evaluated_before));
-        judge_call(rt, &mut usage, &backend, sent_estimate, evaluated, call_prefill_ms).await;
+        judge_call(rt, &mut usage, &backend, sent_estimate, evaluated, call_prefill_ms, &turn_conv).await;
 
         // Flush remaining tag buffer after stream ends
         let reasoning_tail = reasoning_filter.finish();
@@ -2994,7 +3074,7 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
                 }
                 None => {
                     deadline_stopped = true;
-                    tracing::warn!(iteration, "loop.turn_deadline_stop (mid-stream)");
+                    tracing::warn!(conversation_id = %turn_conv, iteration, "loop.turn_deadline_stop (mid-stream)");
                     let _ = writer.send_event("metadata", json!({"deadline_stop": true, "iteration": iteration})).await;
                 }
             }
@@ -3090,12 +3170,24 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
             // that landed in Drive as literal XML on 2026-05-21.
             let malformed_tool_call = !length_truncated
                 && looks_like_malformed_tool_call(trimmed);
+            // A post-tool answer that uses none of a relevant retrieval
+            // result nudges ONCE per turn (rule: `retrieval_use`, i1178a).
+            let unused_retrieval = !length_truncated
+                && !trivial_after_tool
+                && !malformed_tool_call
+                && super::retrieval_use::ignores_retrieval(
+                    &selection,
+                    &retrieved_text,
+                    trimmed,
+                    !nudge_history.is_empty(),
+                );
             let stalled_empty = !length_truncated
-                && (trimmed.is_empty() || trivial_after_tool || malformed_tool_call);
+                && (trimmed.is_empty() || trivial_after_tool || malformed_tool_call || unused_retrieval);
 
             if length_truncated && iteration < max_iterations {
                 tracing::info!(
                     iteration,
+                    conversation_id = %turn_conv,
                     chars = combined_content.chars().count(),
                     "loop.auto_continue_on_length_truncation"
                 );
@@ -3110,7 +3202,7 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
                 const CONTINUE_NUDGE: &str = "Continue from exactly where you left off. \
                     Do not repeat what you already produced — pick up the next sentence/section.";
                 if let Some(escalation) = push_nudge_with_escalation(
-                    &mut session, &mut nudge_history, CONTINUE_NUDGE,
+                    &mut session, &mut nudge_history, CONTINUE_NUDGE, &turn_conv,
                 ) {
                     result.response = escalation;
                     break;
@@ -3122,8 +3214,10 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
                 let had_reasoning = !full_reasoning.trim().is_empty();
                 tracing::warn!(
                     iteration,
+                    conversation_id = %turn_conv,
                     had_reasoning,
                     reasoning_chars = full_reasoning.chars().count(),
+                    unused_retrieval,
                     "loop.stall_detected_empty_response"
                 );
                 let _ = writer.send_event("metadata", json!({
@@ -3144,6 +3238,8 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
                      via the structured tool_calls field, or write the final answer in plain text."
                 } else if trivial_after_tool {
                     SHORT_SYNTHESIS_NUDGE
+                } else if unused_retrieval {
+                    super::retrieval_use::RETRIEVAL_UNUSED_NUDGE
                 } else if had_reasoning {
                     "Your previous message had no user-visible content — only `<think>` reasoning. \
                      Every tool result you asked for is already in this conversation; nothing is \
@@ -3154,7 +3250,7 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
                      Otherwise write the final answer (see Tool Usage Rules in your system prompt)."
                 };
                 if let Some(escalation) = push_nudge_with_escalation(
-                    &mut session, &mut nudge_history, nudge,
+                    &mut session, &mut nudge_history, nudge, &turn_conv,
                 ) {
                     result.response = escalation;
                     break;
@@ -3176,6 +3272,7 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
             {
                 tracing::warn!(
                     iteration,
+                    conversation_id = %turn_conv,
                     "loop.scheduling_hallucination_nudging"
                 );
                 let _ = writer.send_event("metadata", json!({
@@ -3184,7 +3281,7 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
                 })).await;
                 let nudge = crate::verify::response::scheduling_hallucination_nudge();
                 if let Some(escalation) = push_nudge_with_escalation(
-                    &mut session, &mut nudge_history, nudge,
+                    &mut session, &mut nudge_history, nudge, &turn_conv,
                 ) {
                     result.response = escalation;
                     break;
@@ -3205,11 +3302,12 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
             {
                 tracing::warn!(
                     iteration,
+                    conversation_id = %turn_conv,
                     "loop.tool_error_hidden_nudging"
                 );
                 let nudge = crate::verify::response::tool_error_hidden_nudge();
                 if let Some(escalation) = push_nudge_with_escalation(
-                    &mut session, &mut nudge_history, nudge,
+                    &mut session, &mut nudge_history, nudge, &turn_conv,
                 ) {
                     result.response = escalation;
                     break;
@@ -3229,11 +3327,12 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
             {
                 tracing::warn!(
                     iteration,
+                    conversation_id = %turn_conv,
                     "loop.validation_errors_nudging"
                 );
                 let nudge = crate::verify::response::validation_errors_nudge();
                 if let Some(escalation) = push_nudge_with_escalation(
-                    &mut session, &mut nudge_history, nudge,
+                    &mut session, &mut nudge_history, nudge, &turn_conv,
                 ) {
                     result.response = escalation;
                     break;
@@ -3257,22 +3356,31 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
         // tools that benefit from it (currently noo_coding_task).
         for call in &mut tool_calls {
             tools::inject_coordinator_context(call, conversation_id, "dashboard");
-            let _ = writer.send_event("tool_call", json!({
-                "name": call.name,
-                "arguments": call.arguments,
-            })).await;
+            // A call the loop will not run (the knowledge base is already in
+            // front of the model) is not announced as a tool starting.
+            let deferred = kb_deferred_result(call, iteration, kb_shown, &turn_conv);
+            if deferred.is_none() {
+                let _ = writer.send_event("tool_call", json!({
+                    "name": call.name,
+                    "arguments": call.arguments,
+                })).await;
+            }
 
             let tool_start = Instant::now();
-            let repeat = repeat_guard.check(call, iteration);
+            let repeat = deferred.or_else(|| repeat_guard.check(call, iteration));
             let repeated = repeat.is_some();
             let tool_result = match repeat {
                 Some(r) => r,
-                None => crate::mcp_bridge::CONVERSATION
-                    .scope(
+                None => bounded_tool(
+                    call,
+                    ends_at,
+                    &turn_conv,
+                    crate::mcp_bridge::CONVERSATION.scope(
                         Some(conversation_id.to_string()),
                         crate::mcp_bridge::CALLER.scope(user_id.map(str::to_string), rt.execute_tool(call)),
-                    )
-                    .await,
+                    ),
+                )
+                .await,
             };
             let tool_elapsed_ms = tool_start.elapsed().as_millis() as u64;
 
@@ -3311,7 +3419,7 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
             }
 
             // Implicit retrieval feedback for learning loops
-            if tool_result.success {
+            if tool_result.success && !repeated {
                 rt.record_retrieval_feedback(
                     conversation_id, &call.name, true,
                 ).await;
@@ -3321,6 +3429,10 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
             if call.name == "noo_tool_search" && tool_result.success {
                 let all_schemas = rt.tool_schemas().await;
                 expand_tools_from_search(&mut tool_schemas, &all_schemas, &tool_result.output);
+            }
+
+            if tool_result.success && !repeated && super::retrieval_use::is_retrieval_tool(&call.name) {
+                super::retrieval_use::note_retrieval(&mut retrieved_text, &tool_result.output);
             }
 
             let sanitized_output = sanitize_tool_output(&tool_result.output);
@@ -3600,6 +3712,11 @@ async fn run_inner_bound<R: HarnessRuntime>(
     // and runs this same loop — tools, context, session, usage, hooks.
 
     let start = Instant::now();
+    // The turn's id as the caller sent it, bounded for logging
+    // (`log_conversation_id`), so a log reader can match every loop line to
+    // its turn. The session store keys the coerced form
+    // (`session::coerce_conversation_id`, a UUIDv5 of the raw id).
+    let turn_conv = log_conversation_id(conversation_id);
     let mut usage = UsageStats::default();
 
     // Resolve backend — pass user's model preference for targeted routing
@@ -3782,7 +3899,7 @@ async fn run_inner_bound<R: HarnessRuntime>(
         &[
             ("Known facts about the user", temporal_ctx.as_deref()),
             (super::context::CLUSTER_FRAME_LABEL, Some(cluster_ctx.as_str())),
-            ("Knowledge base", rag_ctx.as_deref()),
+            (super::context::KB_FRAME_LABEL, rag_ctx.as_deref()),
             ("Memory", mem_ctx.as_deref()),
             ("Other channels", channel_ctx.as_deref()),
             ("Video recall", video_ctx.as_deref()),
@@ -3791,6 +3908,11 @@ async fn run_inner_bound<R: HarnessRuntime>(
             ("Companion devices", companion_ctx.as_deref()),
         ],
     );
+    // The persona was built before the layers were fetched: when THIS turn's
+    // frame carries the knowledge base, tell the model it is already shown
+    // instead of "call noo_rag_query FIRST" (i1178a, half a).
+    super::context::mark_kb_shown(&mut session.messages, data_frame.as_deref(), rag_ctx.as_deref());
+    let kb_shown = super::context::kb_in_frame(data_frame.as_deref(), rag_ctx.as_deref());
     super::context::place_clock(&mut session.messages, chrono::Utc::now());
     if let Some(f) = data_frame.as_deref() {
         record_layer_chars(rt.metrics(), "retrieved_data_frame", f).await;
@@ -3804,7 +3926,7 @@ async fn run_inner_bound<R: HarnessRuntime>(
         post_dedup_chars = deduped.len(),
         "context_injected_nonstream"
     );
-    log_request_size(&request_size(&session.messages, &tool_schemas, data_frame.as_deref(), max_input), &calib, tier, "nonstream");
+    log_request_size(&request_size(&session.messages, &tool_schemas, data_frame.as_deref(), max_input), &calib, tier, "nonstream", &turn_conv);
 
     // Instructions and the question alone too large for this backend's
     // context (i802 PR-2, step 5): say so instead of sending a prompt the
@@ -3836,6 +3958,9 @@ async fn run_inner_bound<R: HarnessRuntime>(
 
     // Ralph-loop nudge history (see streaming-loop counterpart).
     let mut nudge_history: Vec<&'static str> = Vec::new();
+    // What this turn's retrieval tools returned (bounded), for the
+    // "answer ignored the retrieved material" stall rule (`retrieval_use`).
+    let mut retrieved_text = String::new();
 
     // An LLM transport failure that aborts the loop. Held rather than
     // returned immediately: an earlier iteration may already have produced
@@ -3857,20 +3982,26 @@ async fn run_inner_bound<R: HarnessRuntime>(
             deadline_stopped = true;
             tracing::warn!(
                 iteration,
+                conversation_id = %turn_conv,
                 remaining_secs = ends_at.saturating_duration_since(Instant::now()).as_secs(),
                 "loop.turn_deadline_stop (non-streaming)"
             );
             break;
         }
         result.iterations = iteration;
+        super::route_budget::note_iteration(iteration);
         let iter_start = Instant::now();
         if let Some(line) = window_refusal.take() {
             llm_failure = Some(super::backend::ContextTooSmall(line).into());
             break;
         }
         // What this call sends, and the backend's count before it (i802).
+        let offered = offered_tools(&tool_schemas, iteration, kb_shown);
+        if offered.len() < tool_schemas.len() {
+            tracing::info!(conversation_id = %turn_conv, iteration, has_rag = true, tool = KB_RETRIEVAL_TOOL, "coordinator.kb_tool_deferred");
+        }
         let (evaluated_before, sent_estimate) =
-            (usage.prompt_tokens, (estimate_tokens(&session.messages) + estimate_tool_tokens(&tool_schemas)) as u64);
+            (usage.prompt_tokens, (estimate_tokens(&session.messages) + estimate_tool_tokens(&offered)) as u64);
         let mut call_prefill_ms: Option<u64> = None;
 
         // For OpenAI-compat (vLLM, node-agent proxy), use stream=true even
@@ -3888,7 +4019,7 @@ async fn run_inner_bound<R: HarnessRuntime>(
         // AFTER the call — fallback may have switched api_format.
         let resp = match send_llm_with_fallback(
             rt, &mut backend, &mut failed_backend_urls, effective_model,
-            &session.messages, Some(&tool_schemas), false, enable_thinking, turn_ends,
+            &session.messages, Some(&offered), false, enable_thinking, turn_ends,
             None::<(&crate::websocket::NullSink, &mut Option<Value>)>, true,
         ).await {
             Ok(r) => r,
@@ -3914,10 +4045,10 @@ async fn run_inner_bound<R: HarnessRuntime>(
                 };
                 if resend_whole_after_cut(&s, resent, Instant::now(), ends_at) {
                     resent = true;
-                    tracing::warn!(iteration, cut = ?s.cut, "loop.model_call_resent_whole");
+                    tracing::warn!(conversation_id = %turn_conv, iteration, cut = ?s.cut, "loop.model_call_resent_whole");
                     resp = match send_llm_with_fallback(
                         rt, &mut backend, &mut failed_backend_urls, effective_model,
-                        &session.messages, Some(&tool_schemas), false, enable_thinking, turn_ends,
+                        &session.messages, Some(&offered), false, enable_thinking, turn_ends,
                         None::<(&crate::websocket::NullSink, &mut Option<Value>)>, true,
                     ).await {
                         Ok(r) => r,
@@ -3949,7 +4080,7 @@ async fn run_inner_bound<R: HarnessRuntime>(
                     Some(why) => llm_failure = Some(anyhow::anyhow!(why)),
                     None => {
                         deadline_stopped = true;
-                        tracing::warn!(iteration, "loop.turn_deadline_stop (non-streaming, mid-stream)");
+                        tracing::warn!(conversation_id = %turn_conv, iteration, "loop.turn_deadline_stop (non-streaming, mid-stream)");
                     }
                 }
                 break;
@@ -3960,7 +4091,7 @@ async fn run_inner_bound<R: HarnessRuntime>(
             usage.total_tokens += streamed.total_tokens as u32;
             call_prefill_ms = streamed.prefill_ms;
             let evaluated = u64::from(usage.prompt_tokens.saturating_sub(evaluated_before));
-            judge_call(rt, &mut usage, &backend, sent_estimate, evaluated, call_prefill_ms).await;
+            judge_call(rt, &mut usage, &backend, sent_estimate, evaluated, call_prefill_ms, &turn_conv).await;
 
             let combined_content = if !streamed.reasoning.is_empty() && !streamed.content.is_empty() {
                 format!("<think>{}</think>\n\n{}", streamed.reasoning, streamed.content)
@@ -4018,7 +4149,7 @@ async fn run_inner_bound<R: HarnessRuntime>(
                 usage.total_tokens += (p + c) as u32;
             }
             let evaluated = u64::from(usage.prompt_tokens.saturating_sub(evaluated_before));
-            judge_call(rt, &mut usage, &backend, sent_estimate, evaluated, call_prefill_ms).await;
+            judge_call(rt, &mut usage, &backend, sent_estimate, evaluated, call_prefill_ms, &turn_conv).await;
             let message = parse_llm_response(super::backend::wire_format(&backend), &llm_response);
             let content = message.get("content").and_then(|c| c.as_str()).unwrap_or("").to_string();
             let mut msg = message.clone();
@@ -4054,16 +4185,28 @@ async fn run_inner_bound<R: HarnessRuntime>(
                 && trimmed_len < POST_TOOL_MIN_SYNTHESIS_CHARS
                 && !nudge_history.contains(&SHORT_SYNTHESIS_NUDGE);
             let malformed_tool_call = looks_like_malformed_tool_call(trimmed);
+            // A post-tool answer that uses none of a relevant retrieval
+            // result nudges ONCE per turn (rule: `retrieval_use`, i1178a).
+            let unused_retrieval = !trivial_after_tool
+                && !malformed_tool_call
+                && super::retrieval_use::ignores_retrieval(
+                    &selection,
+                    &retrieved_text,
+                    trimmed,
+                    !nudge_history.is_empty(),
+                );
 
-            if (trimmed.is_empty() || trivial_after_tool || malformed_tool_call)
+            if (trimmed.is_empty() || trivial_after_tool || malformed_tool_call || unused_retrieval)
                 && iteration < max_iterations
             {
                 tracing::warn!(
                     iteration,
+                    conversation_id = %turn_conv,
                     visible_chars = trimmed_len,
                     raw_chars = content.chars().count(),
                     had_prior_tool_result,
                     malformed_tool_call,
+                    unused_retrieval,
                     "loop.stall_detected_empty_response (non-streaming)"
                 );
                 // Short structural nudge — see streaming path comment.
@@ -4073,6 +4216,8 @@ async fn run_inner_bound<R: HarnessRuntime>(
                      via the structured tool_calls field, or write the final answer in plain text."
                 } else if trivial_after_tool {
                     SHORT_SYNTHESIS_NUDGE
+                } else if unused_retrieval {
+                    super::retrieval_use::RETRIEVAL_UNUSED_NUDGE
                 } else {
                     "Your previous message had no user-visible content — only `<think>` reasoning. \
                      Every tool result you asked for is already in this conversation; nothing is \
@@ -4080,7 +4225,7 @@ async fn run_inner_bound<R: HarnessRuntime>(
                      `<think>` block."
                 };
                 if let Some(escalation) = push_nudge_with_escalation(
-                    &mut session, &mut nudge_history, nudge,
+                    &mut session, &mut nudge_history, nudge, &turn_conv,
                 ) {
                     result.response = escalation;
                     break;
@@ -4101,11 +4246,12 @@ async fn run_inner_bound<R: HarnessRuntime>(
             {
                 tracing::warn!(
                     iteration,
+                    conversation_id = %turn_conv,
                     "loop.scheduling_hallucination_nudging (non-streaming)"
                 );
                 let nudge = crate::verify::response::scheduling_hallucination_nudge();
                 if let Some(escalation) = push_nudge_with_escalation(
-                    &mut session, &mut nudge_history, nudge,
+                    &mut session, &mut nudge_history, nudge, &turn_conv,
                 ) {
                     result.response = escalation;
                     break;
@@ -4125,11 +4271,12 @@ async fn run_inner_bound<R: HarnessRuntime>(
             {
                 tracing::warn!(
                     iteration,
+                    conversation_id = %turn_conv,
                     "loop.tool_error_hidden_nudging (non-streaming)"
                 );
                 let nudge = crate::verify::response::tool_error_hidden_nudge();
                 if let Some(escalation) = push_nudge_with_escalation(
-                    &mut session, &mut nudge_history, nudge,
+                    &mut session, &mut nudge_history, nudge, &turn_conv,
                 ) {
                     result.response = escalation;
                     break;
@@ -4146,11 +4293,12 @@ async fn run_inner_bound<R: HarnessRuntime>(
             {
                 tracing::warn!(
                     iteration,
+                    conversation_id = %turn_conv,
                     "loop.validation_errors_nudging (non-streaming)"
                 );
                 let nudge = crate::verify::response::validation_errors_nudge();
                 if let Some(escalation) = push_nudge_with_escalation(
-                    &mut session, &mut nudge_history, nudge,
+                    &mut session, &mut nudge_history, nudge, &turn_conv,
                 ) {
                     result.response = escalation;
                     break;
@@ -4170,16 +4318,20 @@ async fn run_inner_bound<R: HarnessRuntime>(
         for call in &mut tool_calls {
             tools::inject_coordinator_context(call, conversation_id, channel);
             let tool_start = Instant::now();
-            let repeat = repeat_guard.check(call, iteration);
+            let repeat = kb_deferred_result(call, iteration, kb_shown, &turn_conv).or_else(|| repeat_guard.check(call, iteration));
             let repeated = repeat.is_some();
             let tool_result = match repeat {
                 Some(r) => r,
-                None => crate::mcp_bridge::CONVERSATION
-                    .scope(
+                None => bounded_tool(
+                    call,
+                    ends_at,
+                    &turn_conv,
+                    crate::mcp_bridge::CONVERSATION.scope(
                         Some(conversation_id.to_string()),
                         crate::mcp_bridge::CALLER.scope(user_id.map(str::to_string), rt.execute_tool(call)),
-                    )
-                    .await,
+                    ),
+                )
+                .await,
             };
             let tool_elapsed_ms = tool_start.elapsed().as_millis() as u64;
 
@@ -4187,6 +4339,7 @@ async fn run_inner_bound<R: HarnessRuntime>(
             usage.total_latency_ms += tool_elapsed_ms;
 
             let output_truncated: String = tool_result.output.chars().take(2000).collect();
+            super::route_budget::note_tool_call();
             result.tool_calls.push(json!({
                 "name": call.name,
                 "arguments": call.arguments,
@@ -4210,7 +4363,7 @@ async fn run_inner_bound<R: HarnessRuntime>(
             }
 
             // Implicit retrieval feedback for learning loops
-            if tool_result.success {
+            if tool_result.success && !repeated {
                 rt.record_retrieval_feedback(
                     conversation_id, &call.name, true,
                 ).await;
@@ -4220,6 +4373,10 @@ async fn run_inner_bound<R: HarnessRuntime>(
             if call.name == "noo_tool_search" && tool_result.success {
                 let all_schemas = rt.tool_schemas().await;
                 expand_tools_from_search(&mut tool_schemas, &all_schemas, &tool_result.output);
+            }
+
+            if tool_result.success && !repeated && super::retrieval_use::is_retrieval_tool(&call.name) {
+                super::retrieval_use::note_retrieval(&mut retrieved_text, &tool_result.output);
             }
 
             let sanitized_output = sanitize_tool_output(&tool_result.output);
@@ -4270,6 +4427,7 @@ async fn run_inner_bound<R: HarnessRuntime>(
     }
 
     if deadline_stopped {
+        super::route_budget::note_deadline_stop();
         result.response = with_deadline_note(&result.response).0;
     }
 
@@ -4399,8 +4557,11 @@ fn turn_ends_at<R: HarnessRuntime>(rt: &R, start: Instant) -> Instant {
     // checked_add: an absurd NOO_HARNESS_TURN_TIMEOUT_SECS or `exp` must
     // not panic the turn; a year is "no bound" for a turn.
     let far = Duration::from_secs(365 * 86_400);
+    // A route that bounds its turn (route_budget, i1178a) shortens it here;
+    // every other route keeps the global deadline.
+    let deadline = super::route_budget::capped(super::turn_deadline(), super::route_budget::current().map(|b| b.cap));
     let by_clock = start
-        .checked_add(super::turn_deadline())
+        .checked_add(deadline)
         .unwrap_or_else(|| start + far);
     let Some(exp) = rt.credential_expires_at() else {
         return by_clock;
@@ -4419,7 +4580,43 @@ fn turn_ends_at<R: HarnessRuntime>(rt: &R, start: Instant) -> Instant {
 /// What one more model call is expected to need: two stream idle bounds,
 /// at most five minutes.
 fn model_call_budget() -> Duration {
-    (crate::tls::stream_idle() * 2).min(Duration::from_secs(300))
+    super::route_budget::call_budget(
+        (crate::tls::stream_idle() * 2).min(Duration::from_secs(300)),
+        super::route_budget::current().map(|b| b.cap),
+    )
+}
+
+/// One tool call, bounded (i1178a): never past the turn's end, and on a
+/// route that caps its turn never past the tool timeout either. A tool that
+/// does not finish is told to the model as a failed call, so the loop goes
+/// on (the model can answer from what it has) instead of waiting in silence.
+async fn bounded_tool<F: std::future::Future<Output = crate::tools::ToolResult>>(
+    call: &crate::tools::ToolCall,
+    ends_at: Instant,
+    conversation_id: &str,
+    fut: F,
+) -> crate::tools::ToolResult {
+    let bound = super::route_budget::tool_bound(
+        ends_at.saturating_duration_since(Instant::now()),
+        crate::tools::tool_timeout(),
+        super::route_budget::current().is_some(),
+    );
+    match tokio::time::timeout(bound, fut).await {
+        Ok(r) => r,
+        Err(_) => {
+            tracing::warn!(conversation_id, tool = %call.name, bound_secs = bound.as_secs(), "loop.tool_timeout");
+            crate::tools::ToolResult {
+                name: call.name.clone(),
+                tool_call_id: call.id.clone(),
+                success: false,
+                output: String::new(),
+                error: Some(format!(
+                    "the tool did not finish within {}s; answer from what you already have, or say it timed out",
+                    bound.as_secs()
+                )),
+            }
+        }
+    }
 }
 
 /// Stop before model call `iteration`? Always once `ends_at` has passed;
@@ -4479,7 +4676,7 @@ mod nudge_tests {
     fn a_nudge_is_labelled_as_the_harness_not_the_user() {
         let mut session = crate::session::Session::new("c1".into(), "dashboard".into());
         let mut history: Vec<&'static str> = Vec::new();
-        assert!(push_nudge_with_escalation(&mut session, &mut history, SHORT_SYNTHESIS_NUDGE).is_none());
+        assert!(push_nudge_with_escalation(&mut session, &mut history, SHORT_SYNTHESIS_NUDGE, "c1").is_none());
         let last = session.messages.last().expect("the nudge was pushed");
         assert_eq!(last["role"], "user", "the one role every backend accepts mid-turn");
         let content = last["content"].as_str().unwrap();
@@ -4491,9 +4688,9 @@ mod nudge_tests {
     fn the_third_identical_nudge_escalates_and_the_label_does_not_change_that() {
         let mut session = crate::session::Session::new("c1".into(), "dashboard".into());
         let mut history: Vec<&'static str> = Vec::new();
-        assert!(push_nudge_with_escalation(&mut session, &mut history, SHORT_SYNTHESIS_NUDGE).is_none());
-        assert!(push_nudge_with_escalation(&mut session, &mut history, SHORT_SYNTHESIS_NUDGE).is_none());
-        let stop = push_nudge_with_escalation(&mut session, &mut history, SHORT_SYNTHESIS_NUDGE)
+        assert!(push_nudge_with_escalation(&mut session, &mut history, SHORT_SYNTHESIS_NUDGE, "c1").is_none());
+        assert!(push_nudge_with_escalation(&mut session, &mut history, SHORT_SYNTHESIS_NUDGE, "c1").is_none());
+        let stop = push_nudge_with_escalation(&mut session, &mut history, SHORT_SYNTHESIS_NUDGE, "c1")
             .expect("three in a row stops the loop");
         assert!(stop.contains("3 times in a row"), "{stop}");
     }
@@ -4720,7 +4917,7 @@ mod request_size_tests {
     #[test]
     fn both_loop_paths_log_the_request_size() {
         let src = include_str!("agent_loop.rs").split("mod request_size_tests").next().unwrap();
-        for path in ["\"stream\");", "\"nonstream\");"] {
+        for path in ["\"stream\", &turn_conv);", "\"nonstream\", &turn_conv);"] {
             assert!(src.contains(&format!("log_request_size(&request_size(&session.messages, &tool_schemas, data_frame.as_deref(), max_input), &calib, tier, {path}")), "{path}");
         }
     }
@@ -5062,7 +5259,7 @@ mod window_tests {
         assert_eq!(own.matches("if let Some(line) = window_refusal.take() \u{7b}").count(), 2);
         assert_eq!(own.matches("let (evaluated_before, sent_estimate) =").count(), 2);
         let judged = own.matches("let evaluated = u64::from(usage.prompt_tokens.saturating_sub(evaluated_before));").count();
-        assert_eq!(own.matches("judge_call(rt, &mut usage, &backend, sent_estimate, evaluated, call_prefill_ms).await;").count(), judged);
+        assert_eq!(own.matches("judge_call(rt, &mut usage, &backend, sent_estimate, evaluated, call_prefill_ms, &turn_conv).await;").count(), judged);
         let added = own.matches("usage.prompt_tokens += ").count();
         assert_eq!((added, judged), (5, 3), "a new prompt-count site must be judged");
         let stream = crate::test_src::fn_body(&own, "async fn run_streaming_on_bound<");
@@ -5077,6 +5274,73 @@ mod window_tests {
         let judge = crate::test_src::fn_body(&own, "async fn judge_call<");
         assert!(judge.contains("CallRead::Cut if ollama =>") && judge.contains("note_backend_cut("), "only an Ollama is judged: {judge}");
         assert!(judge.contains("CallRead::Whole =>") && judge.contains("crate::chat_context::learn("), "{judge}");
+    }
+
+    #[test]
+    fn the_logged_conversation_id_is_bounded_and_plain() {
+        // Ids a turn really sends are logged as sent.
+        assert_eq!(log_conversation_id("cf-0123456789abcdef0123456789abcdef"), "cf-0123456789abcdef0123456789abcdef");
+        assert_eq!(log_conversation_id("3f2504e0-4f89-11d3-9a0c-0305e82c3301"), "3f2504e0-4f89-11d3-9a0c-0305e82c3301");
+        // Over-long: cut at the bound.
+        let long = "a".repeat(10_000);
+        assert_eq!(log_conversation_id(&long).chars().count(), LOG_CONVERSATION_ID_MAX);
+        // Control characters, quotes, spaces and `=`: never reach the line.
+        assert_eq!(log_conversation_id("x\n\r\t\"y\" z=1\u{1b}[0m"), "x____y__z_1__0m");
+        assert!(log_conversation_id("é✓\0").chars().all(|c| c == '_'));
+    }
+
+    /// A log reader attributes a turn's lines to one chat by the turn's
+    /// conversation id: every `backend_call`, `context_injected`,
+    /// `coordinator.kb_tool_deferred` and `loop.*` event names it. Reads each
+    /// `tracing::...!(...)` call whole, so a field on another event's line
+    /// does not count.
+    #[test]
+    fn turn_log_lines_carry_the_conversation_id() {
+        let own = crate::test_src::own_code(include_str!("agent_loop.rs"));
+        let mut seen = std::collections::BTreeMap::<&str, usize>::new();
+        for level in ["info", "warn"] {
+            let open = format!("tracing::{level}!(");
+            for (at, _) in own.match_indices(open.as_str()) {
+                let rest = &own[at + open.len()..];
+                let (mut depth, mut in_str, mut esc, mut end) = (1usize, false, false, None);
+                for (i, c) in rest.char_indices() {
+                    if in_str {
+                        match (esc, c) {
+                            (true, _) => esc = false,
+                            (false, '\\') => esc = true,
+                            (false, '"') => in_str = false,
+                            _ => {}
+                        }
+                        continue;
+                    }
+                    match c {
+                        '"' => in_str = true,
+                        '(' => depth += 1,
+                        ')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                end = Some(i);
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                let call = &rest[..end.expect("a tracing call closes")];
+                for name in ["\"backend_call\"", "\"context_injected\"", "\"request_size\"", "\"coordinator.kb_tool_deferred\"", "\"loop."] {
+                    if call.contains(name) {
+                        *seen.entry(name).or_default() += 1;
+                        assert!(call.contains("conversation_id"), "{name} without the conversation id: {call}");
+                    }
+                }
+            }
+        }
+        // Counts, so a renamed event or a moved emitter fails instead of passing empty.
+        assert_eq!(seen.get("\"backend_call\"").copied(), Some(1), "{seen:?}");
+        assert_eq!(seen.get("\"context_injected\"").copied(), Some(1), "{seen:?}");
+        assert_eq!(seen.get("\"request_size\"").copied(), Some(1), "{seen:?}");
+        assert_eq!(seen.get("\"coordinator.kb_tool_deferred\"").copied(), Some(3), "{seen:?}");
+        assert!(seen.get("\"loop.").copied().unwrap_or(0) >= 16, "{seen:?}");
     }
 
     /// The cut alert is one per backend per day, and a node harness may raise
@@ -5193,6 +5457,44 @@ mod node_restart_wiring {
         assert!(code.contains("if resend_whole_after_cut(&s, resent, Instant::now(), ends_at) {"), "the non-streaming loop re-sends a cut answer");
         let cluster = crate::test_src::own_code(include_str!("../routes/cluster.rs"));
         let dc = crate::test_src::fn_body(&cluster, "async fn desired_config_get(");
-        assert!(dc.contains("\"gateway_features\": [crate::node_restart::FEATURE],"), "the agent learns it may refuse with node_restarting");
+        assert!(dc.contains("\"gateway_features\": [crate::node_restart::FEATURE, "), "the agent learns it may refuse with node_restarting");
+    }
+}
+
+#[cfg(test)]
+mod bounded_tool_tests {
+    use super::*;
+
+    fn call() -> crate::tools::ToolCall {
+        crate::tools::ToolCall { id: "c1".into(), name: "slow_tool".into(), arguments: serde_json::json!({}) }
+    }
+
+    /// i1178a: a tool that never finishes is told to the model as a failed
+    /// call within the bound, instead of holding the turn in silence. On a
+    /// capped route the bound is the tool timeout even when the turn has
+    /// longer left.
+    #[tokio::test(start_paused = true)]
+    async fn a_tool_that_does_not_finish_becomes_a_failed_call() {
+        let budget = super::super::route_budget::RouteBudget::new(Duration::from_secs(240));
+        let r = super::super::route_budget::scope(
+            budget,
+            bounded_tool(&call(), Instant::now() + Duration::from_secs(600), "c1", async {
+                tokio::time::sleep(Duration::from_secs(100_000)).await;
+                unreachable!("the bound must end it")
+            }),
+        )
+        .await;
+        assert!(!r.success);
+        let e = r.error.expect("an error the model reads");
+        assert!(e.contains(&format!("{}s", crate::tools::tool_timeout().as_secs())), "{e}");
+        assert_eq!((r.name.as_str(), r.tool_call_id.as_str()), ("slow_tool", "c1"));
+    }
+
+    /// A tool that finishes is returned as it is.
+    #[tokio::test(start_paused = true)]
+    async fn a_tool_that_finishes_is_untouched() {
+        let done = crate::tools::ToolResult { name: "t".into(), tool_call_id: "c1".into(), success: true, output: "ok".into(), error: None };
+        let r = bounded_tool(&call(), Instant::now() + Duration::from_secs(600), "c1", async move { done }).await;
+        assert!(r.success && r.output == "ok");
     }
 }

@@ -46,8 +46,7 @@ const (
 	embedPullBatchMax = 4
 	// embedReserveSlots is held back for query-time /embed.
 	embedReserveSlots = 1
-	// embedFallbackSlots stands in for a backend that declares no slot count
-	// (TEI, for one): one bulk job at a time beside the reserved slot.
+	// embedFallbackSlots stands in for a backend that declares no slot count: one bulk job at a time beside the reserved slot.
 	embedFallbackSlots = 2
 )
 

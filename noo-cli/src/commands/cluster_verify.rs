@@ -40,10 +40,12 @@ mod image_family;
 mod off_by_choice;
 mod pg_memory;
 mod tempo;
+mod gguf_vouch;
 mod warmup;
 pub(crate) mod restart_loops;
 mod gpu_held;
 mod hf_hub;
+mod network_mount;
 mod key_bindings;
 pub(crate) mod rows;
 
@@ -493,6 +495,13 @@ pub(crate) fn node_checks(n: &Value, controller_tag: &str, cli_version: &str, no
         None => out.push(warn("peer identity", "not reported (older agent)", Some(format!("noo cluster provision {id} --wait")))),
     }
 
+    // 4c. The agent refuses calls addressed to another node (i1174), and
+    //     whether the controller has made it strict yet.
+    out.push(target_node_check(id, n, now_unix));
+    //     And the controller's own pin: the latest call for this node it
+    //     refused because the address answered as another node.
+    out.extend(node_identity_check(id, n, now_unix));
+
     // 5. The fleet signing key adopted. The CA-signed bundle lane is retired
     //    So a node that has not adopted takes nothing but a
     //    rollover — which every CA-signed bundle now is, so a provision
@@ -516,7 +525,7 @@ pub(crate) fn node_checks(n: &Value, controller_tag: &str, cli_version: &str, no
 
     // 6b. What the node's NEXT BOOT will do, from
     //     the facts noo-hostd reports as root.
-    out.extend(host_checks(id, &hostd["host"], hostd["alive"].as_bool() == Some(true)));
+    out.extend(host_checks_with(id, &hostd["host"], hostd["alive"].as_bool() == Some(true), onboard_holds_of(n).as_deref()));
 
     // 6c. Backend doors: every door-backed backend on
     //     the node has a leaf that names its door, and the agent records no
@@ -535,12 +544,18 @@ pub(crate) fn node_checks(n: &Value, controller_tag: &str, cli_version: &str, no
     out.extend(llamacpp_offload_check(n));
     out.extend(docker_engine_check(n));
     out.extend(vllm_compute_check(n));
+    out.extend(removed_engine_check(n));
+    out.extend(unplaced_backends_check(n));
     out.extend(hardened_images_check(n));
 
     // 6c''. Vendor telemetry (docs/security/telemetry.md): no running
     //       backend container lacks the switches that keep its vendor from
     //       phoning home (vLLM's stats.vllm.ai report above all).
     out.push(vendor_telemetry_check(n));
+    // 6c-mac. A Mac's native Ollama is its only Ollama lane (i1156): the
+    //         agent never starts an ollama container there, so a stopped
+    //         native Ollama is the whole reason nothing serves.
+    out.extend(native_ollama_check(id, n));
 
     // 6c-images. Backend images: no running backend container was created
     //            from a floating ref (`:latest` or untagged, no digest) — the
@@ -630,6 +645,7 @@ pub(crate) fn node_checks(n: &Value, controller_tag: &str, cli_version: &str, no
     out.extend(backend_caps_check(id, n));
     out.extend(agent_address_check(id, n));
     out.extend(ollama_models_check(id, n));
+    out.extend(gguf_vouch::gguf_verification_check(id, n));
     out.extend(harness_tasks_check(n));
     out.extend(harness_egress_check(id, n));
     settle_after_roll(n, &mut out);
@@ -660,6 +676,11 @@ pub(crate) fn backend_starts_check(id: &str, n: &Value) -> Option<Check> {
         let target = r["target"].as_str().unwrap_or("?");
         let remedy = match reason.find(SYNC) {
             Some(i) => reason[i..].split(['`', ';']).next().unwrap_or(SYNC).trim_end().to_string(),
+            // A Mac's native Ollama is down (agent NativeDownError): its own
+            // remedy, the text after the first ": ".
+            None if reason.starts_with("the native Ollama isn't") => {
+                format!("on {id}: {}", reason.split_once(": ").map_or(reason, |(_, r)| r))
+            }
             None if is_no_space_refusal(reason) => no_space_remedy(id, target),
             None => format!("noo cluster show {id}   # the node's refusal says why"),
         };
@@ -700,6 +721,9 @@ fn no_space_remedy(id: &str, target: &str) -> String {
 /// instead: a FAIL naming the node and the reason. No row when nothing was
 /// refused.
 pub(crate) fn agent_address_check(id: &str, n: &Value) -> Option<Check> {
+    if let Some(why) = n["ip_address_refused"].as_str().filter(|s| !s.is_empty()) {
+        return Some(ip_address_refused_check(id, n, why));
+    }
     let why = n["agent_url_refused"].as_str().filter(|s| !s.is_empty())?;
     let ip = n["ip_address"].as_str().unwrap_or("its registered address");
     Some(fail(
@@ -707,6 +731,30 @@ pub(crate) fn agent_address_check(id: &str, n: &Value) -> Option<Check> {
         format!("{id}: the gateway refused the agent_url this node reported ({why}); it dials https://{ip}:8081 instead"),
         format!("on {id}, set the agent's address (NODE_IP in /etc/noo-node-agent.env) to the address it is registered at, so it reports https://<that address>:<its port>"),
     ))
+}
+
+/// The `agent address` row for an address the gateway did not store
+/// (`ip_address_refused`, i1174): another node holds it, it is the
+/// controller's own, or the heartbeat came from a different tailnet
+/// address. The record keeps its last accepted address (or none: a first
+/// registration, or a stored address that is itself refused now). The next
+/// command follows the reason.
+fn ip_address_refused_check(id: &str, n: &Value, why: &str) -> Check {
+    let detail = match n["ip_address"].as_str().filter(|s| !s.is_empty()) {
+        Some(ip) => format!("{id}: the controller refused the address it reported ({why}) and keeps its previous address {ip}"),
+        None => format!("{id}: the controller did not store the address it reported ({why}); the controller reaches it over its bus or tunnel only"),
+    };
+    let next = if let Some((_, other)) = why.split_once(" is claimed by ") {
+        let other = other.trim();
+        format!("noo cluster verify {other}   # {other} holds that address; if {id} really moved there, its certificate must carry it: noo security pki push-nodes {id} --prove")
+    } else if why.ends_with("is the controller's own address") {
+        format!("on {id}, set NODE_IP in /etc/noo-node-agent.env to {id}'s own address")
+    } else if let Some((peer, _)) = why.strip_prefix("the heartbeat came from tailnet address ").and_then(|r| r.split_once(", not ")) {
+        format!("on {id}, set NODE_IP in /etc/noo-node-agent.env to {peer}, the tailnet address it calls from")
+    } else {
+        format!("noo cluster logs {id}")
+    };
+    fail("agent address", detail, next)
 }
 
 /// The `backend caps` row (#1283): the capability set a node's backend
@@ -824,7 +872,7 @@ pub(crate) fn model_stores_check(id: &str, n: &Value) -> Option<Check> {
     let guard = |store: &str| match store {
         "hf_cache" => "HF weights are verified against the controller's manifest at each backend start, on a placed node only",
         "models" => "GGUF files are hashed against the controller's manifest at each start on a placed node, only when it has one",
-        "ollama" => "Ollama models are checked against the controller's record about every 10 minutes and at backend start, when it holds one (the `ollama models` row); a hand pull is not",
+        "ollama" => "Ollama models are checked against the controller's record every 10 to 15 minutes (on the agent's 5-minute reconcile tick, once 10 minutes have passed since the model's last check) and at backend start, when it holds one (the `ollama models` row); a hand pull is not",
         _ => "anyone can rename or replace the stores under it",
     };
     let mut parts = Vec::new();
@@ -1059,10 +1107,13 @@ pub(crate) fn harness_egress_check(id: &str, n: &Value) -> Option<Check> {
     }
     let h = &n["host_services"]["harness"];
     let e = &h["egress"];
+    // No harness running here, no row: a stopped harness is right on a node
+    // that serves no chat model (policy `auto`), and the agent reports an
+    // egress object for any installed unit, running or not.
+    if h["state"].as_str() != Some("running") {
+        return None;
+    }
     if !e.is_object() {
-        if h["state"].as_str() != Some("running") {
-            return None;
-        }
         return Some(match h["runtime"].as_str() {
             Some(rt) if rt != "systemd" => warn(NAME, format!(
                 "no egress hold on {rt}: the hold is systemd-only, so this node's harness runs with nothing holding it off the internet"), None),
@@ -1072,10 +1123,16 @@ pub(crate) fn harness_egress_check(id: &str, n: &Value) -> Option<Check> {
     }
     let reason = e["reason"].as_str().unwrap_or("");
     let stale: Vec<&str> = e["stale_hosts"].as_array().map(|a| a.iter().filter_map(|v| v.as_str()).collect()).unwrap_or_default();
+    // From a harness that re-checks every minute: how old its latest check is.
+    let age = e["checked_age_secs"].as_i64().map(|a| format!(" (checked {a}s ago)")).unwrap_or_default();
     Some(match e["state"].as_str() {
+        Some("enforced") if stale.is_empty() && e["resolv_held"].as_bool() == Some(false) => warn(NAME, format!(
+            "held off the internet{age}, but the harness's private resolv.conf was replaced by the host's (a host resolver rewrote its file); its allow list still denies every resolver, so nothing leaks; a restart of the harness restores the file"), None),
         Some("enforced") if stale.is_empty() => ok(NAME, format!(
-            "held off the internet: deny {}, unit resolver; the harness's own check from inside the unit: lookup {}, connect {}",
+            "held off the internet{age}: deny {}, unit resolver; the harness's own check from inside the unit: lookup {}, connect {}",
             e["ip_deny"].as_str().unwrap_or("?"), e["lookup"].as_str().unwrap_or("?"), e["connect"].as_str().unwrap_or("?"))),
+        Some("stale") => fail(NAME, format!("{reason}; the harness takes no work it cannot reach the gateway for"),
+            format!("noo cluster provision {id}   # re-renders the hosts file and the allow list from the controller's current address")),
         Some("enforced") => fail(NAME, format!(
             "held off the internet, but {} changed address since the harness's hosts file was rendered: the harness cannot reach its controller (it never falls back to real DNS)",
             stale.join(", ")), format!("noo cluster provision {id}   # re-renders the hosts file and the allowlist")),
@@ -1574,18 +1631,24 @@ pub(crate) fn llamacpp_offload_check(n: &Value) -> Option<Check> {
     (!good.is_empty()).then(|| ok(NAME, good.join(", ")))
 }
 
-/// The oldest Docker Engine (major version) the project tests: CI's
-/// copy-owner job runs docker:27-dind. The one declared minimum: the
-/// `docker engine` verify row reads it, and docs/cli/fleet.md names it. The
-/// operator decides it (i1058); raise it here and nowhere else.
-pub(crate) const MIN_DOCKER_ENGINE_MAJOR: u64 = 27;
+/// The oldest Docker Engine (major version) noomesh supports: 28, the
+/// operator's decision of 2026-11-21 (was 27, i1058). CI's copy-owner job
+/// still runs docker:27-dind, as a canary BELOW this floor for the
+/// copy-owner bug of Engine 24-27 (#1387). The one declared minimum: the
+/// `docker engine` verify row reads it, and docs/cli/fleet.md names it.
+/// Below it is a verify WARN, never a refusal. Raise it here and nowhere else.
+pub(crate) const MIN_DOCKER_ENGINE_MAJOR: u64 = 28;
 
 /// The `docker engine` row (i1058), from the node's `docker_engine` fact.
 /// No row from an agent that predates the fact (a fleet mid-roll stays
-/// quiet). `none` (no Docker, a native-only node) is OK. `unreadable` is a
-/// WARN: the engine is there and could not be checked. A known Docker Engine
-/// below [`MIN_DOCKER_ENGINE_MAJOR`] is a WARN naming the upgrade; at or above
-/// it, OK. Podman's compat API is reported, not compared: its version is
+/// quiet). `none` (Docker not installed, a native-only node) is OK. `down`
+/// (installed, its daemon's socket gone: a clean stop deletes it) is a WARN
+/// naming what showed it installed, a FAIL when the node has a container-lane
+/// backend placed or running ([`container_lane_backends`]: containers cannot
+/// run without the daemon), and OK on darwin, whose backends are native.
+/// `unreadable` is a WARN: the engine is there and could not be checked. A
+/// known Docker Engine below [`MIN_DOCKER_ENGINE_MAJOR`] is a WARN naming the
+/// upgrade; at or above it, OK. Podman's compat API is reported, not compared: its version is
 /// Podman's, not a Docker Engine's.
 pub(crate) fn docker_engine_check(n: &Value) -> Option<Check> {
     const NAME: &str = "docker engine";
@@ -1600,6 +1663,21 @@ pub(crate) fn docker_engine_check(n: &Value) -> Option<Check> {
     };
     match state {
         "none" => Some(ok(NAME, "no Docker on this node (native backends only)")),
+        "down" => {
+            let os = n["os"].as_str().or_else(|| n["hostd"]["host"]["os"].as_str());
+            if os == Some("darwin") {
+                return Some(ok(NAME, format!("Docker Desktop is installed on {id} but not running (not needed: its backends are native)")));
+            }
+            let by = e.get("installed_by").and_then(Value::as_str).unwrap_or("what showed it was not given");
+            let detail = format!("Docker is installed on {id} but its daemon is not answering ({by})");
+            let remedy = format!("on {id} (run on that machine, with sudo): sudo systemctl start docker   # then, from the controller: noo cluster verify {id}");
+            let containers = container_lane_backends(n);
+            if containers.is_empty() {
+                Some(warn(NAME, detail, Some(remedy)))
+            } else {
+                Some(fail(NAME, format!("{detail}; its container-lane backend(s) {} cannot run without it", containers.join(", ")), remedy))
+            }
+        }
         "unreadable" => Some(cannot(e.get("error").and_then(Value::as_str).unwrap_or("no error given").to_string())),
         "ok" if kind == "podman" => Some(ok(NAME, format!("Podman {version} (Docker-compatible API; not compared with the Docker Engine minimum {MIN_DOCKER_ENGINE_MAJOR})"))),
         "ok" => {
@@ -1609,7 +1687,7 @@ pub(crate) fn docker_engine_check(n: &Value) -> Option<Check> {
                 Some(m) if m >= MIN_DOCKER_ENGINE_MAJOR => Some(ok(NAME, format!("{label} (minimum {MIN_DOCKER_ENGINE_MAJOR})"))),
                 Some(_) => Some(warn(NAME,
                     format!("{label} on {id} is below {MIN_DOCKER_ENGINE_MAJOR}, the oldest Docker Engine noomesh tests; known: a container-lane Ollama import fails on an engine below 28 with an agent before 0.6.28"),
-                    Some(format!("upgrade Docker Engine on {id} to {MIN_DOCKER_ENGINE_MAJOR} or newer (https://docs.docker.com/engine/install/), then: noo cluster verify {id}")))),
+                    Some(docker_engine_upgrade_remedy(id, kind)))),
                 None => Some(cannot(format!("version {version:?} does not parse"))),
             }
         }
@@ -1617,15 +1695,54 @@ pub(crate) fn docker_engine_check(n: &Value) -> Option<Check> {
     }
 }
 
-/// The oldest Docker Compose the project tests: CI's `start-inputs` job
+/// The container-lane backends a node has placed (the agent's `lanes`) or
+/// running (`running_backends`): every one whose `backend_runtimes` entry is
+/// not `native`. Sorted, each once. The `docker engine` row FAILs a node whose
+/// daemon is down while this is not empty.
+pub(crate) fn container_lane_backends(n: &Value) -> Vec<String> {
+    let mut names: Vec<&str> = Vec::new();
+    if let Some(lanes) = n["lanes"].as_array() {
+        names.extend(lanes.iter().filter_map(|l| l["backend"].as_str()));
+    }
+    match &n["running_backends"] {
+        Value::Object(m) => names.extend(m.keys().map(String::as_str)),
+        Value::Array(a) => names.extend(a.iter().filter_map(Value::as_str)),
+        _ => {}
+    }
+    let mut out: Vec<String> = names
+        .into_iter()
+        .map(str::trim)
+        .filter(|b| !b.is_empty() && n["backend_runtimes"][*b].as_str() != Some("native"))
+        .map(str::to_string)
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// What to run on a node whose Docker Engine is below
+/// [`MIN_DOCKER_ENGINE_MAJOR`]. The heartbeat names the engine's kind, not the
+/// distro, so a Linux `dockerd` gets both supported routes: Docker's apt
+/// repository (docker-ce) and Docker's convenience script, as a file first
+/// (src/vendor.rs: never `curl … | sh`).
+pub(crate) fn docker_engine_upgrade_remedy(id: &str, kind: &str) -> String {
+    let min = MIN_DOCKER_ENGINE_MAJOR;
+    if kind == "docker-desktop" {
+        return format!("update Docker Desktop on {id} until its engine is {min} or newer, then: noo cluster verify {id}");
+    }
+    format!("upgrade Docker Engine on {id} to {min} or newer with the package manager, from the package that installed it: Docker's apt repository, sudo apt-get update && sudo apt-get install --only-upgrade docker-ce docker-ce-cli containerd.io docker-compose-plugin; or the distribution's own package, sudo apt-get update && sudo apt-get install --only-upgrade docker.io (only if the release ships {min} or newer); otherwise Docker's convenience script, downloaded then run (never piped): curl -fsSL --proto '=https' --tlsv1.2 https://get.docker.com -o get-docker.sh && sudo sh get-docker.sh (https://docs.docker.com/engine/install/); then: noo cluster verify {id}")
+}
+
+/// The oldest Docker Compose noomesh supports: 2.33.0, the Compose that Docker
+/// Engine 28 bundles (the operator's decision of 2026-11-21, with
+/// [`MIN_DOCKER_ENGINE_MAJOR`]; was 2.24.6). CI's `start-inputs` job
 /// (`.github/workflows/start-inputs.yml`) runs the launcher's real `up` path
-/// on the runner's Compose and on 2.24.6, Ubuntu 24.04's `docker-compose-v2`
-/// and the oldest Compose the documented install route gives (green on both
-/// in run 44668278238). The twin of [`MIN_DOCKER_ENGINE_MAJOR`], and the one
-/// declared minimum: the controller's `docker compose` verify row and `noo
-/// onboard`'s Docker probe read it, and docs/getting-started/install.md names
-/// it. The operator decides it; raise it here and nowhere else.
-pub(crate) const MIN_COMPOSE: (u32, u32, u32) = (2, 24, 6);
+/// on the runner's Compose, on this floor, and on 2.24.6 (Ubuntu 24.04's
+/// release-pocket `docker-compose-v2`) as a canary below it. The one declared
+/// minimum: the controller's `docker compose` verify row and `noo onboard`'s
+/// Docker probe read it, and docs/getting-started/install.md names it. Below
+/// it is a WARN, never a refusal. Raise it here and nowhere else.
+pub(crate) const MIN_COMPOSE: (u32, u32, u32) = (2, 33, 0);
 
 /// What `docker compose version --short` said on this machine. Compose runs
 /// only on the controller (the stack launcher); workers use the node agent's
@@ -1640,10 +1757,13 @@ pub(crate) enum ComposeVersion {
     Unreadable(String),
 }
 
-/// `2.24.6`, `v2.38.2`, `2.29.1-desktop.1` -> the three numbers. Anything
-/// else (empty, garbage, two parts) is `None`.
+/// `2.24.6`, `v2.38.2`, `v5.0.2`, `2.29.1-desktop.1`,
+/// `2.40.3+ds1-0ubuntu1~22.04.1` (Ubuntu's package), or the whole line
+/// `Docker Compose version v5.0.2` -> the three numbers: the last word, a
+/// leading `v` dropped, everything from the first `-` or `+` ignored.
+/// Anything else (empty, garbage, two parts) is `None`.
 pub(crate) fn parse_compose_version(text: &str) -> Option<(u32, u32, u32)> {
-    let t = text.trim();
+    let t = text.split_whitespace().next_back().unwrap_or("");
     let t = t.strip_prefix('v').unwrap_or(t);
     let core = t.split(['-', '+']).next().unwrap_or("");
     let mut parts = core.split('.').map(|p| p.parse::<u32>().ok());
@@ -1689,31 +1809,39 @@ pub(crate) fn read_compose_version(docker: &str) -> ComposeVersion {
     }
 }
 
-/// The plain-sentence remedy for a Compose below [`MIN_COMPOSE`]: noomesh
-/// cannot install it for the operator.
-pub(crate) fn compose_upgrade_remedy() -> String {
-    "upgrade the docker-compose-v2 package (or docker-compose-plugin from Docker's apt repository, or Docker Desktop), then: docker compose version".to_string()
+/// The remedy for a Compose below [`MIN_COMPOSE`], for this machine's package
+/// (onboard's `compose_package`: `docker-compose-plugin` from Docker's apt
+/// repository, `docker-compose-v2` from the distro, `None` off the Debian
+/// family). noomesh cannot install it for the operator.
+pub(crate) fn compose_upgrade_remedy(pkg: Option<&str>) -> String {
+    let min = min_compose_text();
+    match pkg {
+        Some("docker-compose-plugin") => format!("upgrade the docker-compose-plugin package to {min} or newer: sudo apt-get update && sudo apt-get install --only-upgrade docker-compose-plugin, then: docker compose version"),
+        Some(p) => format!("upgrade the {p} package to {min} or newer: sudo apt-get update && sudo apt-get install --only-upgrade {p}; if the distro's stays below {min}, install docker-compose-plugin from Docker's apt repository (https://docs.docker.com/engine/install/), then: docker compose version"),
+        None => format!("upgrade the Docker Compose v2 plugin (or Docker Desktop) to {min} or newer (https://docs.docker.com/compose/install/linux/), then: docker compose version"),
+    }
 }
 
-/// `"2.24.6"` from [`MIN_COMPOSE`].
+/// `"2.33.0"` from [`MIN_COMPOSE`].
 pub(crate) fn min_compose_text() -> String {
     format!("{}.{}.{}", MIN_COMPOSE.0, MIN_COMPOSE.1, MIN_COMPOSE.2)
 }
 
-/// The controller's `docker compose` row. Below [`MIN_COMPOSE`]: WARN, a
-/// declared floor and not a known failure (2.24.x does run the launcher; it
-/// recreates more dependents on a secret change). `Unreadable`: WARN,
-/// `cannot be checked`. `Missing` (no Compose v2): FAIL, as onboard's probe and
-/// the launcher's `require_compose_v2` refuse, with `none_remedy` (the
-/// package to install, from onboard). At or above: OK.
-pub(crate) fn docker_compose_check(v: &ComposeVersion, none_remedy: &str) -> Check {
+/// The controller's `docker compose` row. Below [`MIN_COMPOSE`]: WARN with
+/// `upgrade_remedy` ([`compose_upgrade_remedy`] for this machine), a declared
+/// floor and not a known failure (2.24.x does run the launcher; it recreates
+/// more dependents on a secret change). `Unreadable`: WARN, `cannot be
+/// checked`. `Missing` (no Compose v2): FAIL, as onboard's probe and the
+/// launcher's `require_compose_v2` refuse, with `none_remedy` (the package to
+/// install, from onboard). At or above: OK.
+pub(crate) fn docker_compose_check(v: &ComposeVersion, none_remedy: &str, upgrade_remedy: &str) -> Check {
     const NAME: &str = "docker compose";
     let min = min_compose_text();
     match v {
         ComposeVersion::Known(ver, text) if *ver >= MIN_COMPOSE => ok(NAME, format!("Docker Compose {text} (minimum {min})")),
         ComposeVersion::Known(_, text) => warn(NAME,
             format!("Docker Compose {text} is older than the oldest version noomesh tests ({min})"),
-            Some(compose_upgrade_remedy())),
+            Some(upgrade_remedy.to_string())),
         ComposeVersion::Unreadable(why) => warn(NAME,
             format!("cannot be checked: the Docker Compose version could not be read ({why})"),
             Some("docker compose version   # does the Compose v2 plugin answer?".to_string())),
@@ -1771,6 +1899,133 @@ pub(crate) fn vllm_compute_check(n: &Value) -> Option<Check> {
         format!("{id}: {} placed, but {}; its GPU is compute {c}", placed.join(", "), crate::vllm_floor::needs()),
         format!("noo cluster unplace {id} {backend}   # then: noo cluster place {id} ollama <model> (Ollama runs this GPU), or llamacpp"),
     ))
+}
+
+/// The placements of a node's desired config that use the TEI engine, which
+/// 0.6.30 no longer supports (i1182a): every `embedding` placement, and every `reranker`
+/// whose model is not a `.gguf` file or whose image is the TEI one. Each is
+/// `{"backend", "model"}`. The same rule as the gateway's refusal.
+pub(crate) fn removed_engine_placements(placements: &Value) -> Vec<Value> {
+    placements
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter(|p| {
+                    let model = p["model"].as_str().unwrap_or("").trim();
+                    let tei_image = p["image"].as_str().is_some_and(|i| i.to_ascii_lowercase().contains("text-embeddings-inference"));
+                    match p["backend"].as_str() {
+                        Some("embedding") => true,
+                        Some("reranker") => tei_image || (!model.is_empty() && !model.to_ascii_lowercase().ends_with(".gguf")),
+                        _ => false,
+                    }
+                })
+                .map(|p| serde_json::json!({"backend": p["backend"], "model": p["model"].as_str().unwrap_or("")}))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The `unsupported engine` row: the node's desired state holds a placement that
+/// uses the TEI engine (`removed_engine_placements`, injected by
+/// `with_harness_wanted` from desired-config). WARN for each, naming the
+/// replacement (an Ollama embedder, or the GGUF reranker) and the unplace of
+/// the old one; OK when none. No row when desired-config could not be read:
+/// "none" would then be a guess.
+pub(crate) fn removed_engine_check(n: &Value) -> Option<Check> {
+    const NAME: &str = "unsupported engine";
+    let id = n["id"].as_str().unwrap_or("?");
+    let found = n["removed_engine_placements"].as_array()?;
+    if found.is_empty() {
+        return Some(ok(NAME, "no placement uses an unsupported engine"));
+    }
+    let mut lines: Vec<String> = Vec::new();
+    let mut remedies: Vec<String> = Vec::new();
+    for p in found {
+        let backend = p["backend"].as_str().unwrap_or("?");
+        let model = p["model"].as_str().unwrap_or("");
+        let replace = if backend == "embedding" {
+            format!("noo cluster place {id} ollama <model> --role embed")
+        } else {
+            format!("noo cluster place {id} reranker <file>.gguf")
+        };
+        let who = if model.is_empty() { format!("{id} {backend}") } else { format!("{id} {backend} {model}") };
+        lines.push(format!("{who}: uses the TEI engine, which was removed in 0.6.30; nothing runs for this placement; replace it, then unplace it: {replace} && `noo cluster unplace {id} {backend}`"));
+        remedies.push(format!("{replace} && noo cluster unplace {id} {backend}"));
+    }
+    remedies.dedup();
+    Some(warn(NAME, lines.join("; "), Some(remedies.join("; "))))
+}
+
+/// The `unplaced backends` row, from the agent's `orphan_backends` and
+/// `reaped_backends` (node-agent-go internal/backendreap). The agent removes a
+/// backend container only after an explicit unplace; a container it owns that
+/// no placement wants and no unplace names is reported, never removed: WARN,
+/// "`<backend>` is running on `<node>` with no placement", with the stop (or
+/// the place). A container removed on an unplace in the last 24 h is a note.
+/// No row when the agent reports neither (an agent that predates them, or
+/// one that has not judged yet).
+pub(crate) fn unplaced_backends_check(n: &Value) -> Option<Check> {
+    const NAME: &str = "unplaced backends";
+    let id = n["id"].as_str().unwrap_or("?");
+    let orphans = n["orphan_backends"].as_array();
+    let reaped = n["reaped_backends"].as_array();
+    if orphans.is_none() && reaped.is_none() {
+        return None;
+    }
+    let notes: Vec<String> = reaped
+        .into_iter()
+        .flatten()
+        .map(|r| format!("stopped `{}` on `{id}`: unplaced at `{}`", r["backend"].as_str().unwrap_or("?"), r["unplaced_at"].as_str().unwrap_or("?")))
+        .collect();
+    let running: Vec<&str> = orphans.into_iter().flatten().filter_map(|o| o["backend"].as_str()).collect();
+    if running.is_empty() {
+        let mut detail = "no backend container runs without a placement".to_string();
+        if !notes.is_empty() {
+            detail = format!("{detail}; {}", notes.join("; "));
+        }
+        return Some(ok(NAME, detail));
+    }
+    let mut lines: Vec<String> = running.iter().map(|b| format!("`{b}` is running on `{id}` with no placement")).collect();
+    lines.extend(notes);
+    let remedy = running
+        .iter()
+        .map(|b| format!("noo cluster stop-backend {id} {b}   # or place it: noo cluster place {id} {b} <model>"))
+        .collect::<Vec<_>>()
+        .join("; ");
+    Some(warn(NAME, lines.join("; "), Some(remedy)))
+}
+
+/// The `unsupported engine space` row: an embedding space whose model no node
+/// serves and that names a Hugging Face repo id (`org/name`), the shape a
+/// TEI-served model has and an Ollama tag does not. Searches over its existing
+/// vectors still work; embed writes are refused until a node serves the model
+/// or the space is migrated. WARN naming the migrate command. `body` is
+/// `/api/cluster/embedding-spaces`; unreadable (None) gives no row, as that
+/// is already the `embedding spaces` row's WARN. This is a heuristic on the
+/// recorded model name: the gateway does not record which engine served it.
+pub(crate) fn removed_engine_space_check(body: Option<&Value>) -> Option<Check> {
+    const NAME: &str = "unsupported engine space";
+    let spaces = body?["spaces"].as_array()?;
+    let stale: Vec<(&str, &str)> = spaces
+        .iter()
+        .filter(|s| s["live"].as_u64().unwrap_or(0) + s["static_live"].as_u64().unwrap_or(0) == 0)
+        .filter_map(|s| Some((s["space"].as_str()?, s["model"].as_str()?)))
+        .filter(|(_, m)| m.contains('/') && !m.starts_with("hf.co/"))
+        .collect();
+    if stale.is_empty() {
+        return Some(ok(NAME, "no embedding space is bound to a model only an unsupported engine served"));
+    }
+    let detail = stale
+        .iter()
+        .map(|(sp, m)| format!("space {sp} model {m}: no node serves this model, and it is a Hugging Face id (the kind only the TEI engine, since removed, served); embed writes are refused until a node serves it or the space is migrated: `noo cluster embedding-space migrate {sp} <model>`"))
+        .collect::<Vec<_>>()
+        .join("; ");
+    let remedy = stale
+        .iter()
+        .map(|(sp, _)| format!("noo cluster embedding-space migrate {sp} <model>"))
+        .collect::<Vec<_>>()
+        .join("; ");
+    Some(warn(NAME, detail, Some(remedy)))
 }
 
 /// The hardened image of ours that replaces an upstream backend image
@@ -2025,6 +2280,9 @@ pub(crate) fn vendor_telemetry_check(n: &Value) -> Check {
     let mut unmanaged_set: Vec<String> = Vec::new();
     let mut unmanaged_missing: Vec<(String, &'static str)> = Vec::new();
     let mut mac_ollama = false;
+    // The native ollama's plist is a boot service (root's, enroll since
+    // i1156): the agent cannot edit it, so the remedy is sudo.
+    let mut mac_system = false;
     for (b, entry) in bc {
         // A Mac's native ollama (node-agent-go backendrt/ollama_telemetry.go):
         // `managed: false` = no brew plist, so nothing here may touch or judge it.
@@ -2062,11 +2320,19 @@ pub(crate) fn vendor_telemetry_check(n: &Value) -> Check {
                 } else {
                     problems.push(format!("{b} lacks {}", names.join(", ")));
                     mac_ollama |= entry["runtime"].as_str() == Some("native");
+                    mac_system |= entry["plist_domain"].as_str() == Some("system");
                 }
             }
         }
     }
-    let remedy = if mac_ollama {
+    let remedy = if mac_ollama && mac_system {
+        "on the Mac: L=sh.brew.ollama; [ -f /Library/LaunchDaemons/$L.plist ] || L=homebrew.mxcl.ollama; \
+         P=/Library/LaunchDaemons/$L.plist; \
+         sudo plutil -insert EnvironmentVariables -dictionary $P 2>/dev/null; \
+         sudo plutil -replace EnvironmentVariables.OLLAMA_NO_CLOUD -string 1 $P; \
+         sudo launchctl bootout system/$L; sudo launchctl bootstrap system $P   \
+         # or run `noo enroll --resume`; the agent cannot edit a boot service's plist".to_string()
+    } else if mac_ollama {
         // Either brew label (sh.brew.ollama is current Homebrew), and the
         // domain launchd actually holds the job in (user/<uid> on a headless
         // Mac over SSH, where gui/<uid> answers 125).
@@ -2117,6 +2383,68 @@ pub(crate) fn vendor_telemetry_check(n: &Value) -> Check {
         return ok(NAME, parts.join("; "));
     }
     ok(NAME, format!("{}: every vendor telemetry switch set", proven.join(", ")))
+}
+
+/// The boot-service command that starts a Mac's native Ollama as the node's
+/// user (node-agent-go backendrt `OllamaBootServiceCmd`, keep in lockstep).
+/// `--sudo-service-user` makes Homebrew write `UserName` into the system
+/// plist; without it a root `brew services start` runs Ollama as root, with
+/// root's home and an empty model store.
+pub(crate) const MAC_OLLAMA_START: &str = "sudo HOMEBREW_NO_ANALYTICS=1 brew services start --sudo-service-user \"$USER\" ollama";
+
+/// A heartbeat's `backend_containers.ollama` entry that is a Mac's native
+/// Ollama: runtime `native` (the agent's OllamaGuard report, darwin only) on
+/// a node whose `os` is darwin (an agent that does not report `os` is judged
+/// by the runtime alone).
+fn is_darwin_native_ollama(n: &Value, entry: &Value) -> bool {
+    entry["runtime"].as_str() == Some("native") && n["os"].as_str().is_none_or(|os| os == "darwin")
+}
+
+/// The `native ollama` row (followup i1156). On a Mac the native Ollama is
+/// the only Ollama lane: the agent refuses an ollama container there. The
+/// heartbeat's `backend_containers.ollama.running` says whether it answers on
+/// 127.0.0.1:11434; `binary_present` (newer agents, sent only while it is not
+/// running) picks the remedy: start the boot service, or install Ollama
+/// first. FAIL when it is not running; WARN when it runs from a per-user
+/// LaunchAgent (`plist_domain: user`: not a boot service yet); OK otherwise;
+/// no row off a Mac.
+pub(crate) fn native_ollama_check(id: &str, n: &Value) -> Option<Check> {
+    const NAME: &str = "native ollama";
+    let entry = &n["backend_containers"]["ollama"];
+    if !is_darwin_native_ollama(n, entry) {
+        return None;
+    }
+    if entry["running"].as_bool() != Some(false) {
+        // Serving, but from a per-user LaunchAgent (a Mac enrolled before
+        // i1156): it starts only at that user's login, so a rebooted headless
+        // Mac has an agent and no Ollama. Nothing on a roll fixes it: the
+        // root applier never runs Homebrew as root (node_fetch.rs, H2), so
+        // the remedy is the Mac's own `noo enroll --resume`, never
+        // `provision`. An agent that does not report `plist_domain` is not
+        // judged on it.
+        return Some(match entry["plist_domain"].as_str() {
+            Some("user") => warn(
+                NAME,
+                format!("{id}: serving on 127.0.0.1:11434, but not a boot service yet (a per-user LaunchAgent: it starts only at a login, so after a reboot or a power cut nothing serves Ollama until someone logs in)"),
+                Some(format!("on {id}, once, as the node's user: `noo enroll --resume` (registers it as a boot service run as that user, keeps its model store; asks for sudo, no new token)")),
+            ),
+            Some("system") => ok(NAME, "serving on 127.0.0.1:11434 as a boot service"),
+            _ => ok(NAME, "serving on 127.0.0.1:11434"),
+        });
+    }
+    let launcher = entry["launcher"].as_str().unwrap_or("none");
+    if entry["binary_present"].as_bool() == Some(false) {
+        return Some(fail(
+            NAME,
+            format!("{id}: the native Ollama isn't installed on this Mac, so nothing serves Ollama there (the agent never runs it in a container on a Mac)"),
+            format!("on {id}: install it: `HOMEBREW_NO_ANALYTICS=1 brew install ollama`, then start it with `{MAC_OLLAMA_START}` (a boot service), or run `noo enroll --resume`"),
+        ));
+    }
+    Some(fail(
+        NAME,
+        format!("{id}: the native Ollama isn't running on this Mac (nothing answers on 127.0.0.1:11434; launcher: {launcher}), so nothing serves Ollama there"),
+        format!("on {id}: start it with `{MAC_OLLAMA_START}` (a boot service), or run `noo enroll --resume`"),
+    ))
 }
 
 /// A leaf inside this window fails the row: the next backend recreate
@@ -2405,8 +2733,22 @@ pub(crate) fn data_root_policy_row(n: &Value) -> Option<Check> {
     let pol = n.get("data_roots")?.get("policy")?;
     let id = n["id"].as_str().unwrap_or("?");
     let root = n["data_roots"]["noo_data_root"].as_str().unwrap_or("<root>");
+    // What the agent reads the root as (i1160): a boot-time mount (fstab or a
+    // systemd mount unit), a disk recorded at a known-good start, or a plain
+    // directory. Older agents do not say; then nothing is shown.
+    let kind = data_root_kind(&pol["filesystem"]);
+    // A disk that arrived over a root the node had already written to: those
+    // entries are under the mount now (the agent's count at its first look).
+    let hidden = data_root_hidden_note(&pol["filesystem"]);
+    // "Cannot tell" (an unreadable mount table, fstab or unit directory): the
+    // agent refuses nothing for it and says why; so does the row.
+    let hidden = match pol["filesystem"]["not_checked"].as_str() {
+        Some(why) if !why.is_empty() => format!("{hidden}; not checked: {why}"),
+        _ => hidden,
+    };
     if pol["ok"].as_bool() == Some(true) {
-        return Some(ok(NAME, format!("{root}: dedicated, conventional and owned by the agent")));
+        let k = kind.as_deref().map(|k| format!("; {k}")).unwrap_or_default();
+        return Some(ok(NAME, format!("{root}: dedicated, conventional and owned by the agent{k}{hidden}")));
     }
     let probs: Vec<&Value> = pol["problems"].as_array().map(|a| a.iter().collect()).unwrap_or_default();
     let codes: Vec<&str> = probs.iter().filter_map(|p| p["code"].as_str()).collect();
@@ -2427,6 +2769,8 @@ pub(crate) fn data_root_policy_row(n: &Value) -> Option<Check> {
     } else if self_owned_by_operator {
         "noo onboard --only services (declares your data root to the agent in /etc/noo/data-root-owner; asks for sudo once)"
             .to_string()
+    } else if only_ownership && codes.contains(&"missing") {
+        data_root_missing_remedy(id, root, pol["filesystem"]["meant"].as_str())
     } else if only_ownership {
         format!("on {id}: sudo install -d -o noo-agent -g noo-agent {root} && sudo chmod go-w {root}")
     } else {
@@ -2438,8 +2782,84 @@ pub(crate) fn data_root_policy_row(n: &Value) -> Option<Check> {
         };
         format!("noo cluster set-config {id} --data-root {target} && noo cluster provision {id} --move-data --wait")
     };
-    let msg = format!("{root}: {detail}");
+    let msg = match &kind {
+        Some(k) => format!("{root} [{k}]: {detail}{hidden}"),
+        None => format!("{root}: {detail}{hidden}"),
+    };
+    // Refused in warn mode too (the agent's safety problems, i1160): a root
+    // that does not answer, or whose mount is not there.
+    if codes.contains(&"not_answering") {
+        // The agent's detail already leads with the phrase; say it once.
+        let lead = format!("data root {root} not answering: ");
+        let rest = detail.strip_prefix(lead.as_str()).unwrap_or(detail.as_str());
+        return Some(fail(NAME, format!("{lead}{rest}"), data_root_hung_remedy(id, root)));
+    }
+    if codes.iter().any(|c| matches!(*c, "not_on_recorded_fs" | "mount_missing")) {
+        let mut r = data_root_mount_remedy(id, root);
+        // Only a DIFFERENT disk can have been replaced on purpose; a root back
+        // on the root filesystem is a missing mount, never re-recorded.
+        if codes.contains(&"not_on_recorded_fs") && detail.contains("on a different filesystem") {
+            r.push_str(&format!("; only if the disk was replaced or the root moved ON PURPOSE: on {id}: sudo rm {DATA_ROOT_FS_RECORD} (the agent records the new filesystem at its next check)"));
+        }
+        return Some(fail(NAME, msg, r));
+    }
     Some(if pol["mode"] == "enforce" { fail(NAME, msg, remedy) } else { warn(NAME, msg, Some(remedy)) })
+}
+
+/// `data_roots.policy.filesystem` as the row shows it: "mount (fstab)",
+/// "mount (systemd unit)", "mount (recorded)", "directory"; None when the
+/// agent does not say (older agents, or not Linux).
+fn data_root_kind(fs: &Value) -> Option<String> {
+    match (fs["meant"].as_str()?, fs["by"].as_str().unwrap_or("")) {
+        ("mount", "") => Some("mount".to_string()),
+        ("mount", by) => Some(format!("mount ({by})")),
+        ("directory", _) => Some("directory".to_string()),
+        _ => None,
+    }
+}
+
+/// `data_roots.policy.filesystem.hidden_note` (the agent's own sentence,
+/// node-agent-go dataroots.HiddenNote: how many entries a disk that arrived
+/// hides, since when, and the day the note clears) as "; <note>", or "".
+/// The agent stops sending it 7 days after the disk arrived.
+fn data_root_hidden_note(fs: &Value) -> String {
+    match fs["hidden_note"].as_str() {
+        Some(note) if !note.is_empty() => format!("; {note}"),
+        _ => String::new(),
+    }
+}
+
+/// The agent's record of each data root's filesystem
+/// (node-agent-go/internal/dataroots/fsid.go RecordFileName, in its state dir).
+const DATA_ROOT_FS_RECORD: &str = "/var/lib/noo-node-agent/data-root-fs.json";
+
+/// The remedy for a root whose mount is not there. It never creates the
+/// directory: `install -d` on an unmounted root makes an agent-owned
+/// directory on the ROOT disk, which the agent then fills and the mount
+/// later hides (i1160).
+pub(crate) fn data_root_mount_remedy(id: &str, root: &str) -> String {
+    format!("on {id}: the mount for {root} is not there: mount it (check `findmnt {root}`, your fstab or systemd mount unit) — do NOT create the directory, a mount would hide it; \
+             the agent clears this by itself once the mount is back")
+}
+
+/// The remedy for a root that does not answer (a hung mount, a failing disk).
+fn data_root_hung_remedy(id: &str, root: &str) -> String {
+    format!("on {id}: the disk under {root} does not answer (a hung NFS mount or a failing disk): check `findmnt {root}` and \
+             `dmesg | grep -iE 'I/O error|nfs|usb|nvme'`; the agent keeps beating and refuses backend starts and fetches into it until it answers")
+}
+
+/// The remedy for a MISSING root: create it only when it is meant to be a
+/// plain directory (`data_roots.policy.filesystem.meant`, sent by agents
+/// since 0.6.30); a mount, or a root an older agent cannot say, gets the
+/// mount remedy first.
+pub(crate) fn data_root_missing_remedy(id: &str, root: &str, meant: Option<&str>) -> String {
+    let create = format!("sudo install -d -o noo-agent -g noo-agent {root} && sudo chmod go-w {root}");
+    match meant {
+        Some("directory") => format!("on {id}: {create}"),
+        Some("mount") => data_root_mount_remedy(id, root),
+        _ => format!("{}; only if {root} is meant to be a plain directory on this disk (no mount): on {id}: {create}",
+            data_root_mount_remedy(id, root)),
+    }
 }
 
 /// The node record plus the gateway's answer on the harness (and the
@@ -2482,6 +2902,8 @@ fn with_harness_wanted(g: &Globals, n: &Value) -> Value {
     // The `vllm compute` row: the vLLM placements, judged against the node's
     // gpu_compute_cap.
     let vllm_placed = desired.as_ref().map(|d| vllm_placements(&d["placements"])).unwrap_or_default();
+    // The `unsupported engine` row: placements on the TEI engine (i1182a).
+    let removed_engines = desired.as_ref().map(|d| removed_engine_placements(&d["placements"]));
     // Control over the bus: a node that advertises it gets one health round
     // trip over NATS, run by the gateway (the only principal that may send).
     // Nothing is asked of a node that does not advertise, so its row reads
@@ -2523,11 +2945,19 @@ fn with_harness_wanted(g: &Globals, n: &Value) -> Value {
         if !vllm_placed.is_empty() {
             obj.insert("vllm_placements".into(), serde_json::json!(vllm_placed));
         }
+        if let Some(r) = removed_engines {
+            obj.insert("removed_engine_placements".into(), serde_json::json!(r));
+        }
         if let Some(w) = wanted {
             obj.insert("harness_wanted".into(), Value::Bool(w));
         }
         if let Some(d) = declared {
             obj.insert("declared_data_root".into(), Value::String(d));
+        }
+        // The `holds` row: what onboard held on THIS machine, for its own
+        // node only (another machine's record is not readable from here).
+        if crate::role::is_self_node(&id) {
+            obj.insert("onboard_docker_holds".into(), serde_json::json!(crate::docker_hold::recorded_here()));
         }
     }
     n
@@ -2585,7 +3015,23 @@ pub(crate) fn gpu_driver_remedy(host: &Value, next: &str, running: &str, runbook
     }
 }
 
+/// What onboard held on this machine (`docker_hold::RECORD_PATH`), as
+/// [`with_harness_wanted`] injects it for the self node only. `None` for any
+/// other node: this box cannot read another machine's record. Pure.
+pub(crate) fn onboard_holds_of(n: &Value) -> Option<Vec<String>> {
+    n["onboard_docker_holds"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+}
+
+/// [`host_checks_with`] for a node whose onboard record is not known here.
+#[cfg(test)]
 pub(crate) fn host_checks(id: &str, host: &Value, hostd_alive: bool) -> Vec<Check> {
+    host_checks_with(id, host, hostd_alive, None)
+}
+
+/// [`host_checks`], with what onboard held on this node when it is this
+/// machine (`onboard`: `None` = not known here, `Some(&[])` = onboard held
+/// nothing). The `holds` row then says whether onboard placed the hold.
+pub(crate) fn host_checks_with(id: &str, host: &Value, hostd_alive: bool, onboard: Option<&[String]>) -> Vec<Check> {
     let mut out = Vec::new();
     if host.is_null() {
         if hostd_alive {
@@ -2655,10 +3101,10 @@ pub(crate) fn host_checks(id: &str, host: &Value, hostd_alive: bool) -> Vec<Chec
         let mut unheld: Vec<&str> = platform.keys().map(String::as_str).filter(|p| !held.contains(p)).collect();
         unheld.sort_unstable();
         if unheld.is_empty() {
-            out.push(ok("holds", format!("{} platform package(s) held", platform.len())));
+            out.push(ok("holds", holds_ok_detail(platform.len(), onboard)));
         } else {
             out.push(warn("holds",
-                holds_detail(&unheld),
+                holds_detail_with(&unheld, onboard),
                 Some(format!("on {id}: sudo apt-mark hold {}", unheld.join(" ")))));
         }
     }
@@ -2720,6 +3166,38 @@ pub(crate) fn holds_detail(unheld: &[&str]) -> String {
     }
     let also = if other.is_empty() { String::new() } else { format!(" (also not pinned: {})", other.join(", ")) };
     format!("Docker isn't pinned ({}): a routine `apt upgrade` can restart every container. Hold it when you want control.{also}", docker.join(", "))
+}
+
+/// The `holds` row when every platform package is held, saying which holds
+/// onboard placed (i1098 row 12) when this is the machine onboard ran on, so
+/// months later the reason apt will not upgrade Docker is on the row. Pure.
+pub(crate) fn holds_ok_detail(count: usize, onboard: Option<&[String]>) -> String {
+    match onboard {
+        None => format!("{count} platform package(s) held"),
+        Some([]) => format!("{count} platform package(s) held; onboard placed none of these holds (it holds only a Docker it installed)"),
+        Some(held) => format!(
+            "{count} platform package(s) held; onboard held {} when it installed Docker, so an unattended upgrade cannot restart dockerd. To take an update: {}",
+            held.join(", "), crate::docker_hold::update_path(held)),
+    }
+}
+
+/// [`holds_detail`], plus whether onboard placed a hold on the Docker that is
+/// not held now, when this is the machine onboard ran on. Pure.
+pub(crate) fn holds_detail_with(unheld: &[&str], onboard: Option<&[String]>) -> String {
+    let base = holds_detail(unheld);
+    let Some(held) = onboard else { return base };
+    let docker_unheld: Vec<&str> = unheld.iter().copied().filter(|p| crate::docker_hold::CANDIDATES.contains(p)).collect();
+    if docker_unheld.is_empty() {
+        return base;
+    }
+    let released: Vec<&str> = docker_unheld.iter().copied().filter(|p| held.iter().any(|h| h == p)).collect();
+    if held.is_empty() {
+        format!("{base} Onboard placed no hold here: it holds only a Docker it installed itself.")
+    } else if released.is_empty() {
+        format!("{base} Onboard holds {} (it installed them); it did not install these.", held.join(", "))
+    } else {
+        format!("{base} Onboard held {} when it installed Docker, and the hold is gone (released for an update? hold it again).", released.join(", "))
+    }
 }
 
 /// The `host telemetry` row (docs/security/telemetry.md, "Host software").
@@ -3302,6 +3780,36 @@ pub(crate) fn default_chat_check(classes: Option<&Value>, has_gpu: Option<bool>,
     ok(NAME, format!("{detail} — {}", later.join("; ")))
 }
 
+/// The `reranker` row (i1182a): the gateway's own `capabilities.rerank`
+/// (a live node advertises rerank). Without one, `/api/external/rerank` is
+/// served by the chat model, which may answer the input order unranked.
+/// A warning: callers still get an answer, marked for what it is.
+pub(crate) fn reranker_check(caps: Option<&Value>) -> Check {
+    const NAME: &str = "reranker";
+    const PLACE: &str = "noo cluster place <node> reranker <file>.gguf --on cpu";
+    let Some(caps) = caps else {
+        return warn(NAME, "not read (GET /api/external/capabilities)", None);
+    };
+    match caps["rerank"]["available"].as_bool() {
+        Some(true) => ok(NAME, "a reranker node serves /api/external/rerank"),
+        // Placed, but no lane routes yet (its model loading, or its agent not
+        // reachable): the gateway names the nodes.
+        Some(false) if caps["rerank"]["state"].as_str() == Some("loading") => warn(
+            NAME,
+            caps["rerank"]["reason"].as_str().unwrap_or("a reranker is placed but not serving yet").to_string(),
+            None,
+        ),
+        // Reranking is optional: none placed is not a fault, so it is OK and
+        // says what answers instead and how to place one. (A gateway older
+        // than `state` reports false only when no node advertises at all.)
+        Some(false) => ok(
+            NAME,
+            format!("no reranker placed (optional): /api/external/rerank answers with the labelled chat-model fallback; place one with `{PLACE}`"),
+        ),
+        None => warn(NAME, "the gateway's capabilities carry no rerank.available", None),
+    }
+}
+
 /// The `embedding spaces` row (i145): each space, its one model and how many
 /// nodes serve it. `x` when the default space (`knowledge`) has no live node
 /// (every unqualified embed fails); `!` when another space has none, or an
@@ -3404,6 +3912,84 @@ pub(crate) fn agent_metrics_check(nodes: &[(String, String)], up: Option<&Value>
     ok(NAME, format!("{total}/{total} node agents scraped"))
 }
 
+/// The `target-node check` row (i1174): every controller call names the node
+/// it is meant for (`X-Noo-Node`) and the agent refuses one that names
+/// another. STRICT once the agent also refuses a controller call that names
+/// none, which the controller turns on per node in desired-config as soon as
+/// the agent reports the check. Tolerant otherwise, and the row says which
+/// of the two reasons holds. Read from the node record (the heartbeat's
+/// `checks_target_node` and `requires_target_node`, false when the agent
+/// does not say).
+pub(crate) fn target_node_check(id: &str, n: &Value, now_unix: i64) -> Check {
+    const NAME: &str = "target-node check";
+    // The agent refused a call addressed elsewhere in the last ten minutes
+    // (`wrong_node_refused`, 421 wrong_node): a FAIL naming the call.
+    if let Some(w) = n.get("wrong_node_refused").filter(|v| v.is_object()) {
+        let target = w["target"].as_str().map(str::trim).unwrap_or("");
+        let path = w["path"].as_str().unwrap_or("?");
+        let age = w["at"].as_i64().map(|t| format!(", {}s ago", (now_unix - t).max(0))).unwrap_or_default();
+        if target.is_empty() {
+            return fail(
+                NAME,
+                format!("{id}'s agent refused a controller call that named no node ({path}, 421 wrong_node{age}): it is strict and the call did not carry X-Noo-Node"),
+                format!("noo cluster logs {id}   # the agent's wrong_node line names the call"),
+            );
+        }
+        return fail(
+            NAME,
+            format!("{id}'s agent refused a call addressed to {target} ({path}, 421 wrong_node{age}): the controller dialled {id}'s address for {target}"),
+            format!("noo cluster verify {target}   # its node identity and agent address rows say where the controller dials {target}"),
+        );
+    }
+    let checks = n["checks_target_node"].as_bool() == Some(true);
+    let requires = n["requires_target_node"].as_bool() == Some(true);
+    if checks && requires {
+        return ok(NAME, "strict: the agent refuses a call addressed to another node, and a controller call that names none");
+    }
+    if checks {
+        return warn(
+            NAME,
+            "tolerant: not yet told (the agent refuses a call addressed to another node; the controller's flag to refuse a call that names none applies at its next desired-config read)",
+            Some(format!("noo cluster verify {id}   # re-run after the node's next reconcile")),
+        );
+    }
+    warn(
+        NAME,
+        format!("tolerant: the agent is older than the controller (upgrade it: `noo cluster provision {id}`)"),
+        Some(format!("noo cluster provision {id}")),
+    )
+}
+
+/// The `node identity` row (i1174): the controller refused a call meant for
+/// this node in the last ten minutes because the address answered as
+/// another node (`node_identity_mismatch` on `/api/cluster/nodes`, the
+/// gateway's 502), or because its address book gives the dialled address to
+/// another node. FAIL with the fact and the next command; no row otherwise.
+pub(crate) fn node_identity_check(id: &str, n: &Value, now_unix: i64) -> Option<Check> {
+    const NAME: &str = "node identity";
+    let m = n.get("node_identity_mismatch").filter(|v| v.is_object())?;
+    let host = m["host"].as_str().unwrap_or("?");
+    let presented: Vec<&str> = m["presented"].as_array().map(|a| a.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
+    let age = m["at"].as_i64().map(|t| format!(", {}s ago", (now_unix - t).max(0))).unwrap_or_default();
+    let owner = presented.iter().find_map(|p| p.strip_prefix("address owned by "));
+    let detail = match owner {
+        Some(other) => format!(
+            "{host} was not dialled for {id} (502 node_identity_mismatch{age}): the controller's address book gives {host} to {other}, and {id}'s record still names it"
+        ),
+        None => format!(
+            "{host} answered with {}'s certificate when dialled for {id} (502 node_identity_mismatch{age}): the controller's address book gives {host} to {id}",
+            if presented.is_empty() { "another".to_string() } else { presented.join(", ") }
+        ),
+    };
+    // `--prove` is the proof form of push-nodes (#1457): it mints an address
+    // only once the node there shows it holds the node's current key.
+    Some(fail(
+        NAME,
+        detail,
+        format!("noo cluster verify {id} --json   # the agent address and agent certificate rows show the address {id} reports; if {id} really moved to {host}: noo security pki push-nodes {id} --prove"),
+    ))
+}
+
 /// The `agent certificate` row: the node's leaf (the controller's copy under
 /// `pki/nodes/<id>/node.crt`) must cover the host of the `agent_url` the
 /// gateway dials. When it does not, every gateway call to the node fails TLS
@@ -3417,6 +4003,10 @@ pub(crate) fn agent_metrics_check(nodes: &[(String, String)], up: Option<&Value>
 /// node claims that address (`other`: its registered or dialed address, or a
 /// SAN in its leaf). A leaf for another node's address would let this node
 /// answer as that one; then it is a finding to investigate, with no remedy.
+/// An address the leaf does not carry is not one push-nodes mints on its own
+/// (it mints only vetted addresses: the enrollment, tailnet and current-leaf
+/// ones, i1174), so the remedy is the proof form, `--prove`, which mints it
+/// once the node at that address shows it holds the node's current key.
 pub(crate) fn agent_cert_check(id: &str, host: &str, covers: Option<bool>, other: Option<&str>) -> Option<Check> {
     match covers {
         Some(true) => return None,
@@ -3439,10 +4029,13 @@ pub(crate) fn agent_cert_check(id: &str, host: &str, covers: Option<bool>, other
             ),
             remedy: None,
         }.checked(),
+        // Unclaimed: re-issued only on proof that the node serves the address
+        // (`--prove`: a dial-back pinned to the node's own key, #1457), private
+        // or public alike, since plain push-nodes mints only vetted addresses.
         None => fail(
             "agent certificate",
-            format!("{id}: its certificate does not cover the address the controller dials it at ({host}), so every call to it fails TLS (imports, logs, metrics); `noo security pki push-nodes {id}` will issue it a certificate for {host}"),
-            format!("noo security pki push-nodes {id}   # then: noo cluster verify"),
+            format!("{id}: its certificate does not cover the address the controller dials it at ({host}), so every call to it fails TLS (imports, logs, metrics); {host} is not {id}'s enrollment, tailnet or current-leaf address, so `noo security pki push-nodes {id} --prove` will issue it a certificate for {host} once the node there proves it holds {id}'s current key"),
+            format!("noo security pki push-nodes {id} --prove   # then: noo cluster verify {id}"),
         ),
     })
 }
@@ -3877,6 +4470,57 @@ fn netns_restore_row_here(root: &std::path::Path) -> Check {
     netns_restore_row(systemd, state, remedy)
 }
 
+/// The `hostd at boot` row (i1160 risk 5): does the controller's noo-hostd,
+/// whose BootRestore brings the stack back after a reboot, start at boot
+/// with no one logged in? Pure over the facts. `linger` is read only for a
+/// user unit. No row when no hostd unit or agent is installed here.
+///
+/// - systemd user unit, linger on: OK; off: WARN with the exact enable
+///   command; unreadable: WARN, cannot be checked;
+/// - systemd system unit: OK;
+/// - macOS LaunchAgent: WARN, said plainly (there is no noomesh remedy).
+pub(crate) fn hostd_at_boot_row(
+    kind: crate::hostd_boot::HostdKind,
+    user: &str,
+    linger: Option<crate::hostd_boot::Linger>,
+) -> Option<Check> {
+    use crate::hostd_boot::{remedy, HostdKind, Linger};
+    const NAME: &str = "hostd at boot";
+    let lose = format!("after a reboot nothing restores the stack until {user} logs in");
+    match kind {
+        HostdKind::Absent => None,
+        HostdKind::SystemUnit => Some(ok(NAME, "noo-hostd is a system unit: it starts at boot")),
+        HostdKind::LaunchAgent => Some(warn(
+            NAME,
+            format!("noo-hostd is {user}'s LaunchAgent, which runs only in a login session: {lose}. \
+                     noomesh has no setting for this today; macOS automatic login for {user} is the only way, and FileVault turns it off"),
+            None,
+        )),
+        HostdKind::UserUnit => {
+            let linger = linger.unwrap_or_else(|| Linger::Unreadable("not read".into()));
+            if let Linger::Unreadable(why) = &linger {
+                return Some(warn(
+                    NAME,
+                    format!("cannot be checked: linger for {user} could not be read ({why}); without it, {lose}"),
+                    Some(remedy(user)),
+                ));
+            }
+            if linger == Linger::Off {
+                return Some(warn(NAME, format!("noo-hostd is {user}'s user unit and linger is off: {lose}"), Some(remedy(user))));
+            }
+            Some(ok(NAME, format!("noo-hostd is {user}'s user unit and linger is on: it starts at boot, with no login")))
+        }
+    }
+}
+
+fn hostd_at_boot_row_here() -> Option<Check> {
+    use crate::hostd_boot as hb;
+    let kind = hb::kind_here();
+    let user = crate::netns_unit::owner();
+    let linger = (kind == hb::HostdKind::UserUnit).then(|| hb::read_linger(&user));
+    hostd_at_boot_row(kind, &user, linger)
+}
+
 /// The `ollama slots` row's advice (i802), and the command that applies it.
 pub(crate) const CPU_ONLY_SLOTS_ADVICE: &str = "CPU-only: one Ollama slot prefills about 3x faster on a 4-core CPU (~370 against ~125 tok/s) and saves cache, with no embedding loss (measured, i802)";
 pub(crate) const CPU_ONLY_SLOTS_REMEDY: &str = "noo config set compose_env '{\"OLLAMA_EMBED_NUM_PARALLEL\":\"1\"}' && noo stack restart --force ollama-embed";
@@ -4177,6 +4821,115 @@ pub(crate) fn externally_reachable_leaf_names(
     out
 }
 
+/// The "controller address" row (i1173): whether the address remote nodes
+/// were handed for this controller survives its LAN address changing.
+/// Nodes keep that URL (`/etc/noo/controller-url`, the agent env) and are
+/// never told a new one, so a controller that moves strands them, and the
+/// fix cannot reach them from here.
+///
+/// `advertised` is the URL enrollment hands out (`NOO_GATEWAY_URL`, else
+/// `services.gateway_url`); `dns` is `NOO_CONTROLLER_DNS`; `local` is this
+/// machine's addresses (`None`: unknown). `None` when nothing remote can
+/// enroll (no URL, or a loopback one the mint refuses). Pure.
+pub(crate) fn controller_address_check(advertised: Option<&str>, dns: Option<&str>, local: Option<&[String]>) -> Option<Check> {
+    const NAME: &str = "controller address";
+    if let Some(n) = dns.map(str::trim).filter(|n| !n.is_empty()) {
+        return Some(ok(NAME, format!("nodes reach this controller by the name {n}, which does not change with its address")));
+    }
+    let url = advertised.map(str::trim).filter(|u| !u.is_empty())?;
+    let host = url_host(url);
+    if host.is_empty() || host.eq_ignore_ascii_case("localhost") || host.eq_ignore_ascii_case("gateway") {
+        return None;
+    }
+    let Ok(ip) = host.parse::<std::net::IpAddr>() else {
+        return Some(ok(NAME, format!("nodes reach this controller by the name {host}, which does not change with its address")));
+    };
+    if ip.is_loopback() || ip.is_unspecified() {
+        return None;
+    }
+    if let std::net::IpAddr::V4(v4) = ip {
+        let o = v4.octets();
+        if o[0] == 100 && (64..128).contains(&o[1]) {
+            return Some(ok(NAME, format!("nodes reach this controller at its tailnet address {ip}, which a local network change does not move")));
+        }
+    }
+    const KEEP: &str = "put the controller on a tailnet, the default path (`noo onboard --reconfigure`), which gives it \
+        a name that does not move; or reserve this address for it in your router (often called a DHCP reservation)";
+    let holds = local.map(|l| l.iter().any(|a| a.trim().parse::<std::net::IpAddr>().is_ok_and(|x| x == ip)));
+    match holds {
+        Some(false) => Some(fail(
+            NAME,
+            format!(
+                "nodes were told to reach this controller at {ip}, which is no longer this machine's address (it now has {}): \
+                 every node set up with it has lost the controller, and nothing sent from here can reach them",
+                local.unwrap_or(&[]).join(", ")
+            ),
+            format!(
+                "give this machine {ip} back (reserve it in your router, then restart the machine), or set \
+                 services.gateway_url to its new address and enroll each node again (docs/getting-started/add-a-node.md)"
+            ),
+        )),
+        _ => Some(warn(
+            NAME,
+            format!(
+                "nodes reach this controller at {ip}, a local network address: if the router hands this machine a new one \
+                 (after a power cut, say), every node loses the controller and cannot be fixed from here"
+            ),
+            Some(KEEP.to_string()),
+        )),
+    }
+}
+
+/// The host of a URL or a bare `host[:port]`, brackets off an IPv6 literal.
+fn url_host(url: &str) -> String {
+    let rest = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
+    let hp = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    let hp = hp.rsplit_once('@').map(|(_, h)| h).unwrap_or(hp);
+    if let Some(v6) = hp.strip_prefix('[') {
+        return v6.split(']').next().unwrap_or("").to_string();
+    }
+    match hp.matches(':').count() {
+        1 => hp.split(':').next().unwrap_or("").to_string(),
+        _ => hp.to_string(),
+    }
+}
+
+/// This machine's addresses (`hostname -I`), or `None` when they cannot be
+/// read (macOS, a container without the tool).
+pub(crate) fn local_addresses() -> Option<Vec<String>> {
+    let out = std::process::Command::new("hostname").arg("-I").output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let v: Vec<String> = String::from_utf8_lossy(&out.stdout).split_whitespace().map(str::to_string).collect();
+    (!v.is_empty()).then_some(v)
+}
+
+/// The URL enrollment hands remote nodes, and `NOO_CONTROLLER_DNS`, as this
+/// controller declares them (process env, the repo `.env`, noomesh.yaml).
+pub(crate) fn advertised_controller() -> (Option<String>, Option<String>) {
+    crate::envfile::ensure_repo_env();
+    let root = crate::envfile::repo_root();
+    let read = |k: &str| {
+        std::env::var(k).ok().filter(|v| !v.trim().is_empty())
+            .or_else(|| Some(crate::onboard::env::read_env_key(&root.join(".env"), k)).filter(|v| !v.trim().is_empty()))
+    };
+    let url = read("NOO_GATEWAY_URL").or_else(|| {
+        std::fs::read_to_string(root.join("noomesh.yaml"))
+            .ok()
+            .and_then(|t| serde_yaml::from_str::<serde_yaml::Value>(&t).ok())
+            .and_then(|d| d.get("services")?.get("gateway_url")?.as_str().map(str::to_string))
+    });
+    (url, read("NOO_CONTROLLER_DNS"))
+}
+
+/// The row as judged on this machine.
+pub(crate) fn controller_address_row_here() -> Option<Check> {
+    let (url, dns) = advertised_controller();
+    let local = local_addresses();
+    controller_address_check(url.as_deref(), dns.as_deref(), local.as_deref())
+}
+
 /// The "service cert names" row. A leaf that serves remote
 /// nodes (`nats`, `redis`, `postgres`, `model-cache`) must carry the names
 /// they dial: the tailnet name when the box has one, `noo-controller`, the
@@ -4284,6 +5037,14 @@ fn grafana_mounts_sso_pub() -> Option<bool> {
     }))
 }
 
+fn retired_text(v: &[&crate::pki::KeyIssue]) -> String {
+    format!(
+        "{} leftover private key(s) of the TEI engine removed in 0.6.30 — nothing reads them; delete it by hand: {}",
+        v.len(),
+        v.iter().map(|i| format!("{} {:04o}", i.rel, i.mode)).collect::<Vec<_>>().join(", ")
+    )
+}
+
 /// The "pki key modes" row. Every private key under the PKI dir has one
 /// reader (`pki::KeyReader`). A key readable beyond it (0644, a group
 /// that is not its reader's) is a FAIL: that is a private key someone
@@ -4295,7 +5056,7 @@ fn grafana_mounts_sso_pub() -> Option<bool> {
 /// readable beyond its owner is a WARN that `fix-modes` closes (i277a). Issuance, `noo upgrade --stack`, provision and
 /// onboard set every mode they can, so a FAIL here that needs no sudo
 /// line means one of them has not run since the key changed.
-pub(crate) fn pki_key_modes_check(issues: &[crate::pki::KeyIssue], grant_lines: &[String], total_keys: usize) -> Check {
+pub(crate) fn pki_key_modes_check(issues: &[crate::pki::KeyIssue], grant_lines: &[String], total_keys: usize, pki_dir: &std::path::Path) -> Check {
     use crate::pki::KeyIssueKind as K;
     let names = |kind: K| -> Vec<String> {
         issues.iter().filter(|i| i.kind == kind).map(|i| format!("{} {:04o}", i.rel, i.mode)).collect()
@@ -4320,6 +5081,14 @@ pub(crate) fn pki_key_modes_check(issues: &[crate::pki::KeyIssue], grant_lines: 
             if grant_lines.is_empty() { "noo security pki fix-modes --dry-run".to_string() } else { grant_lines.join(" && ") },
         );
     }
+    let retired_open: Vec<&crate::pki::KeyIssue> = issues.iter().filter(|i| i.kind == K::RetiredLeaf && i.mode & 0o077 != 0).collect();
+    if !retired_open.is_empty() {
+        return fail(
+            "pki key modes",
+            retired_text(&retired_open),
+            retired_open.iter().map(|i| crate::pki::retired_leaf_rm_line(pki_dir, &i.rel)).collect::<Vec<_>>().join(" && "),
+        );
+    }
     let unreadable = names(K::Unreadable);
     if !unreadable.is_empty() {
         return warn(
@@ -4336,6 +5105,17 @@ pub(crate) fn pki_key_modes_check(issues: &[crate::pki::KeyIssue], grant_lines: 
             // A key with no reader entry is a third-party add-on's: its only
             // consumers are the provision copies, so fix-modes makes it 0600.
             Some("noo security pki fix-modes".to_string()),
+        );
+    }
+    // Retired TEI leaves: nothing reads them, so any other-account access is
+    // pure exposure. Group/world-readable (mode & 0o077) is a FAIL (above the
+    // WARN-only kinds); owner-only is a WARN. Both name `rm <path>`.
+    let retired_warn: Vec<&crate::pki::KeyIssue> = issues.iter().filter(|i| i.kind == K::RetiredLeaf).collect();
+    if !retired_warn.is_empty() {
+        return warn(
+            "pki key modes",
+            retired_text(&retired_warn),
+            Some(retired_warn.iter().map(|i| crate::pki::retired_leaf_rm_line(pki_dir, &i.rel)).collect::<Vec<_>>().join(" && ")),
         );
     }
     ok("pki key modes", format!("{total_keys} private key(s), each readable only by its reader"))
@@ -4998,14 +5778,36 @@ const UNPROBED_GUESSES: [&str; 2] = [
     "(postgres container not running, or no routable address)",
 ];
 
-/// A live-probe row that could not probe, when docker refused this account:
-/// its guessed cause becomes docker's own words and the remedy the docker
-/// one. Any other row, or no refusal, is returned unchanged.
-pub(crate) fn docker_refused(mut c: Check, refusal: Option<&str>) -> Check {
-    let Some(e) = refusal else { return c };
-    if let Some(g) = UNPROBED_GUESSES.iter().find(|g| c.detail.contains(*g)) {
-        c.detail = c.detail.replace(g, &format!("— {e}"));
-        c.remedy = Some(crate::commands::secrets_delivery::DOCKER_REFUSED_REMEDY.into());
+/// The compose services whose state each [`UNPROBED_GUESSES`] entry guessed
+/// at, same order: a row hears only about its own containers.
+const UNPROBED_SERVICES: [&[&str]; 2] = [&["gateway", "sandbox"], &["postgres"]];
+
+/// A live-probe row that could not probe, when docker did not answer this
+/// account: its guessed cause becomes what was observed and the remedy the
+/// one for that cause. Any other row, or nothing observed, is unchanged.
+pub(crate) fn docker_refused(c: Check, refusal: Option<&crate::commands::secrets_delivery::DockerRefusal>) -> Check {
+    docker_unprobed(c, refusal, &crate::commands::secrets::unknown_notes())
+}
+
+/// [`docker_refused`], pure over what was observed.
+pub(crate) fn docker_unprobed(
+    mut c: Check,
+    refusal: Option<&crate::commands::secrets_delivery::DockerRefusal>,
+    notes: &[(String, String)],
+) -> Check {
+    let Some(i) = UNPROBED_GUESSES.iter().position(|g| c.detail.contains(*g)) else { return c };
+    let g = UNPROBED_GUESSES[i];
+    if let Some(e) = refusal {
+        c.detail = c.detail.replace(g, &format!("— {}", e.detail()));
+        c.remedy = Some(e.remedy());
+    } else if let Some(note) = UNPROBED_SERVICES[i]
+        .iter()
+        .find_map(|svc| crate::commands::secrets::note_for(notes, &crate::envfile::container(svc)))
+    {
+        // docker answers `version`, yet an inspect did not: "not running" is
+        // not what was seen.
+        c.detail = c.detail.replace(g, &format!("— {note}"));
+        c.remedy = Some("docker info".into());
     }
     c
 }
@@ -5307,9 +6109,6 @@ pub(crate) const COMPOSE_BACKENDS: &[(&str, BackendFront)] = &[
     ("vllm-secondary", BackendFront::Stunnel("vllm-secondary")),
     ("llamacpp", BackendFront::Stunnel("llamacpp")),
     ("ollama", BackendFront::Stunnel("ollama")),
-    ("tei", BackendFront::Stunnel("tei")),
-    ("tei-gpu", BackendFront::Stunnel("tei-gpu")),
-    ("reranker", BackendFront::Stunnel("reranker")),
     ("ollama-embed", BackendFront::Stunnel("ollama-embed")),
     ("ollama-embed-cpu", BackendFront::Stunnel("ollama-embed-cpu")),
 ];
@@ -6458,6 +7257,21 @@ fn agent_protect_remedy(node: &str, key: &str) -> String {
     }
 }
 
+/// Did this apply report come from a bundle that carried no agent config?
+/// The applier names `agent-env` (or `agent-env=unchanged`) on its
+/// `applied:` line whenever the bundle carried one, and only then reports the
+/// hold (scripts/noo-apply.sh). A certificate or single-kind bundle
+/// (`security pki push-nodes`, a key or CA rotation, a single push) applies
+/// without it and says nothing about the hold. A report with no `applied:`
+/// line (a refused or failed apply) is not this case. The LAST `applied:` is
+/// the applier's summary (`echo "applied:$applied"`, the end of its run); an
+/// earlier log line that happens to contain the word is not.
+fn applied_without_agent_config(msg: &str) -> bool {
+    let Some(at) = msg.rfind("applied:") else { return false };
+    let line = msg[at + "applied:".len()..].lines().next().unwrap_or("");
+    !line.split_whitespace().any(|t| t == "agent-env" || t.starts_with("agent-env="))
+}
+
 /// The `agent protect` row (proposal 61 phase 0b): from each node's last
 /// apply report, whether the node agent's unit is held to the paths it
 /// writes. `nodes` is every node with whether its noo-hostd reports macOS
@@ -6474,8 +7288,16 @@ pub(crate) fn agent_protect_check(nodes: &[(String, bool)], reports: &[(String, 
     let mut held: Vec<String> = Vec::new();
     let mut held_nodes: Vec<&str> = Vec::new();
     let mut refused: Vec<(String, String)> = Vec::new();
+    // Nodes whose last apply carried no agent config: their hold is not
+    // re-reported, which is not the same as no hold.
+    let mut not_rereported: Vec<&str> = Vec::new();
     for (node, _, msg) in reports {
-        let Some(at) = msg.find(AGENT_PROTECT_TAG) else { continue };
+        let Some(at) = msg.find(AGENT_PROTECT_TAG) else {
+            if applied_without_agent_config(msg) {
+                not_rereported.push(node.as_str());
+            }
+            continue;
+        };
         let val = msg[at + AGENT_PROTECT_TAG.len()..].split_whitespace().next().unwrap_or("");
         if let Some(key) = val.strip_prefix("REFUSED:") {
             refused.push((node.clone(), key.to_string()));
@@ -6503,19 +7325,33 @@ pub(crate) fn agent_protect_check(nodes: &[(String, bool)], reports: &[(String, 
     if due.is_empty() {
         return None;
     }
-    let unheld: Vec<&str> = due.iter().copied().filter(|n| !held_nodes.contains(n)).collect();
-    if !unheld.is_empty() {
-        let mut detail = format!(
-            "no hold reported on {} (installed by onboard, or never applied): its node agent is not held to the paths it writes",
-            unheld.join(", ")
-        );
+    let unknown: Vec<&str> = due.iter().copied().filter(|n| !held_nodes.contains(n) && not_rereported.contains(n)).collect();
+    let unheld: Vec<&str> = due.iter().copied().filter(|n| !held_nodes.contains(n) && !not_rereported.contains(n)).collect();
+    if !unheld.is_empty() || !unknown.is_empty() {
+        let mut parts: Vec<String> = Vec::new();
+        if !unheld.is_empty() {
+            parts.push(format!(
+                "no hold reported on {} (installed by onboard, or never applied): its node agent is not held to the paths it writes",
+                unheld.join(", ")
+            ));
+        }
+        if !unknown.is_empty() {
+            parts.push(format!(
+                "hold unknown on {}: its last apply carried no agent config (a certificate or single-kind bundle); \
+                 the hold it had is not re-reported until its next full provision",
+                unknown.join(", ")
+            ));
+        }
+        let mut detail = parts.join("; ");
         if !held.is_empty() {
             detail.push_str(&format!("; held: {}", held.join(", ")));
         }
+        let mut to_provision = unheld.clone();
+        to_provision.extend(unknown.iter().copied());
         return Some(warn(
             "agent protect",
             detail,
-            Some(provision_each(&unheld)),
+            Some(provision_each(&to_provision)),
         ));
     }
     Some(ok("agent protect", format!("the node agent writes only where it must on {}", held.join(", "))))
@@ -8041,6 +8877,7 @@ mod gateway_redis_tests {
                     restarts: 7,
                     last_error: Some("Fatal error: can't open the AOF manifest file appendonly.aof.manifest: Permission denied".into()),
                     crashed: None,
+                    agent_backend: None,
                 }]),
                 "noo",
             )
@@ -8718,6 +9555,28 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             // verified" (0.6.16-rc.3: an older gateway's node list waited on
             // NATS KV past this 10 s bound).
             let bus = unanswered_nodes_rows(health_body(g).as_ref());
+            // On a NODE (role from what this box has, not a switch): say what
+            // the agent says while the controller is away, and the node-side
+            // checks; never a controller's command (`noo stack status`).
+            if let Some(node) = crate::role::detect().node_only().cloned() {
+                let has_ts = std::path::Path::new("/usr/bin/tailscale").is_file() || std::path::Path::new("/usr/local/bin/tailscale").is_file();
+                let (line, guide) = unreachable_from_node(&node.name, node.controller_url.as_deref(), has_ts);
+                if g.json {
+                    println!("{}", serde_json::json!({ "ok": false, "error": "controller unreachable from this node", "node": node.name,
+                        "controller_url": node.controller_url, "detail": line, "controller": { "ok": false, "checks": checks_json(&bus) },
+                        "next": guide.iter().map(|(c, _)| next_cmd(c, &[])).collect::<Vec<_>>() }));
+                } else {
+                    // The bus row, when /health answered with the bus down:
+                    // as true on a node as on the controller.
+                    if !bus.is_empty() {
+                        render("controller", &bus, true);
+                    }
+                    println!("{}", ui::status_line(Glyph::Err, &line));
+                    let g2: Vec<(&str, &str)> = guide.iter().map(|(c, w)| (c.as_str(), w.as_str())).collect();
+                    ui::guide(&g2);
+                }
+                return Ok(1);
+            }
             if g.json {
                 println!("{}", serde_json::json!({ "ok": false, "error": "gateway unreachable", "controller": { "ok": false, "checks": checks_json(&bus) },
                     "next": GATEWAY_UNREACHABLE_NEXT.iter().map(|(c, _)| next_cmd(c, &[])).collect::<Vec<_>>() }));
@@ -8924,6 +9783,7 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         // i1096: the keys that act as an admin, or mint agent tokens.
         checks.push(key_bindings::row((kc, &keys, &ke), (uc, &users, &ue)));
         checks.push(system_credentials_check(crate::commands::systems::store_missing_credentials()));
+        checks.extend(gguf_vouch::model_store_readable_row());
         // Is there a recent backup, and is it anywhere but this machine? 2026-10-24:
         // the 03:30 run never happened and nothing said so; every dump sat on the
         // disk next to the data.
@@ -8956,6 +9816,9 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         }
         checks.push(noo_data_bound_row(&crate::envfile::repo_root()));
         checks.push(netns_restore_row_here(&crate::envfile::repo_root()));
+        if let Some(row) = hostd_at_boot_row_here() {
+            checks.push(row);
+        }
         // i802: advisory only, on a CPU-only controller.
         if let Some(row) = cpu_only_ollama_slots_row_here(&crate::envfile::repo_root()) {
             checks.push(row);
@@ -9037,6 +9900,9 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                 checks.push(c);
             }
         }
+        if let Some(c) = controller_address_row_here() {
+            checks.push(c);
+        }
         let (id_host, id_ip, id_ts) = crate::onboard::steps::local_cert_identity();
         checks.push(service_cert_names_check(&externally_reachable_leaf_names(
             &crate::pki::pki_dir(), &id_host, &id_ip, &id_ts,
@@ -9060,6 +9926,9 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         checks.push(default_chat_check(model_classes.as_ref(), fleet_has_gpu(&fleet), fleet_node_count(&fleet)));
         let spaces = get_json_opt(g, "/api/cluster/embedding-spaces", true, 15);
         checks.push(embedding_spaces_check(spaces.as_ref()));
+        // i1182a: with no reranker placed, rerank is the chat model's.
+        checks.push(reranker_check(get_json_opt(g, "/api/external/capabilities", true, 15).as_ref()));
+        checks.extend(removed_engine_space_check(spaces.as_ref()));
         // Finding 126: a loaded model measured over its estimate or pool.
         let fit_ids: Vec<&str> = fleet.iter().filter_map(|n| n["id"].as_str()).collect();
         let fits: Vec<(String, Option<Value>)> = par_map(&fit_ids, |id| {
@@ -9138,10 +10007,14 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             .iter()
             .filter_map(|k| sso.key_grant_command(k))
             .collect();
-        checks.push(pki_key_modes_check(&key_issues, &grant_lines, sso.list_keys().len()));
+        checks.push(pki_key_modes_check(&key_issues, &grant_lines, sso.list_keys().len(), &sso.dir));
         checks.push(docker_userns_check(read_daemon_json()));
         // Compose runs only here (the stack launcher); nodes never run it.
-        checks.push(docker_compose_check(&read_compose_version("docker"), &crate::onboard::steps::compose_remedy_here()));
+        checks.push(docker_compose_check(
+            &read_compose_version("docker"),
+            &crate::onboard::steps::compose_remedy_here(),
+            &crate::onboard::steps::compose_upgrade_remedy_here(),
+        ));
         checks.push(tailscale_ssh_check(tailscale_status));
         let gw_mounts = std::fs::read_to_string(crate::envfile::repo_root().join("docker-compose.cluster.yml"))
             .ok()
@@ -9168,13 +10041,13 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         // said as that, not as "container not running" (failed lookup is not
         // absence; rc.3 stranger cell, docker group not active).
         let refused = crate::commands::secrets_delivery::docker_refusal();
-        checks.push(docker_refused(sandbox_listener_check(compose.as_deref(), sandbox_probe.as_ref()), refused.as_deref()));
+        checks.push(docker_refused(sandbox_listener_check(compose.as_deref(), sandbox_probe.as_ref()), refused.as_ref()));
         // The sandbox executor (i161): the health body that probe read over
         // the gateway's leaf says which uid model-written code runs as.
         // Which form of the AppArmor profile is installed (bundled, or the
         // AppArmor 3.x form without its `userns,` rule): stated, not silent.
         checks.push(with_profile_form(
-            docker_refused(sandbox_executor_check(sandbox_probe.as_ref()), refused.as_deref()),
+            docker_refused(sandbox_executor_check(sandbox_probe.as_ref()), refused.as_ref()),
             crate::onboard::sandbox_apparmor::installed_form(
                 std::fs::read_to_string(crate::onboard::sandbox_apparmor::INSTALLED).ok().as_deref()),
         ));
@@ -9229,7 +10102,7 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         checks.push(docker_refused(postgres_client_cert_check(
             no_cert.as_ref().map(|(ok, e)| (*ok, e.as_str())),
             plaintext.as_ref().map(|(ok, e)| (*ok, e.as_str())),
-        ), refused.as_deref()));
+        ), refused.as_ref()));
         // `cluster.postgres_memory` (unset = standard): the sizes asked for,
         // and "recreate needed" while the running postgres has others.
         checks.push(pg_memory::live(&root));
@@ -9239,6 +10112,9 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         // cache judged is the self-node AGENT's (its heartbeat in `fleet`),
         // plus the compose cache's own row when that is another directory.
         checks.extend(hf_hub::live(Some(&Value::Array(fleet.clone()))));
+        // Every network mount under the data roots answers a bounded stat
+        // (i1149: a hung hard NFS mount made calls hang with no word why).
+        checks.push(network_mount::live());
         // One "<name> at rest" row per directory that holds state in the
         // clear (`at_rest_dirs`): the process env is what the launcher
         // resolved from `.env`, so the paths are the ones compose bound.
@@ -9308,7 +10184,7 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         checks.push(image_family::image_family_row());
         // A container docker keeps restarting reads "Up" between restarts;
         // judge RestartCount + recency instead (0.6.4 redis AOF, 2026-10-16).
-        checks.push(restart_loops::restart_loops_row());
+        checks.push(restart_loops::restart_loops_row(g));
         // A GPU service the launcher held because the GPU did not answer at
         // start (i277e): the core runs without it, this row keeps it named.
         checks.push(gpu_held::gpu_held_row());
@@ -9613,6 +10489,39 @@ pub(crate) fn cert_expiry_row(certs: &[(String, i64)]) -> Check {
     ok(NAME, format!("{} certificate(s); the soonest, {}, in {} days", certs.len(), sorted[0].0, sorted[0].1))
 }
 
+/// The refusals of one report, each with Docker's reason (at most five
+/// named, then a count). An entry whose reason is empty came from an older
+/// hostd that read Docker's message from stdout and lost it; on the
+/// containerd image store most of those were images an earlier ref's removal
+/// had already deleted (2026-11-22). Said as such, with the check. Pure.
+pub(crate) fn refused_detail(refused: &[&Value], when: &str) -> String {
+    const SHOWN: usize = 5;
+    let name = |i: &Value| i["refs"].get(0).and_then(|r| r.as_str()).or(i["id"].as_str()).unwrap_or("?").to_string();
+    let reason = |i: &Value| i["result"].as_str().unwrap_or("").trim_start_matches("refused:").trim().to_string();
+    let (silent, said): (Vec<&Value>, Vec<&Value>) = refused.iter().copied().partition(|i| reason(i).is_empty());
+    let mut parts: Vec<String> = said.iter().take(SHOWN).map(|i| format!("{}: {}", name(i), reason(i))).collect();
+    if said.len() > SHOWN {
+        parts.push(format!("{} more", said.len() - SHOWN));
+    }
+    let mut out = String::new();
+    if !said.is_empty() {
+        out = format!("{} superseded image(s) Docker refused to remove at {when}: {}", said.len(), parts.join("; "));
+    }
+    if !silent.is_empty() {
+        if !out.is_empty() {
+            out.push_str(". ");
+        }
+        out.push_str(&format!(
+            "{} more reported refused at {when} with no reason recorded (an older hostd lost Docker's message; on the containerd \
+             image store most were already removed): `docker image inspect {}` answering \"No such image\" means it is gone; \
+             the next roll's cleanup reports them correctly",
+            silent.len(),
+            silent[0]["id"].as_str().unwrap_or("<id>")
+        ));
+    }
+    out
+}
+
 /// `image retention`: what hostd's rung 5 last judged on this controller, read
 /// from the report it writes beside the keep file
 /// (`<root>/.noo-host-spool/image-retention-report.json`). Read-only: it
@@ -9662,16 +10571,7 @@ pub(crate) fn image_retention_row(report: Option<Result<Value, String>>, blocked
         format!("{} MB", bytes / 1_000_000)
     };
     if !refused.is_empty() {
-        let first = refused[0]["refs"].get(0).and_then(|r| r.as_str()).or(refused[0]["id"].as_str()).unwrap_or("?");
-        return warn(
-            NAME,
-            format!(
-                "{} superseded image(s) Docker refused to remove at {when} (first: {first}: {})",
-                refused.len(),
-                refused[0]["result"].as_str().unwrap_or("")
-            ),
-            None,
-        );
+        return warn(NAME, refused_detail(&refused, when), None);
     }
     if marked.is_empty() {
         return ok(NAME, format!("nothing superseded at {when}; {} image(s) judged", images.len()));
@@ -10069,6 +10969,43 @@ fn tier_json(t: Option<Tier>) -> Option<&'static str> {
 
 /// What a verify that could not read the node list suggests, in the text
 /// guide and as `next` under --json.
+/// What verify says on a NODE that cannot reach the controller: the agent's
+/// own story while it is away (nothing is reconciled; what runs keeps
+/// running) and the checks that live on this node: the URL it uses and where
+/// that is set, whether this machine has a route to it, the tailnet when it
+/// has one, then the controller itself. Never a controller-only command
+/// (`role::is_controller_only`). Pure.
+pub(crate) fn unreachable_from_node(node: &str, controller_url: Option<&str>, has_tailscale: bool) -> (String, Vec<(String, String)>) {
+    let url = controller_url.map(str::trim).filter(|u| !u.is_empty());
+    let line = match url {
+        Some(u) => format!(
+            "this machine is node '{node}' and cannot reach the controller at {u}: nothing is reconciled on this node until it answers; running backends keep running"
+        ),
+        None => format!(
+            "this machine is node '{node}' and has no controller URL ({} is missing or empty), so it cannot reach the controller: nothing is reconciled until it can; running backends keep running",
+            crate::role::NODE_CONTROLLER_URL
+        ),
+    };
+    let host = url
+        .and_then(|u| u.split_once("://").map(|(_, r)| r).or(Some(u)))
+        .and_then(|r| r.split(['/', '?']).next())
+        .map(|hp| match hp.strip_prefix('[') {
+            Some(v6) => v6.split(']').next().unwrap_or("").to_string(),
+            None => hp.rsplit_once(':').map(|(h, _)| h).unwrap_or(hp).to_string(),
+        })
+        .filter(|h| !h.is_empty())
+        .unwrap_or_else(|| "<controller host>".to_string());
+    let mut guide = vec![
+        (format!("cat {}", crate::role::NODE_CONTROLLER_URL), "the controller URL this node uses (written at enroll)".to_string()),
+        (format!("ip route get {host}"), "whether this machine has a route to the controller".to_string()),
+    ];
+    if has_tailscale {
+        guide.push(("tailscale status".to_string(), "whether this node is on the tailnet and sees the controller".to_string()));
+    }
+    guide.push(("noo health".to_string(), "asks the controller at that URL directly".to_string()));
+    (line, guide)
+}
+
 const GATEWAY_UNREACHABLE_NEXT: &[(&str, &str)] = &[("noo health", "is the controller up"), ("noo stack status", "which container is not")];
 
 /// The `seats` field of --json: the seats judged, `[]` when the registry has
@@ -11278,7 +12215,7 @@ mod tests {
         let c = node_checks(&healthy(now), "v0.2.70", "0.5.57", now, Some(true));
         let failed: Vec<_> = c.iter().filter(|c| c.verdict == Verdict::Fail).map(|c| c.name).collect();
         assert!(failed.is_empty(), "{failed:?}");
-        assert_eq!(c.len(), 24, "eighteen node invariants (the log shipper, peer identity, control over bus, streaming over tunnel, backend doors, vendor telemetry, backend images, data root, lanes and harness egress among them) plus six host-fact rows (boot partition and host telemetry among them), each judged");
+        assert_eq!(c.len(), 25, "nineteen node invariants (the log shipper, peer identity, control over bus, streaming over tunnel, backend doors, vendor telemetry, backend images, data root, lanes, harness egress and the target-node check among them) plus six host-fact rows (boot partition and host telemetry among them), each judged");
         let lanes = c.iter().find(|c| c.name == "lanes").expect("the lanes row");
         assert_eq!((lanes.verdict, lanes.detail.as_str()), (Verdict::Ok, "1 chat lane(s): 1 serving, 0 on demand"));
     }
@@ -11480,7 +12417,7 @@ mod tests {
     }
 
     /// Every shape of the `backend doors` row, one plant at a time, on a
-    /// node running vLLM and TEI in Docker and a NATIVE ollama (no door —
+    /// node running vLLM and a reranker in Docker and a NATIVE ollama (no door —
     /// the operator's loopback process, never judged here).
     #[test]
     fn the_backend_doors_row_judges_each_shape() {
@@ -11489,24 +12426,24 @@ mod tests {
         let far = now + 80 * 86_400;
         let base = || {
             let mut n = healthy(now);
-            n["running_backends"] = serde_json::json!({"vllm": "m", "embedding": "harrier", "ollama": "gemma"});
-            n["backend_runtimes"] = serde_json::json!({"vllm": "docker", "embedding": "docker", "ollama": "native"});
+            n["running_backends"] = serde_json::json!({"vllm": "m", "reranker": "bge-reranker-v2-m3-Q8_0.gguf", "ollama": "gemma"});
+            n["backend_runtimes"] = serde_json::json!({"vllm": "docker", "reranker": "docker", "ollama": "native"});
             n["backend_leaves"] = serde_json::json!({
                 "vllm": {"dns": ["vllm", "noo-vllm", "noo-vllm-secondary"], "not_after": far},
-                "tei": {"dns": ["tei", "noo-stunnel-tei"], "not_after": far},
+                "reranker": {"dns": ["reranker", "noo-stunnel-reranker"], "not_after": far},
             });
             n
         };
         let good = |svc: &str| match svc {
             "vllm" => door_leaf(&["vllm", "localhost", "noo-vllm", "noo-vllm-secondary"], far),
-            "tei" => door_leaf(&["tei", "localhost", "noo-stunnel-tei"], far),
+            "reranker" => door_leaf(&["reranker", "localhost", "noo-stunnel-reranker"], far),
             other => panic!("read a leaf for {other}, which has no docker backend here"),
         };
         let judge = |n: &Value, leaf: &dyn Fn(&str) -> LeafState| backend_doors_check(n, leaf, now);
 
         let c = judge(&base(), &good);
         assert_eq!(c.verdict, Verdict::Ok, "{}", c.detail);
-        assert!(c.detail.contains("embedding") && c.detail.contains("vllm") && !c.detail.contains("ollama"), "{}", c.detail);
+        assert!(c.detail.contains("reranker") && c.detail.contains("vllm") && !c.detail.contains("ollama"), "{}", c.detail);
 
         // Agent predates the report: WARN, never OK, never FAIL on that alone.
         let mut n = base();
@@ -11518,10 +12455,10 @@ mod tests {
         // Refusals: backend_door (plaintext) and backend_tls (refused start).
         for scope in ["backend_door", "backend_tls"] {
             let mut n = base();
-            n["reconcile_refusals"] = serde_json::json!([{ "scope": scope, "target": "embedding", "reason": "r" }]);
+            n["reconcile_refusals"] = serde_json::json!([{ "scope": scope, "target": "reranker", "reason": "r" }]);
             let c = judge(&n, &good);
             assert_eq!(c.verdict, Verdict::Fail, "{scope}");
-            assert!(c.detail.contains("embedding") && c.detail.contains(scope), "{}", c.detail);
+            assert!(c.detail.contains("reranker") && c.detail.contains(scope), "{}", c.detail);
             assert!(c.remedy.as_deref().unwrap().starts_with("noo cluster provision host3"));
         }
 
@@ -11531,21 +12468,21 @@ mod tests {
             assert_eq!(c.verdict, Verdict::Fail, "{needle}: {}", c.detail);
             assert!(c.detail.contains(needle), "{needle}: {}", c.detail);
         };
-        fails(&|s: &str| if s == "tei" { LeafState::Missing } else { good(s) }, "holds no tei leaf");
-        fails(&|s: &str| if s == "tei" { door_leaf(&["tei", "noo-tei"], far) } else { good(s) }, "does not name noo-stunnel-tei");
+        fails(&|s: &str| if s == "reranker" { LeafState::Missing } else { good(s) }, "holds no reranker leaf");
+        fails(&|s: &str| if s == "reranker" { door_leaf(&["reranker", "noo-reranker"], far) } else { good(s) }, "does not name noo-stunnel-reranker");
         fails(&|s: &str| if s == "vllm" { door_leaf(&["noo-vllm"], now + 3 * 86_400) } else { good(s) }, "expires in 3 days");
 
         // Node-side report: missing, not naming the door, expiring.
         let mut n = base();
-        n["backend_leaves"].as_object_mut().unwrap().remove("tei");
+        n["backend_leaves"].as_object_mut().unwrap().remove("reranker");
         let c = judge(&n, &good);
         assert_eq!(c.verdict, Verdict::Fail);
-        assert!(c.detail.contains("node holds no services/tei leaf"), "{}", c.detail);
+        assert!(c.detail.contains("node holds no services/reranker leaf"), "{}", c.detail);
         let mut n = base();
         n["backend_leaves"]["vllm"]["dns"] = serde_json::json!(["vllm"]);
         assert!(judge(&n, &good).detail.contains("node's services/vllm leaf does not name noo-vllm"));
         let mut n = base();
-        n["backend_leaves"]["tei"]["not_after"] = serde_json::json!(now + 86_400);
+        n["backend_leaves"]["reranker"]["not_after"] = serde_json::json!(now + 86_400);
         assert_eq!(judge(&n, &good).verdict, Verdict::Fail);
 
         // vllm-secondary shares the vllm leaf and is dialled by its own name.
@@ -11556,13 +12493,13 @@ mod tests {
     }
 
     /// A node record whose `backend doors` fails only because the node has
-    /// no tei leaf YET, with the node's `backend_containers` report as given
+    /// no reranker leaf YET, with the node's `backend_containers` report as given
     /// `far`-dated leaves otherwise.
     fn door_warmup_case(now: i64, containers: Option<Value>) -> (Value, impl Fn(&str) -> crate::commands::node_leaves::LeafState) {
         let far = now + 80 * 86_400;
         let mut n = healthy(now);
-        n["running_backends"] = serde_json::json!({"vllm": "m", "embedding": "harrier"});
-        n["backend_runtimes"] = serde_json::json!({"vllm": "docker", "embedding": "docker"});
+        n["running_backends"] = serde_json::json!({"vllm": "m", "reranker": "bge-reranker-v2-m3-Q8_0.gguf"});
+        n["backend_runtimes"] = serde_json::json!({"vllm": "docker", "reranker": "docker"});
         n["backend_leaves"] = serde_json::json!({
             "vllm": {"dns": ["vllm", "noo-vllm", "noo-vllm-secondary"], "not_after": far},
         });
@@ -11571,7 +12508,7 @@ mod tests {
         }
         let good = move |svc: &str| match svc {
             "vllm" => door_leaf(&["vllm", "localhost", "noo-vllm", "noo-vllm-secondary"], far),
-            "tei" => door_leaf(&["tei", "localhost", "noo-stunnel-tei"], far),
+            "reranker" => door_leaf(&["reranker", "localhost", "noo-stunnel-reranker"], far),
             other => panic!("read a leaf for {other}"),
         };
         (n, good)
@@ -11584,7 +12521,7 @@ mod tests {
         e
     }
 
-    /// The first verify after a bundle apply. The node's tei
+    /// The first verify after a bundle apply. The node's reranker
     /// door has no leaf yet and its container started 5s ago, health
     /// starting: `starting`, not FAIL, no remedy. Past the window the same
     /// record FAILs and names the backend.
@@ -11592,42 +12529,42 @@ mod tests {
     fn a_node_backend_five_seconds_old_and_starting_reads_starting() {
         let now = 1_800_000_000;
         let (n, leaf) = door_warmup_case(now, Some(serde_json::json!({
-            "vllm": life(now, 4000, Some("healthy")), "embedding": life(now, 5, Some("starting")) })));
+            "vllm": life(now, 4000, Some("healthy")), "reranker": life(now, 5, Some("starting")) })));
         let c = backend_doors_check(&n, &leaf, now);
         assert_eq!(c.verdict, Verdict::Starting, "{}", c.detail);
-        assert!(c.detail.starts_with("starting (embedding 5s since start, health=starting"), "{}", c.detail);
-        assert!(c.detail.contains("node holds no services/tei leaf"), "the unproven problem stays visible: {}", c.detail);
+        assert!(c.detail.starts_with("starting (reranker 5s since start, health=starting"), "{}", c.detail);
+        assert!(c.detail.contains("node holds no services/reranker leaf"), "the unproven problem stays visible: {}", c.detail);
         assert!(c.remedy.is_none(), "{:?}", c.remedy);
         assert_eq!(checks_json(&[c])[0]["verdict"], "starting");
 
         // The agent's own refusal for that missing leaf (the reason text
         // node-agent-go writes) is warm-up too.
-        let (mut n, leaf) = door_warmup_case(now, Some(serde_json::json!({ "embedding": life(now, 5, Some("starting")) })));
-        n["backend_leaves"]["tei"] = serde_json::json!({"dns": ["tei", "noo-stunnel-tei"], "not_after": now + 80 * 86_400});
-        n["reconcile_refusals"] = serde_json::json!([{ "scope": "backend_tls", "target": "embedding",
-            "reason": "this node's PKI dir has no services/tei leaf (/etc/noo/pki/services/tei/service.crt: no such file or directory); ..." }]);
+        let (mut n, leaf) = door_warmup_case(now, Some(serde_json::json!({ "reranker": life(now, 5, Some("starting")) })));
+        n["backend_leaves"]["reranker"] = serde_json::json!({"dns": ["reranker", "noo-stunnel-reranker"], "not_after": now + 80 * 86_400});
+        n["reconcile_refusals"] = serde_json::json!([{ "scope": "backend_tls", "target": "reranker",
+            "reason": "this node's PKI dir has no services/reranker leaf (/etc/noo/pki/services/reranker/service.crt: no such file or directory); ..." }]);
         n["backend_containers"]["vllm"] = life(now, 4000, Some("healthy"));
         let c = backend_doors_check(&n, &leaf, now);
         assert_eq!(c.verdict, Verdict::Starting, "{}", c.detail);
 
         // Past the window: FAIL, remedy kept, the backend named.
         let (n, leaf) = door_warmup_case(now, Some(serde_json::json!({
-            "embedding": life(now, warmup::WARMUP_WINDOW_SECS, Some("starting")) })));
+            "reranker": life(now, warmup::WARMUP_WINDOW_SECS, Some("starting")) })));
         let c = backend_doors_check(&n, &leaf, now);
         assert_eq!(c.verdict, Verdict::Fail, "{}", c.detail);
-        assert!(c.detail.contains("the embedding container has been up 180s, past the 180s warm-up"), "{}", c.detail);
+        assert!(c.detail.contains("the reranker container has been up 180s, past the 180s warm-up"), "{}", c.detail);
         assert!(c.remedy.is_some());
 
         // Inside the window but not warming: unhealthy, healthy, stopped.
         for e in [life(now, 5, Some("unhealthy")), life(now, 5, Some("healthy")),
             serde_json::json!({"running": false, "started_at": now - 5})] {
-            let (n, leaf) = door_warmup_case(now, Some(serde_json::json!({ "embedding": e.clone() })));
+            let (n, leaf) = door_warmup_case(now, Some(serde_json::json!({ "reranker": e.clone() })));
             let c = backend_doors_check(&n, &leaf, now);
             assert_eq!(c.verdict, Verdict::Fail, "{e}: {}", c.detail);
-            assert!(c.detail.contains("the embedding container"), "{}", c.detail);
+            assert!(c.detail.contains("the reranker container"), "{}", c.detail);
         }
         // No healthcheck declared: uptime alone explains it, as for Loki.
-        let (n, leaf) = door_warmup_case(now, Some(serde_json::json!({ "embedding": life(now, 40, None) })));
+        let (n, leaf) = door_warmup_case(now, Some(serde_json::json!({ "reranker": life(now, 40, None) })));
         assert_eq!(backend_doors_check(&n, &leaf, now).verdict, Verdict::Starting);
     }
 
@@ -11644,8 +12581,8 @@ mod tests {
         for report in [
             serde_json::json!({}),
             serde_json::json!({ "vllm": life(now, 5, Some("starting")) }),
-            serde_json::json!({ "embedding": {"running": true, "health": "starting"} }),
-            serde_json::json!({ "embedding": {"started_at": now - 5, "health": "starting"} }),
+            serde_json::json!({ "reranker": {"running": true, "health": "starting"} }),
+            serde_json::json!({ "reranker": {"started_at": now - 5, "health": "starting"} }),
             Value::Null,
         ] {
             let (n, leaf) = door_warmup_case(now, Some(report.clone()));
@@ -11659,7 +12596,7 @@ mod tests {
     #[test]
     fn backend_doors_security_faults_never_soften() {
         let now = 1_800_000_000;
-        let fresh = serde_json::json!({ "vllm": life(now, 5, Some("starting")), "embedding": life(now, 5, Some("starting")) });
+        let fresh = serde_json::json!({ "vllm": life(now, 5, Some("starting")), "reranker": life(now, 5, Some("starting")) });
         type Plant = Box<dyn Fn(&mut Value)>;
         let plants: Vec<(&str, Plant)> = vec![
             ("node leaf not naming its door", Box::new(|n: &mut Value| n["backend_leaves"]["vllm"]["dns"] = serde_json::json!(["vllm"]))),
@@ -11769,6 +12706,41 @@ mod tests {
         let mut ctl = with_egress(now, serde_json::json!({"state": "unknown"}));
         ctl["self_node"] = true.into();
         assert!(node_checks(&ctl, "v0.2.70", "0.5.57", now, Some(true)).iter().all(|c| c.name != "harness egress"));
+    }
+
+    /// i1246: the row reads the harness's CURRENT check. A stopped harness has
+    /// no row (robopi: policy auto, no chat model), the age is shown, a
+    /// replaced private resolv.conf alone is a WARN (the allow list still
+    /// holds), and a gateway the hold cuts off is its own FAIL with re-apply.
+    #[test]
+    fn the_harness_egress_row_reads_the_current_check() {
+        let now = 1_800_000_000;
+        let held = serde_json::json!({"state": "enforced", "reason": "", "ip_deny": "0.0.0.0/0 ::/0", "ip_allow": "127.0.0.1/32 ::1/128 10.0.0.5/32",
+            "resolver": "unit", "pid_match": true, "lookup": "failed", "connect": "timeout", "stale_hosts": [], "checked_age_secs": 40, "resolv_held": true});
+        let row = |e: serde_json::Value| node_checks(&with_egress(now, e), "v0.2.70", "0.5.57", now, Some(true)).into_iter().find(|c| c.name == "harness egress");
+
+        let ok = row(held.clone()).unwrap();
+        assert_eq!(ok.verdict, Verdict::Ok);
+        assert!(ok.detail.starts_with("held off the internet (checked 40s ago):"), "{}", ok.detail);
+
+        let mut lost = held.clone();
+        lost["resolv_held"] = false.into();
+        let w = row(lost).unwrap();
+        assert_eq!(w.verdict, Verdict::Warn);
+        assert!(w.detail.contains("private resolv.conf was replaced") && w.detail.contains("nothing leaks"), "{}", w.detail);
+
+        let mut stale = held.clone();
+        stale["state"] = "stale".into();
+        stale["reason"] = "held, but the harness cannot reach the gateway at 10.0.0.5:8443 from inside its hold (the allow list may be stale): re-apply".into();
+        let f = row(stale).unwrap();
+        assert_eq!(f.verdict, Verdict::Fail);
+        assert!(f.detail.contains("cannot reach the gateway at 10.0.0.5:8443"), "{}", f.detail);
+        assert!(f.remedy.as_deref().unwrap().starts_with("noo cluster provision host6"), "{:?}", f.remedy);
+
+        let mut stopped = with_egress(now, serde_json::json!({"state": "unknown", "reason": "the harness unit is not running"}));
+        stopped["host_services"]["harness"]["state"] = "stopped".into();
+        assert!(node_checks(&stopped, "v0.2.70", "0.5.57", now, Some(true)).iter().all(|c| c.name != "harness egress"),
+            "a stopped harness (and its egress object) gives no row");
     }
 
     /// A harness under a runtime with no hold (node-mac, a Mac node: launchd)
@@ -12512,36 +13484,36 @@ mod tests {
     fn the_pki_key_modes_row_names_the_file_and_the_fix() {
         use crate::pki::{KeyIssue, KeyIssueKind, KeyReader};
         let exposed = KeyIssue { rel: "nodes/host3/node.key".into(), mode: 0o644, reader: KeyReader::Cli, kind: KeyIssueKind::Exposed };
-        let c = pki_key_modes_check(std::slice::from_ref(&exposed), &[], 5);
+        let c = pki_key_modes_check(std::slice::from_ref(&exposed), &[], 5, std::path::Path::new("/p"));
         assert_eq!(c.verdict, Verdict::Fail, "a world-readable private key is a failure, not a warning");
         assert!(c.detail.contains("nodes/host3/node.key 0644"), "{}", c.detail);
         assert!(c.remedy.as_deref().unwrap().starts_with("noo security pki fix-modes"), "{:?}", c.remedy);
         // Owned by another uid and unreadable here: only the sudo line helps.
         let foreign = KeyIssue { rel: "services/nats/service.key".into(), mode: 0o600, reader: KeyReader::ContainerRoot, kind: KeyIssueKind::WrongOwner };
         let chown = "sudo chown 1000:1000 /p/services/nats/service.key && sudo chmod 600 /p/services/nats/service.key".to_string();
-        let c = pki_key_modes_check(std::slice::from_ref(&foreign), std::slice::from_ref(&chown), 5);
+        let c = pki_key_modes_check(std::slice::from_ref(&foreign), std::slice::from_ref(&chown), 5, std::path::Path::new("/p"));
         assert_eq!(c.verdict, Verdict::Fail);
         assert!(c.detail.contains("services/nats/service.key 0600") && c.detail.contains("another uid"), "{}", c.detail);
         assert_eq!(c.remedy.as_deref(), Some(chown.as_str()));
         let unreadable = KeyIssue { rel: "services/loki/service.key".into(), mode: 0o640, reader: KeyReader::ContainerUid(65532), kind: KeyIssueKind::Unreadable };
         let line = "sudo chgrp 65532 /p/services/loki/service.key && sudo chmod 640 /p/services/loki/service.key".to_string();
-        let c = pki_key_modes_check(&[unreadable], std::slice::from_ref(&line), 5);
+        let c = pki_key_modes_check(&[unreadable], std::slice::from_ref(&line), 5, std::path::Path::new("/p"));
         assert_eq!(c.verdict, Verdict::Warn);
         assert!(c.detail.contains("services/loki/service.key"), "{}", c.detail);
         assert_eq!(c.remedy.as_deref(), Some(line.as_str()));
         let unknown = KeyIssue { rel: "services/mystery/service.key".into(), mode: 0o644, reader: KeyReader::Unknown, kind: KeyIssueKind::UnknownReader };
-        let c = pki_key_modes_check(&[unknown], &[], 5);
+        let c = pki_key_modes_check(&[unknown], &[], 5, std::path::Path::new("/p"));
         assert_eq!(c.verdict, Verdict::Warn);
         let r = c.remedy.unwrap();
         assert_eq!(r, "noo security pki fix-modes", "fix-modes makes a no-reader key 0600 (i277a)");
         assert!(c.detail.contains("services/mystery/service.key 0644"), "{}", c.detail);
         // Exposure outranks an unreadable key: the fix for both is the same verb,
         // and the sudo line rides along when the verb alone cannot finish it.
-        let c = pki_key_modes_check(&[exposed, KeyIssue { rel: "x".into(), mode: 0o640, reader: KeyReader::ContainerUid(70), kind: KeyIssueKind::Unreadable }], std::slice::from_ref(&line), 5);
+        let c = pki_key_modes_check(&[exposed, KeyIssue { rel: "x".into(), mode: 0o640, reader: KeyReader::ContainerUid(70), kind: KeyIssueKind::Unreadable }], std::slice::from_ref(&line), 5, std::path::Path::new("/p"));
         assert!(c.detail.contains("beyond their reader"));
         let remedy = c.remedy.unwrap();
         assert!(remedy.starts_with("noo security pki fix-modes") && remedy.contains(&line), "{remedy}");
-        let c = pki_key_modes_check(&[], &[], 19);
+        let c = pki_key_modes_check(&[], &[], 19, std::path::Path::new("/p"));
         assert_eq!(c.verdict, Verdict::Ok);
         assert!(c.detail.contains("19 private key(s)"));
     }
@@ -12563,7 +13535,7 @@ mod tests {
                 .map(|kind| KeyIssue { rel: rel.into(), mode: acc.mode, reader, kind })
                 .into_iter()
                 .collect();
-            pki_key_modes_check(&issues, &[], 1)
+            pki_key_modes_check(&issues, &[], 1, std::path::Path::new("/p"))
         };
         let granted = |uid: u32| Access {
             mode: 0o640,
@@ -13491,6 +14463,88 @@ mod tests {
         assert!(own.contains("out.extend(gpu_target_cpu_build_check(n));"), "the row is in the run");
     }
 
+    /// i1182a: the `unsupported engine` row WARNs for every `embedding` placement
+    /// and every non-GGUF or TEI-image reranker, naming the replacement; a
+    /// GGUF reranker and an empty desired state are OK.
+    #[test]
+    fn unsupported_engine_row_warns_on_a_tei_placement_and_is_ok_otherwise() {
+        use serde_json::json;
+        let found = removed_engine_placements(&json!([
+            {"backend": "embedding", "model": "BAAI/bge-small-en-v1.5", "desired_state": "running"},
+            {"backend": "reranker", "model": "BAAI/bge-reranker-v2-m3", "desired_state": "running"},
+            {"backend": "reranker", "model": "x.gguf", "image": "ghcr.io/huggingface/text-embeddings-inference:cpu-1.9.4"},
+            {"backend": "reranker", "model": "bge-reranker-v2-m3-Q8_0.gguf", "desired_state": "running"},
+            {"backend": "ollama", "model": "harrier", "role": "embed", "desired_state": "running"},
+        ]));
+        assert_eq!(found.len(), 3, "{found:?}");
+        let n = json!({"id": "node-a", "removed_engine_placements": found});
+        let c = removed_engine_check(&n).expect("a row");
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.contains("node-a embedding BAAI/bge-small-en-v1.5: uses the TEI engine, which was removed in 0.6.30; nothing runs for this placement; replace it, then unplace it: noo cluster place node-a ollama <model> --role embed && `noo cluster unplace node-a embedding`"), "{}", c.detail);
+        assert!(c.detail.contains("noo cluster place node-a reranker <file>.gguf"), "{}", c.detail);
+        assert!(c.remedy.as_deref().unwrap().contains("noo cluster unplace node-a embedding"), "{:?}", c.remedy);
+        assert!(c.remedy.as_deref().unwrap().contains("noo cluster unplace node-a reranker"), "{:?}", c.remedy);
+
+        let gguf = removed_engine_placements(&json!([{"backend": "reranker", "model": "bge-reranker-v2-m3-Q8_0.gguf"}]));
+        let c = removed_engine_check(&json!({"id": "node-a", "removed_engine_placements": gguf})).expect("a row");
+        assert_eq!(c.verdict, Verdict::Ok);
+        assert_eq!(c.detail, "no placement uses an unsupported engine");
+        let c = removed_engine_check(&json!({"id": "node-a", "removed_engine_placements": []})).expect("a row");
+        assert_eq!(c.verdict, Verdict::Ok);
+        assert!(removed_engine_check(&json!({"id": "node-a"})).is_none(), "desired-config unread: no guess");
+        let own = crate::test_src::own_code(include_str!("cluster_verify.rs"));
+        let inject = crate::test_src::fn_body(&own, "fn with_harness_wanted(");
+        assert!(inject.contains("removed_engine_placements(&d[\"placements\"])"), "fed from desired-config");
+        assert!(own.contains("out.extend(removed_engine_check(n));"), "the row is in the run");
+    }
+
+    /// A container the agent owns with no placement is a WARN naming the
+    /// stop (or the place); a removal on an unplace is a note; an agent that
+    /// reports neither gives no row.
+    #[test]
+    fn unplaced_backends_row_warns_on_an_orphan_and_notes_a_reap() {
+        use serde_json::json;
+        let n = json!({"id": "node-a", "orphan_backends": [{"backend": "reranker", "container": "noo-reranker", "since": "2026-11-20T10:00:00Z"}],
+            "reaped_backends": [{"backend": "vllm", "at": "2026-11-23T10:05:00Z", "unplaced_at": "2026-11-23T10:00:00.000Z"}]});
+        let c = unplaced_backends_check(&n).expect("a row");
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert_eq!(c.name, "unplaced backends");
+        assert!(c.detail.contains("`reranker` is running on `node-a` with no placement"), "{}", c.detail);
+        assert!(c.detail.contains("stopped `vllm` on `node-a`: unplaced at `2026-11-23T10:00:00.000Z`"), "{}", c.detail);
+        assert_eq!(c.remedy.as_deref(), Some("noo cluster stop-backend node-a reranker   # or place it: noo cluster place node-a reranker <model>"));
+        let c = unplaced_backends_check(&json!({"id": "node-a", "orphan_backends": [],
+            "reaped_backends": [{"backend": "vllm", "at": "t", "unplaced_at": "u"}]})).expect("a row");
+        assert_eq!(c.verdict, Verdict::Ok);
+        assert_eq!(c.detail, "no backend container runs without a placement; stopped `vllm` on `node-a`: unplaced at `u`");
+        let c = unplaced_backends_check(&json!({"id": "node-a", "orphan_backends": []})).expect("a row");
+        assert_eq!((c.verdict, c.detail.as_str()), (Verdict::Ok, "no backend container runs without a placement"));
+        assert!(unplaced_backends_check(&json!({"id": "node-a"})).is_none(), "not reported: no guess");
+        let own = crate::test_src::own_code(include_str!("cluster_verify.rs"));
+        assert!(own.contains("out.extend(unplaced_backends_check(n));"), "the row is in the run");
+    }
+
+    /// i1182a: a space bound to a Hugging Face model no node serves WARNs
+    /// naming `embedding-space migrate`; a served space, an Ollama tag and an
+    /// unread list do not.
+    #[test]
+    fn unsupported_engine_space_row_names_the_migrate_command() {
+        use serde_json::json;
+        let body = json!({"spaces": [
+            {"space": "knowledge", "model": "harrier", "default": true, "live": 2},
+            {"space": "old", "model": "BAAI/bge-small-en-v1.5", "default": false, "live": 0},
+            {"space": "served", "model": "org/served", "default": false, "live": 1},
+        ]});
+        let c = removed_engine_space_check(Some(&body)).expect("a row");
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.contains("space old model BAAI/bge-small-en-v1.5") && !c.detail.contains("org/served"), "{}", c.detail);
+        assert_eq!(c.remedy.as_deref(), Some("noo cluster embedding-space migrate old <model>"));
+        let fine = json!({"spaces": [{"space": "knowledge", "model": "harrier", "default": true, "live": 0}]});
+        assert_eq!(removed_engine_space_check(Some(&fine)).expect("a row").verdict, Verdict::Ok);
+        assert!(removed_engine_space_check(None).is_none());
+        let own = crate::test_src::own_code(include_str!("cluster_verify.rs"));
+        assert!(own.contains("checks.extend(removed_engine_space_check(spaces.as_ref()));"), "the row is in the run");
+    }
+
     /// The `vllm compute` row FAILs when a vLLM placement sits on a node below
     /// the vLLM image's compute floor (or one that does not report its compute
     /// capability), naming it, the floor and the remedy; no row otherwise.
@@ -13741,6 +14795,96 @@ mod tests {
         assert_eq!(vendor_telemetry_check(&older).verdict, Verdict::Warn);
         let none = serde_json::json!({"id": "host3", "backend_containers": {}});
         assert_eq!(vendor_telemetry_check(&none).verdict, Verdict::Ok);
+    }
+
+    // Followup i1156: a Mac's native Ollama is its only Ollama lane; a stopped
+    // one FAILs with the remedy that fits (start vs install first); a Linux
+    // node gets no row.
+    #[test]
+    fn native_ollama_row_fails_on_a_mac_whose_ollama_is_down() {
+        let down = serde_json::json!({"id": "node_a", "os": "darwin", "backend_containers": {
+            "ollama": {"running": false, "runtime": "native", "launcher": "brew-service", "managed": true, "binary_present": true}}});
+        let c = native_ollama_check("node_a", &down).expect("a row on a Mac");
+        assert_eq!(c.verdict, Verdict::Fail, "{c:?}");
+        assert!(c.detail.contains("the native Ollama isn't running on this Mac"), "{}", c.detail);
+        let r = c.remedy.as_deref().unwrap();
+        assert!(r.contains("sudo HOMEBREW_NO_ANALYTICS=1 brew services start --sudo-service-user \"$USER\" ollama"), "{r}");
+        assert!(r.contains("run `noo enroll --resume`") && !r.contains("brew install"), "{r}");
+
+        let absent = serde_json::json!({"id": "node_a", "os": "darwin", "backend_containers": {
+            "ollama": {"running": false, "runtime": "native", "launcher": "none", "managed": false, "binary_present": false}}});
+        let c = native_ollama_check("node_a", &absent).expect("a row on a Mac");
+        assert_eq!(c.verdict, Verdict::Fail, "{c:?}");
+        assert!(c.detail.contains("isn't installed"), "{}", c.detail);
+        assert!(c.remedy.as_deref().unwrap().contains("`HOMEBREW_NO_ANALYTICS=1 brew install ollama`, then start it"), "{c:?}");
+
+        // An older agent (no `os`, no `binary_present`): judged by the
+        // runtime, the start remedy.
+        let older = serde_json::json!({"id": "node_a", "backend_containers": {
+            "ollama": {"running": false, "runtime": "native"}}});
+        assert_eq!(native_ollama_check("node_a", &older).map(|c| c.verdict), Some(Verdict::Fail));
+
+        let up = serde_json::json!({"id": "node_a", "os": "darwin", "backend_containers": {
+            "ollama": {"running": true, "runtime": "native", "managed": true}}});
+        assert_eq!(native_ollama_check("node_a", &up).map(|c| c.verdict), Some(Verdict::Ok));
+
+        // Serving from a per-user LaunchAgent (enrolled before i1156): WARN,
+        // and the remedy is the Mac's own `noo enroll --resume`, never
+        // `provision` (a roll cannot register a boot service).
+        let user = serde_json::json!({"id": "node_a", "os": "darwin", "backend_containers": {
+            "ollama": {"running": true, "runtime": "native", "managed": true, "plist_domain": "user"}}});
+        let c = native_ollama_check("node_a", &user).expect("a row on a Mac");
+        assert_eq!(c.verdict, Verdict::Warn, "{c:?}");
+        assert!(c.detail.contains("not a boot service yet"), "{}", c.detail);
+        let r = c.remedy.as_deref().unwrap();
+        assert!(r.contains("`noo enroll --resume`") && !r.contains("provision"), "{r}");
+        let system = serde_json::json!({"id": "node_a", "os": "darwin", "backend_containers": {
+            "ollama": {"running": true, "runtime": "native", "managed": true, "plist_domain": "system"}}});
+        let c = native_ollama_check("node_a", &system).expect("a row on a Mac");
+        assert_eq!(c.verdict, Verdict::Ok, "{c:?}");
+        assert_eq!(c.detail, "serving on 127.0.0.1:11434 as a boot service");
+        // No row's remedy on a Mac names provision: it cannot fix any of them.
+        for n in [&down, &absent, &older, &user] {
+            let c = native_ollama_check("node_a", n).unwrap();
+            assert!(!c.remedy.as_deref().unwrap_or("").contains("provision"), "{c:?}");
+        }
+
+        // Linux: a stopped container ollama, or a native-looking entry on a
+        // node that says it is not a Mac: no row.
+        let linux = serde_json::json!({"id": "node_b", "os": "linux", "backend_containers": {
+            "ollama": {"running": false, "started_at": 1, "telemetry_missing": []}}});
+        assert!(native_ollama_check("node_b", &linux).is_none());
+        let not_mac = serde_json::json!({"id": "node_b", "os": "linux", "backend_containers": {
+            "ollama": {"running": false, "runtime": "native"}}});
+        assert!(native_ollama_check("node_b", &not_mac).is_none());
+        // The self-node's adopted stack ollama is not a Mac's.
+        let stack = serde_json::json!({"id": "ctrl", "backend_containers": {
+            "ollama": {"running": false, "runtime": "stack"}}});
+        assert!(native_ollama_check("ctrl", &stack).is_none());
+    }
+
+    // The agent's native-down refusal surfaces its own remedy in `backend
+    // starts`, not `noo cluster show`.
+    #[test]
+    fn backend_starts_row_surfaces_the_native_ollama_remedy() {
+        let n = serde_json::json!({"id": "node_a", "reconcile_refusals": [{"scope": "backend_start", "target": "ollama",
+            "reason": "the native Ollama isn't running on this Mac: start it with `sudo HOMEBREW_NO_ANALYTICS=1 brew services start --sudo-service-user nodeuser ollama` (a boot service), or run `noo enroll --resume`"}]});
+        let c = backend_starts_check("node_a", &n).unwrap();
+        let r = c.remedy.as_deref().unwrap();
+        assert!(r.starts_with("on node_a: start it with `sudo HOMEBREW_NO_ANALYTICS=1 brew services start"), "{r}");
+        assert!(!r.contains("noo cluster show"), "{r}");
+    }
+
+    // A boot-service plist (root's) gets the sudo remedy in `vendor telemetry`.
+    #[test]
+    fn vendor_telemetry_row_gives_sudo_for_a_boot_service_plist() {
+        let n = serde_json::json!({"id": "node_a", "backend_containers": {
+            "ollama": {"running": true, "runtime": "native", "managed": true, "plist_label": "sh.brew.ollama",
+                       "plist_domain": "system", "telemetry_missing": ["OLLAMA_NO_CLOUD"]}}});
+        let c = vendor_telemetry_check(&n);
+        assert_eq!(c.verdict, Verdict::Fail, "{c:?}");
+        let r = c.remedy.as_deref().unwrap();
+        assert!(r.contains("sudo launchctl bootstrap system $P") && !r.contains("LaunchAgents"), "{r}");
     }
 
     // host8 2026-10-03: an old agent-created noo-ollama beside the stack's
@@ -14510,6 +15654,71 @@ mod tests {
         assert_eq!(c.verdict, Verdict::Warn, "{}", c.detail);
         assert!(c.detail.contains("no hold reported on node_a ("), "{}", c.detail);
         assert!(c.remedy.as_deref().is_some_and(|r| r.contains("noo cluster provision node_a --wait")), "{:?}", c.remedy);
+    }
+
+    /// A certificate-only bundle (push-nodes, a rotation) applies without the
+    /// agent's config, so its report says nothing about the hold: the node
+    /// reads unknown until its next full provision, never "not held" and
+    /// never "never applied".
+    #[test]
+    fn the_agent_protect_row_reads_a_cert_only_apply_as_unknown() {
+        let certs = [("node_a".to_string(), Some(0), "applied: ca.crt node.crt node.key verified-by: signing-key".to_string())];
+        let c = agent_protect_check(&[("node_a".to_string(), false)], &certs).expect("a row");
+        assert_eq!(c.verdict, Verdict::Warn, "{}", c.detail);
+        assert!(c.detail.contains("hold unknown on node_a: its last apply carried no agent config (a certificate or single-kind bundle)"), "{}", c.detail);
+        assert!(c.detail.contains("not re-reported until its next full provision"), "{}", c.detail);
+        assert!(!c.detail.contains("not held") && !c.detail.contains("never applied"), "{}", c.detail);
+        assert!(c.remedy.as_deref().is_some_and(|r| r.contains("noo cluster provision node_a --wait")), "{:?}", c.remedy);
+    }
+
+    /// The report as the gateway stores it: the applier's tail, line breaks
+    /// folded, so `release-check:` and `binary-sha:` follow the summary on
+    /// one line. They do not flip the reading: certificates only is still
+    /// unknown. And the summary is the LAST `applied:`: an earlier log line
+    /// containing the word, without the agent's config, does not make a full
+    /// apply (`agent-env`, no tag) read unknown.
+    #[test]
+    fn the_agent_protect_row_reads_the_folded_summary_and_only_the_last_applied() {
+        let folded = "applied: ca.crt node.crt node.key verified-by: signing-key release-check: generation=2 release=0.6.30 stack=v0.6.30 binary-sha: agent-binary=ab12";
+        let c = agent_protect_check(&[("node_a".to_string(), false)], &[("node_a".to_string(), Some(0), folded.to_string())]).expect("a row");
+        assert!(c.detail.contains("hold unknown on node_a:"), "{}", c.detail);
+        let two = "noo-apply: the previous run applied: ca.crt node.crt\napplied: ca.crt node.crt node.key agent-env verified-by: signing-key";
+        let c = agent_protect_check(&[("node_a".to_string(), false)], &[("node_a".to_string(), Some(0), two.to_string())]).expect("a row");
+        assert!(c.detail.contains("no hold reported on node_a (installed by onboard, or never applied)") && !c.detail.contains("hold unknown"), "{}", c.detail);
+    }
+
+    /// A report that carried the agent's config and no tag keeps today's
+    /// reading (an applier older than the hold), whether the env changed
+    /// (`agent-env`) or not (`agent-env=unchanged`); so does a failed apply
+    /// (no `applied:` line).
+    #[test]
+    fn the_agent_protect_row_reads_agent_env_without_a_tag_and_a_failed_apply_as_today() {
+        for msg in ["applied: agent-env=unchanged verified-by: signing-key", "applied: ca.crt node.crt node.key agent-env nats-creds",
+                    "noo-apply: REFUSED — the bundle's signature does not verify"] {
+            let r = [("node_a".to_string(), Some(0), msg.to_string())];
+            let c = agent_protect_check(&[("node_a".to_string(), false)], &r).expect("a row");
+            assert!(c.detail.contains("no hold reported on node_a (installed by onboard, or never applied)"), "{msg}: {}", c.detail);
+            assert!(!c.detail.contains("hold unknown"), "{msg}: {}", c.detail);
+        }
+    }
+
+    /// A tagged report is held whatever else the line names; a fleet with a
+    /// held, an unknown and an unreported node names each, and the remedy
+    /// provisions both that are not held.
+    #[test]
+    fn the_agent_protect_row_names_held_unknown_and_unreported_together() {
+        let nodes = [("host6".to_string(), false), ("host7".to_string(), false), ("host8".to_string(), false)];
+        let reports = [
+            ("host6".to_string(), Some(0), "applied: agent-env=unchanged agent-protect=unchanged:6 verified-by: signing-key".to_string()),
+            ("host7".to_string(), Some(0), "applied: ca.crt node.crt node.key verified-by: signing-key".to_string()),
+        ];
+        let c = agent_protect_check(&nodes, &reports).expect("a row");
+        assert_eq!(c.verdict, Verdict::Warn, "{}", c.detail);
+        assert!(c.detail.contains("no hold reported on host8 (installed by onboard, or never applied)"), "{}", c.detail);
+        assert!(c.detail.contains("hold unknown on host7:"), "{}", c.detail);
+        assert!(c.detail.contains("held: host6 (6 writable paths)"), "{}", c.detail);
+        let r = c.remedy.unwrap_or_default();
+        assert!(r.contains("noo cluster provision host8 --wait") && r.contains("noo cluster provision host7 --wait") && !r.contains("host6"), "{r}");
     }
 
     /// A Mac (no systemd) owes no hold: never listed, and a Mac-only fleet
@@ -15393,6 +16602,85 @@ mod config_mount_tests {
         assert!(!super::data_root_policy_row(&both).unwrap().remedy.unwrap().starts_with("noo onboard"));
     }
 
+    /// i1160: a root that does not answer is a FAIL, in warn mode too,
+    /// named "data root <path> not answering".
+    #[test]
+    fn a_data_root_not_answering_fails() {
+        use serde_json::json;
+        let n = json!({"id": "node_a", "data_roots": {"noo_data_root": "/data/noo", "probe_error": "x",
+            "policy": {"mode": "warn", "ok": false, "problems": [{"code": "not_answering",
+                "detail": "data root /data/noo not answering: no reply within 5s"}]}}});
+        let c = super::data_root_policy_row(&n).unwrap();
+        assert_eq!(c.verdict, super::Verdict::Fail);
+        assert!(c.detail.starts_with("data root /data/noo not answering: no reply"), "{}", c.detail);
+        let r = c.remedy.unwrap();
+        assert!(r.contains("findmnt /data/noo") && !r.contains("install -d"), "{r}");
+    }
+
+    /// i1160: a missing root whose mount is not there is never fixed by
+    /// creating the directory: the remedy says to mount it, first.
+    #[test]
+    fn a_missing_mount_is_mounted_not_created() {
+        use serde_json::json;
+        let missing = |meant: Option<&str>| {
+            let mut pol = json!({"mode": "warn", "ok": false, "problems": [{"code": "missing", "detail": "/data/noo does not exist"}]});
+            if let Some(m) = meant {
+                pol["filesystem"] = json!({"meant": m});
+            }
+            json!({"id": "node_a", "data_roots": {"noo_data_root": "/data/noo", "policy": pol}})
+        };
+        let mount = super::data_root_policy_row(&missing(Some("mount"))).unwrap().remedy.unwrap();
+        assert!(mount.starts_with("on node_a: the mount for /data/noo is not there: mount it (check `findmnt /data/noo`, your fstab or systemd mount unit)"), "{mount}");
+        assert!(mount.contains("do NOT create the directory") && !mount.contains("install -d"), "{mount}");
+        // An agent that cannot say (older, or nothing recorded): the mount first.
+        let unknown = super::data_root_policy_row(&missing(None)).unwrap().remedy.unwrap();
+        assert!(unknown.starts_with("on node_a: the mount for /data/noo is not there"), "{unknown}");
+        assert!(unknown.find("findmnt").unwrap() < unknown.find("install -d").unwrap(), "{unknown}");
+        // A plain directory: creating it is the remedy.
+        let dir = super::data_root_policy_row(&missing(Some("directory"))).unwrap().remedy.unwrap();
+        assert_eq!(dir, "on node_a: sudo install -d -o noo-agent -g noo-agent /data/noo && sudo chmod go-w /data/noo");
+        // Not on its recorded filesystem: FAIL in warn mode, mount it, never create.
+        let moved = |detail: &str| json!({"id": "node_a", "data_roots": {"noo_data_root": "/data/noo",
+            "policy": {"mode": "warn", "ok": false, "problems": [{"code": "not_on_recorded_fs", "detail": detail}]}}});
+        let c = super::data_root_policy_row(&moved("/data/noo is on /dev/sda1 at / (ext4): the ROOT filesystem")).unwrap();
+        assert_eq!(c.verdict, super::Verdict::Fail);
+        let r = c.remedy.unwrap();
+        assert!(r.starts_with("on node_a: the mount for /data/noo is not there") && !r.contains("install -d"), "{r}");
+        assert!(!r.contains("data-root-fs.json"), "back on the root fs: never re-record: {r}");
+        // A different disk: the record may be replaced, on purpose only.
+        let r = super::data_root_policy_row(&moved("/data/noo is on a different filesystem, /dev/sdc1")).unwrap().remedy.unwrap();
+        assert!(r.contains("data-root-fs.json"), "{r}");
+    }
+
+    /// i1160: the row says what the agent reads the root as, from what the
+    /// machine declares (fstab, a systemd mount unit) or its record.
+    #[test]
+    fn the_data_root_row_shows_mount_or_directory() {
+        use serde_json::json;
+        let row = |fs: serde_json::Value, ok: bool| {
+            let probs = if ok { json!([]) } else { json!([{"code": "mount_missing", "detail": "not mounted"}]) };
+            let n = json!({"id": "node_a", "data_roots": {"noo_data_root": "/data/noo",
+                "policy": {"mode": "warn", "ok": ok, "problems": probs, "filesystem": fs}}});
+            super::data_root_policy_row(&n).unwrap().detail
+        };
+        assert_eq!(row(json!({"meant": "mount", "by": "fstab"}), true),
+            "/data/noo: dedicated, conventional and owned by the agent; mount (fstab)");
+        // Cannot tell: said, never a refusal.
+        assert_eq!(row(json!({"meant": "unknown", "by": "", "not_checked": "cannot read /etc/fstab: permission denied"}), true),
+            "/data/noo: dedicated, conventional and owned by the agent; not checked: cannot read /etc/fstab: permission denied");
+        assert_eq!(row(json!({"meant": "directory", "by": ""}), true),
+            "/data/noo: dedicated, conventional and owned by the agent; directory");
+        assert_eq!(row(json!({"meant": "mount", "by": "systemd unit"}), false), "/data/noo [mount (systemd unit)]: not mounted");
+        assert_eq!(row(json!({"meant": "unknown", "by": ""}), true), "/data/noo: dedicated, conventional and owned by the agent");
+        // A disk that arrived over 3 entries: the row carries the agent's note.
+        let note = "the disk is now mounted at /data/noo since 2026-11-22: 3 files written before it was mounted are hidden under the mount point \
+                    on the root filesystem: unmount to recover or remove them; this note clears by itself on 2026-11-29";
+        assert_eq!(row(json!({"meant": "mount", "by": "fstab", "hidden_entries": 3, "hidden_note": note}), true),
+            format!("/data/noo: dedicated, conventional and owned by the agent; mount (fstab); {note}"));
+        assert_eq!(row(json!({"meant": "mount", "by": "fstab"}), true),
+            "/data/noo: dedicated, conventional and owned by the agent; mount (fstab)");
+    }
+
     #[test]
     fn an_undeclared_legacy_root_is_declared_where_it_is_not_moved() {
         use serde_json::json;
@@ -16084,7 +17372,7 @@ mod digest_tests {
             rel: "services/mystery/service.key".into(), mode: 0o644,
             reader: crate::pki::KeyReader::Unknown, kind: crate::pki::KeyIssueKind::UnknownReader,
         };
-        let c = pki_key_modes_check(&[unknown], &[], 5);
+        let c = pki_key_modes_check(&[unknown], &[], 5, std::path::Path::new("/p"));
         let r = c.remedy.unwrap();
         // fix-modes tightens a key with no reader row to 0600 (i277a).
         assert_eq!(r, "noo security pki fix-modes", "{r}");
@@ -16904,6 +18192,58 @@ mod netns_restore_row_tests {
 }
 
 #[cfg(test)]
+mod hostd_at_boot_row_tests {
+    use super::*;
+    use crate::hostd_boot::{HostdKind, Linger};
+
+    /// i1160 risk 5: a user unit with linger off is the controller that
+    /// stays down after a power cut until someone logs in.
+    #[test]
+    fn hostd_at_boot_warns_when_linger_is_off() {
+        let c = hostd_at_boot_row(HostdKind::UserUnit, "alex", Some(Linger::Off)).expect("a row");
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert_eq!(c.detail, "noo-hostd is alex's user unit and linger is off: after a reboot nothing restores the stack until alex logs in");
+        assert_eq!(c.remedy.as_deref(), Some("sudo loginctl enable-linger alex"));
+    }
+
+    #[test]
+    fn hostd_at_boot_is_ok_with_linger_on_or_a_system_unit() {
+        let c = hostd_at_boot_row(HostdKind::UserUnit, "alex", Some(Linger::On)).expect("a row");
+        assert_eq!(c.verdict, Verdict::Ok);
+        assert!(c.detail.contains("linger is on") && c.detail.contains("starts at boot"), "{}", c.detail);
+        assert_eq!(hostd_at_boot_row(HostdKind::SystemUnit, "alex", None).expect("a row").verdict, Verdict::Ok);
+        assert!(hostd_at_boot_row(HostdKind::Absent, "alex", None).is_none());
+    }
+
+    #[test]
+    fn hostd_at_boot_unreadable_linger_cannot_be_checked() {
+        for linger in [Some(Linger::Unreadable("Failed to connect to bus".into())), None] {
+            let c = hostd_at_boot_row(HostdKind::UserUnit, "alex", linger.clone()).expect("a row");
+            assert_eq!(c.verdict, Verdict::Warn, "{linger:?}");
+            assert!(c.detail.starts_with("cannot be checked: linger for alex could not be read"), "{}", c.detail);
+            assert!(c.detail.contains("until alex logs in"), "{}", c.detail);
+            assert_eq!(c.remedy.as_deref(), Some("sudo loginctl enable-linger alex"));
+        }
+    }
+
+    #[test]
+    fn hostd_at_boot_says_a_mac_launch_agent_waits_for_login() {
+        let c = hostd_at_boot_row(HostdKind::LaunchAgent, "alex", None).expect("a row");
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.starts_with("noo-hostd is alex's LaunchAgent") && c.detail.contains("until alex logs in"), "{}", c.detail);
+        assert!(c.detail.contains("automatic login") && c.detail.contains("FileVault"), "{}", c.detail);
+        assert_eq!(c.remedy, None);
+    }
+
+    #[test]
+    fn the_controller_run_has_the_hostd_at_boot_row() {
+        let own = crate::test_src::own_code(include_str!("cluster_verify.rs"));
+        let run = crate::test_src::fn_body(&own, "pub fn cluster_verify(");
+        assert!(run.contains("hostd_at_boot_row_here()"), "{run}");
+    }
+}
+
+#[cfg(test)]
 mod docker_refused_row_tests {
     use super::*;
 
@@ -16920,7 +18260,7 @@ mod docker_refused_row_tests {
         for r in rows {
             let name = r.name;
             let before = r.detail.clone();
-            let c = docker_refused(r, Some(DENIED));
+            let c = docker_unprobed(r, Some(&crate::commands::secrets_delivery::DockerRefusal::Denied(DENIED.to_string())), &[]);
             assert!(c.detail.contains(DENIED), "{name}: {}", c.detail);
             assert!(!c.detail.contains("not running"), "{name}: failed lookup is not absence: {}", c.detail);
             assert_eq!(c.remedy.as_deref(), Some(crate::commands::secrets_delivery::DOCKER_REFUSED_REMEDY), "{name}");
@@ -16931,14 +18271,50 @@ mod docker_refused_row_tests {
                 "sandbox executor" => sandbox_executor_check(None),
                 _ => postgres_client_cert_check(None, None),
             };
-            assert_eq!(docker_refused(again, None).detail, before, "{name}");
+            assert_eq!(docker_unprobed(again, None, &[]).detail, before, "{name}");
         }
     }
 
     #[test]
     fn a_row_that_did_probe_is_never_rewritten() {
         let c = ok("sandbox executor", "code runs as sandbox-exec (uids 65600-65663)");
-        assert_eq!(docker_refused(c.clone(), Some(DENIED)).detail, c.detail);
+        let denied = crate::commands::secrets_delivery::DockerRefusal::Denied(DENIED.to_string());
+        assert_eq!(docker_unprobed(c.clone(), Some(&denied), &[]).detail, c.detail);
+        assert_eq!(docker_unprobed(c.clone(), None, &[(crate::envfile::container("gateway").to_string(), "could not inspect x (y)".to_string())]).detail, c.detail);
+    }
+
+    /// docker answered `version` but an inspect did not (a hung bind mount):
+    /// the row says that, not "container not running", with `docker info`.
+    /// Unknown for container A is no evidence about container B: B's row
+    /// (whose container was really Stopped) keeps its own text.
+    #[test]
+    fn another_containers_unknown_is_not_this_rows_cause() {
+        let a = crate::commands::secrets::container_unknown_message(&crate::envfile::container("postgres"), "`docker inspect` did not answer in 10 s");
+        let notes = [(crate::envfile::container("postgres").to_string(), a.clone())];
+        let before = sandbox_executor_check(None);
+        let c = docker_unprobed(before.clone(), None, &notes);
+        assert_eq!(c.detail, before.detail, "the sandbox row heard about postgres");
+        assert!(!c.detail.contains("could not inspect"), "{}", c.detail);
+        assert_eq!(c.remedy, before.remedy);
+        // The postgres row does get its own container's note.
+        let pg = docker_unprobed(postgres_client_cert_check(None, None), None, &notes);
+        assert!(pg.detail.contains("could not inspect"), "{}", pg.detail);
+        assert_eq!(crate::commands::secrets::note_for(&notes, "other"), None);
+    }
+
+    #[test]
+    fn an_unknown_inspect_is_not_said_as_a_stopped_container() {
+        let note = crate::commands::secrets::container_unknown_message("noo-gateway", "`docker inspect` did not answer in 10 s");
+        let gw = crate::envfile::container("gateway").to_string();
+        let pg = crate::envfile::container("postgres").to_string();
+        let notes = [(gw, note.clone()), (pg, note.clone())];
+        for r in [sandbox_executor_check(None), postgres_client_cert_check(None, None)] {
+            let name = r.name;
+            let c = docker_unprobed(r, None, &notes);
+            assert!(c.detail.contains("could not inspect noo-gateway"), "{name}: {}", c.detail);
+            assert!(!c.detail.contains("not running"), "{name}: {}", c.detail);
+            assert_eq!(c.remedy.as_deref(), Some("docker info"), "{name}");
+        }
     }
 
     #[test]
@@ -17008,6 +18384,35 @@ mod image_retention_row_tests {
         let r = image_retention_row(Some(Ok(rep)), None);
         assert_eq!(r.verdict, Verdict::Warn);
         assert!(r.detail.contains("ghcr.io/noomesh/x:old") && r.detail.contains("being used"), "{}", r.detail);
+    }
+
+    #[test]
+    fn every_refusal_is_named_with_its_reason() {
+        let rep = json!({"written_at": "T", "dry_run": false, "bytes": 0,
+            "images": [img(true, Some("refused: conflict: container c1 is using its referenced image")),
+                       img(true, Some("refused: image has dependent child images")),
+                       img(true, Some("removed"))]});
+        let r = image_retention_row(Some(Ok(rep)), None);
+        assert_eq!(r.verdict, Verdict::Warn);
+        assert!(r.detail.starts_with("2 superseded image(s) Docker refused"), "{}", r.detail);
+        assert!(r.detail.contains("container c1 is using") && r.detail.contains("dependent child images"), "{}", r.detail);
+        let many: Vec<Value> = (0..8).map(|i| img(true, Some(&format!("refused: reason {i}")))).collect();
+        let r = image_retention_row(Some(Ok(json!({"written_at": "T", "dry_run": false, "bytes": 0, "images": many}))), None);
+        assert!(r.detail.contains("reason 4") && !r.detail.contains("reason 5") && r.detail.contains("3 more"), "{}", r.detail);
+    }
+
+    /// 2026-11-22: an older hostd lost Docker's message, so 13 images read
+    /// "refused: " with nothing after it, and every one was already gone.
+    /// Said as such, with the check, never as a bare empty refusal.
+    #[test]
+    fn a_refusal_with_no_reason_says_it_was_probably_removed_and_how_to_check() {
+        let rep = json!({"written_at": "T", "dry_run": false, "bytes": 0,
+            "images": [img(true, Some("refused: ")), img(true, Some("refused:"))]});
+        let r = image_retention_row(Some(Ok(rep)), None);
+        assert_eq!(r.verdict, Verdict::Warn);
+        assert!(r.detail.starts_with("2 more reported refused at T with no reason recorded"), "{}", r.detail);
+        assert!(r.detail.contains("docker image inspect") && r.detail.contains("No such image"), "{}", r.detail);
+        assert!(!r.detail.contains("Docker refused to remove"), "no empty refusal is shown as Docker's: {}", r.detail);
     }
 
     #[test]
@@ -17340,7 +18745,7 @@ mod model_stores_tests {
         assert_eq!(c.verdict, Verdict::Warn);
         for want in ["2 world-writable", "/data/noo/hf-cache (mode 0777, owner 1000:1000",
             "HF weights are verified against the controller's manifest at each backend start, on a placed node only", "/data/noo/ollama",
-            "Ollama models are checked against the controller's record about every 10 minutes"] {
+            "Ollama models are checked against the controller's record every 10 to 15 minutes (on the agent's 5-minute reconcile tick"] {
             assert!(c.detail.contains(want), "{want}: {}", c.detail);
         }
         let r = c.remedy.unwrap();
@@ -17897,19 +19302,47 @@ mod docker_engine_tests {
     fn an_engine_below_the_minimum_warns_with_the_upgrade() {
         let c = docker_engine_check(&node(json!({"state": "ok", "version": "26.1.4", "kind": "dockerd"}))).expect("a row");
         assert_eq!(c.verdict, Verdict::Warn, "{c:?}");
-        assert!(c.detail.contains("Docker Engine 26.1.4 on node_a is below 27"), "{}", c.detail);
+        assert!(c.detail.contains("Docker Engine 26.1.4 on node_a is below 28"), "{}", c.detail);
         assert!(c.detail.contains("container-lane Ollama import fails on an engine below 28"), "{}", c.detail);
-        assert!(c.remedy.as_deref().unwrap_or("").starts_with("upgrade Docker Engine on node_a to 27 or newer"), "{:?}", c.remedy);
+        assert!(c.remedy.as_deref().unwrap_or("").starts_with("upgrade Docker Engine on node_a to 28 or newer"), "{:?}", c.remedy);
+    }
+
+    /// The operator's floor of 2026-11-21: Engine 28. 27.5.1 (the CI canary's
+    /// dind) WARNs with the whole message and both upgrade routes.
+    #[test]
+    fn engine_27_5_1_is_below_the_floor_of_28() {
+        let c = docker_engine_check(&node(json!({"state": "ok", "version": "27.5.1", "kind": "dockerd"}))).expect("a row");
+        assert_eq!(c.verdict, Verdict::Warn, "{c:?}");
+        assert_eq!(
+            c.detail,
+            "Docker Engine 27.5.1 on node_a is below 28, the oldest Docker Engine noomesh tests; known: a container-lane Ollama import fails on an engine below 28 with an agent before 0.6.28"
+        );
+        assert_eq!(
+            c.remedy.as_deref(),
+            Some("upgrade Docker Engine on node_a to 28 or newer with the package manager, from the package that installed it: Docker's apt repository, sudo apt-get update && sudo apt-get install --only-upgrade docker-ce docker-ce-cli containerd.io docker-compose-plugin; or the distribution's own package, sudo apt-get update && sudo apt-get install --only-upgrade docker.io (only if the release ships 28 or newer); otherwise Docker's convenience script, downloaded then run (never piped): curl -fsSL --proto '=https' --tlsv1.2 https://get.docker.com -o get-docker.sh && sudo sh get-docker.sh (https://docs.docker.com/engine/install/); then: noo cluster verify node_a")
+        );
+        let d = docker_engine_check(&node(json!({"state": "ok", "version": "27.5.1", "kind": "docker-desktop"}))).expect("a row");
+        assert_eq!(d.verdict, Verdict::Warn, "{d:?}");
+        assert_eq!(d.remedy.as_deref(), Some("update Docker Desktop on node_a until its engine is 28 or newer, then: noo cluster verify node_a"));
+    }
+
+    #[test]
+    fn engines_28_0_0_and_29_2_1_pass() {
+        for v in ["28.0.0", "29.2.1"] {
+            let c = docker_engine_check(&node(json!({"state": "ok", "version": v, "kind": "dockerd"}))).expect("a row");
+            assert_eq!(c.verdict, Verdict::Ok, "{v}: {c:?}");
+            assert_eq!(c.detail, format!("Docker Engine {v} (minimum 28)"));
+        }
     }
 
     #[test]
     fn an_engine_at_or_above_the_minimum_is_ok() {
-        for (v, kind) in [("27.0.1", "dockerd"), ("28.5.1", "docker-desktop"), ("29.0.0-rc.1", "dockerd")] {
+        for (v, kind) in [("28.0.1", "dockerd"), ("28.5.1", "docker-desktop"), ("29.0.0-rc.1", "dockerd")] {
             let c = docker_engine_check(&node(json!({"state": "ok", "version": v, "kind": kind}))).expect("a row");
             assert_eq!(c.verdict, Verdict::Ok, "{v}: {c:?}");
             assert!(c.detail.contains(v), "{}", c.detail);
         }
-        assert_eq!(MIN_DOCKER_ENGINE_MAJOR, 27, "the declared minimum is the operator's (i1058)");
+        assert_eq!(MIN_DOCKER_ENGINE_MAJOR, 28, "the declared minimum is the operator's (2026-11-21; was 27, i1058)");
     }
 
     #[test]
@@ -17929,6 +19362,71 @@ mod docker_engine_tests {
         assert_eq!(podman.verdict, Verdict::Ok, "Podman's version is not a Docker Engine's: {podman:?}");
     }
 
+    const DOWN_REMEDY: &str = "on node_a (run on that machine, with sudo): sudo systemctl start docker   # then, from the controller: noo cluster verify node_a";
+
+    /// rc.2 rehearsal: a Linux node whose dockerd was stopped read OK "no
+    /// Docker on this node". The agent now says `down`: a WARN naming what
+    /// showed Docker installed, with the start command run on that node.
+    #[test]
+    fn a_down_daemon_on_linux_warns_with_the_start_remedy() {
+        let mut n = node(json!({"state": "down", "installed_by": "dockerd at /usr/bin/dockerd"}));
+        n["os"] = "linux".into();
+        let c = docker_engine_check(&n).expect("a row");
+        assert_eq!(c.verdict, Verdict::Warn, "{c:?}");
+        assert_eq!(c.detail, "Docker is installed on node_a but its daemon is not answering (dockerd at /usr/bin/dockerd)");
+        assert_eq!(c.remedy.as_deref(), Some(DOWN_REMEDY));
+        // An agent that does not report `os` is judged as Linux.
+        let bare = docker_engine_check(&node(json!({"state": "down", "installed_by": "unit file /lib/systemd/system/docker.service"}))).expect("a row");
+        assert_eq!(bare.verdict, Verdict::Warn, "{bare:?}");
+    }
+
+    /// A down daemon on a node with a container-lane backend placed or
+    /// running FAILs: those containers cannot run. A native one does not count.
+    #[test]
+    fn a_down_daemon_under_a_container_backend_fails() {
+        let mut placed = node(json!({"state": "down", "installed_by": "dockerd at /usr/bin/dockerd"}));
+        placed["os"] = "linux".into();
+        placed["lanes"] = json!([{"backend": "vllm", "model": "m", "role": "chat", "state": "down", "reason": ""}]);
+        let c = docker_engine_check(&placed).expect("a row");
+        assert_eq!(c.verdict, Verdict::Fail, "{c:?}");
+        assert_eq!(c.detail, "Docker is installed on node_a but its daemon is not answering (dockerd at /usr/bin/dockerd); its container-lane backend(s) vllm cannot run without it");
+        assert_eq!(c.remedy.as_deref(), Some(DOWN_REMEDY));
+
+        let mut running = node(json!({"state": "down", "installed_by": "dockerd at /usr/bin/dockerd"}));
+        running["running_backends"] = json!({"llamacpp": "m.gguf", "ollama": "gemma"});
+        running["backend_runtimes"] = json!({"ollama": "native"});
+        let c = docker_engine_check(&running).expect("a row");
+        assert_eq!(c.verdict, Verdict::Fail, "{c:?}");
+        assert!(c.detail.ends_with("backend(s) llamacpp cannot run without it"), "{}", c.detail);
+
+        let mut native = node(json!({"state": "down", "installed_by": "dockerd at /usr/bin/dockerd"}));
+        native["running_backends"] = json!({"ollama": "gemma"});
+        native["backend_runtimes"] = json!({"ollama": "native"});
+        assert_eq!(docker_engine_check(&native).expect("a row").verdict, Verdict::Warn, "a native backend needs no daemon");
+    }
+
+    /// On a Mac the backends are native: Docker Desktop not running is fine.
+    #[test]
+    fn a_down_docker_desktop_on_darwin_is_ok() {
+        let mut n = node(json!({"state": "down", "installed_by": "Docker Desktop at /Applications/Docker.app"}));
+        n["os"] = "darwin".into();
+        n["running_backends"] = json!({"ollama": "gemma"});
+        let c = docker_engine_check(&n).expect("a row");
+        assert_eq!(c.verdict, Verdict::Ok, "{c:?}");
+        assert_eq!(c.detail, "Docker Desktop is installed on node_a but not running (not needed: its backends are native)");
+        let mut h = node(json!({"state": "down", "installed_by": "Docker Desktop at /Applications/Docker.app"}));
+        h["hostd"] = json!({"host": {"os": "darwin"}});
+        assert_eq!(docker_engine_check(&h).expect("a row").verdict, Verdict::Ok, "hostd's os when the beat's is absent");
+    }
+
+    /// An older agent's `none` keeps today's text.
+    #[test]
+    fn an_older_agents_none_keeps_its_text() {
+        let c = docker_engine_check(&node(json!({"state": "none"}))).expect("a row");
+        assert_eq!(c.verdict, Verdict::Ok, "{c:?}");
+        assert_eq!(c.detail, "no Docker on this node (native backends only)");
+    }
+
     #[test]
     fn node_checks_carry_the_docker_engine_row() {
         let c = node_checks(&node(json!({"state": "ok", "version": "24.0.7", "kind": "dockerd"})), "", "", 0, None);
@@ -17942,6 +19440,58 @@ mod docker_compose_tests {
 
     fn known(text: &str) -> ComposeVersion {
         compose_version_from(true, &format!("{text}\n"), "")
+    }
+
+    const UPGRADE: &str = "upgrade it";
+
+    /// The operator's floor of 2026-11-21: Compose 2.33.0. The fleet runs
+    /// Compose 5.x (`docker compose version` prints `Docker Compose version
+    /// v5.0.2`); Ubuntu's package prints `2.40.3+ds1-0ubuntu1~22.04.1`.
+    /// Each string goes through the real parse and the real row.
+    #[test]
+    fn compose_5_and_ubuntu_suffixes_parse_and_meet_the_floor_of_2_33_0() {
+        for (v, want) in [
+            ("5.0.2", (5, 0, 2)),
+            ("v5.0.2", (5, 0, 2)),
+            ("2.33.0", (2, 33, 0)),
+            ("2.33.1", (2, 33, 1)),
+            ("2.40.3", (2, 40, 3)),
+            ("2.40.3+ds1-0ubuntu1~22.04.1", (2, 40, 3)),
+        ] {
+            assert_eq!(parse_compose_version(v), Some(want), "{v:?}");
+            let c = docker_compose_check(&known(v), "install it", UPGRADE);
+            assert_eq!(c.verdict, Verdict::Ok, "{v}: {c:?}");
+            assert_eq!(c.detail, format!("Docker Compose {v} (minimum 2.33.0)"));
+        }
+        // The whole `docker compose version` line reads as its last word.
+        assert_eq!(parse_compose_version("Docker Compose version v5.0.2"), Some((5, 0, 2)));
+        assert_eq!(
+            known("Docker Compose version v5.0.2"),
+            ComposeVersion::Known((5, 0, 2), "Docker Compose version v5.0.2".into())
+        );
+        for (v, want) in [("2.32.9", (2, 32, 9)), ("2.24.6", (2, 24, 6)), ("2.24.6+ds1-0ubuntu1~22.04.1", (2, 24, 6))] {
+            assert_eq!(parse_compose_version(v), Some(want), "{v:?}");
+            let c = docker_compose_check(&known(v), "install it", UPGRADE);
+            assert_eq!(c.verdict, Verdict::Warn, "{v}: {c:?}");
+            assert_eq!(c.detail, format!("Docker Compose {v} is older than the oldest version noomesh tests (2.33.0)"));
+            assert_eq!(c.remedy.as_deref(), Some(UPGRADE));
+        }
+    }
+
+    #[test]
+    fn the_compose_upgrade_remedy_names_this_machines_package() {
+        assert_eq!(
+            compose_upgrade_remedy(Some("docker-compose-plugin")),
+            "upgrade the docker-compose-plugin package to 2.33.0 or newer: sudo apt-get update && sudo apt-get install --only-upgrade docker-compose-plugin, then: docker compose version"
+        );
+        assert_eq!(
+            compose_upgrade_remedy(Some("docker-compose-v2")),
+            "upgrade the docker-compose-v2 package to 2.33.0 or newer: sudo apt-get update && sudo apt-get install --only-upgrade docker-compose-v2; if the distro's stays below 2.33.0, install docker-compose-plugin from Docker's apt repository (https://docs.docker.com/engine/install/), then: docker compose version"
+        );
+        assert_eq!(
+            compose_upgrade_remedy(None),
+            "upgrade the Docker Compose v2 plugin (or Docker Desktop) to 2.33.0 or newer (https://docs.docker.com/compose/install/linux/), then: docker compose version"
+        );
     }
 
     #[test]
@@ -17969,31 +19519,135 @@ mod docker_compose_tests {
     #[test]
     fn a_compose_below_the_minimum_warns_with_the_upgrade() {
         for v in ["2.24.5", "v2.20.2", "1.29.2"] {
-            let c = docker_compose_check(&known(v), "install it");
+            let c = docker_compose_check(&known(v), "install it", &compose_upgrade_remedy(Some("docker-compose-v2")));
             assert_eq!(c.verdict, Verdict::Warn, "{v}: {c:?}");
-            assert_eq!(c.detail, format!("Docker Compose {v} is older than the oldest version noomesh tests (2.24.6)"));
-            assert!(c.remedy.as_deref().unwrap_or("").starts_with("upgrade the docker-compose-v2 package"), "{:?}", c.remedy);
+            assert_eq!(c.detail, format!("Docker Compose {v} is older than the oldest version noomesh tests (2.33.0)"));
+            assert!(c.remedy.as_deref().unwrap_or("").starts_with("upgrade the docker-compose-v2 package to 2.33.0 or newer"), "{:?}", c.remedy);
         }
     }
 
     #[test]
     fn a_compose_at_or_above_the_minimum_is_ok() {
-        for v in ["2.24.6", "v2.38.2", "2.29.1-desktop.1", "2.25.0", "3.0.0"] {
-            let c = docker_compose_check(&known(v), "install it");
+        for v in ["2.33.0", "v2.38.2", "2.35.1-desktop.1", "2.34.0", "3.0.0"] {
+            let c = docker_compose_check(&known(v), "install it", UPGRADE);
             assert_eq!(c.verdict, Verdict::Ok, "{v}: {c:?}");
             assert!(c.detail.contains(v), "{}", c.detail);
         }
-        assert_eq!(MIN_COMPOSE, (2, 24, 6), "the declared minimum is the operator's: the start-inputs job's oldest Compose");
+        assert_eq!(MIN_COMPOSE, (2, 33, 0), "the declared minimum is the operator's (2026-11-21): Docker 28's bundled Compose");
     }
 
     #[test]
     fn an_unreadable_compose_warns_and_a_missing_one_fails_with_the_package() {
-        let c = docker_compose_check(&ComposeVersion::Unreadable("exit 1".into()), "install it");
+        let c = docker_compose_check(&ComposeVersion::Unreadable("exit 1".into()), "install it", UPGRADE);
         assert_eq!(c.verdict, Verdict::Warn, "{c:?}");
         assert!(c.detail.starts_with("cannot be checked: the Docker Compose version could not be read (exit 1)"), "{}", c.detail);
-        let m = docker_compose_check(&ComposeVersion::Missing("not a docker command".into()), "install it with: sudo apt install docker-compose-v2");
+        let m = docker_compose_check(&ComposeVersion::Missing("not a docker command".into()), "install it with: sudo apt install docker-compose-v2", UPGRADE);
         assert_eq!(m.verdict, Verdict::Fail, "{m:?}");
         assert_eq!(m.remedy.as_deref(), Some("install it with: sudo apt install docker-compose-v2"));
+    }
+}
+
+#[cfg(test)]
+mod target_node_row_tests {
+    use super::*;
+
+    #[test]
+    fn the_target_node_row_tells_strict_from_the_two_tolerant_states() {
+        let strict = target_node_check("node-b", &serde_json::json!({"checks_target_node": true, "requires_target_node": true}), 0);
+        assert_eq!((strict.name, strict.verdict), ("target-node check", Verdict::Ok));
+        assert!(strict.detail.starts_with("strict"), "{}", strict.detail);
+        let untold = target_node_check("node-b", &serde_json::json!({"checks_target_node": true, "requires_target_node": false}), 0);
+        assert_eq!(untold.verdict, Verdict::Warn);
+        assert!(untold.detail.starts_with("tolerant: not yet told"), "{}", untold.detail);
+        for old in [serde_json::json!({"checks_target_node": false, "requires_target_node": false}), serde_json::json!({})] {
+            let row = target_node_check("node-b", &old, 0);
+            assert_eq!(row.verdict, Verdict::Warn);
+            assert!(row.detail.starts_with("tolerant: the agent is older than the controller"), "{}", row.detail);
+            assert_eq!(row.remedy.as_deref(), Some("noo cluster provision node-b"));
+        }
+    }
+
+    #[test]
+    fn every_node_gets_the_target_node_row() {
+        let src = include_str!("cluster_verify.rs");
+        let f = crate::test_src::fn_body(src, "pub(crate) fn node_checks(");
+        assert!(f.contains("out.push(target_node_check(id, n, now_unix));"));
+        assert!(f.contains("out.extend(node_identity_check(id, n, now_unix));"));
+    }
+
+    /// An agent's 421 wrong_node (the heartbeat's `wrong_node_refused`) is
+    /// one FAIL naming the call and the next command.
+    #[test]
+    fn a_wrong_node_refusal_fails_the_target_node_row() {
+        let n = serde_json::json!({"checks_target_node": true, "requires_target_node": true,
+            "wrong_node_refused": {"target": "node-c", "path": "/start", "at": 940}});
+        let row = target_node_check("node-b", &n, 1000);
+        assert_eq!(row.verdict, Verdict::Fail);
+        assert_eq!(
+            row.detail,
+            "node-b's agent refused a call addressed to node-c (/start, 421 wrong_node, 60s ago): the controller dialled node-b's address for node-c"
+        );
+        assert!(row.remedy.as_deref().unwrap().starts_with("noo cluster verify node-c"), "{:?}", row.remedy);
+        let headerless = serde_json::json!({"checks_target_node": true, "requires_target_node": true,
+            "wrong_node_refused": {"target": "", "path": "/start", "at": 940}});
+        let row = target_node_check("node-b", &headerless, 1000);
+        assert_eq!(row.verdict, Verdict::Fail);
+        assert!(row.detail.contains("a controller call that named no node"), "{}", row.detail);
+        assert!(row.remedy.as_deref().unwrap().starts_with("noo cluster logs node-b"), "{:?}", row.remedy);
+    }
+
+    /// The gateway's 502 node_identity_mismatch (`/api/cluster/nodes`'
+    /// `node_identity_mismatch`) is one FAIL with the fact and the next
+    /// command; no row without it.
+    #[test]
+    fn an_identity_refusal_fails_the_node_identity_row() {
+        assert!(node_identity_check("node-b", &serde_json::json!({}), 1000).is_none());
+        let n = serde_json::json!({"node_identity_mismatch": {"host": "192.0.2.41", "expected": ["node-b"], "presented": ["node-c"], "at": 990}});
+        let row = node_identity_check("node-b", &n, 1000).expect("a row");
+        assert_eq!((row.name, row.verdict), ("node identity", Verdict::Fail));
+        assert_eq!(
+            row.detail,
+            "192.0.2.41 answered with node-c's certificate when dialled for node-b (502 node_identity_mismatch, 10s ago): the controller's address book gives 192.0.2.41 to node-b"
+        );
+        let remedy = row.remedy.as_deref().unwrap();
+        assert!(remedy.starts_with("noo cluster verify node-b --json"), "{remedy}");
+        assert!(remedy.contains("noo security pki push-nodes node-b --prove"), "{remedy}");
+        assert!(!remedy.contains("provision"), "{remedy}");
+        let held = serde_json::json!({"node_identity_mismatch": {"host": "192.0.2.41:8081", "expected": ["node-b"], "presented": ["address owned by node-c"], "at": 990}});
+        let row = node_identity_check("node-b", &held, 1000).expect("a row");
+        assert!(row.detail.contains("gives 192.0.2.41:8081 to node-c, and node-b's record still names it"), "{}", row.detail);
+    }
+
+    /// `ip_address_refused` is one FAIL on the `agent address` row, with
+    /// the next command for its reason.
+    #[test]
+    fn a_refused_address_fails_the_agent_address_row() {
+        let row = |why: &str| {
+            agent_address_check("node-b", &serde_json::json!({"ip_address": "192.0.2.41", "ip_address_refused": why})).expect("a row")
+        };
+        let claimed = row("192.0.2.42 is claimed by node-c");
+        assert_eq!((claimed.name, claimed.verdict), ("agent address", Verdict::Fail));
+        assert_eq!(
+            claimed.detail,
+            "node-b: the controller refused the address it reported (192.0.2.42 is claimed by node-c) and keeps its previous address 192.0.2.41"
+        );
+        // A first registration (or a stored address itself refused): none kept.
+        let none = agent_address_check("node-b", &serde_json::json!({"ip_address_refused": "192.0.2.42 is claimed by node-c"})).expect("a row");
+        assert_eq!((none.name, none.verdict), ("agent address", Verdict::Fail));
+        assert_eq!(
+            none.detail,
+            "node-b: the controller did not store the address it reported (192.0.2.42 is claimed by node-c); the controller reaches it over its bus or tunnel only"
+        );
+        assert!(none.remedy.as_deref().unwrap().starts_with("noo cluster verify node-c"), "{:?}", none.remedy);
+        assert!(claimed.remedy.as_deref().unwrap().starts_with("noo cluster verify node-c"), "{:?}", claimed.remedy);
+        let own = row("192.0.2.1 is the controller's own address");
+        assert!(own.remedy.as_deref().unwrap().starts_with("on node-b, set NODE_IP"), "{:?}", own.remedy);
+        let peer = row("the heartbeat came from tailnet address 100.64.0.9, not 100.64.0.8");
+        assert!(peer.remedy.as_deref().unwrap().contains("to 100.64.0.9, the tailnet address it calls from"), "{:?}", peer.remedy);
+        for r in [&claimed, &own, &peer] {
+            assert!(!r.remedy.as_deref().unwrap().contains("provision"), "{:?}", r.remedy);
+        }
+        assert!(agent_address_check("node-b", &serde_json::json!({"ip_address": "192.0.2.41"})).is_none());
     }
 }
 
@@ -18002,13 +19656,27 @@ mod agent_cert_tests {
     use super::*;
 
     #[test]
+    fn an_unclaimed_address_is_reissued_only_on_proof() {
+        // Private or public, one remedy: plain push-nodes mints only vetted
+        // addresses (i1174), so the proof form is the way to a new one.
+        for host in ["10.0.0.41", "192.0.2.41"] {
+            let row = agent_cert_check("node-b", host, Some(false), None).expect("a row");
+            assert_eq!(row.verdict, Verdict::Fail);
+            assert_eq!(row.remedy.as_deref(), Some("noo security pki push-nodes node-b --prove   # then: noo cluster verify node-b"));
+        }
+        // A claimed one gets none.
+        assert!(agent_cert_check("node-b", "10.0.0.41", Some(false), Some("node-c")).unwrap().remedy.is_none());
+    }
+
+    #[test]
     fn a_leaf_that_misses_the_dialed_address_fails_naming_both() {
         let row = agent_cert_check("node-b", "192.0.2.41", Some(false), None).expect("a row");
         assert_eq!(row.name, "agent certificate");
         assert_eq!(row.verdict, Verdict::Fail);
         assert!(row.detail.contains("node-b") && row.detail.contains("192.0.2.41") && row.detail.contains("fails TLS"), "{}", row.detail);
-        assert!(row.remedy.as_deref().unwrap().contains("noo security pki push-nodes node-b"));
+        assert!(row.remedy.as_deref().unwrap().contains("noo security pki push-nodes node-b --prove"), "{:?}", row.remedy);
         assert!(row.detail.contains("will issue it a certificate for 192.0.2.41"), "the row says what it would certify: {}", row.detail);
+        assert!(row.detail.contains("not node-b's enrollment, tailnet or current-leaf address"), "{}", row.detail);
     }
 
     /// The address is another node's: a finding, never a remedy that would
@@ -18100,6 +19768,46 @@ mod json_parity_tests {
         assert_eq!(cmds, ["noo health", "noo stack status"]);
     }
 
+    /// On a node the gateway-unreachable verify says the agent's own story
+    /// and node-side checks, never a controller-only command.
+    #[test]
+    fn a_node_that_cannot_reach_the_controller_gets_node_checks_only() {
+        for (url, ts) in [(Some("https://ctrl.example.ts.net:8080"), true), (Some("https://100.64.0.1:8080"), false), (Some("https://[fd00::1]:8080/"), false), (None, false)] {
+            let (line, guide) = unreachable_from_node("node_a", url, ts);
+            assert!(line.contains("nothing is reconciled") && line.contains("running backends keep running"), "{line}");
+            assert!(line.contains("node 'node_a'"), "{line}");
+            for (c, _) in &guide {
+                assert!(!crate::role::is_controller_only(c), "a node is told to run a controller-only command: {c}");
+            }
+            assert!(guide.iter().any(|(c, _)| c == "cat /etc/noo/controller-url"), "{guide:?}");
+            assert_eq!(guide.iter().any(|(c, _)| c == "tailscale status"), ts, "tailnet check only with tailscale: {guide:?}");
+            assert_eq!(guide.last().map(|(c, _)| c.as_str()), Some("noo health"));
+        }
+        let (_, g) = unreachable_from_node("node_a", Some("https://100.64.0.1:8080"), false);
+        assert!(g.iter().any(|(c, _)| c == "ip route get 100.64.0.1"), "{g:?}");
+        let (_, g) = unreachable_from_node("node_a", Some("https://[fd00::1]:8080/"), false);
+        assert!(g.iter().any(|(c, _)| c == "ip route get fd00::1"), "{g:?}");
+        let (line, _) = unreachable_from_node("node_a", None, false);
+        assert!(line.contains("/etc/noo/controller-url"), "{line}");
+    }
+
+    /// The controller's own guide names a controller-only verb (it is one),
+    /// so the predicate is not vacuous.
+    #[test]
+    fn is_controller_only_knows_stack() {
+        assert!(crate::role::is_controller_only("noo stack status"));
+        assert!(!crate::role::is_controller_only("noo health"));
+        assert!(!crate::role::is_controller_only("tailscale status"));
+    }
+
+    #[test]
+    fn verify_takes_the_node_branch_before_the_controller_guide() {
+        let src = include_str!("cluster_verify.rs");
+        let node = src.find("if let Some(node) = crate::role::detect().node_only().cloned() {").expect("the node branch");
+        let ctl = src.find("ui::guide(GATEWAY_UNREACHABLE_NEXT);").expect("the controller guide");
+        assert!(node < ctl);
+    }
+
     /// `seats: []` is "none enrolled"; null is "the gateway did not say".
     #[test]
     fn json_seats_unknown_is_null_not_empty() {
@@ -18137,6 +19845,69 @@ mod remedy_command_tests {
             "Docker isn't pinned (docker-ce): a routine `apt upgrade` can restart every container. Hold it when you want control. (also not pinned: tailscale)"
         );
         assert_eq!(super::holds_detail(&["tailscale"]), "tailscale not pinned: a routine `apt upgrade` can move them. Hold them when you want control.");
+    }
+
+    /// i1098 row 12 (operator 2026-11-21): on the machine onboard ran on, the
+    /// `holds` row shows the set onboard held and says onboard placed it, with
+    /// the way to take an update; it says so when onboard placed none, and
+    /// when a hold onboard placed is gone. Another node's row is unchanged.
+    #[test]
+    fn the_holds_row_shows_what_onboard_held() {
+        let docker = ["containerd.io", "docker-buildx-plugin", "docker-ce", "docker-ce-cli", "docker-compose-plugin"];
+        let platform: serde_json::Map<String, Value> = docker.iter().chain(["tailscale"].iter()).map(|p| (p.to_string(), json!("1"))).collect();
+        let host = |held: &[&str]| json!({
+            "os": "linux", "running_kernel": "7.0.11", "default_kernel": "7.0.11",
+            "platform": platform, "held": held,
+            "tailscale_state": "Running", "tailscale_online": true,
+        });
+        let rec: Vec<String> = docker.iter().map(|p| p.to_string()).collect();
+        let nothing: &[String] = &[];
+        let row = |h: &Value, onboard: Option<&[String]>| host_checks_with("node_a", h, true, onboard).into_iter().find(|c| c.name == "holds").expect("a holds row");
+        let mut all: Vec<&str> = docker.to_vec();
+        all.push("tailscale");
+
+        let held = row(&host(&all), Some(rec.as_slice()));
+        assert_eq!(held.verdict, Verdict::Ok);
+        assert_eq!(held.detail, "6 platform package(s) held; onboard held containerd.io, docker-buildx-plugin, docker-ce, docker-ce-cli, docker-compose-plugin \
+            when it installed Docker, so an unattended upgrade cannot restart dockerd. To take an update: sudo apt-mark unhold containerd.io docker-buildx-plugin docker-ce docker-ce-cli docker-compose-plugin \
+            && sudo apt-get update && sudo apt-get install --only-upgrade containerd.io docker-buildx-plugin docker-ce docker-ce-cli docker-compose-plugin, \
+            then noo cluster verify, then sudo apt-mark hold containerd.io docker-buildx-plugin docker-ce docker-ce-cli docker-compose-plugin");
+        assert_eq!(row(&host(&all), Some(nothing)).detail,
+            "6 platform package(s) held; onboard placed none of these holds (it holds only a Docker it installed)");
+        assert_eq!(row(&host(&all), None).detail, "6 platform package(s) held", "another node: unchanged");
+
+        // Docker present before onboard: not held, and the row says onboard placed nothing.
+        let before = row(&host(&["tailscale"]), Some(nothing));
+        assert_eq!(before.verdict, Verdict::Warn);
+        assert!(before.detail.starts_with("Docker isn't pinned (containerd.io, docker-buildx-plugin, docker-ce, docker-ce-cli, docker-compose-plugin)"), "{}", before.detail);
+        assert!(before.detail.ends_with(" Onboard placed no hold here: it holds only a Docker it installed itself."), "{}", before.detail);
+        assert_eq!(before.remedy.as_deref(), Some("on node_a: sudo apt-mark hold containerd.io docker-buildx-plugin docker-ce docker-ce-cli docker-compose-plugin"));
+
+        // Onboard held docker-ce; the person unheld it for an update.
+        let gone = row(&host(&["containerd.io", "docker-buildx-plugin", "docker-ce-cli", "docker-compose-plugin", "tailscale"]), Some(rec.as_slice()));
+        assert_eq!(gone.detail, "Docker isn't pinned (docker-ce): a routine `apt upgrade` can restart every container. Hold it when you want control. \
+            Onboard held docker-ce when it installed Docker, and the hold is gone (released for an update? hold it again).");
+        // A Docker package onboard did not install, unheld: named as not onboard's.
+        let other = row(&host(&["containerd.io", "docker-ce", "tailscale"]), Some(&rec[..1]));
+        assert!(other.detail.ends_with(" Onboard holds containerd.io (it installed them); it did not install these."), "{}", other.detail);
+        // Only Docker is onboard's business: an unheld tailscale alone reads as before.
+        assert_eq!(row(&host(&docker), Some(rec.as_slice())).detail, super::holds_detail(&["tailscale"]));
+    }
+
+    /// The record reaches the row for the self node only: with_harness_wanted
+    /// injects it under that test, and node_checks hands it to the row.
+    #[test]
+    fn the_onboard_record_is_read_for_the_self_node_only() {
+        assert_eq!(onboard_holds_of(&json!({"id": "n"})), None);
+        assert_eq!(onboard_holds_of(&json!({"onboard_docker_holds": []})), Some(Vec::new()));
+        assert_eq!(onboard_holds_of(&json!({"onboard_docker_holds": ["docker-ce"]})), Some(vec!["docker-ce".to_string()]));
+        let own = crate::test_src::own_code(include_str!("cluster_verify.rs"));
+        let inject = crate::test_src::fn_body(&own, "fn with_harness_wanted(");
+        let gate = inject.find("if crate::role::is_self_node(&id) {").expect("gated on the self node");
+        let put = inject.find("obj.insert(\"onboard_docker_holds\".into(), serde_json::json!(crate::docker_hold::recorded_here()));").expect("the record");
+        assert!(gate < put, "{inject}");
+        let node = crate::test_src::fn_body(&own, "pub(crate) fn node_checks(");
+        assert!(node.contains("host_checks_with(id, &hostd[\"host\"], hostd[\"alive\"].as_bool() == Some(true), onboard_holds_of(n).as_deref())"), "{node}");
     }
 
     /// The at-rest rows say what is planned without an internal id.
@@ -18320,5 +20091,109 @@ mod default_chat_fleet_shape_tests {
         assert_eq!(brief_split(std::slice::from_ref(&c)).passed, 1);
         assert_eq!(fleet_node_count(&[]), None);
         assert_eq!(fleet_node_count(&[json!({"id": "ctrl"})]), Some(1));
+    }
+}
+
+#[cfg(test)]
+mod controller_address_tests {
+    use super::*;
+
+    fn s(v: &[&str]) -> Vec<String> {
+        v.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn a_name_or_a_tailnet_address_survives_a_move() {
+        let c = controller_address_check(Some("https://ctrl.example.ts.net:8080"), None, None).unwrap();
+        assert_eq!(c.verdict, Verdict::Ok, "{}", c.detail);
+        let c = controller_address_check(Some("https://100.64.0.1:8080"), None, Some(&s(&["192.0.2.5"]))).unwrap();
+        assert_eq!(c.verdict, Verdict::Ok, "{}", c.detail);
+        assert!(c.detail.contains("tailnet address"), "{}", c.detail);
+        let c = controller_address_check(Some("https://192.0.2.5:8080"), Some("noo.example.lan"), Some(&s(&["192.0.2.9"]))).unwrap();
+        assert_eq!(c.verdict, Verdict::Ok, "NOO_CONTROLLER_DNS wins: {}", c.detail);
+    }
+
+    /// i1173: a LAN IP this machine holds works today and strands every
+    /// node the day the router hands out another one: said, with the fix.
+    #[test]
+    fn a_local_ip_it_holds_warns_with_the_tailnet_first() {
+        let c = controller_address_check(Some("https://192.0.2.5:8080"), None, Some(&s(&["192.0.2.5", "100.64.0.3"]))).unwrap();
+        assert_eq!(c.verdict, Verdict::Warn, "{}", c.detail);
+        assert!(c.detail.contains("cannot be fixed from here"), "{}", c.detail);
+        let r = c.remedy.unwrap();
+        assert!(r.starts_with("put the controller on a tailnet, the default path"), "{r}");
+        assert!(r.contains("DHCP reservation"), "{r}");
+        let unknown = controller_address_check(Some("https://192.0.2.5:8080"), None, None).unwrap();
+        assert_eq!(unknown.verdict, Verdict::Warn, "unknown local addresses never FAIL");
+    }
+
+    /// The controller moved: the address nodes hold is no longer its own.
+    #[test]
+    fn a_local_ip_it_no_longer_holds_fails_naming_both() {
+        let c = controller_address_check(Some("https://192.0.2.5:8080/"), None, Some(&s(&["192.0.2.77"]))).unwrap();
+        assert_eq!(c.verdict, Verdict::Fail, "{}", c.detail);
+        assert!(c.detail.contains("192.0.2.5") && c.detail.contains("192.0.2.77"), "{}", c.detail);
+        assert!(c.remedy.unwrap().contains("enroll each node again"));
+    }
+
+    #[test]
+    fn nothing_to_judge_without_a_remote_url() {
+        for u in [None, Some(""), Some("https://localhost:8080"), Some("https://127.0.0.1:8080"), Some("https://gateway:8080")] {
+            assert!(controller_address_check(u, None, Some(&s(&["192.0.2.5"]))).is_none(), "{u:?}");
+        }
+    }
+
+    #[test]
+    fn hosts_parse_from_urls_and_bare_forms() {
+        assert_eq!(url_host("https://192.0.2.5:8080/x"), "192.0.2.5");
+        assert_eq!(url_host("192.0.2.5"), "192.0.2.5");
+        assert_eq!(url_host("https://[fd00::5]:8080"), "fd00::5");
+        assert_eq!(url_host("https://u@ctrl.lan:8080"), "ctrl.lan");
+    }
+
+    #[test]
+    fn verify_runs_the_row_beside_the_service_cert_names() {
+        let src = include_str!("cluster_verify.rs");
+        let row = src.find("if let Some(c) = controller_address_row_here() {").expect("called");
+        let svc = src.find("checks.push(service_cert_names_check(").expect("anchor");
+        assert!(row < svc);
+    }
+}
+
+#[cfg(test)]
+mod reranker_row_tests {
+    use super::{reranker_check, Verdict};
+    use serde_json::json;
+
+    /// i1182a: no reranker placed WARNs with the place command; a placed one
+    /// is OK; an unread or shapeless answer is not judged as either.
+    #[test]
+    fn no_reranker_placed_is_ok_and_a_loading_one_warns() {
+        // None placed is not a fault (reranking is optional): OK, saying what
+        // answers instead and how to place one. A fresh install reads OK here.
+        let c = reranker_check(Some(&json!({"rerank": {"available": false, "models": [], "state": "none"}})));
+        assert_eq!(c.verdict, Verdict::Ok);
+        assert_eq!(c.detail, "no reranker placed (optional): /api/external/rerank answers with the labelled chat-model fallback; place one with `noo cluster place <node> reranker <file>.gguf --on cpu`");
+        let older = reranker_check(Some(&json!({"rerank": {"available": false, "models": []}})));
+        assert_eq!(older.verdict, Verdict::Ok, "a gateway older than `state` says false only with none placed");
+        let ok = reranker_check(Some(&json!({"rerank": {"available": true, "models": ["default"]}})));
+        assert_eq!(ok.verdict, Verdict::Ok);
+        let unread = reranker_check(None);
+        assert_eq!(unread.verdict, Verdict::Warn);
+        assert!(unread.detail.starts_with("not read") && unread.remedy.is_none(), "{}", unread.detail);
+        let loading = reranker_check(Some(&json!({"rerank": {"available": false, "models": [], "state": "loading",
+            "reason": "placed on node-a, loading: not serving yet (its model is loading or its agent is not reachable); a request now is answered by the chat model, labelled"}})));
+        assert_eq!(loading.verdict, Verdict::Warn);
+        assert!(loading.detail.starts_with("placed on node-a, loading") && loading.remedy.is_none(), "{}", loading.detail);
+        assert!(!loading.detail.contains("no reranker placed"), "a placed reranker is never called absent");
+        let odd = reranker_check(Some(&json!({"chat": {}})));
+        assert!(odd.remedy.is_none() && !odd.detail.contains("no reranker placed"), "{}", odd.detail);
+    }
+
+    /// The row runs on the controller, from the gateway's own capabilities.
+    #[test]
+    fn the_controller_checks_read_the_gateways_capabilities() {
+        let own = crate::test_src::own_code(include_str!("cluster_verify.rs"));
+        assert!(own.contains(r#"checks.push(reranker_check(get_json_opt(g, "/api/external/capabilities", true, 15).as_ref()));"#));
     }
 }

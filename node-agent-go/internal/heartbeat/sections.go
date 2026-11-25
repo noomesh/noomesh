@@ -5,9 +5,11 @@ package heartbeat
 
 import (
 	"runtime"
+	"time"
 
 	"github.com/noomesh/noomesh/node-agent-go/internal/auth"
 	"github.com/noomesh/noomesh/node-agent-go/internal/backendleaves"
+	"github.com/noomesh/noomesh/node-agent-go/internal/backendreap"
 	"github.com/noomesh/noomesh/node-agent-go/internal/hardware"
 	"github.com/noomesh/noomesh/node-agent-go/internal/imagesource"
 	"github.com/noomesh/noomesh/node-agent-go/internal/modelpresence"
@@ -29,6 +31,14 @@ type payloadSection struct {
 	stage string
 	add   func(r *Reporter, p map[string]any)
 }
+
+// wrongNodeReport reads the agent's latest wrong_node refusal (a seam for
+// the payload tests).
+var wrongNodeReport = auth.LastWrongNode
+
+// misaddressedReport reads the peers whose misaddressed calls this agent
+// refused (a seam for the payload tests).
+var misaddressedReport = auth.MisaddressedFrom
 
 // The sections both a registration and a heartbeat carry. Each field is
 // assembled here and nowhere else.
@@ -69,6 +79,24 @@ var (
 		// receiving the bearer — both roll orders stay safe.
 		p["controller_leaf_only"] = auth.ControllerLeafOnly(r.cfg)
 		p["control_transports"] = r.controlTransports()
+		// This agent refuses a call addressed to another node (X-Noo-Node),
+		// and whether it currently refuses a header-less controller call
+		// (the desired-config flag the controller sends once it read the
+		// first field). i1174.
+		p[auth.ChecksTargetNodeField] = true
+		p[auth.RequiresTargetNodeField] = auth.RequiresTargetNode()
+		// The latest call this agent refused as addressed elsewhere, for ten
+		// minutes after it (verify's `target-node check` row). Absent when
+		// there was none.
+		if w := wrongNodeReport(); w != nil {
+			p[auth.WrongNodeRefusedField] = w
+		}
+		// The peers (never the controller) whose calls named another node
+		// in the last ten minutes: this node's report on each caller, for an
+		// operator alert on the caller. Absent when there were none.
+		if m := misaddressedReport(); len(m) > 0 {
+			p[auth.MisaddressedFromField] = m
+		}
 	}}
 
 	secBackendLeaves = payloadSection{name: "backendLeaves", stage: "backend_leaves", add: func(r *Reporter, p map[string]any) {
@@ -181,11 +209,13 @@ var heartbeatSections = []payloadSection{
 	secModelSets,
 	secImageStore,
 	secOllamaVerify,
+	secGGUFUnverified,
 	secNodeLocal,
 	secBackendCaps,
 	secLlamacppOffload,
 	secNodeFacts,
 	secLastStop,
+	secBackendReap,
 }
 
 // Heartbeat-only sections.
@@ -240,6 +270,16 @@ var (
 		// claim "none placed".
 		if ov := r.ollamaVerifyReport(); ov != nil {
 			p["ollama_verify"] = ov
+		}
+	}}
+
+	secGGUFUnverified = payloadSection{name: "ggufUnverified", add: func(r *Reporter, p map[string]any) {
+		// The GGUF backends that started on a local file the controller has
+		// not vouched for: [{backend, model, reason, since}], until the node
+		// re-verifies the file against the controller's manifest. OMITTED
+		// when there are none.
+		if gu := r.ggufUnverifiedReport(); gu != nil {
+			p["gguf_unverified"] = gu
 		}
 	}}
 
@@ -364,6 +404,21 @@ var (
 			if hd := r.hostdState(); len(hd) > 0 {
 				p["hostd"] = hd
 			}
+		}
+	}}
+
+	secBackendReap = payloadSection{name: "backendReap", add: func(r *Reporter, p map[string]any) {
+		// The unplace reaper's account (internal/backendreap):
+		// `orphan_backends` once the reconciler has judged them (`[]` is
+		// "none"; omitted before its first judgement), and the
+		// `reaped_backends` of the last 24 h when there are any. The
+		// controller deletes the unplace record each reaped entry names.
+		rs, os, judged := backendreap.Report(time.Now())
+		if judged {
+			p["orphan_backends"] = os
+		}
+		if len(rs) > 0 {
+			p["reaped_backends"] = rs
 		}
 	}}
 

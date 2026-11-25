@@ -1116,8 +1116,6 @@ pub const CORE_REGISTRY: &[SecretSpec] = &[
         consumers: &[
             "noo-vllm",
             "noo-vllm-secondary",
-            "noo-tei",
-            "noo-tei-gpu",
             "noo-whisper",
             "noo-reranker",
             "noo-node-agent",
@@ -4865,12 +4863,91 @@ pub(crate) fn recreate_verdicts(
         .collect()
 }
 
+/// What `docker inspect` of one container came to. Four answers, because
+/// "not running" is only true of two of them (i1159b row 3: after a power
+/// cut a hung inspect and a missing socket both read as "Postgres is DOWN").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ContainerState {
+    Running,
+    /// The container exists and is not running.
+    Stopped,
+    /// docker answered "no such object".
+    Absent,
+    /// docker did not say: it timed out, could not be run, refused, or
+    /// printed something unexpected. The string is why.
+    Unknown(String),
+}
+
+/// The bound on one `docker inspect` of a container.
+pub(crate) const CONTAINER_STATE_SECS: u64 = 10;
+
+/// [`container_state`], pure over the bounded call's result.
+pub(crate) fn container_state_of(probe: &crate::bounded::Bounded) -> ContainerState {
+    use crate::bounded::Bounded;
+    match probe {
+        Bounded::TimedOut { secs } => ContainerState::Unknown(format!("`docker inspect` did not answer in {secs} s")),
+        Bounded::SpawnFailed(e) => ContainerState::Unknown(format!("docker could not be run: {e}")),
+        Bounded::Answered(o) if o.status.success() => match String::from_utf8_lossy(&o.stdout).trim() {
+            "true" => ContainerState::Running,
+            "false" => ContainerState::Stopped,
+            other => ContainerState::Unknown(format!("`docker inspect` printed {other:?}")),
+        },
+        Bounded::Answered(o) => {
+            let err = String::from_utf8_lossy(&o.stderr);
+            let lower = err.to_ascii_lowercase();
+            if lower.contains("no such object") || lower.contains("no such container") {
+                ContainerState::Absent
+            } else {
+                let line = err.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("docker inspect failed");
+                ContainerState::Unknown(line.to_string())
+            }
+        }
+    }
+}
+
+/// The unknowns seen this process, for a row that could not probe and has
+/// to say why (the verify rows return `None` for "could not probe").
+static UNKNOWN_NOTES: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new());
+
+/// "could not inspect <c> (<why>): ..." for [`ContainerState::Unknown`]: the
+/// observed fact, then the next command. Never "down" or "not running".
+pub(crate) fn container_unknown_message(container: &str, why: &str) -> String {
+    format!(
+        "could not inspect {container} ({why}): run `docker info`; if it answers, a bind mount of {container} may be hung"
+    )
+}
+
+/// `docker inspect` of `name`, bounded at [`CONTAINER_STATE_SECS`].
+pub(crate) fn container_state(name: &str) -> ContainerState {
+    let state = container_state_of(&crate::bounded::docker(
+        &["inspect", "-f", "{{.State.Running}}", name],
+        std::time::Duration::from_secs(CONTAINER_STATE_SECS),
+    ));
+    if let ContainerState::Unknown(why) = &state {
+        if let Ok(mut notes) = UNKNOWN_NOTES.lock() {
+            notes.push((name.to_string(), container_unknown_message(name, why)));
+        }
+    }
+    state
+}
+
+/// Every unknown [`container_state`] met this process, as `(container,
+/// message)`: a row looks up only its own container.
+pub(crate) fn unknown_notes() -> Vec<(String, String)> {
+    UNKNOWN_NOTES.lock().map(|n| n.clone()).unwrap_or_default()
+}
+
+/// The note for `container` alone, from `notes`; another container's
+/// unknown is no evidence about this one.
+pub(crate) fn note_for<'a>(notes: &'a [(String, String)], container: &str) -> Option<&'a str> {
+    notes.iter().find(|(c, _)| c == container).map(|(_, m)| m.as_str())
+}
+
+/// Running, or not: for a caller whose message makes no claim about WHY it
+/// is not (an unknown reads as not running here). Callers that name a cause
+/// ask [`container_state`].
 pub(crate) fn container_running(name: &str) -> bool {
-    Command::new("docker")
-        .args(["inspect", "-f", "{{.State.Running}}", name])
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "true")
-        .unwrap_or(false)
+    container_state(name) == ContainerState::Running
 }
 
 // ── The command ──────────────────────────────────────────────────────────
@@ -5208,15 +5285,28 @@ pub fn secrets_rotate(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     // silently conflated with "confirmed working".
     let mut unverified: Vec<String> = Vec::new();
     if !db_items.is_empty() {
-        if !container_running(&pg_container) {
-            drop(prepared);
-            fail(
-                g.json,
-                ExitCode::Generic,
-                "postgres_down",
-                &format!("{pg_container} is not running — cannot ALTER ROLE"),
-                Some("start it first (`noo stack start`); the store was not modified"),
-            );
+        match container_state(&pg_container) {
+            ContainerState::Running => {}
+            ContainerState::Unknown(why) => {
+                drop(prepared);
+                fail(
+                    g.json,
+                    ExitCode::Generic,
+                    "postgres_state_unknown",
+                    &format!("{} — cannot ALTER ROLE", container_unknown_message(&pg_container, &why)),
+                    Some("the store was not modified; once docker answers, re-run"),
+                );
+            }
+            ContainerState::Stopped | ContainerState::Absent => {
+                drop(prepared);
+                fail(
+                    g.json,
+                    ExitCode::Generic,
+                    "postgres_down",
+                    &format!("{pg_container} is not running — cannot ALTER ROLE"),
+                    Some("start it first (`noo stack start`); the store was not modified"),
+                );
+            }
         }
         for p in &db_items {
             let role = p.db_role.as_deref().unwrap();
@@ -5954,15 +6044,23 @@ pub fn secrets_resync(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         ),
     };
 
-    if !container_running(&pg_container) {
-        fail(
+    match container_state(&pg_container) {
+        ContainerState::Running => {}
+        ContainerState::Unknown(why) => fail(
+            g.json,
+            ExitCode::Generic,
+            "postgres_state_unknown",
+            &format!("{} — nothing to converge against", container_unknown_message(&pg_container, &why)),
+            Some("this says nothing about Postgres or a drifted password: docker did not answer; fix that and re-run"),
+        ),
+        ContainerState::Stopped | ContainerState::Absent => fail(
             g.json,
             ExitCode::Generic,
             "postgres_down",
             &format!("{pg_container} is not running — nothing to converge against"),
             Some("this failure means Postgres is DOWN, which is a different problem from a \
                   drifted password: start it first (`noo stack start`)"),
-        );
+        ),
     }
     // Same reasoning as the audit probe: loopback is `trust` in the stock
     // pg_hba, so a check over 127.0.0.1 cannot fail and would make every
@@ -8805,5 +8903,76 @@ mod onboard_audit_table_tests {
         let own = crate::test_src::own_code(include_str!("secrets.rs"));
         let down = crate::test_src::fn_body(&own, "pub fn secrets_audit_stack_down(");
         assert!(down.contains("audit_run(g, &[], stack_minted, true)"));
+    }
+}
+
+#[cfg(test)]
+mod container_state_tests {
+    use super::*;
+    use crate::bounded::Bounded;
+    use std::os::unix::process::ExitStatusExt;
+
+    fn answered(code: i32, stdout: &str, stderr: &str) -> Bounded {
+        Bounded::Answered(std::process::Output {
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: stderr.as_bytes().to_vec(),
+        })
+    }
+
+    #[test]
+    fn the_answer_maps_to_its_state() {
+        assert_eq!(container_state_of(&answered(0, "true\n", "")), ContainerState::Running);
+        assert_eq!(container_state_of(&answered(0, "false\n", "")), ContainerState::Stopped);
+        assert_eq!(
+            container_state_of(&answered(1, "", "Error response from daemon: No such object: noo-postgres\n")),
+            ContainerState::Absent
+        );
+        assert_eq!(container_state_of(&answered(1, "", "Error: No such container: x")), ContainerState::Absent);
+    }
+
+    #[test]
+    fn what_docker_did_not_say_is_unknown_never_stopped() {
+        let timed = container_state_of(&Bounded::TimedOut { secs: 10 });
+        assert!(matches!(&timed, ContainerState::Unknown(w) if w.contains("did not answer in 10 s")), "{timed:?}");
+        let e = std::io::Error::new(std::io::ErrorKind::NotFound, "No such file or directory");
+        assert!(matches!(container_state_of(&Bounded::SpawnFailed(e)), ContainerState::Unknown(_)));
+        let down = container_state_of(&answered(1, "", "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?"));
+        assert!(matches!(&down, ContainerState::Unknown(w) if w.starts_with("Cannot connect")), "{down:?}");
+        let denied = container_state_of(&answered(1, "", "permission denied while trying to connect to the docker API at unix:///var/run/docker.sock"));
+        assert!(matches!(denied, ContainerState::Unknown(_)), "{denied:?}");
+        assert!(matches!(container_state_of(&answered(0, "\n", "")), ContainerState::Unknown(_)), "an empty answer says nothing");
+        assert_ne!(container_state_of(&Bounded::TimedOut { secs: 10 }), ContainerState::Stopped);
+    }
+
+    #[test]
+    fn the_unknown_message_never_says_down_or_not_running() {
+        let m = container_unknown_message("noo-postgres", "`docker inspect` did not answer in 10 s");
+        assert_eq!(
+            m,
+            "could not inspect noo-postgres (`docker inspect` did not answer in 10 s): run `docker info`; if it answers, a bind mount of noo-postgres may be hung"
+        );
+        assert!(!m.contains("down") && !m.contains("not running") && !m.contains("DOWN"), "{m}");
+    }
+
+    #[test]
+    fn the_inspect_is_bounded_at_ten_seconds() {
+        assert_eq!(CONTAINER_STATE_SECS, 10);
+        let own = crate::test_src::own_code(include_str!("secrets.rs"));
+        let body = crate::test_src::fn_body(&own, "pub(crate) fn container_state(");
+        assert!(body.contains("crate::bounded::docker(") && body.contains("Duration::from_secs(CONTAINER_STATE_SECS)"), "{body}");
+    }
+
+    #[test]
+    fn the_claiming_callers_branch_on_the_state() {
+        let own = crate::test_src::own_code(include_str!("secrets.rs"));
+        assert!(!crate::test_src::fn_body(&own, "pub(crate) fn container_state(").contains("unwrap_or(false)"));
+        let wrapper = crate::test_src::fn_body(&own, "pub(crate) fn container_running(");
+        assert!(wrapper.contains("container_state(name) == ContainerState::Running"), "{wrapper}");
+        // Both "Postgres is DOWN" sites ask the state and keep the claim to Stopped/Absent.
+        assert_eq!(own.matches("container_state(&pg_container)").count(), 2);
+        assert_eq!(own.matches("\"postgres_state_unknown\"").count(), 2);
+        let push = crate::test_src::own_code(include_str!("cluster_push_secrets.rs"));
+        assert!(push.contains("container_state(&gateway_container)") && push.contains("\"gateway_state_unknown\""));
     }
 }

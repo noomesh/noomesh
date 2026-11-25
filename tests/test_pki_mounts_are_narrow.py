@@ -18,7 +18,7 @@ projection:
 
 * `ca.crt` — anyone.
 * `services/<one name>` — one service leaf directory, whose name need not be
-  the compose service's (stunnel-tei serves the `tei` leaf).
+  the compose service's (stunnel-ollama-embed-cpu serves the `ollama-embed-cpu` leaf).
 * `gateway/` — only the controller's own processes (CONTROLLER_SERVICES).
 * `nodes/${NODE_ID…}` — only a node agent, and only its own id.
 * `sso/grafana.pub` — Grafana alone, and only that one file: the PUBLIC half of the pair the gateway signs Grafana session tokens

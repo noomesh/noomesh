@@ -123,6 +123,26 @@ noo cluster desired gpu-2
 noo cluster unplace gpu-2 ollama
 ```
 
+**Remove what a node runs.** `noo cluster unplace` records the unplace with
+the placement's removal, and the node agent stops and removes the backend's
+container (and its door) once it has read that record on two consecutive
+reconcile passes and no placement of the backend remains, within about 10
+minutes; its model files are never touched. `unplace` prints one line saying
+so, with `noo cluster stop-backend <node> <backend>` to stop it now (in
+`--json`, the `note` field). A controller that does not advertise
+`reap_unplaced_backends` (an older one) does not have the container stopped:
+the line says so, and `noo cluster stop-backend` is how to stop it. The record is shipped to that node only and only for 24 hours, so a
+placement made again after it always wins. The agent never removes a
+container because a placement is simply absent: a backend container it owns
+that no placement wants and no unplace names is reported by `noo cluster
+verify` (the `unplaced backends` row: "`<backend>` is running on `<node>`
+with no placement"), and stays running until you stop it or place it:
+
+```sh
+noo cluster stop-backend gpu-2 reranker     # stop and remove it (asks first; -y skips)
+noo cluster place gpu-2 reranker <file>.gguf # or declare it
+```
+
 An ollama unloads an idle model after its keep_alive (5 minutes by
 default) and loads it again, cold, on the next request. `--keep-warm`
 declares an ollama chat model warm on any ollama runtime (agent-run,
@@ -146,20 +166,42 @@ noo cluster fit gpu-2 --with llamacpp gemma-3-27b-it-Q4_K_M.gguf --on cpu
 |---|---|
 | llamacpp | `N_GPU_LAYERS=0` in the placement env; the container gets no GPU device |
 | ollama | the container gets no GPU device (`CUDA_VISIBLE_DEVICES` emptied). One ollama serves every role on a node, so it runs on CPU only when every role asks for cpu |
-| TEI (`embedding`, the TEI `reranker`) | the CPU image (`cpu-1.9.4`), always |
 | vllm | refused: vLLM runs on a GPU only |
 
 With no `--on`, a placement keeps the target it already has; otherwise
 `N_GPU_LAYERS=0` means cpu, and a node with a GPU defaults to gpu. `--on
 gpu` on a node that reports no GPU is refused.
 
-TEI takes its GPU image only on a usable NVIDIA runtime: an NVIDIA GPU the
-agent sees and the `nvidia` runtime registered with docker (a `/dev/dxg`
-device alone, as on WSL2 without the toolkit, is not enough). `--on gpu`
-without one is refused at start, with the fix (install the NVIDIA container
-toolkit, or place it `--on cpu`), and shows as a start refusal; it never
-runs a CPU embedder that looks placed. With no `--on`, TEI takes the GPU
-image when a runtime is usable, else the CPU image.
+**The TEI engine was removed in 0.6.30.** New placements of it are
+refused: a new `embedding` placement is refused, so place an
+Ollama embedder instead, `noo cluster place <node> ollama <model> --role
+embed`. The model is an embedding-space decision, so it is not mapped for you.
+A `reranker` placement whose model is a Hugging Face id (not a `.gguf` file),
+or that names the TEI image, is refused too: place a GGUF cross-encoder,
+`noo cluster place <node> reranker <file>.gguf` (for example
+`bge-reranker-v2-m3-Q8_0.gguf`, shipped with `noo cluster sync-model-files
+<node> -m <file>`). A `.gguf` reranker is unchanged.
+
+A `reranker` placement serves the rerank role and nothing else: the bare
+`noo cluster place <node> reranker <file>.gguf` is placed for rerank, so it
+needs no `--role`, and `--role chat` or `--role embed` on it is refused.
+Placing another backend with `--role rerank` is accepted as before. A
+reranker placed on a 0.6.30 release candidate before rc.6 was stored with
+the chat role: after the upgrade, place it again, `noo cluster place <node>
+reranker <file>.gguf`, and the placement is corrected in place (its env and
+target are kept).
+
+**Upgrading a node that had a TEI placement.** The placement stays in the
+node's desired state but runs nothing: on its first reconcile pass after the
+upgrade the agent stops and removes the leftover TEI containers (and their
+TLS doors), and logs one line per container with the replacement command.
+`noo cluster verify` shows the placement in the `unsupported engine` row,
+with the command that replaces it, then `noo cluster unplace <node> <backend>`
+clears the old one. An embedding space whose model was a TEI model keeps
+serving searches over its existing vectors and refuses embed writes until a
+node serves that model or the space is migrated
+(`noo cluster embedding-space migrate <space> <model>`); verify shows it in the
+`unsupported engine space` row.
 
 llamacpp on gpu runs the CUDA build of llama.cpp (`llamacpp-cuda`, CUDA
 12.9, amd64) with every layer on the GPU, on a node with an NVIDIA GPU of
@@ -380,8 +422,9 @@ reads verified about a minute after `place`, plus the import and its first
 byte check); `--stopped` records it without starting, `--port`/`--tls`/`--image`
 pin the container. `desired` shows the node's config row (ip, tier, ssh
 user, data root, models dir, GPU override) and its placements
-(`backend | model | port | tls | desired`). `unplace` removes the record
-and leaves the container as-is. Node facts that the agent cannot detect
+(`backend | model | port | tls | desired`). `unplace` removes the record,
+and the node agent then stops and removes the backend's container (see
+"Remove what a node runs" above). Node facts that the agent cannot detect
 go in with `noo cluster set-config gpu-2 --tier 2 --gpu-model "RTX 4090"
 --vram-gb 24` (the GPU override is inactive until **both** fields are set).
 
@@ -423,7 +466,7 @@ A node may serve several spaces: place each model as its own embed row
 (`noo cluster place gpu-2 ollama harrier --role embed`, then the code model
 the same way) and the node joins each space's pool. Placing a second embed
 model on ollama adds a row; chat and rerank placements still replace the
-role's one row, and a backend other than ollama (TEI, llama.cpp) holds one
+role's one row, and a backend other than ollama (llama.cpp) holds one
 embed model, so a second replaces the first. Remove one embed model with
 `noo cluster unplace gpu-2 ollama --role embed --model nomic-embed-code`.
 
@@ -483,6 +526,12 @@ dispatches a job per node that pulls existing GGUF files from the
 controller's model store (`$MODELS_DIR`, else `$NOO_DATA_ROOT/models`) and
 verifies them; `--dry-run` only plans. `--user` is refused.
 Catalog reads (`list`, `search`, `ollama`, `huggingface`) use a 24-hour
+`noo cluster import-model <node> <model>` imports a staged model into the
+node's **already-running** Ollama: the noo-ollama container, or the native
+Ollama on a Mac. It never starts a backend; if that Ollama is down the import
+fails and says how to start it (on Linux, `noo cluster place <node> ollama
+<model>`). With `--place`, the placement is sent only after the import
+succeeds.
 local cache with offline fallback; `noo models refresh` rebuilds it.
 See [weight-cache.md](../models/weight-cache.md).
 
@@ -541,18 +590,31 @@ restarts named `noo-*` containers through the same rail. `noo upgrade
 ### Check each node's Docker Engine
 
 Each agent reports its Docker Engine in the heartbeat (`docker_engine`: the
-version and the kind, `dockerd`, `docker-desktop` or `podman`; `none` without
-Docker; `unreadable` with the error when Docker is there but its version
-could not be read). `noo cluster show <node>` prints it, and `noo cluster
+version and the kind, `dockerd`, `docker-desktop` or `podman`; `none` when
+Docker is not installed; `down` when Docker is installed (a `dockerd` binary,
+a `docker.service` or `docker.socket` unit file, or Docker Desktop on a Mac)
+but its daemon's socket is gone, as a cleanly stopped `dockerd` leaves it;
+`unreadable` with the error when Docker is there but its version could not be
+read). `noo cluster show <node>` prints it, and `noo cluster
 verify` has a `docker engine` row:
 
-- below **27**, the oldest Docker Engine the project tests (CI runs
-  `docker:27-dind`): WARN, with the upgrade as the remedy. Known consequence:
+- below **28**, the oldest Docker Engine noomesh supports: WARN, with the
+  upgrade as the remedy (Docker's apt repository, or Docker's convenience
+  script; Docker Desktop: update it). Nothing refuses an older engine. CI
+  still runs `docker:27-dind` as a canary below the floor. Known consequence:
   a container-lane Ollama import fails on an engine below 28 with an agent
   before 0.6.28;
 - `unreadable`: WARN, `cannot be checked`, with the error;
-- `none` (a native-only node) and 27 or newer: ok. Podman is shown, not
-  compared;
+- `down` on Linux: WARN, "Docker is installed on the node but its daemon is
+  not answering", naming what showed it installed. The remedy runs on that
+  node, with sudo: `sudo systemctl start docker`; then, from the controller,
+  `noo cluster verify <node>`. FAIL instead when the node has a container-lane
+  backend placed or running (its `lanes` or `running_backends`, less any
+  `backend_runtimes` calls native): those containers cannot run without the
+  daemon. On a Mac, `down` is ok: Docker Desktop is not needed there, its
+  backends are native;
+- `none` (Docker not installed, a native-only node) and 28 or newer: ok.
+  Podman is shown, not compared;
 - an agent that predates the report: no row.
 
 The minimum is the operator's decision. It is declared once, as
@@ -662,7 +724,7 @@ the GPU back, says so, and takes it again on its own once the GPU is free.
 
 **What counts as foreign.** A GPU process is noomesh's when it runs in a
 any noomesh container on the host: the agent's backends, the compose-managed
-controller stack (`noo-ollama-embed`, `noo-tei`, ...) and older leftovers.
+controller stack (`noo-ollama-embed`, ...) and older leftovers.
 Containers are recognised by their labels (compose project `noomesh` or
 `pai-assistant`, `noo.managed-by`), with the `noo-` name as the fallback; a
 container recognised only by name is reported as `orphan`. Everything else
@@ -916,12 +978,13 @@ drain_started, drained_at}`, plus `workload` for a reservation and
 | `noo cluster verify` | `[<node>...] [--controller] [--wait] [--timings] [--brief]` | Assert node and controller invariants; exit 1 with the remedy (--brief: failures first) |
 | `noo cluster invite` | — | Mint a tagged tailscale auth key and print the `noo enroll --via-tailnet <url>` line |
 | `noo cluster down` | `<backend> [--node <node>] [-y\|--yes]` | Stop a backend on one node or all nodes; destructive, asks for confirmation (-y) |
+| `noo cluster stop-backend` | `<node> <backend> [-y\|--yes]` | Stop a backend's container on a node, e.g. one running with no placement; asks first (-y) |
 | `noo cluster desired` | `<node>` | Alias of show: the node in full, with its desired config and every placement |
 | `noo cluster proposals` | `[--status <s>] [--limit <n>]` | List the enrollment proposals agents filed, with each host in full |
 | `noo cluster show` | `<node>` | Show one node in full: hardware, agent version, tier drift, bus principal, roles |
 | `noo cluster forget` | `<node> [--purge-tailscale] [-y\|--yes]` | Remove a dead node's row, KV entry and enrollments; --purge-tailscale drops its device |
 | `noo cluster place` | `<node> <backend\|harness> <model\|auto> [--on cpu\|gpu] [--keep-warm\|--no-keep-warm] [--env KEY=VALUE]... [--kind noo\|claude-code\|copilot\|codex] [--role chat\|embed\|rerank] [--port <port>] [--tls] [--image <image>] [--stopped] [--force] [--retune]` | Declare a backend and model on a node (cpu or gpu), auto-tuned; model auto: harness only |
-| `noo cluster unplace` | `<node> <backend> [--role chat\|embed\|rerank] [--model <model>]` | Remove a placement, or one embed model; a container keeps running, a harness is stopped |
+| `noo cluster unplace` | `<node> <backend> [--role chat\|embed\|rerank] [--model <model>]` | Remove a placement or one embed model; the agent then stops and removes what it ran |
 | `noo cluster fit` | `<node> [--with <backend> <model> [--on cpu\|gpu] [--role <role>] [--env KEY=VALUE]...]` | Show whether placements fit a node's GPU memory and RAM, with or without one more |
 | `noo cluster class list` | — | Show the model classes consumers may send as `model`, with candidate placement and health |
 | `noo cluster class set` | `<class> <node>/<backend>[=<model>]... [--degraded <node>/<backend>[=<model>]]... [--alias <name>]... [--pool]` | Declare a model class: failover order, or --pool to share the load; --degraded ones last |
@@ -971,7 +1034,7 @@ drain_started, drained_at}`, plus `workload` for a reservation and
 | `noo cluster push-secrets` | `[<node>...] [--dry-run] [--explain] [--gateway-container <name>] [--sops-file <path>] [-y\|--yes]` | Stage fleet-wide secrets from env.sops as a bundle each node collects |
 | `noo cluster nats-users render` | `[--rotate] [--drop-legacy] [--dry-run] [-y\|--yes]` | Mint per-principal NATS passwords from the gateway registry and render users.conf |
 | `noo cluster nats-creds rotate` | `<node\|gateway\|worker\|trellion\|trellion_intel>... [--mint-only] [--restart] [-y\|--yes]` | Rotate a bus credential: nodes deliver over the rail; others re-render + recreate |
-| `noo cluster import-model` | `<node> <name> [--place] [--role chat\|embed\|rerank] [-b\|--backend <backend>]` | Import a store model or a staged ollama:<tag> into a node's ollama |
+| `noo cluster import-model` | `<node> <name> [--place] [--role chat\|embed\|rerank] [-b\|--backend <backend>]` | Import into the node's running ollama (container; Mac: native); --place only after success |
 | `noo cluster ship-model` | `<hf_id> <node> [--name <name>] [--quant <quant>] [--place] [-b\|--backend <backend>]` | Convert an HF model to GGUF and have a node import it; needs a source checkout |
 | `noo cluster clean` | `<node>\|all [--deep] [-y\|--yes]` | Remove this stack's containers on node(s) through their agents; --deep removes images too |
 | `noo cluster seed` | `[-f\|--file <path>] [--export] [--dry-run]` | Apply (or export) the cluster desired state from config/cluster-seed.yaml |

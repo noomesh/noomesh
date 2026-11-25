@@ -12,7 +12,7 @@
 //
 //	"backend_leaves": {
 //	  "vllm": {"dns": ["vllm", "localhost", "noo-vllm", "noo-vllm-secondary"], "not_after": 1790000000},
-//	  "tei":  {"dns": ["tei", "localhost", "noo-stunnel-tei"], "not_after": 1790000000}
+//	  "ollama": {"dns": ["ollama", "localhost", "noo-stunnel-ollama"], "not_after": 1790000000}
 //	}
 //
 // One entry per $NOO_PKI_DIR/services/<x>/service.crt that parses, for the
@@ -39,7 +39,7 @@ import (
 // `service` column of noo-cli's NODE_DOOR_LEAVES (node_leaves.rs), pinned
 // against it by tests/test_node_backend_leaves_on_the_rail.py. airllm is
 // plaintext by named exception and has no leaf.
-var Services = []string{"vllm", "llamacpp", "ollama", "tei", "reranker"}
+var Services = []string{"vllm", "llamacpp", "ollama", "reranker"}
 
 // Leaf is what the agent reports for one held leaf: the certificate's DNS
 // SANs and its NotAfter in unix seconds. The field names are the ones

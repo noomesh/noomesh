@@ -150,28 +150,7 @@ fi
 # Ubuntu's own docker.io + docker-compose-v2 installed, and the step FAILs by
 # name unless the engine now running is the docker.io package's.
 if [ "$DOCKER" = distro ]; then
-    step distro-docker 900 -- sudo bash -c '
-      set -u
-      systemctl stop docker.socket docker.service containerd.service 2>/dev/null
-      engines="$(dpkg-query -W -f "\${Package}\n" "docker-ce*" "docker-buildx-plugin" "docker-compose-plugin" "containerd.io" "moby-*" 2>/dev/null | sort -u | tr "\n" " ")"
-      echo "image engine packages: ${engines:-none}"
-      [ -z "${engines// /}" ] || DEBIAN_FRONTEND=noninteractive apt-get remove -y -q $engines >/dev/null || { echo "could not remove the image engine"; exit 1; }
-      apt-get update -q >/dev/null && DEBIAN_FRONTEND=noninteractive apt-get install -y -q docker.io docker-compose-v2 >/dev/null || { echo "apt could not install docker.io docker-compose-v2"; exit 1; }
-      systemctl enable --now docker.service >/dev/null 2>&1
-      usermod -aG docker "${SUDO_USER:-runner}" 2>/dev/null
-      t=0; until docker info >/dev/null 2>&1 || [ $t -ge 60 ]; do sleep 2; t=$((t+2)); done
-      pkg="$(dpkg-query -W -f "\${Version}" docker.io 2>/dev/null)"
-      # What the archive offers (the first run, 2026-11-13, found 29.1.3 on
-      # 22.04, not the 27.x assumed): a future pin can only pick from these.
-      apt-cache madison docker.io 2>/dev/null | head -6 | sed "s/^/available: /"
-      echo "docker.io package: ${pkg:-NOT INSTALLED}"
-      docker version 2>&1 | sed -n "/^Server/,\$p" | head -8
-      docker compose version 2>&1 | head -1
-      left="$(dpkg-query -W -f "\${Package} \${Status}\n" "docker-ce" "moby-engine" 2>/dev/null | grep -c " installed$")"
-      srv="$(docker version --format "{{.Server.Version}}" 2>/dev/null)"
-      echo "engine: server ${srv:-none}, from docker.io ${pkg:-none}, image engines still installed: $left"
-      [ -n "$pkg" ] && [ -n "$srv" ] && [ "$left" = 0 ] || { echo "DISTRO-DOCKER FAIL: the engine running is not Ubuntu docker.io"; exit 1; }
-    ' || finish
+    step distro-docker 900 -- sudo bash "$HERE/distro-docker.sh" || finish
     meta docker_engine "$(docker version --format '{{.Server.Version}}' 2>/dev/null) (Ubuntu docker.io)"
 fi
 
@@ -608,7 +587,11 @@ RAG_WS_CHAT="$HERE/ws_chat.py"
 # (0.6.25-rc.4 run 1, slots4: killed at 300 s with nothing kept).
 RAG_AGENT_EVIDENCE="$HERE/agent_evidence.py"
 RAG_VERDICT="$OUT/rag-chat.verdict"
-export RAG_QUERY_LINE RAG_CHAT_LINE RAG_WS_CHAT RAG_VERDICT RAG_AGENT_EVIDENCE
+# On a chat miss (and always on the default-model cell) the gateway's lines for
+# the turn, the chat_contexts and a replayed SSE: logs/rag-chat-evidence.log.
+RAG_CHAT_EVIDENCE="$HERE/rag_chat_evidence.py"
+RAG_EVIDENCE_LOG="$OUT/logs/rag-chat-evidence.log"
+export RAG_QUERY_LINE RAG_CHAT_LINE RAG_WS_CHAT RAG_VERDICT RAG_AGENT_EVIDENCE RAG_CHAT_EVIDENCE RAG_EVIDENCE_LOG CELL_PY
 step probe-rag-chat 1500 -- sh -c '
   [ -n "$RAG_QUERY_LINE" ] || { echo "RAG PROBE: first-chat.md has no noo rag query line about anything.md"; exit 0; }
   fact="14(th)? (of )?march|ZIRCON-4471|kestrel"
@@ -627,7 +610,7 @@ step probe-rag-chat 1500 -- sh -c '
   for path in chat agent console; do
     echo "== $path: \"$RAG_CHAT_LINE\""
     case "$path" in
-      chat) out="$(noo chat --message "$RAG_CHAT_LINE" 2>&1)" ;;
+      chat) c0="$(date +%s)"; out="$(noo chat --message "$RAG_CHAT_LINE" 2>&1)" ;;
       agent) a0="$(date +%s)"; out="$(timeout 300 noo inference agent "$RAG_CHAT_LINE" 2>&1)"; arc=$?
              if [ "$arc" = 124 ]; then
                out="$out
@@ -640,6 +623,14 @@ RAG PROBE: agent timed out after 300 s (killed)"
     if printf "%s" "$out" | grep -qiE "$fact"; then got=yes; else got=no; fi
     echo "RAG PROBE: $path returned the fact=$got (index ready=$indexed)"
     [ "$path" = chat ] && echo "got=$got indexed=$indexed" > "$RAG_VERDICT"
+    if [ "$path" = chat ] && { [ "$got" = no ] || [ "$MODEL" = default ]; }; then
+      rp=""; [ "$got" = no ] && rp="$RAG_CHAT_LINE"
+      { echo "RAG-CHAT EVIDENCE: noo chat returned the fact=$got; judged output (first 30 lines):"
+        printf "%s\n" "$out" | head -n 30
+        timeout 600 python3 -I "$RAG_CHAT_EVIDENCE" --since "$c0" --replay "$rp" 2>&1
+      } 2>&1 | python3 "$CELL_PY" redact > "$RAG_EVIDENCE_LOG"
+      echo "RAG PROBE: chat evidence kept in logs/rag-chat-evidence.log"
+    fi
   done
   true'
 
@@ -664,7 +655,7 @@ step rag-chat 60 -- sh -c '
   case "$v" in *"indexed=yes"*) ;; *) echo "RAG-CHAT: not judged: the index never returned the fact (${v:-no verdict})"; exit 0 ;; esac
   case "$v" in *"got=yes"*) echo "RAG-CHAT PASS: noo chat returned the ingested document'"'"'s fact"; exit 0 ;; esac
   if [ "$MODEL" = default ]; then
-    echo "RAG-CHAT FAIL: noo chat (the coordinator route) did not return the fact the index holds"; exit 1
+    echo "RAG-CHAT FAIL: noo chat (the coordinator route) did not return the fact the index holds (evidence: logs/rag-chat-evidence.log)"; exit 1
   fi
   echo "RAG-CHAT NOTE: the tiny test model ($TINY_MODEL) did not return the fact; this cell runs MODEL=$MODEL, not the product default, so this is not a product verdict"' || fail_onboarded
 
@@ -712,6 +703,54 @@ if [ "$CELL" = "$CONTEXT_PIN_CELL" ] && [ -f "$CONTEXT_FIT" ]; then
     judged_ctx_continue context-fit-pinned-running 400 running --expect-decided 4096
     judged_ctx context-fit-pinned-check 600 pinned-check
     judged_ctx context-fit-doesnt-fit 300 doesnt-fit --expect-backend ollama
+fi
+
+# JUDGED (harness, i1246): a chat served through a harness held off the
+# internet, on this one-box install's own node (harness_e2e.py's header says
+# what is the test's hand: building the bundle, and nothing else). After the
+# fresh-install judges above, before the forced restart below; it unplaces
+# the harness and removes its class when done, so later turns run as before.
+# A FAIL is recorded (the cell fails) without stopping the cell; NOTE where
+# the hold cannot exist (no systemd, no systemd-run).
+if [ -f "$HERE/harness_e2e.py" ]; then
+    # The window around the judge, kept so a red is attributable: the
+    # gateway's log from 7 min before it (the context-fit turns before it
+    # included), its container state after, and the node side (the harness
+    # and agent journals, the Ollama logs). Every file goes through the
+    # redactor and is uploaded only when the upload scan passes on that
+    # exact file; otherwise only its lines' timestamps and levels are kept.
+    GW_WIN_SINCE="$(date -u -d '-420 sec' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -v-420S +%Y-%m-%dT%H:%M:%SZ)"
+    step harness-e2e 1500 -- env NOO_BIN="$NOO_BIN" python3 -I "$HERE/harness_e2e.py" --out "$OUT" || true
+    step harness-e2e-capture 300 -- env GW_WIN_SINCE="$GW_WIN_SINCE" OUT="$OUT" CELL_PY="$CELL_PY" sh -c '
+        if docker info >/dev/null 2>&1; then D="docker"; else D="sudo -n docker"; fi
+        echo "gateway state after harness-e2e: $($D inspect -f "status={{.State.Status}} started_at={{.State.StartedAt}} restart_count={{.RestartCount}} oom_killed={{.State.OOMKilled}} exit_code={{.State.ExitCode}}" noo-gateway)"
+        tmp="$(mktemp)"
+        $D logs --timestamps --since "$GW_WIN_SINCE" noo-gateway 2>&1 | python3 "$CELL_PY" redact > "$tmp"
+        echo "gateway window: since $GW_WIN_SINCE, $(wc -l < "$tmp") lines"
+        if python3 "$CELL_PY" scan "$tmp" && python3 -I "$(dirname "$CELL_PY")/secret_check.py" "$tmp"; then
+            mv "$tmp" "$OUT/logs/gateway-window.log"
+            echo "upload scan and secret check passed on logs/gateway-window.log; kept"
+        else
+            rm -f "$tmp"
+            echo "upload scan or secret check refused the gateway window; withheld (only the state line above is kept)"
+        fi
+        # Node side, same rule: each file is kept only when the scan passes on
+        # it; else only its lines timestamps and levels.
+        keep() {  # keep <name>: reads stdin
+            t2="$(mktemp)"; python3 "$CELL_PY" redact > "$t2"
+            n="$(wc -l < "$t2")"
+            if python3 "$CELL_PY" scan "$t2" && python3 -I "$(dirname "$CELL_PY")/secret_check.py" "$t2"; then mv "$t2" "$OUT/logs/$1"; echo "upload scan and secret check passed on logs/$1 ($n lines); kept"
+            else python3 -I "$(dirname "$CELL_PY")/stamps.py" < "$t2" > "$OUT/logs/$1.stamps"; rm -f "$t2"; echo "upload scan or secret check refused logs/$1 ($n lines); kept only timestamps and levels (logs/$1.stamps)"; fi
+        }
+        S="$(echo "$GW_WIN_SINCE" | sed "s/T/ /; s/Z$//")"
+        sudo -n journalctl -u noo-harness --since "$S UTC" --no-pager -o short-iso 2>&1 | keep harness-journal.log
+        sudo -n journalctl -u noo-node-agent --since "$S UTC" --no-pager -o short-iso 2>&1 | keep agent-journal.log
+        if systemctl list-unit-files ollama.service >/dev/null 2>&1; then
+            sudo -n journalctl -u ollama --since "$S UTC" --no-pager -o short-iso 2>&1 | keep ollama-native.log
+        fi
+        for c in $($D ps -a --format "{{.Names}}" | grep -E "ollama" | grep -v stunnel); do
+            $D logs --timestamps --since "$GW_WIN_SINCE" "$c" 2>&1 | keep "container-$c.log"
+        done' || true
 fi
 
 # ── the real CLI's reload and forced restart (the release lead) ──────────

@@ -17,7 +17,9 @@ can restart into a silent control-plane stall, the next boot can hang on the
 new kernel, and the fallback kernel may have no GPU driver. Recovery then
 needs hands at the console and several reboots.
 
-## Two classes of package
+## For people
+
+### Two classes of package
 
 | Class | What | How it updates |
 |---|---|---|
@@ -28,7 +30,7 @@ The platform set is what the stack depends on: compose 2.40 or newer, a GPU
 runtime the backends can use, and Tailscale for the tailnet bind and the
 `ts.net` door. A Docker upgrade also restarts every container on the node.
 
-## Hold the platform packages (once per Linux node)
+### Hold the platform packages (once per Linux node)
 
 The package names differ by distribution (Pop!_OS ships `linux-system76`,
 Ubuntu `linux-generic`, Raspberry Pi OS its own kernel packages), so hold
@@ -44,12 +46,43 @@ apt-mark showhold
 `sudo apt upgrade` then lists these as "kept back". That is the point; it is
 not an error.
 
+**The Docker that `noo onboard` installs is already held.** When the wizard
+installs Docker itself (get.docker.com, on apt systems), it holds the Docker
+packages that install added, so an unattended upgrade cannot restart dockerd
+(a dockerd restart restarts every container). It holds only what it
+installed: a Docker that was on the machine before is never held, and its
+summary says "not held: it was already installed". What it held is recorded
+in `/etc/noo/onboard-docker-holds`; the `holds` row of
+`noo cluster verify <node>` on that machine shows the set and says onboard
+placed it, and `noo offboard` releases exactly that set. Onboard installs
+Docker only where apt is, so on dnf or zypper systems it holds nothing.
+
+### Taking a Docker security update
+
+A hold is not "never update". To take a Docker update on purpose (the
+controller last, as below), with the packages onboard's summary or the
+`holds` row names:
+
+```sh
+sudo apt-mark unhold docker-ce docker-ce-cli containerd.io docker-compose-plugin docker-buildx-plugin
+sudo apt-get update
+sudo apt-get install --only-upgrade docker-ce docker-ce-cli containerd.io docker-compose-plugin docker-buildx-plugin
+noo cluster verify <node>
+sudo apt-mark hold docker-ce docker-ce-cli containerd.io docker-compose-plugin docker-buildx-plugin
+```
+
+The upgrade restarts dockerd, and with it every container on that machine;
+the stack comes back by itself. Hold again even when verify shows a problem:
+the hold is what keeps the next unattended run from moving Docker again.
+Only apt is held for now: on dnf or zypper, Docker updates with the system
+unless you lock it yourself (`dnf versionlock`, `zypper addlock`).
+
 Not covered here: a **WSL2** node's kernel and GPU driver come from Windows
 (update them through Windows Update and the NVIDIA Windows driver, on the same
 canary-first rule); a **macOS** node has no apt, and its agent updates with
 the `noo` CLI.
 
-## Release a platform update
+### Release a platform update
 
 1. **Pick a canary**: a worker whose loss does not stop anything, with the
    same kind of GPU as the nodes that will follow (an NVIDIA node for an
@@ -85,7 +118,7 @@ the `noo` CLI.
    pre-reboot check below.
 7. **Re-hold** on every node: run the hold command again.
 
-## Before rebooting the controller
+### Before rebooting the controller
 
 `noo cluster verify <controller-node>` answers most of this: the `next boot`,
 `gpu driver`, `boot partition`, `holds` and `tailnet control` rows are the checks below, read
@@ -108,7 +141,7 @@ from the node itself.
   `noo doctor exposure` must not report `boot_safe: false`; if it does, it
   prints the one-line sysctl that fixes it.
 
-## If the controller does not come back
+### If the controller does not come back
 
 1. At the console: if it is stuck on the logo, press **Esc** to see the boot
    messages.
@@ -122,7 +155,7 @@ from the node itself.
    reconnected; `docker ps -a` shows any backend left in `Created` by a boot
    without the GPU driver (safe to remove).
 
-## If the GPU does not answer when the stack starts
+### If the GPU does not answer when the stack starts
 
 A GPU fault at container start (the CDI error `error getting device handle
 for index '0': Unknown Error`, an `nvidia-container-cli` or NVML error) holds
@@ -136,3 +169,30 @@ meanwhile; the gateway already treats it as a peer endpoint.
 `noo cluster verify --controller` keeps the hold visible in its
 `GPU services` row. A GPU driver fault clears with a reboot of the host;
 then `noo stack start` starts the held services.
+
+## For agents
+
+- **Changing a host's packages is the person's.** Holding, unholding,
+  upgrading and rebooting all take `sudo` on that node, and a platform
+  update moves one node at a time on purpose (canary first, controller
+  last, a day between). Never run `apt upgrade`, `apt-mark` or a reboot on
+  a node yourself, and never on a remote node.
+- **Onboard's Docker holds:** `noo onboard` holds only the Docker packages
+  it installed (recorded in `/etc/noo/onboard-docker-holds`); `noo offboard`
+  releases exactly those. A Docker update is the person's: the five commands
+  under "Taking a Docker security update", on their node.
+- **Read, and report:** `noo --json cluster verify <node>` carries the
+  rows this runbook relies on: `next boot`, `gpu driver`,
+  `boot partition`, `holds` and `tailnet control`. Before a person reboots
+  the controller, these are the pre-reboot check; report any that is not
+  OK. A `boot partition` FAIL's remedy is ordered (pin a known-good entry
+  first): pass it on whole.
+- **A GPU that did not answer at start** holds only the GPU services: the
+  launcher exits 75, `noo upgrade --stack` reports "stack up except
+  <service>", and verify's `GPU services` row stays FAIL. A host reboot
+  (the person's) clears a driver fault. After it, run what the message
+  named: `noo upgrade --stack` when the hold came from an upgrade (its pin
+  has already moved), else `noo stack start`.
+- **The tailnet bind:** with `NOO_BIND_MODE=tailnet`, `noo doctor exposure`
+  must not report `boot_safe: false` (`null` means the sysctl was not read);
+  on `false`, its one-line sysctl fix is the person's to apply.

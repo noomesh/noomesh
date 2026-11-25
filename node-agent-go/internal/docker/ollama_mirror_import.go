@@ -92,9 +92,7 @@ func (c *Client) ollamaImportBase(ctx context.Context) (via, base string, host b
 		return "", "", false, fmt.Errorf("no `ollama` binary on this node and Docker is not available to run it in %s", OllamaContainer)
 	}
 	if !c.isRunning(ctx, OllamaContainer) {
-		return "", "", false, fmt.Errorf(
-			"the %s container is not running and the import goes only to it on this node — start it (`noo cluster start-backend %s ollama`), then re-run",
-			OllamaContainer, os.Getenv("NODE_ID"))
+		return "", "", false, ollamaContainerDown()
 	}
 	if strings.TrimSpace(os.Getenv("OLLAMA_URL")) != "" {
 		// The blobs would go to the daemon at OLLAMA_URL and the manifest

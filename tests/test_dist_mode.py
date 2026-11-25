@@ -165,7 +165,7 @@ def test_every_addon_overlay_image_is_published() -> None:
 # Profiles the CONTROLLER host starts. `noo stack start` selects controller
 # plus these opt-ins, so a --dist install must be able to pull all of them.
 #
-# Worker/GPU-node profiles (llamacpp, airllm, tei-compose, gpu-tier2, ...) are
+# Worker/GPU-node profiles (llamacpp, airllm, gpu-tier2, ...) are
 # deliberately NOT here. Widening the check to every profile flags six more
 # services — airllm, llamacpp and four stunnel-* sidecars — which is a real
 # gap but a different one: those run on worker nodes, need arm64 variants, and

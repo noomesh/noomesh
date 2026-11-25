@@ -32,6 +32,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"github.com/noomesh/noomesh/node-agent-go/internal/addonwl"
+	"github.com/noomesh/noomesh/node-agent-go/internal/ctrlreach"
 	"github.com/noomesh/noomesh/node-agent-go/internal/diskreclaim"
 	"io"
 	"log/slog"
@@ -115,6 +116,9 @@ type desiredConfig struct {
 	// What the controller understands from this agent (stopdrain): absent on
 	// an older gateway, which then never gets the node_restarting refusal.
 	GatewayFeatures []string `json:"gateway_features"`
+	// i1174: refuse a controller call that names no target node
+	// (auth.TargetNode). Absent (an older controller) is false: tolerant.
+	RequireTargetNode bool `json:"require_target_node"`
 	// The node's resolved harness profile (tier default, override,
 	// measured). A pre-profile gateway omits it; absent means "no
 	// profile", which is exactly the behaviour before profiles existed.
@@ -142,6 +146,10 @@ type desiredConfig struct {
 	// job executor) send the same value, so nothing reloads the model at
 	// another context. Absent on an older gateway or when nothing is decided.
 	ChatContexts map[string]int `json:"chat_contexts"`
+	// This node's explicit unplaces (reap_unplaced.go): the ONLY thing the
+	// agent removes a backend container on. Absent on a controller that
+	// predates it, which then never has a container removed.
+	Unplaced []unplacedTombstone `json:"unplaced"`
 }
 
 // Reconciler pulls desired config and converges the node toward it.
@@ -245,6 +253,11 @@ type Reconciler struct {
 	// desired hash to change. Single-goroutine (ticker) access; no lock.
 	driftRecreated map[string]string
 
+	// hashWaits counts, per backend, the quick retries spent on a start the
+	// controller could not vouch for yet because it was still hashing the
+	// image tar (docker.ImageHashingError). Tick goroutine only.
+	hashWaits map[string]int
+
 	// ggufMissing: backend -> the standing refusal for a placed .gguf that
 	// is missing from the effective models dir (ggufPresent). Kept until
 	// the file is back so nothing clears the refusal meanwhile. Tick
@@ -253,6 +266,13 @@ type Reconciler struct {
 	ggufExists  func(ctx context.Context, dir, file string) (bool, error)
 	// startBackendFn: nil = r.docker.StartBackend. A seam for tests only.
 	startBackendFn func(ctx context.Context, backend, model string, gpuCount int, o dockerpkg.StartOverrides) error
+	// reverifyFn: nil = dockerpkg.ReverifyUnvouchedGGUF. A seam for tests only
+	// (stopBackendFn, declared below with the reaper's seams, is shared).
+	reverifyFn func(ctx context.Context, backend, model string) *dockerpkg.GGUFReverifyMismatchError
+	// removeRetiredTEIFn: nil = r.docker.RemoveRetiredTEI. A seam for tests only.
+	removeRetiredTEIFn func(ctx context.Context) ([]dockerpkg.RetiredTEI, error)
+	// retiredTEIDone: the leftover-TEI check has run clean this agent run.
+	retiredTEIDone bool
 
 	// ollamaPulls tracks the registry pull an ollama placement needs, per
 	// model: one in flight at a time, and a failed pull waits before it is
@@ -260,6 +280,14 @@ type Reconciler struct {
 	// every tick). Written from the tick goroutine and the pull goroutine.
 	pullMu      sync.Mutex
 	ollamaPulls map[string]*ollamaPullState
+
+	// ollamaStartedAt is when this agent last started (or began to replace)
+	// the ollama container and its door; read by the import goroutine to tell
+	// a push reset by a just-replaced door (doorReplaced). Guarded by pullMu.
+	ollamaStartedAt time.Time
+	// ollamaEnsureFn: nil = ensureOllamaModels + verifyOllamaModels. A seam
+	// for tests only.
+	ollamaEnsureFn func(ctx context.Context, t *tick)
 
 	// ollamaVerify checks every placed ollama model's bytes against the
 	// controller's store, off the tick (ollama_verify.go). nil = not wired.
@@ -299,6 +327,17 @@ type Reconciler struct {
 	// envConflicts are the placement_env_conflict refusal targets recorded
 	// last pass, so ones that resolved are cleared.
 	envConflicts map[string]bool
+
+	// The unplace reaper (reap_unplaced.go). goodReads counts good reads
+	// since the agent started; unplacedPrev is the previous good read's
+	// tombstones (nil after a read that was not good). Tick goroutine only.
+	goodReads    int
+	unplacedPrev map[unplacedTombstone]bool
+	// listManagedFn: nil = r.docker.ManagedContainers; stopBackendFn: nil =
+	// r.docker.StopBackend; reapNow: nil = time.Now. Seams for tests only.
+	listManagedFn func(ctx context.Context) ([]dockerpkg.ManagedContainer, error)
+	stopBackendFn func(ctx context.Context, backend string) error
+	reapNow       func() time.Time
 }
 
 type ollamaPullState struct {
@@ -349,6 +388,7 @@ func New(cfg *config.Config, docker *dockerpkg.Client, client *http.Client, harn
 		cliInstalled:    cliOnPath,
 		harnessEgress:   egressReaderFor(harness),
 		driftRecreated:  map[string]string{},
+		hashWaits:       map[string]int{},
 		ggufMissing:     map[string]string{},
 		ggufExists:      docker.HostFileExists,
 	}
@@ -374,6 +414,21 @@ func (r *Reconciler) nativeBackends(ctx context.Context) map[string]string {
 	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
 	return r.native.Running(ctx)
+}
+
+// nativeOnly reports whether backend runs on this node only through the
+// native lane (a Mac's Ollama): no container start, stop or image for it.
+func (r *Reconciler) nativeOnly(backend string) bool {
+	return r.native.NativeOnly(backend)
+}
+
+// nativeDownError is the refusal for a native-only backend this tick found
+// not serving (the caller has already checked it is not), nil for any other.
+func (r *Reconciler) nativeDownError(backend string) *backendrt.NativeDownError {
+	if !r.nativeOnly(backend) {
+		return nil
+	}
+	return r.native.DownError(backend)
 }
 
 // Run blocks until ctx cancels. First pass after a short delay (so
@@ -436,8 +491,14 @@ func (r *Reconciler) nudgeCh() chan struct{} {
 //   - a verify pass ends that was busy while a tick found other models due
 //     (ollamaVerifyLoop.missed), so they are checked on the next tick; a
 //     pass that skipped nothing never nudges;
-//   - an import failed because its door could not be dialled (doorNotUp):
-//     a few quick retries, one spaced nudge each (importDoorRetryAfter).
+//   - an import failed because its door could not be dialled (doorNotUp),
+//     or because its push was cut off by a door this agent replaced a
+//     moment ago (doorReplaced): a few quick retries, one spaced nudge each
+//     (importDoorRetryAfter).
+//
+// A pass that recreates ollama does not start the import or pull at all
+// (the models are ensured only when the spec is not drifting): the started
+// container's readiness nudge brings the pass that does, through the new door.
 //
 // Any other FAILED import or pull never nudges: its backoff
 // (ollamaPullRetryAfter) decides when it is tried again. Nudges coalesce (a
@@ -482,7 +543,10 @@ func (r *Reconciler) nudgeWhenReady(ctx context.Context, backend, model string, 
 // only backend whose next tick has work left: ensure, import, verify).
 func (r *Reconciler) backendStarted(ctx context.Context, backend, model string) {
 	r.clearBackendStart(backend)
+	delete(r.hashWaits, backend)
 	if backend == "ollama" {
+		r.noteOllamaStart(time.Now())
+		r.ollamaVerify.markAllDue()
 		go r.nudgeWhenReady(ctx, backend, model, startReadyWithin, startReadyEvery)
 	}
 }
@@ -517,6 +581,9 @@ type tick struct {
 	effective []placement
 	// ollamaRows: every still-wanted ollama placement (all roles).
 	ollamaRows []placement
+	// reapConfirmed: the unplace tombstones this read may act on
+	// (observeUnplaced: two consecutive good reads, not the first).
+	reapConfirmed []unplacedTombstone
 }
 
 // phase is one step of a reconcile pass. It returns false to end the pass
@@ -531,8 +598,11 @@ type phase struct {
 // the node advertises from it; stop early when nothing is desired; MCP
 // servers (before backends — a discovery report is small, a pull is not);
 // the models dir; what is running here; multi-role merge; the shared-GPU
-// yield's sizing; image prefetch; converge each placement; restart an
-// engine its door's restart left stranded; then reap what was removed.
+// yield's sizing; image prefetch; stop and remove the TEI containers an older
+// agent left; converge each placement; restart an
+// engine its door's restart left stranded; then reap what was removed (the
+// harness; a backend container only on an explicit unplace, never on an
+// absent placement: reap_unplaced.go).
 var reconcilePhases = []phase{
 	{"fetchDesired", (*Reconciler).fetchDesired},
 	{"offerWorkloadApprovals", (*Reconciler).offerWorkloadApprovals},
@@ -547,9 +617,11 @@ var reconcilePhases = []phase{
 	{"planEffective", (*Reconciler).planEffective},
 	{"sizeGpuYield", (*Reconciler).sizeGpuYield},
 	{"prefetch", (*Reconciler).prefetch},
+	{"removeRetiredTEI", (*Reconciler).removeRetiredTEI},
 	{"convergePlacements", (*Reconciler).convergePlacements},
 	{"healDoorNamespaces", (*Reconciler).healDoorNamespaces},
 	{"reportAndCleanup", (*Reconciler).reportAndCleanup},
+	{"reapUnplacedBackends", (*Reconciler).reapUnplacedBackends},
 	{"writeImageKeep", (*Reconciler).writeImageKeep},
 }
 
@@ -567,10 +639,23 @@ func (r *Reconciler) Once(ctx context.Context) {
 func (r *Reconciler) fetchDesired(ctx context.Context, t *tick) bool {
 	desired, err := r.fetch(ctx)
 	if err != nil {
+		// A failed read breaks the unplace reaper's two consecutive reads.
+		r.forgetUnplaced()
+		// No controller, no pass: nothing is started, stopped or changed
+		// until it answers. Said ONCE per outage (ctrlreach, shared with the
+		// heartbeat); each tick's failure at debug. An answer that is an
+		// error is not an outage and keeps its WARN.
+		if ctrlreach.Unreachable(err) {
+			ctrlreach.Failed("reconcile", r.cfg.ControllerURL, err, time.Now())
+			slog.Debug("reconcile.fetch_failed", "error", err)
+			return false
+		}
 		slog.Warn("reconcile.fetch_failed", "error", err)
 		return false
 	}
+	ctrlreach.Answered("reconcile", time.Now())
 	t.desired = desired
+	t.reapConfirmed = r.observeUnplaced(desired)
 	return true
 }
 
@@ -790,7 +875,7 @@ func (r *Reconciler) sizeGpuYield(ctx context.Context, t *tick) bool {
 func (r *Reconciler) prefetch(ctx context.Context, t *tick) bool {
 	// Fetch the images this tick will start, concurrently, before the
 	// ordered start loop (which then finds them local).
-	r.prefetchImages(ctx, t.effective, t.running, t.specLabels, t.floating, t.native)
+	r.prefetchImages(ctx, t.effective, t.running, t.specLabels, t.floating, t.native, r.nativeOnly)
 	return true
 }
 
@@ -819,6 +904,11 @@ func (r *Reconciler) convergeContainer(ctx context.Context, t *tick, p placement
 				"detail", "the controller asked for it to stop, but this node did not start it and will not stop a process it does not own")
 			return
 		}
+		if r.nativeOnly(p.Backend) {
+			// The native lane is this node's only lane for it: there is
+			// no container to stop, and Docker is not asked.
+			return
+		}
 		if _, ok := t.running[p.Backend]; ok {
 			slog.Info("reconcile.stopping_backend", "backend", p.Backend)
 			if err := r.docker.StopBackend(ctx, p.Backend); err != nil {
@@ -826,6 +916,13 @@ func (r *Reconciler) convergeContainer(ctx context.Context, t *tick, p placement
 			}
 		}
 	case "running":
+		// A placement of a removed engine is refused with its replacement,
+		// not skipped: `noo cluster show` says why nothing runs.
+		if why := retiredBackendRefusal(p.Backend, r.cfg.NodeID); why != "" {
+			slog.Error("reconcile.backend_refused", "backend", p.Backend, "reason", why)
+			refusals.Record("backend_start", p.Backend, why)
+			return
+		}
 		if model, ok := t.native[p.Backend]; ok {
 			slog.Info("reconcile.native_backend_unmanaged",
 				"backend", p.Backend, "running_model", model,
@@ -867,6 +964,22 @@ func (r *Reconciler) convergeContainer(ctx context.Context, t *tick, p placement
 				// `--env OLLAMA_FLASH_ATTENTION=1` reaches it.
 				backendrt.SetOllamaTuning(nativeOllamaTuning(t.ollamaRows, harnessprofile.Current()))
 			}
+			// Serving again: a native-down refusal from an earlier tick
+			// no longer holds.
+			if r.native.NativeOnly(p.Backend) {
+				r.clearBackendStart(p.Backend)
+			}
+			return
+		}
+		// A Mac (followup i1156): the native lane is the ONLY lane for a
+		// backend it can serve. Nothing answers on its port, so the
+		// backend is down; never fall through to a container start, which
+		// dials a Docker a Mac may not have and reports a docker.sock error
+		// instead of the cause. Refused every tick until it serves.
+		if derr := r.nativeDownError(p.Backend); derr != nil {
+			slog.Warn("reconcile.native_backend_down", "backend", p.Backend,
+				"binary_present", derr.BinaryPresent, "detail", derr.Error())
+			refusals.Record("backend_start", p.Backend, derr.Error())
 			return
 		}
 		// Paused for other work on the GPU (internal/gpuyield): the
@@ -913,18 +1026,21 @@ func (r *Reconciler) convergeContainer(ctx context.Context, t *tick, p placement
 			if r.ggufMissing[p.Backend] != "" {
 				r.ggufPresent(ctx, t, p)
 			}
-			r.clearBackendStart(p.Backend)
-			if p.Backend == "ollama" {
-				// The container is up with OLLAMA_MODEL set; that says
-				// nothing about whether the weights are there. Pull the
-				// tag if the container lacks it (off-tick; see ollamaPulls).
-				r.ensureOllamaModels(ctx, r.cfg.NodeID, t.ollamaRows, r.docker.OllamaHasModel, r.docker.OllamaPull)
-				// Then the bytes it holds, against the controller's store
-				// (off-tick; see ollama_verify.go).
-				r.verifyOllamaModels(ctx, t.ollamaRows, dockerpkg.OllamaLaneContainer)
+			if r.reverifyUnvouched(ctx, p) {
+				return
 			}
+			r.clearBackendStart(p.Backend)
 			curHash, hasLabel := t.specLabels[p.Backend]
-			switch decideBackendDrift(hasLabel, curHash, desiredHash, r.driftRecreated[p.Backend], t.floating[p.Backend]) {
+			// Decide drift BEFORE ensuring the models: a pass that is about
+			// to recreate ollama (and its door) must not start an import
+			// that pushes a blob through the door being replaced. The
+			// started container's readiness nudge brings the next pass,
+			// which imports through the new door.
+			drift := decideBackendDrift(hasLabel, curHash, desiredHash, r.driftRecreated[p.Backend], t.floating[p.Backend])
+			if p.Backend == "ollama" && drift != driftRecreate {
+				r.ensureHeldOllama(ctx, t)
+			}
+			switch drift {
 			case driftConverged:
 				// Fully converged — clear any prior drift bookkeeping.
 				delete(r.driftRecreated, p.Backend)
@@ -957,8 +1073,7 @@ func (r *Reconciler) convergeContainer(ctx context.Context, t *tick, p placement
 		// Guard: a gguf-only engine given a NON-gguf model can never
 		// start. This is the case the check below misses, because it
 		// keys on the model ENDING in .gguf — so a HuggingFace repo id
-		// (which is what an operator naturally types, and what the TEI
-		// reranker legitimately takes) slips straight through to a
+		// (which is what an operator naturally types) slips straight through to a
 		// permanent restart loop:
 		//
 		//   gguf_init_from_file: failed to open GGUF file
@@ -972,7 +1087,13 @@ func (r *Reconciler) convergeContainer(ctx context.Context, t *tick, p placement
 				"backend", p.Backend, "model", p.Model,
 				"detail", "this engine loads a gguf FILE from the models dir, not a HuggingFace repo id",
 				"fix", "set the placement model to a .gguf filename (noo cluster place "+
-					r.cfg.NodeID+" "+p.Backend+" <file>.gguf), or set RERANK_ENGINE=tei for a repo id")
+					r.cfg.NodeID+" "+p.Backend+" <file>.gguf)")
+			if p.Backend == "reranker" {
+				// The upgrade case: a reranker placed with a repo id ran on
+				// TEI, which is gone. Say so in the refusal `noo cluster
+				// show` prints, not only in this log.
+				refusals.Record("backend_start", p.Backend, retiredRerankerRefusal(r.cfg.NodeID, p.Model))
+			}
 			// Skipping the start is not enough. If the container already
 			// exists it carries a restart policy and Docker keeps cycling
 			// it independently of this loop — which is exactly what
@@ -1046,6 +1167,11 @@ func (r *Reconciler) convergeContainer(ctx context.Context, t *tick, p placement
 			Target:      dockerpkg.StartTarget(p.Backend, p.Target, p.Env),
 			MemoryLimit: p.MemoryLimitBytes,
 		}
+		if p.Backend == "ollama" {
+			// Before the start: an import already pushing through the door
+			// sees its reset as soon as the old container goes.
+			r.noteOllamaStart(time.Now())
+		}
 		startErr := error(nil)
 		if r.startBackendFn != nil {
 			startErr = r.startBackendFn(ctx, p.Backend, p.Model, 0, overrides)
@@ -1071,11 +1197,26 @@ func (r *Reconciler) convergeContainer(ctx context.Context, t *tick, p placement
 			// Record it with the error verbatim so the
 			// heartbeat carries it; cleared when the backend is next
 			// seen running (above) or starts (below).
-			refusals.Record("backend_start", p.Backend, err.Error())
+			r.recordBackendStartFailure(p.Backend, err)
 			return
 		}
 		r.backendStarted(ctx, p.Backend, p.Model)
 	}
+}
+
+// ensureHeldOllama is the running ollama container's model work: the
+// container is up with OLLAMA_MODEL set, which says nothing about whether
+// the weights are there. Pull or import what it lacks (off-tick; see
+// ollamaPulls), then check the bytes it holds against the controller's
+// store (off-tick; see ollama_verify.go). ollamaEnsureFn replaces it in
+// tests.
+func (r *Reconciler) ensureHeldOllama(ctx context.Context, t *tick) {
+	if r.ollamaEnsureFn != nil {
+		r.ollamaEnsureFn(ctx, t)
+		return
+	}
+	r.ensureOllamaModels(ctx, r.cfg.NodeID, t.ollamaRows, r.docker.OllamaHasModel, r.docker.OllamaPull)
+	r.verifyOllamaModels(ctx, t.ollamaRows, dockerpkg.OllamaLaneContainer)
 }
 
 // healDoorNamespaces restarts a fronted engine whose stunnel sidecar
@@ -1096,6 +1237,7 @@ func (r *Reconciler) reportAndCleanup(ctx context.Context, t *tick) bool {
 	// Nor does a vLLM backend no longer placed keep its start refusal: the
 	// compute-floor refusal's remedy IS the unplace.
 	clearUnplacedVllmRefusals(t.desired.Placements)
+	clearUnplacedRetiredRefusals(t.desired.Placements)
 	// A placement that was removed or stopped must stop reporting a model
 	// presence; only still-wanted ollama placements keep one.
 	// Keys of every still-wanted ollama placement survive, including the
@@ -1305,16 +1447,22 @@ func (r *Reconciler) startOllamaImport(ctx context.Context, node, key, model, ro
 		st.inFlight = false
 		if err != nil {
 			// Never a substring of err's text: doorNotUp reads its type.
-			if doorNotUp(err) && st.doorRetries < len(importDoorRetryAfter) {
+			notUp := doorNotUp(err)
+			replaced := !notUp && doorReplaced(err, r.ollamaStartedAt, time.Now())
+			if (notUp || replaced) && st.doorRetries < len(importDoorRetryAfter) {
 				wait := importDoorRetryAfter[st.doorRetries]
 				st.doorRetries++
+				detail := "the import could not dial ollama's door (not up yet); retrying shortly, without the " + ollamaPullRetryAfter.String() + " backoff"
+				if replaced {
+					detail = "the import's push was cut off by an ollama door this agent just replaced; retrying shortly, without the " + ollamaPullRetryAfter.String() + " backoff"
+				}
 				slog.Warn("reconcile.ollama_import_door_not_up", "model", model, "backend", key,
 					"error", err, "quick_retry", st.doorRetries, "of", len(importDoorRetryAfter), "retry_in", wait.String(),
-					"detail", "the import could not dial ollama's door (not up yet); retrying shortly, without the "+ollamaPullRetryAfter.String()+" backoff")
+					"door_replaced", replaced, "detail", detail)
 				r.after(wait, r.Nudge)
 				return
 			}
-			if !doorNotUp(err) {
+			if !notUp && !replaced {
 				st.doorRetries = 0
 			} else if st.doorRetries == len(importDoorRetryAfter) {
 				st.doorRetries++ // logged once until a success or an answered failure
@@ -1452,7 +1600,6 @@ var placementEnvExact = map[string]struct{}{
 var placementEnvPrefixes = []string{
 	"VLLM_",      // vLLM tuning (parsers, max-model-len, quantization, V2 runner…)
 	"LLAMA_ARG_", // llama-server's own argument environment
-	"TEI_",       // text-embeddings-inference
 	"RERANK_",    // reranker engine/model/ctx/threads
 }
 
@@ -1699,6 +1846,8 @@ func (r *Reconciler) fetch(ctx context.Context) (*desiredConfig, error) {
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		return nil, err
 	}
+	// The controller decides strictness, per node, on every read.
+	auth.SetRequireTargetNode(out.RequireTargetNode)
 	return &out, nil
 }
 
@@ -1709,9 +1858,8 @@ func (r *Reconciler) fetch(ctx context.Context) (*desiredConfig, error) {
 // time (dockerpkg.BackendDialURL) so a pre-door container and a sidecar-
 // fronted one are both reached as they run.
 var embedBackends = map[string]bool{
-	"embedding": true, // TEI
-	"ollama":    true, // ollama's OpenAI-compatible /v1/embeddings
-	"llamacpp":  true, // llama-server --embedding
+	"ollama":   true, // ollama's OpenAI-compatible /v1/embeddings
+	"llamacpp": true, // llama-server --embedding
 }
 
 // resolveEmbedTarget picks the backend this node is DECLARED to serve
@@ -1727,6 +1875,11 @@ var embedBackends = map[string]bool{
 func resolveEmbedTarget(placements []placement) embedtarget.Target {
 	for _, p := range placements {
 		if p.Role != "embed" || p.DesiredState == "stopped" {
+			continue
+		}
+		if p.Backend == retiredBackendEmbedding {
+			// Refused in convergeContainer, with the replacement; it is not
+			// an unmapped backend to add to the table.
 			continue
 		}
 		if !embedBackends[p.Backend] {

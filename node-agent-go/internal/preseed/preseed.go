@@ -40,6 +40,7 @@ import (
 	"time"
 
 	nodeconfig "github.com/noomesh/noomesh/node-agent-go/internal/config"
+	"github.com/noomesh/noomesh/node-agent-go/internal/dataroots"
 	"github.com/noomesh/noomesh/node-agent-go/internal/logship"
 	"github.com/noomesh/noomesh/node-agent-go/internal/refusals"
 )
@@ -266,7 +267,9 @@ func (c *Client) fetchVerified(ctx context.Context, fileURL, dest, expectedSHA25
 	}
 	// Absent, unreadable or mismatching: fetch and land over it.
 
-	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
+	// Gated: a dest under a data root that is not on its recorded
+	// filesystem (its mount is not there) is not created (dataroots.MkdirAll).
+	if err := dataroots.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
 		return false, err
 	}
 	tmp := dest + ".partial"
@@ -467,6 +470,36 @@ func (e *PresentMismatchError) Unwrap() error { return e.Fetch }
 // callers outside this package that verify through a VerifiedRecord
 // themselves (the ollama store check, docker/ollama_verify.go).
 func HashFile(path string) (string, error) { return hashFile(path, nil) }
+
+// HashFileCtx is HashFile that stops when ctx ends: the read loop checks ctx
+// at each chunk and returns its error, so a hash of a multi-GB file does not
+// outlive a node that is shutting down.
+func HashFileCtx(ctx context.Context, path string) (string, error) {
+	hashCalls.Add(1)
+	return hashNiced(func() (string, error) {
+		f, err := os.Open(path)
+		if err != nil {
+			return "", err
+		}
+		defer f.Close()
+		h := sha256.New()
+		buf := make([]byte, 1<<20)
+		for {
+			if err := ctx.Err(); err != nil {
+				return "", err
+			}
+			n, rerr := f.Read(buf)
+			h.Write(buf[:n])
+			if rerr == io.EOF {
+				break
+			}
+			if rerr != nil {
+				return "", rerr
+			}
+		}
+		return hex.EncodeToString(h.Sum(nil)), nil
+	})
+}
 
 // hashCalls counts hashFile calls: the tests' view of "re-hashed or not".
 var hashCalls atomic.Int64

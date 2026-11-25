@@ -256,7 +256,7 @@ def test_every_job_that_reads_a_free_text_input_validates_it_first():
 def test_the_install_matrix_validates_cli_tag_in_every_job_that_runs_a_cell():
     sites, _ = _validation_sites()
     jobs = {job for wf, job, _, _, kinds in sites if wf == "install-matrix.yml" and "cli_tag" in kinds.values()}
-    assert jobs == {"cell", "wsl2", "upgrade"}, jobs
+    assert jobs == {"cell", "wsl2", "upgrade", "reboot"}, jobs
 
 
 def _site_ids():
@@ -330,6 +330,7 @@ def _prefix(script: pathlib.Path) -> str:
 @pytest.mark.parametrize("name,checks", [
     ("run.sh", {"CLI_TAG": "cli_tag"}),
     ("upgrade.sh", {"CLI_TAG": "cli_tag", "PREV_TAG": "prev_tag"}),
+    ("reboot.sh", {"CLI_TAG": "cli_tag"}),
 ])
 def test_each_cell_script_refuses_at_its_top(tmp_path, name, checks):
     """The script's own lines up to the end-of-check marker, run as the

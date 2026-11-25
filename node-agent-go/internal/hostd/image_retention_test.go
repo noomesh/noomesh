@@ -166,6 +166,7 @@ func TestPostRollRemovesOnlyOursSupersededNeverForced(t *testing.T) {
 		"system df -v":                "{}",
 	}
 	fr.rc = map[string]int{"image inspect --format {{.Id}} sha256": 1} // gone after its refs were removed
+	fr.rcMsg = map[string]string{"image inspect --format {{.Id}} sha256": "Error response from daemon: No such image: " + iid("c")}
 	r := queue(t, e, "c", Command{Op: "disk-reclaim", Service: "docker",
 		Args: []string{"dry_run=false", "only=superseded-images", "keep=" + keep}})
 	if r.RC != 0 {
@@ -372,5 +373,95 @@ func TestTheRealKeepFileProtectsBothLocks(t *testing.T) {
 	}
 	if removed != 1 {
 		t.Errorf("removed %d, want exactly the unused image in neither lock", removed)
+	}
+}
+
+// storeRunner is a Docker with one image under several refs, for removeImage.
+// classic: each ref is untagged on its own and the image goes with the last.
+// containerd: untagging the first ref deletes the image (Docker 29's default
+// store), so every later ref's rm fails "No such image".
+type storeRunner struct {
+	containerd bool
+	refs       map[string]bool
+	gone       bool
+	refuse     string // a real refusal message for every rm ("" = none)
+	refuseRC   int
+	calls      []string
+}
+
+func (s *storeRunner) Run(_ context.Context, _ string, _ []string, name string, args ...string) (int, string) {
+	j := strings.Join(append([]string{name}, args...), " ")
+	s.calls = append(s.calls, j)
+	switch {
+	case strings.HasPrefix(j, "docker image inspect"):
+		if s.gone {
+			return 1, "Error response from daemon: No such image: " + args[len(args)-1]
+		}
+		return 0, ""
+	case strings.HasPrefix(j, "docker image rm -- "):
+		if s.refuse != "" || s.refuseRC != 0 {
+			return s.refuseRC, s.refuse
+		}
+		ref := args[len(args)-1]
+		if s.gone {
+			return 1, "Error response from daemon: No such image: " + ref
+		}
+		delete(s.refs, ref)
+		if s.containerd || len(s.refs) == 0 {
+			s.gone = true
+		}
+		return 0, ""
+	}
+	return 0, ""
+}
+
+func (s *storeRunner) Capture(_ context.Context, _ string, name string, args ...string) (int, string) {
+	return 0, ""
+}
+
+func verdictOf(refs ...string) *imageVerdict {
+	return &imageVerdict{ID: iid("e"), Refs: refs, Remove: true}
+}
+
+// 2026-11-22: after a roll on a containerd-store engine, 13 images were
+// reported "refused: " with no reason, and every one of them was gone.
+func TestAnImageGoneAfterAnEarlierRefIsRemovedOnBothStores(t *testing.T) {
+	refs := []string{nsNoo + "ollama:v0.6.24", nsNoo + "ollama@sha256:" + h64("4")}
+	for _, cd := range []bool{false, true} {
+		s := &storeRunner{containerd: cd, refs: map[string]bool{refs[0]: true, refs[1]: true}}
+		e := &Engine{Runner: s}
+		msg, ok := e.removeImage(context.Background(), verdictOf(refs...))
+		if !ok || msg != "" {
+			t.Fatalf("containerd=%v: an image that is gone was reported refused (%q); calls: %v", cd, msg, s.calls)
+		}
+	}
+}
+
+// A real refusal keeps Docker's words; one with no words names the exit code.
+func TestARefusalCarriesDockersReasonOrTheExitCode(t *testing.T) {
+	refs := []string{nsNoo + "ollama:v0.6.24"}
+	s := &storeRunner{refs: map[string]bool{refs[0]: true}, refuseRC: 1,
+		refuse: "Error response from daemon: conflict: unable to remove repository reference (must force) - container c1 is using its referenced image"}
+	e := &Engine{Runner: s}
+	msg, ok := e.removeImage(context.Background(), verdictOf(refs...))
+	if ok || !strings.Contains(msg, "container c1 is using") {
+		t.Fatalf("want the refusal with Docker's reason, got ok=%v %q", ok, msg)
+	}
+	s = &storeRunner{refs: map[string]bool{refs[0]: true}, refuseRC: 2}
+	e = &Engine{Runner: s}
+	msg, ok = e.removeImage(context.Background(), verdictOf(refs...))
+	if ok || msg != "docker image rm exited 2 with no message" {
+		t.Fatalf("an empty reason must name the exit code, got ok=%v %q", ok, msg)
+	}
+}
+
+// A daemon that cannot answer is not "gone": the failed rm stays a refusal.
+func TestAnInspectThatFailsForAnotherReasonIsNotGone(t *testing.T) {
+	f := &fakeRunner{rc: map[string]int{"image rm": 1, "image inspect": 1},
+		rcMsg: map[string]string{"image rm": "Cannot connect to the Docker daemon", "image inspect": "Cannot connect to the Docker daemon"}}
+	e := &Engine{Runner: f}
+	msg, ok := e.removeImage(context.Background(), verdictOf(nsNoo+"ollama:v0.6.24"))
+	if ok || !strings.Contains(msg, "Cannot connect") {
+		t.Fatalf("want a refusal naming the daemon, got ok=%v %q", ok, msg)
 	}
 }

@@ -804,7 +804,7 @@ var containerIDRe = regexp.MustCompile(`[0-9a-f]{64}`)
 // docker.ClassifyNoomesh). The cgroup file is world-readable, so the
 // unprivileged agent needs only the docker socket it already has. It covers
 // every noomesh container on the host, not just the backends this agent
-// starts: the compose-managed noo-ollama-embed / noo-tei / ... and
+// starts: the compose-managed noo-ollama-embed / ... and
 // older-image orphans hold GPU memory too, and counting them as foreign made
 // a controller yield its own chat backend to its own embedder (ctrl,
 // 2026-10-21).

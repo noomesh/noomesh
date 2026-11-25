@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"runtime"
+	"time"
 
 	"github.com/noomesh/noomesh/node-agent-go/internal/imagesource"
 )
@@ -95,13 +96,56 @@ func IsImagePin(err error) bool {
 	return errors.As(err, &p)
 }
 
+// ImageHashingError: the controller has the image's tar and is still
+// computing its hash, so it cannot vouch for it yet. Retryable; neither
+// "not staged" nor a pin refusal. The running image is kept.
+type ImageHashingError struct {
+	Ref        string
+	Tar        string
+	RetryAfter time.Duration
+	Err        error
+}
+
+func (e *ImageHashingError) Error() string {
+	return fmt.Sprintf("the controller is still hashing %s; keeping the running image; retrying in %ds",
+		e.Tar, int(e.RetryAfter.Round(time.Second)/time.Second))
+}
+
+func (e *ImageHashingError) Unwrap() error { return e.Err }
+
+// AsImageHashing reports whether err is (or wraps) an ImageHashingError.
+func AsImageHashing(err error) (*ImageHashingError, bool) {
+	var h *ImageHashingError
+	if errors.As(err, &h) {
+		return h, true
+	}
+	return nil, false
+}
+
+// hashingRetryAfter is the gateway's Retry-After when the error carries one,
+// else the 202's default.
+func hashingRetryAfter(err error) time.Duration {
+	var h *hashingError
+	if errors.As(err, &h) && h.retryAfter > 0 {
+		return h.retryAfter
+	}
+	return 5 * time.Second
+}
+
 // resolvePinnedImage is resolveImage for a pinned ref (see the chain above).
 // It fails closed at every step: no manifest, no local fallback, no backoff
 // shortcut to an unverified local copy.
 func (c *Client) resolvePinnedImage(ctx context.Context, ref, pin string) (source, imageID string, err error) {
 	arch := runtime.GOARCH
-	m, _, merr := fetchImageManifest(ctx, ref, arch)
+	m, tarName, merr := fetchImageManifest(ctx, ref, arch)
 	if merr != nil || m == nil {
+		// The controller has the tar and is still hashing it (the 202, or
+		// the wait for it running out): not a refusal. Typed and retryable;
+		// the running container is untouched (ensureImageFn runs before
+		// ContainerRemove) and the reconciler retries after RetryAfter.
+		if merr != nil && manifestStillHashing(merr) {
+			return "", "", &ImageHashingError{Ref: ref, Tar: tarName, RetryAfter: hashingRetryAfter(merr), Err: merr}
+		}
 		if merr == nil || errors.Is(merr, ErrArtifactAbsent) {
 			return "", "", &ImageNotStagedError{Ref: ref, Arch: arch, Tar: ImageTarGzName(ref, arch), AltTar: ImageTarName(ref, arch)}
 		}

@@ -121,6 +121,138 @@ docker_release_exists() {
     return 2
 }
 
+# >>> data-root-mount-guard (tests/test_prep_host_mount_guard.py runs this block)
+# A data root under a boot-time mount that is not mounted now is never
+# created: the directory would land on the root filesystem, the mount would
+# hide it at the next boot, and the node would fill the root disk. The rule
+# is the node agent's (node-agent-go/internal/dataroots/fsid.go): the
+# longest boot-time mount covering the path, from /etc/fstab (not `noauto`,
+# unless also `x-systemd.automount`) or an ENABLED, unmasked .mount/.automount
+# unit in /etc/systemd/system or /run/systemd/generator*. An automount is
+# touched once (bounded) before it is called missing. "Cannot tell" never
+# refuses: an unreadable fstab, unit directory, unit or mount table prints
+# one note and prep goes on as before. Only a positive finding refuses.
+# Check mode runs it (a FAIL before the token is spent), and so does prep,
+# right before it creates the data root (step 7, data-dirs).
+# The optional arguments are for tests: FSTAB MOUNTINFO "UNIT_DIR...".
+command -v say >/dev/null 2>&1 || say() { printf 'prep-host: %s\n' "$*"; }
+DRMG_AWK_UNESC='
+function oct(s,  n, i) { n = 0; for (i = 1; i <= length(s); i++) n = n * 8 + substr(s, i, 1); return n }
+function unesc(s,  out, i, c) {
+    out = ""
+    for (i = 1; i <= length(s); i++) {
+        c = substr(s, i, 1)
+        if (c == "\\" && substr(s, i + 1, 3) ~ /^[0-7][0-7][0-7]$/) { out = out sprintf("%c", oct(substr(s, i + 1, 3))); i += 3 }
+        else out = out c
+    }
+    return out
+}
+function clean(s) { while (length(s) > 1 && substr(s, length(s)) == "/") s = substr(s, 1, length(s) - 1); return s }
+function under(p, m) { return m == "/" || p == m || index(p, m "/") == 1 }
+function has(opts, o,  n, a, i) { n = split(opts, a, ","); for (i = 1; i <= n; i++) if (a[i] == o) return 1; return 0 }
+'
+_drmg_mounted() {  # _drmg_mounted PATH WHERE MOUNTINFO: a real (non-autofs) mount at WHERE or deeper holds PATH
+    local len
+    len="$(awk -v p="$1" "$DRMG_AWK_UNESC"'
+        { sep = 0; for (i = 7; i <= NF; i++) if ($i == "-") { sep = i; break } }
+        sep && $(sep + 1) != "autofs" { t = clean(unesc($5)); if (under(p, t) && length(t) > best) best = length(t) }
+        END { print best + 0 }' "$3")"
+    [ "$len" -ge "${#2}" ]
+}
+data_root_mount_guard() {  # data_root_mount_guard PATH [FSTAB MOUNTINFO "UNIT_DIR..."]
+    local p fstab mi udirs d f base where opts best by auto
+    p="$1"
+    while [ "${#p}" -gt 1 ] && [ "${p%/}" != "$p" ]; do p="${p%/}"; done
+    fstab="${2:-/etc/fstab}"; mi="${3:-/proc/self/mountinfo}"
+    if [ $# -ge 4 ]; then udirs="$4"; else
+        udirs=/etc/systemd/system
+        for d in /run/systemd/generator*; do [ -d "$d" ] && udirs="$udirs $d"; done
+    fi
+    # The fstab's covering entry, as "LEN<TAB>WHERE<TAB>AUTO"; "bad" when a
+    # line cannot be parsed.
+    if [ ! -r "$fstab" ] || ! best="$(awk -v p="$p" "$DRMG_AWK_UNESC"'
+        /^[ \t]*(#|$)/ { next }
+        NF < 3 { bad = 1; exit }
+        $3 == "swap" { next }
+        { w = clean(unesc($2)); if (w == "/" || substr(w, 1, 1) != "/") next
+          auto = has($4, "x-systemd.automount")
+          if (has($4, "noauto") && !auto) next
+          if (!under(p, w)) next
+          if (length(w) > length(bw)) { bw = w; ba = auto } else if (w == bw && auto) ba = 1 }
+        END { if (bad) print "bad"; else if (bw != "") printf "%d\t%s\t%d\n", length(bw), bw, ba }' "$fstab")" || [ "$best" = bad ]; then
+        say "NOTE: cannot read $fstab: not checking whether a boot-time mount covers $p"
+        return 0
+    fi
+    where=""; auto=0; by=""
+    if [ -n "$best" ]; then
+        where="$(printf '%s\n' "$best" | cut -f2)"; auto="$(printf '%s\n' "$best" | cut -f3)"; by="$fstab"
+    fi
+    for d in $udirs; do
+        if [ ! -r "$d" ] || [ ! -x "$d" ]; then
+            say "NOTE: cannot read the unit directory $d: not checking whether a boot-time mount covers $p"
+            return 0
+        fi
+        for f in "$d"/*.mount "$d"/*.automount; do
+            [ -e "$f" ] || [ -L "$f" ] || continue
+            base="${f##*/}"
+            # Masked (a link to /dev/null, or an empty file): not mounted at boot.
+            [ -s "$f" ] || continue
+            # Enabled: a link to it in a *.wants/ or *.requires/ beside it.
+            set -- "$d"/*.wants/"$base" "$d"/*.requires/"$base"
+            while [ $# -gt 0 ] && [ ! -e "$1" ] && [ ! -L "$1" ]; do shift; done
+            [ $# -gt 0 ] || continue
+            if [ ! -r "$f" ]; then
+                say "NOTE: cannot read the unit $f: not checking whether a boot-time mount covers $p"
+                return 0
+            fi
+            set -- "$(awk -v p="$p" -v base="$base" "$DRMG_AWK_UNESC"'
+                { line = $0; sub(/^[ \t]+/, "", line); k = line; sub(/[ \t]*=.*/, "", k); v = line
+                  if (index(v, "=") == 0) next
+                  sub(/^[^=]*=[ \t]*/, "", v); sub(/[ \t]+$/, "", v)
+                  if (k == "Where") wh = v; else if (k == "Options") op = v }
+                END {
+                  ext = base; sub(/.*\./, "", ext); name = base; sub(/\.[^.]*$/, "", name)
+                  if (wh == "") { wh = "/"
+                      for (i = 1; i <= length(name); i++) { c = substr(name, i, 1)
+                          if (c == "-") wh = wh "/"
+                          else if (c == "\\" && substr(name, i + 1, 1) == "x" && substr(name, i + 2, 2) ~ /^[0-9a-fA-F][0-9a-fA-F]$/) {
+                              wh = wh sprintf("%c", index("0123456789abcdef", tolower(substr(name, i + 2, 1))) * 16 + index("0123456789abcdef", tolower(substr(name, i + 3, 1))) - 17); i += 3 }
+                          else wh = wh c } }
+                  wh = clean(wh)
+                  if (wh == "/" || substr(wh, 1, 1) != "/" || !under(p, wh)) exit
+                  if (ext == "automount") print wh "\t1"
+                  else if (!has(op, "noauto")) print wh "\t0" }' "$f")"
+            [ -n "$1" ] || continue
+            if [ "${#where}" -lt "$(printf '%s\n' "$1" | cut -f1 | awk '{ print length($0) }')" ]; then
+                where="$(printf '%s\n' "$1" | cut -f1)"; auto="$(printf '%s\n' "$1" | cut -f2)"; by="the systemd unit $f"
+            elif [ "$where" = "$(printf '%s\n' "$1" | cut -f1)" ] && [ "$(printf '%s\n' "$1" | cut -f2)" = 1 ]; then
+                auto=1
+            fi
+        done
+    done
+    [ -n "$where" ] || return 0
+    if [ ! -r "$mi" ]; then
+        say "NOTE: cannot read $mi: not checking whether the mount $where over $p is mounted"
+        return 0
+    fi
+    if ! _drmg_mounted "$p" "$where" "$mi"; then
+        # An automount (or an autofs trap above the path) mounts on first
+        # access: touch it once, bounded, and look again.
+        if [ "$auto" = 1 ] || awk -v p="$p" "$DRMG_AWK_UNESC"'
+            { sep = 0; for (i = 7; i <= NF; i++) if ($i == "-") { sep = i; break } }
+            sep && $(sep + 1) == "autofs" { t = clean(unesc($5)); if (t != "/" && under(p, t)) f = 1 }
+            END { exit !f }' "$mi"; then
+            timeout 5 stat "$p/." >/dev/null 2>&1 || true
+        fi
+        if ! _drmg_mounted "$p" "$where" "$mi"; then
+            say "FATAL: $p is under the mount $where declared in $by, which is not mounted: mount it (mount $where, check findmnt $where), then re-run enrollment. Not creating the directory: the mount would hide it."
+            return 1
+        fi
+    fi
+    return 0
+}
+# <<< data-root-mount-guard
+
 # ── Check mode (PREP_CHECK=1) ──────────────────────────────────────────────
 # `noo enroll` runs this BEFORE it spends the single-use token, so a box prep
 # is going to choke on is refused while the paste is still good (2026-10-10:
@@ -230,6 +362,10 @@ if [ "${PREP_CHECK:-}" = 1 ]; then
         case "$NOO_DATA_ROOT" in
             /media/*) pc_warn "data root is under /media — desktop automounts may not exist at boot; add an /etc/fstab entry for that drive" ;;
         esac
+        # The same guard prep runs before it creates the root, here before the
+        # token is spent: a refusal is a FAIL, a "cannot tell" note a warn.
+        if ! DRMG_OUT="$(data_root_mount_guard "$NOO_DATA_ROOT")"; then pc_fail "${DRMG_OUT#prep-host: FATAL: }"
+        elif [ -n "$DRMG_OUT" ]; then pc_warn "${DRMG_OUT#prep-host: NOTE: }"; fi
     fi
 
     printf 'prep-check: platform=%s codename=%s pkg=%s\n' "$PLAT_FAMILY" "$PLAT_CODENAME" "$PLAT_PKG"
@@ -668,6 +804,12 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
+# A oneshot has no start timeout by default: a hung run stays activating and
+# its timer never fires again (i1160). 7200 s = the bundle transfer's own
+# --max-time 3600 (noo-fetch.sh) + the apply and its report (~25 min worst
+# case: service restarts, hostd heartbeat, report retries) + margin. The
+# timer starts the next run as soon as this one fails.
+TimeoutStartSec=7200
 ExecStart=/usr/local/bin/noo-fetch
 UNIT
         cat > /etc/systemd/system/noo-fetch.timer <<'UNIT'
@@ -713,6 +855,7 @@ if [ -z "${NOO_DATA_ROOT:-}" ]; then
     [ -n "$NOO_DATA_ROOT" ] || NOO_DATA_ROOT=/var/lib/noo
 fi
 say "data root: $NOO_DATA_ROOT"
+data_root_mount_guard "$NOO_DATA_ROOT" || exit 1
 # >>> data-dirs (tests/test_prep_host_data_dirs.py runs this block)
 # Owners, one rule with the CLI (noo-cli onboard/steps.rs intended_owner):
 #   - the root: noo-agent when this creates it; an existing root keeps its

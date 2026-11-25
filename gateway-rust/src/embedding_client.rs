@@ -4,19 +4,19 @@
 //! Backend-agnostic embedding client — the ONE place that knows how to
 //! talk to an embedding server.
 //!
-//! TEI (HuggingFace Text Embeddings Inference) is no longer deployed on the
-//! controller — it was the live embedder/reranker at cutover but is now
-//! optional legacy at best. The default embedder is ollama/harrier, and the
-//! default reranker is the hardened llama.cpp image, both reached mesh-routed
-//! through the node-agent (`embed_with_mesh()`), not by dialling TEI or any
-//! other backend directly.
+//! The default embedder is ollama/harrier, and the default reranker is the
+//! hardened llama.cpp image, both reached mesh-routed through the node-agent
+//! (`embed_with_mesh()`), not by dialling any backend directly. The stack no
+//! longer ships or places a TEI server (i1182a).
 //!
 //! Every Rust embed call site (external embeddings proxy, memory search,
 //! coordinator conversation-recall, preflight probe) resolves the endpoint
 //! here and speaks one of three wire formats ("api formats"):
 //!
-//!   - `tei`    — HuggingFace Text Embeddings Inference native (legacy;
-//!                still accepted if an install still runs a TEI server):
+//!   - `tei`    — the HuggingFace-native `/embed` shape (legacy; kept only
+//!                because the Python side accepts the same
+//!                `PAGEINDEX_EMBEDDING_BACKEND=tei` for an external server
+//!                the operator runs themselves; the stack deploys none):
 //!                POST {url}/embed          {"inputs": [..], "truncate": true} → [[f64]]
 //!   - `openai` — OpenAI-compatible (TEI, llama.cpp, vLLM, Ollama all serve it):
 //!                POST {url}/v1/embeddings  {"model": m, "input": [..]}
@@ -31,13 +31,13 @@
 //!
 //! The MODEL (and vector width) come from the embedding space record in the
 //! DB (`embedding_spaces`, i145): a caller names a space, `knowledge` by
-//! default. `PAGEINDEX_EMBEDDING_MODEL` → `EMBEDDING_MODEL` → `TEI_MODEL` →
+//! default. `PAGEINDEX_EMBEDDING_MODEL` → `EMBEDDING_MODEL` →
 //! `harrier` and `EMBEDDING_DIM` only seed `knowledge` on an empty table
 //! ([`configured_model`]).
 //!
-//! TLS: on installs that still run a co-located TEI sidecar behind stunnel,
-//! the endpoint may be that sidecar (https with the private cluster PKI), so
-//! all requests go through `tls::cluster_client()` regardless of backend.
+//! TLS: the endpoint may be a stunnel door (https with the private cluster
+//! PKI), so all requests go through `tls::cluster_client()` regardless of
+//! backend.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -143,10 +143,8 @@ impl std::fmt::Display for EmbedError {
 /// path posts and in which wire format (env → yaml → default), with the
 /// space's model.
 pub fn resolve() -> EmbeddingEndpoint {
-    // Ollama-first defaults: TEI is no longer deployed on the controller
-    // (the old noo-tei/tei defaults pointed at nothing on a normal install),
-    // while ollama is the stack's always-available fallback engine and what
-    // serves the default embedding model in practice. Explicit config still
+    // Ollama-first defaults: ollama is the stack's always-available fallback
+    // engine and what serves the default embedding model in practice. Explicit config still
     // wins, and most embed traffic goes through the mesh regardless — these
     // defaults only shape the static-endpoint path and preflight probes.
     // The stunnel-fronted (mTLS) ollama door: ollama serves no TLS itself.
@@ -209,15 +207,20 @@ pub fn configured_model() -> String {
     if !model.is_empty() {
         return model;
     }
-    // EMBEDDING_MODEL is the stack-wide model name; TEI_MODEL is the
-    // legacy deploy-time name kept for older installs.
-    std::env::var("EMBEDDING_MODEL")
-        .or_else(|_| std::env::var("TEI_MODEL"))
+    seed_model_from(|k| std::env::var(k).ok())
+}
+
+/// The tail of the seed chain, reading env through `get` (so a test needs no
+/// process env). `EMBEDDING_MODEL` is the stack-wide model name. (The old
+/// `TEI_MODEL` alias is gone, i1182a: a space seeded from it already records
+/// its model.)
+fn seed_model_from(get: impl Fn(&str) -> Option<String>) -> String {
+    get("EMBEDDING_MODEL")
         // harrier: the product's default embedder (1024-dim, matching
         // trellion's hardcoded vector(1024) DDL). Locally converted —
         // the CLI's embed-ensure step fetches it from the
         // models-harrier-v1 release when absent.
-        .unwrap_or_else(|_| "harrier".into())
+        .unwrap_or_else(|| "harrier".into())
 }
 
 impl EmbeddingEndpoint {
@@ -316,7 +319,7 @@ impl EmbeddingEndpoint {
     ) -> Result<Vec<Vec<f64>>, (EmbedError, bool)> {
         let (url, body) = self.request_parts(texts);
         // mTLS-aware client — the endpoint may be the stunnel sidecar
-        // (e.g. https://stunnel-tei:443) presenting a cluster-CA cert.
+        // (e.g. https://stunnel-ollama:11434) presenting a cluster-CA cert.
         let client = crate::tls::cluster_client();
         let resp = client
             .post(&url)
@@ -1053,6 +1056,20 @@ mod tests {
         ep.embed_via_mesh(&format!("{url}/embed"), &[], &texts(), T).await.unwrap();
         let b = seen.lock().unwrap()[0].clone();
         assert_eq!(b["keep_alive"], json!(EMBED_KEEP_ALIVE), "body: {b}");
+    }
+
+    /// i1182a: the `TEI_MODEL` alias is gone from the seed chain. A stray
+    /// `TEI_MODEL` seeds nothing; `EMBEDDING_MODEL` still does.
+    #[test]
+    fn the_tei_model_alias_no_longer_seeds_the_model() {
+        let only_tei = |k: &str| (k == "TEI_MODEL").then(|| "BAAI/bge-small-en-v1.5".to_string());
+        assert_eq!(seed_model_from(only_tei), "harrier");
+        let stack = |k: &str| match k {
+            "EMBEDDING_MODEL" => Some("bge-m3".to_string()),
+            "TEI_MODEL" => Some("BAAI/bge-small-en-v1.5".to_string()),
+            _ => None,
+        };
+        assert_eq!(seed_model_from(stack), "bge-m3");
     }
 
     #[test]

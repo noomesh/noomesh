@@ -413,6 +413,32 @@ pub(crate) fn unit_has_runtime_dir(unit: &str) -> bool {
     unit.lines().any(|l| l.trim() == "RuntimeDirectory=kiosk")
 }
 
+/// The installed kiosk.service as the seat reads it (the seat user can read
+/// /etc/systemd/system, no root needed), for the heartbeat's `kiosk_unit`:
+/// - `needs_migrate`: a dedicated unit from before 0.6.30 (i1153) that still
+///   orders After= plymouth-quit-wait.service, which returns only once
+///   something quits the splash: after a reboot the display can stay black.
+///   Only `seat-sync --migrate` (root) replaces it;
+/// - `current`: a dedicated unit that quits the splash itself;
+/// - `shared`: a shared-mode unit (no getty conflict), which waits on the
+///   splash by design: the desktop's display manager hands it over;
+/// - `absent` / `unreadable`: no unit, or one the seat could not read.
+///
+/// Directives only: this release's unit names plymouth-quit-wait in a comment.
+pub(crate) fn kiosk_unit_word(read: std::io::Result<String>) -> &'static str {
+    let text = match read {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return "absent",
+        Err(_) => return "unreadable",
+    };
+    let directives = || text.lines().map(str::trim).filter(|l| !l.starts_with('#') && !l.starts_with(';'));
+    if !directives().any(|l| l.starts_with("Conflicts=") && l.contains("getty@")) {
+        return "shared";
+    }
+    let waits_on_splash = directives().any(|l| l.strip_prefix("After=").is_some_and(|a| a.split_whitespace().any(|u| u == "plymouth-quit-wait.service")));
+    if waits_on_splash { "needs_migrate" } else { "current" }
+}
+
 /// This release's kiosk.service for a seat with these parameters: the unit
 /// the seat bundle carries (`seat_bundle_files`) and `seat-sync --migrate`
 /// installs.
@@ -1047,8 +1073,13 @@ if [ -f @R@/etc/systemd/system/kiosk.service ]; then
   # never runs a script the seat can write, so it is never a link into @DIR@.
   install -m 0755 -o root -g root @WORK@/noo-kiosk-watchdog @R@@BIN@/noo-kiosk-watchdog
 @CLEAN@  systemctl daemon-reload
-  systemctl restart kiosk-serve.service || true
-  systemctl restart kiosk.service || true
+  # This release's [Install] (a dedicated display is also wanted by
+  # multi-user.target): re-link an enabled unit, never enable a disabled one.
+  if systemctl is-enabled --quiet kiosk.service 2>/dev/null; then systemctl reenable kiosk.service || true; fi
+  # --no-block: a start queued behind a boot job that never finishes must
+  # not hang this script; the self-check below is the bound (i1153).
+  systemctl restart kiosk-serve.service --no-block || true
+  systemctl restart kiosk.service --no-block || true
   # Self-check: never report success with a dead display.
   ok=0; i=0; a=unknown; s=unknown
   while [ "$i" -lt @WAIT@ ]; do
@@ -1066,6 +1097,13 @@ if [ -f @R@/etc/systemd/system/kiosk.service ]; then
   if [ "$ok" -lt 3 ]; then
     echo "" >&2
     echo "noo-seat: ERROR - THE DISPLAY IS NOT RUNNING: kiosk.service is '$a', kiosk-serve.service is '$s' after @WAIT@ s" >&2
+    if [ -n "$(systemctl show -p Job --value kiosk.service 2>/dev/null || true)" ]; then
+      after=" $(systemctl show -p After --value kiosk.service 2>/dev/null || true) "
+      behind=$(systemctl list-jobs --no-legend --full --no-pager 2>/dev/null | while read -r _ u _ st _; do
+        case "$after" in *" $u "*) echo "$st $u" ;; esac
+      done | sort | sed -n '1s/^[a-z]* //p')
+      echo "noo-seat: kiosk.service did not start within @WAIT@ s: a start job is queued behind ${behind:-a unit systemctl list-jobs names}" >&2
+    fi
     echo "noo-seat: why: journalctl -u kiosk.service -n 50 --no-pager   (and: journalctl -u kiosk-serve.service -n 50 --no-pager)" >&2
     exit 1
   fi
@@ -1380,6 +1418,22 @@ fn unit_state(unit: &str) -> String {
     sh_out(Command::new("systemctl").args(["is-active", unit])).filter(|s| !s.is_empty()).unwrap_or_else(|| "unknown".into())
 }
 
+/// The sync's display restart: `--no-block` plus a bounded wait, never a
+/// blocking `systemctl restart`. One queued behind a boot job that never
+/// finishes held the whole sync (and the roll waiting on its report) for
+/// the unit's 15 minutes, then again on the next tick (i1153). A start
+/// that does not happen in the bound is a failed restart, said in the
+/// journal with what it waits behind.
+fn restart_display_bounded() -> bool {
+    match super::kiosk::restart_kiosk_bounded(false) {
+        Ok(_) => true,
+        Err(e) => {
+            eprintln!("noo-seat-sync: {e}");
+            false
+        }
+    }
+}
+
 fn unit_exists(unit: &str) -> bool {
     Command::new("systemctl").args(["cat", unit]).output().map(|o| o.status.success()).unwrap_or(false)
 }
@@ -1403,7 +1457,14 @@ fn state_dir_for(cfg: &SeatConfig, layout: &str) -> PathBuf {
 pub(crate) fn local_seat_display() -> Option<(Option<String>, String)> {
     let cfg: SeatConfig = serde_json::from_slice(&std::fs::read(Path::new(SEAT_DIR).join("seat.json")).ok()?).ok()?;
     let st = read_state(&cfg);
-    Some((st.console_build, format!("sudo {} kiosk seat-sync --migrate", cfg.applier_path().display())))
+    Some((st.console_build, seat_migrate_command(&cfg.applier_path().display().to_string())))
+}
+
+/// The one root command that repairs a seat, for the seat's own copy of
+/// `noo` at `applier`: `noo kiosk reload` on the seat and verify's seat rows
+/// on the controller both print it.
+pub(crate) fn seat_migrate_command(applier: &str) -> String {
+    format!("sudo {applier} kiosk seat-sync --migrate")
 }
 
 fn read_state(cfg: &SeatConfig) -> SeatState {
@@ -1463,6 +1524,12 @@ fn heartbeat_body_with(cfg: &SeatConfig, state: &SeatState, layout: &str, cli_ve
         // this sync: verify compares it with this release's.
         "kiosk_unit_sha": std::fs::read(KIOSK_UNIT_PATH).ok().map(|b| sha256_hex(&b)),
         "kiosk_unit_runtime_dir": std::fs::read_to_string(KIOSK_UNIT_PATH).ok().map(|t| unit_has_runtime_dir(&t)),
+        // Whether that unit still waits on the boot splash (0.6.30, i1153):
+        // read-only, a word whatever the read gives, never a failed sync.
+        "kiosk_unit": kiosk_unit_word(std::fs::read_to_string(KIOSK_UNIT_PATH)),
+        // This seat's own copy of `noo`, so verify's repair names its real
+        // path. The root layout's copy is elsewhere: not stated there.
+        "seat_applier": (layout == "user").then(|| cfg.applier_path().display().to_string()),
         "kiosk_bins": kiosk_bins_layout(Path::new("/"), &cfg.cli_home),
         "console_build": console,
         "page_search": page_search,
@@ -1884,7 +1951,7 @@ fn apply_blob(blob: &[u8], cfg: &SeatConfig, state: &mut SeatState) -> Result<Ap
             vouched.is_ok(),
             &|| unit_state("kiosk.service") == "active",
             &|| Command::new(format!("{KIOSK_BIN}/noo-kiosk-cdp")).arg("reload").status().map(|s| s.success()).unwrap_or(false),
-            &|| Command::new("systemctl").args(["restart", "kiosk.service"]).status().map(|s| s.success()).unwrap_or(false),
+            &restart_display_bounded,
         );
         let replaced = prevs.borrow().clone();
         o.display = settle_display(
@@ -1893,7 +1960,7 @@ fn apply_blob(blob: &[u8], cfg: &SeatConfig, state: &mut SeatState) -> Result<Ap
             &|| display_stays_up(&|| unit_state("kiosk.service") == "active",
                 &|| std::thread::sleep(std::time::Duration::from_secs(1)), 20, 3),
             &|| replaced.iter().all(|(d, p)| std::fs::rename(p, d).is_ok()),
-            &|| Command::new("systemctl").args(["restart", "kiosk.service"]).status().map(|s| s.success()).unwrap_or(false),
+            &restart_display_bounded,
             &|| for (_, p) in &replaced { let _ = std::fs::remove_file(p); },
         );
         if !console.is_empty() && display_settled(o.display) {
@@ -2474,11 +2541,34 @@ fn hb_layout(seat: &Value) -> Option<&str> {
 /// once a seat is on the user layout). The user name comes from the seat
 /// row, so only a plain account name is used; anything else is a placeholder.
 pub(crate) fn seat_applier_for_remedy(seat: &Value) -> String {
+    if let Some(p) = reported_applier(seat) {
+        return p.to_string();
+    }
     let user = seat["enroll_user"].as_str().or_else(|| seat["facts"]["cli_user"].as_str()).unwrap_or("");
     let plain = !user.is_empty() && user.len() <= 32 && user != "root"
         && user.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
     format!("~{}/.local/libexec/noo-seat/noo", if plain { user } else { "<seat user>" })
 }
+
+/// The applier path a 0.6.30+ seat states in its heartbeat (`seat_applier`),
+/// used only when it is a plain absolute path ending in the user layout's
+/// `/.local/libexec/noo-seat/noo` AND its home is the seat user's own (the
+/// home's last part is the enrolled user's name): it is printed as a command
+/// a person pastes under sudo, so it never names a directory another account
+/// could write.
+fn reported_applier(seat: &Value) -> Option<&str> {
+    let p = seat["heartbeat"]["seat_applier"].as_str()?;
+    let home = p.strip_suffix("/.local/libexec/noo-seat/noo")?;
+    let plain = home.starts_with('/') && home.len() > 1 && home.len() <= 128 && !home.contains("..")
+        && home.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/'));
+    let user = seat["enroll_user"].as_str().or_else(|| seat["facts"]["cli_user"].as_str()).unwrap_or("");
+    let own = !user.is_empty() && user != "root" && home.rsplit('/').next() == Some(user);
+    (plain && own).then_some(p)
+}
+
+/// The `kiosk unit` WARN for a dedicated unit that waits on the boot splash.
+pub(crate) const KIOSK_UNIT_WAITS_ON_SPLASH: &str =
+    "the kiosk unit predates 0.6.30 and waits on the boot splash, so after a reboot the display can stay black; run once on the seat:";
 
 pub(crate) fn seat_checks(seat: &Value, controller_cli: &str, controller_tag: &str, now: i64) -> Vec<super::cluster_verify::Check> {
     use super::cluster_verify::Verdict;
@@ -2511,7 +2601,7 @@ pub(crate) fn seat_checks(seat: &Value, controller_cli: &str, controller_tag: &s
     // The one root command that puts a seat's display right: it converges
     // the env file, installs this release's watchdog, restarts both kiosk
     // units and refuses to report success unless they stay up.
-    let repair = || Some(format!("on {name}: sudo {} kiosk seat-sync --migrate", seat_applier_for_remedy(seat)));
+    let repair = || Some(format!("on {name}: {}", seat_migrate_command(&seat_applier_for_remedy(seat))));
     let env_src = hb["kiosk"]["env"].as_str().unwrap_or("");
     let env_unreadable = env_src.starts_with("unreadable");
     if env_unreadable {
@@ -2590,13 +2680,30 @@ pub(crate) fn seat_checks(seat: &Value, controller_cli: &str, controller_tag: &s
     // broker's RuntimeDirectory=kiosk, 0.6.16) reaches the seat only through
     // the repair, which installs this release's unit. Without that directory
     // the display runs but cannot be reloaded (node-h after 0.6.24).
-    if hb_unit_stale(hb) {
+    //
+    // A 0.6.30+ seat also reads its unit itself (`kiosk_unit`): a dedicated
+    // unit from before 0.6.30 waits on plymouth-quit-wait and can leave the
+    // display black after a reboot (i1153). Dedicated seats only: a shared
+    // unit waits on the splash by design, and the seat says `shared`.
+    let unit_word = hb["kiosk_unit"].as_str();
+    let dedicated = hb["kiosk"]["mode"].as_str() == Some("dedicated");
+    if unit_word == Some("needs_migrate") {
+        out.push(check("kiosk unit", Verdict::Warn, KIOSK_UNIT_WAITS_ON_SPLASH.into(), repair()));
+    } else if hb_unit_stale(hb) {
         let why = if hb["kiosk_unit_runtime_dir"].as_bool() == Some(false) {
             "kiosk.service is not this release's unit and has no RuntimeDirectory=kiosk: the display's broker has no control socket, so `noo kiosk reload` cannot reload it (the seat's sync cannot update a root unit)"
         } else {
             "kiosk.service is not this release's unit (the seat's sync cannot update a root unit)"
         };
         out.push(check("kiosk unit", Verdict::Warn, why.into(), repair()));
+    } else if unit_word == Some("current") {
+        out.push(check("kiosk unit", Verdict::Ok, "this release's boot order: the display quits the boot splash itself".into(), None));
+    } else if unit_word == Some("unreadable") && dedicated {
+        out.push(check("kiosk unit", Verdict::Warn,
+            "the seat could not read kiosk.service, so whether it waits on the boot splash is unknown".into(), repair()));
+    } else if unit_word.is_none() && dedicated {
+        out.push(check("kiosk unit", Verdict::Ok,
+            "not reported: this seat's noo does not report its kiosk unit yet, so whether its unit waits on the boot splash is not known here".into(), None));
     }
     // Where the display execs its scripts from (a 0.6.11+ seat reports it).
     match hb["kiosk_bins"].as_str() {
@@ -2720,6 +2827,28 @@ pub(crate) fn seat_checks_after_apply(seat: &Value, controller_cli: &str, contro
     out
 }
 
+/// The roll's seat status answer says nothing about the seat: no answer at
+/// all (`Null`), or a record with neither a `last_seen` nor a heartbeat.
+/// Judged as a record, that read as three unrelated faults ("never heard
+/// from since it enrolled", "no CLI version reported", "no kiosk set up on
+/// this seat") on a seat whose sync was stuck in a queued display restart
+/// (i1153).
+pub(crate) fn seat_record_empty(st: &Value) -> bool {
+    let hb_empty = match &st["heartbeat"] {
+        Value::Null => true,
+        Value::Object(m) => m.is_empty(),
+        _ => false,
+    };
+    !st.is_object() || (st["last_seen"].as_str().filter(|s| !s.is_empty()).is_none() && hb_empty)
+}
+
+/// The one check the roll prints for an empty seat record.
+pub(crate) fn seat_did_not_report(name: &str) -> super::cluster_verify::Check {
+    check("seat online", super::cluster_verify::Verdict::Fail,
+        "the seat did not report: its sync may be stuck (a start job queued?)".into(),
+        Some(format!("on {name}: systemctl list-jobs   (and: journalctl -u noo-seat-sync -n 30)")))
+}
+
 /// The seats stage of `noo upgrade` (after the nodes, or alone with
 /// `--seats`): stage every enrolled seat, wait for all of them together with
 /// the nodes' combined wait, then one verify block per seat. No enrolled
@@ -2775,7 +2904,8 @@ pub(crate) fn upgrade_seats(g: &Globals) -> i32 {
                 }
             }
             let st = with_listed_user(st.unwrap_or(Value::Null), &seats, &n);
-            let checks = if ok_apply { seat_checks_after_apply(&st, env!("CARGO_PKG_VERSION"), &console, now_unix()) }
+            let checks = if seat_record_empty(&st) { vec![seat_did_not_report(&n)] }
+                else if ok_apply { seat_checks_after_apply(&st, env!("CARGO_PKG_VERSION"), &console, now_unix()) }
                 else { seat_checks(&st, env!("CARGO_PKG_VERSION"), &console, now_unix()) };
             let seat_ok = ok_apply && checks.iter().all(|c| c.verdict != super::cluster_verify::Verdict::Fail);
             if let Some(h) = checks.iter().find(|c| c.name == "display held") {
@@ -3211,16 +3341,123 @@ mod tests {
                           "kiosk_bins": "shared", "kiosk_watchdog_sha": wd, "console_build": "stack-v0.6.24",
                           "kiosk_unit_sha": sha256_hex(unit.as_bytes()), "kiosk_unit_runtime_dir": unit_has_runtime_dir(unit),
                           "kiosk": {"user": "kiosk", "mode": "dedicated", "vt": "1"}}});
-        assert!(!seat_checks(&seat(&current), "0.6.24", "stack-v0.6.24", now).iter().any(|c| c.name == "kiosk unit"),
-            "this release's unit adds no row");
+        assert!(!seat_checks(&seat(&current), "0.6.24", "stack-v0.6.24", now).iter().any(|c| c.name == "kiosk unit" && c.verdict != Verdict::Ok),
+            "this release's unit adds no WARN");
         let u = seat_checks(&seat(&old), "0.6.24", "stack-v0.6.24", now).into_iter().find(|c| c.name == "kiosk unit").expect("an old unit is said");
         assert_eq!(u.verdict, Verdict::Warn, "{u:?}");
         assert!(u.detail.contains("no RuntimeDirectory=kiosk") && u.detail.contains("cannot reload"), "{u:?}");
         assert!(u.remedy.as_deref().unwrap_or("").contains("kiosk seat-sync --migrate"), "{u:?}");
-        // A seat that reports no unit sha (older CLI) or no parameters: no row, not a guess.
+        // A seat that reports no unit sha (older CLI) or no parameters: no WARN, not a guess.
         let mut quiet = seat(&old);
         quiet["heartbeat"].as_object_mut().unwrap().remove("kiosk_unit_sha");
-        assert!(!seat_checks(&quiet, "0.6.24", "stack-v0.6.24", now).iter().any(|c| c.name == "kiosk unit"));
+        assert!(!seat_checks(&quiet, "0.6.24", "stack-v0.6.24", now).iter().any(|c| c.name == "kiosk unit" && c.verdict != Verdict::Ok));
+    }
+
+    /// A dedicated kiosk.service as units were before 0.6.30 (i1153): no
+    /// splash handover, After= plymouth-quit-wait.service.
+    fn pre_0630_dedicated_unit(current: &str) -> String {
+        current.lines()
+            .filter(|l| !l.contains("plymouth-quit.service") && !l.starts_with("ExecStartPre=-+/bin/plymouth"))
+            .map(|l| l.replace("network-online.target kiosk-serve.service", "network-online.target plymouth-quit-wait.service kiosk-serve.service"))
+            .map(|l| format!("{l}\n"))
+            .collect()
+    }
+
+    /// The seat reads its own kiosk.service (0.6.30): a dedicated unit that
+    /// still waits on plymouth-quit-wait needs the one root migrate; this
+    /// release's names that unit only in a comment; a shared unit waits on
+    /// the splash by design.
+    #[test]
+    fn the_seat_reads_whether_its_kiosk_unit_waits_on_the_splash() {
+        use super::super::kiosk::{render_kiosk_service_in, Mode, SHARED_DEFAULT_VT};
+        let new = seat_kiosk_unit(&KioskParams { user: "kiosk".into(), mode: Mode::Dedicated, vt: 1 });
+        assert_eq!(kiosk_unit_word(Ok(new.clone())), "current", "this release's unit names plymouth-quit-wait only in a comment");
+        let old = pre_0630_dedicated_unit(&new);
+        assert!(old.contains("After=systemd-user-sessions.service network-online.target plymouth-quit-wait.service kiosk-serve.service"), "{old}");
+        assert!(!old.contains("Conflicts=plymouth-quit.service") && old.contains("Conflicts=getty@tty1.service"), "{old}");
+        assert_eq!(kiosk_unit_word(Ok(old)), "needs_migrate");
+        let shared = render_kiosk_service_in("kiosk", Mode::Shared, SHARED_DEFAULT_VT, SEAT_KIOSK_DIR);
+        assert_eq!(kiosk_unit_word(Ok(shared)), "shared", "a shared unit waits on the splash by design");
+        assert_eq!(kiosk_unit_word(Err(std::io::Error::from(std::io::ErrorKind::NotFound))), "absent");
+        assert_eq!(kiosk_unit_word(Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))), "unreadable");
+    }
+
+    /// verify's `kiosk unit` row on a dedicated seat, by what the seat read:
+    /// the splash-waiting unit is a WARN whose remedy is the full migrate
+    /// command for the seat's own applier, the same helper `noo kiosk reload`
+    /// prints; this release's unit and an older seat CLI are OK rows; a
+    /// shared or absent unit adds no row.
+    #[test]
+    fn a_dedicated_unit_that_waits_on_the_splash_names_the_full_migrate_command() {
+        use super::super::cluster_verify::Verdict;
+        let seen = "2025-10-09T08:53:10Z";
+        let now = super::super::cluster_verify::parse_rfc3339_unix(seen).unwrap() + 10;
+        let wd = sha256_hex(super::super::kiosk::WATCHDOG.as_bytes());
+        let applier = "/home/alex/.local/libexec/noo-seat/noo";
+        let seat = |word: Option<&str>, mode: &str| {
+            let mut s = json!({"seat_name": "seat_a", "enroll_user": "alex", "last_seen": seen,
+                "heartbeat": {"cli_version": "0.6.30", "user_cli_current": true, "kiosk_serve": "active", "kiosk_display": "active",
+                              "kiosk_bins": "shared", "kiosk_watchdog_sha": wd, "console_build": "stack-v0.6.30",
+                              "seat_applier": applier, "kiosk": {"user": "kiosk", "mode": mode, "vt": "1"}}});
+            if let Some(w) = word {
+                s["heartbeat"]["kiosk_unit"] = json!(w);
+            }
+            s
+        };
+        let row = |s: &Value| seat_checks(s, "0.6.30", "stack-v0.6.30", now).into_iter().find(|c| c.name == "kiosk unit");
+        let w = row(&seat(Some("needs_migrate"), "dedicated")).expect("a splash-waiting unit is said");
+        assert_eq!(w.verdict, Verdict::Warn, "{w:?}");
+        assert_eq!(w.detail, KIOSK_UNIT_WAITS_ON_SPLASH);
+        let full = seat_migrate_command(applier);
+        assert_eq!(full, "sudo /home/alex/.local/libexec/noo-seat/noo kiosk seat-sync --migrate");
+        assert_eq!(w.remedy, Some(format!("on seat_a: {full}")));
+        // An old unit's sha as well: still one row, the splash reason.
+        let p = KioskParams { user: "kiosk".into(), mode: super::super::kiosk::Mode::Dedicated, vt: 1 };
+        let mut both = seat(Some("needs_migrate"), "dedicated");
+        let old = pre_0630_dedicated_unit(&seat_kiosk_unit(&p));
+        both["heartbeat"]["kiosk_unit_sha"] = json!(sha256_hex(old.as_bytes()));
+        let rows: Vec<_> = seat_checks(&both, "0.6.30", "stack-v0.6.30", now).into_iter().filter(|c| c.name == "kiosk unit").collect();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].detail, KIOSK_UNIT_WAITS_ON_SPLASH);
+
+        let ok = row(&seat(Some("current"), "dedicated")).expect("this release's unit is an OK row");
+        assert_eq!((ok.verdict, ok.remedy.is_none()), (Verdict::Ok, true), "{ok:?}");
+        let quiet = row(&seat(None, "dedicated")).expect("an older seat CLI is said, not judged");
+        assert_eq!(quiet.verdict, Verdict::Ok, "never a FAIL: {quiet:?}");
+        assert!(quiet.detail.starts_with("not reported"), "{quiet:?}");
+        let unread = row(&seat(Some("unreadable"), "dedicated")).expect("an unreadable unit is said");
+        assert_eq!((unread.verdict, unread.remedy), (Verdict::Warn, Some(format!("on seat_a: {full}"))));
+        for (word, mode) in [(Some("shared"), "shared"), (None, "shared"), (Some("unreadable"), "shared"), (Some("absent"), "dedicated")] {
+            assert!(row(&seat(word, mode)).is_none(), "{word:?} {mode}: dedicated seats only");
+        }
+        // A stated path that is not plain is never pasted: the listed user's.
+        let mut odd = seat(Some("needs_migrate"), "dedicated");
+        odd["heartbeat"]["seat_applier"] = json!("/home/x; rm -rf /.local/libexec/noo-seat/noo");
+        assert_eq!(row(&odd).unwrap().remedy.as_deref(), Some("on seat_a: sudo ~alex/.local/libexec/noo-seat/noo kiosk seat-sync --migrate"));
+        // A plain path outside the seat user's own home is never pasted either.
+        for other in ["/tmp/.local/libexec/noo-seat/noo", "/home/bob/.local/libexec/noo-seat/noo"] {
+            let mut elsewhere = seat(Some("needs_migrate"), "dedicated");
+            elsewhere["heartbeat"]["seat_applier"] = json!(other);
+            assert_eq!(row(&elsewhere).unwrap().remedy.as_deref(),
+                Some("on seat_a: sudo ~alex/.local/libexec/noo-seat/noo kiosk seat-sync --migrate"), "{other}");
+        }
+    }
+
+    /// seat-sync's heartbeat states the unit word and the seat's own applier;
+    /// `noo kiosk reload` and verify print one migrate command.
+    #[test]
+    fn the_heartbeat_reports_the_kiosk_unit_word_and_the_seat_applier() {
+        let b = heartbeat_body_for(&cfg(), &SeatState::default(), "user");
+        assert!(matches!(b["kiosk_unit"].as_str(), Some("current" | "needs_migrate" | "shared" | "absent" | "unreadable")), "{b}");
+        assert_eq!(b["seat_applier"], "/home/alex/.local/libexec/noo-seat/noo");
+        assert!(heartbeat_body_for(&cfg(), &SeatState::default(), "legacy-root")["seat_applier"].is_null());
+        let own = crate::test_src::own_code(include_str!("kiosk_seat.rs"));
+        let hb = crate::test_src::fn_body(&own, "fn heartbeat_body_with(");
+        assert!(hb.contains("\"kiosk_unit\": kiosk_unit_word(std::fs::read_to_string(KIOSK_UNIT_PATH)),"), "the seat reports the word");
+        let local = crate::test_src::fn_body(&own, "pub(crate) fn local_seat_display(");
+        assert!(local.contains("seat_migrate_command(&cfg.applier_path()"), "reload prints the helper's command");
+        let checks = crate::test_src::fn_body(&own, "pub(crate) fn seat_checks(");
+        assert!(checks.contains("seat_migrate_command(&seat_applier_for_remedy(seat))"), "verify prints the helper's command");
     }
 
     /// node-h, 0.6.25 roll: the sync restarted a running display under
@@ -3891,7 +4128,14 @@ exec {real_install} "$@"
 "#));
             shim("runuser", "while [ \"$1\" != \"--\" ]; do shift; done\nshift\nexec \"$@\"\n".into());
             shim("id", "if [ \"$1\" = -gn ] && [ \"$2\" = kiosk ]; then echo kiosk; exit 0; fi\necho \"id: '$2': no such user\" >&2\nexit 1\n".into());
-            shim("systemctl", "echo \"systemctl $*\" >> \"$SHIM_LOG\"\nif [ \"$1\" = is-active ]; then echo \"${FAKE_STATE:-active}\"; [ \"${FAKE_STATE:-active}\" = active ]; exit $?; fi\nexit 0\n".into());
+            shim("systemctl", concat!(
+                "echo \"systemctl $*\" >> \"$SHIM_LOG\"\n",
+                "if [ \"$1\" = is-active ]; then echo \"${FAKE_STATE:-active}\"; [ \"${FAKE_STATE:-active}\" = active ]; exit $?; fi\n",
+                // A queued start (i1153): FAKE_JOB names kiosk.service's job.
+                "if [ \"$*\" = \"show -p Job --value kiosk.service\" ]; then echo \"${FAKE_JOB:-}\"; fi\n",
+                "if [ \"$*\" = \"show -p After --value kiosk.service\" ]; then echo \"systemd-user-sessions.service plymouth-quit-wait.service kiosk-serve.service\"; fi\n",
+                "if [ \"$1\" = list-jobs ] && [ -n \"${FAKE_JOB:-}\" ]; then echo \"$FAKE_JOB kiosk.service start waiting\"; echo \"3 plymouth-quit-wait.service start running\"; fi\n",
+                "exit 0\n").into());
             shim("sleep", "exit 0\n".into());
             shim("chown", "echo \"chown $*\" >> \"$SHIM_LOG\"\nexit 0\n".into());
             let work = root.join("_work");
@@ -4012,6 +4256,31 @@ exec {real_install} "$@"
             // A seat with a dead display still has its sync timer back.
             assert!(f.log().contains("systemctl enable --now noo-seat-sync.timer"));
         }
+    }
+
+    /// `--migrate`'s display restart does not block, and when the start is
+    /// still queued after the self-check it says behind what (i1153).
+    #[test]
+    fn the_root_step_names_a_start_job_queued_behind_another_unit() {
+        if !cfg!(target_os = "linux") { return; }
+        let f = FakeRoot::new("queued").with_display();
+        let script = seat_install_script_at(&f.root.to_string_lossy(), &f.work, &f.work.join("noo"), &f.cfg, "alex", SeatScript::Migrate);
+        let sp = f.root.join("_script.sh");
+        std::fs::write(&sp, &script).unwrap();
+        let out = Command::new("sh").arg(&sp)
+            .env("PATH", format!("{}:{}", f.root.join("_shims").display(), std::env::var("PATH").unwrap_or_default()))
+            .env("SHIM_LOG", &f.log)
+            .env("FAKE_STATE", "inactive")
+            .env("FAKE_JOB", "7")
+            .output().unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{err}");
+        assert!(err.contains(&format!("kiosk.service did not start within {DISPLAY_SELF_CHECK_SECS} s: a start job is queued behind plymouth-quit-wait.service")), "{err}");
+        assert!(f.log().contains("systemctl restart kiosk.service --no-block"), "{}", f.log());
+        // No job: the old message only.
+        let g = FakeRoot::new("dead-nojob").with_display();
+        let out = g.run(SeatScript::Migrate, "inactive");
+        assert!(!String::from_utf8_lossy(&out.stderr).contains("a start job is queued"));
     }
 
     /// node-h after 0.6.10: re-running `--migrate` on the user layout is
@@ -4620,5 +4889,27 @@ mod console_identity_tests {
         assert!(or.contains("\"/api/cluster/console-build\"") && or.contains(".filter(|id| id.starts_with(\"ui-\"))"), "{or}");
         let verify = crate::test_src::own_code(include_str!("cluster_verify.rs"));
         assert!(verify.contains("crate::commands::kiosk_seat::controller_console_or(g,"), "cluster verify compares against the gateway's console");
+    }
+}
+
+/// The roll's seat stage on an empty status record (i1153).
+#[cfg(test)]
+mod empty_record_tests {
+    use super::*;
+
+    #[test]
+    fn an_empty_seat_record_is_one_said_cause_not_three_faults() {
+        assert!(seat_record_empty(&Value::Null));
+        assert!(seat_record_empty(&json!({"seat_name": "a", "enroll_user": "u"})), "the listed user alone says nothing about the seat");
+        assert!(seat_record_empty(&json!({"seat_name": "a", "heartbeat": {}, "last_seen": ""})));
+        assert!(!seat_record_empty(&json!({"seat_name": "a", "last_seen": "2026-11-20T10:00:00Z"})));
+        assert!(!seat_record_empty(&json!({"seat_name": "a", "heartbeat": {"cli_version": "0.6.30"}})));
+        let c = seat_did_not_report("seat-a");
+        assert_eq!(c.verdict, super::super::cluster_verify::Verdict::Fail);
+        assert_eq!(c.detail, "the seat did not report: its sync may be stuck (a start job queued?)");
+        assert!(c.remedy.as_deref().unwrap_or("").contains("systemctl list-jobs"));
+        let own = crate::test_src::own_code(include_str!("kiosk_seat.rs"));
+        let roll = crate::test_src::fn_body(&own, "pub(crate) fn upgrade_seats(");
+        assert!(roll.contains("if seat_record_empty(&st) { vec![seat_did_not_report(&n)] }"), "{roll}");
     }
 }

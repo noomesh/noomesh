@@ -421,6 +421,30 @@ func (c *Client) ImportOllamaModel(ctx context.Context, name string) (string, er
 // noo-ollama is not an error to fix here: BackendManager owns bringing
 // backends up, and starting one as a side effect of importing a model would
 // be a second thing this verb does without being asked.
+// errOllamaContainerDown is what an import or a rebuild into noo-ollama
+// returns while that container is not running (a recreate removed the old
+// one and has not started the new one, or the operator stopped it). Match it
+// with errors.Is: a caller that can wait for the start (the verify loop) must
+// tell it from a real failure.
+var errOllamaContainerDown = errors.New("the " + OllamaContainer + " container is not running")
+
+// ollamaContainerDownError carries the operator-facing text and matches
+// errOllamaContainerDown.
+type ollamaContainerDownError struct{ node string }
+
+func (e *ollamaContainerDownError) Error() string {
+	return fmt.Sprintf(
+		"the %s container is not running and the import goes only to it on this node — start it: place it if nothing is placed "+
+			"(`noo cluster place %s ollama <model>`), or restart the placed one (`noo cluster restart-backends %s %s`), then re-run",
+		OllamaContainer, e.node, e.node, OllamaContainer)
+}
+
+func (e *ollamaContainerDownError) Unwrap() error { return errOllamaContainerDown }
+
+func ollamaContainerDown() error {
+	return &ollamaContainerDownError{node: os.Getenv("NODE_ID")}
+}
+
 func (c *Client) isRunning(ctx context.Context, name string) bool {
 	res, err := c.docker.ContainerInspect(ctx, name, client.ContainerInspectOptions{})
 	return err == nil && res.Container.State != nil && res.Container.State.Running
@@ -468,9 +492,7 @@ func runOllamaCreate(ctx context.Context, bin, dir, name, modelfile string) (str
 // directory because `FROM ./<file>` is resolved relative to the Modelfile.
 func (c *Client) ollamaCreateInContainer(ctx context.Context, work, name, modelfile, weight string) (string, error) {
 	if !c.isRunning(ctx, OllamaContainer) {
-		return "", fmt.Errorf(
-			"the %s container is not running and the import goes only to it on this node — start it (`noo cluster start-backend %s ollama`), then re-run",
-			OllamaContainer, os.Getenv("NODE_ID"))
+		return "", ollamaContainerDown()
 	}
 	tarball, err := dirTar(work, []string{modelfile, weight})
 	if err != nil {

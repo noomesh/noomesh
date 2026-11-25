@@ -56,6 +56,26 @@ pub fn role_for_capability(capability: &str) -> Option<&'static str> {
     }
 }
 
+/// The backend that serves the rerank role and nothing else: llama.cpp run
+/// with `--reranking` (`noo cluster place <node> reranker <file>.gguf`).
+pub(crate) const RERANKER_BACKEND: &str = "reranker";
+
+/// The role a placement SERVES, from its backend and its stored role.
+///
+/// A `reranker` serves `rerank`, whatever its row says. Until 0.6.30-rc.6 a
+/// bare `noo cluster place <node> reranker <file>.gguf` (the documented form)
+/// stored role `chat`, so routing never found a rerank node. Those rows are
+/// not migrated: [`derive`] (the rerank gate and the capabilities) and
+/// [`placed_model`] read them as rerank. Every other backend's role is what
+/// was stored.
+pub(crate) fn effective_role<'a>(backend: &str, stored: &'a str) -> &'a str {
+    if backend == RERANKER_BACKEND {
+        "rerank"
+    } else {
+        stored
+    }
+}
+
 fn norm(m: &str) -> String {
     m.trim().strip_suffix(":latest").unwrap_or(m.trim()).to_string()
 }
@@ -83,12 +103,13 @@ pub fn derive(node: &Value, rows: &[PlacementFact]) -> Vec<Value> {
     let presence = node.get("model_presence").and_then(|v| v.as_object());
     let mut out = Vec::new();
     for r in rows {
+        let role = effective_role(&r.backend, &r.role);
         let model = r.model.clone().unwrap_or_default();
         let mut present: Option<bool> = None;
         if let Some(p) = presence {
             for (k, e) in p {
                 let of_backend = k == &r.backend || k.strip_prefix(r.backend.as_str()).is_some_and(|s| s.starts_with('#'));
-                if of_backend && entry_role(e) == r.role && (model.is_empty() || e["model"].as_str().map(norm) == Some(norm(&model))) {
+                if of_backend && effective_role(&r.backend, entry_role(e)) == role && (model.is_empty() || e["model"].as_str().map(norm) == Some(norm(&model))) {
                     present = e["present"].as_bool();
                     break;
                 }
@@ -108,7 +129,7 @@ pub fn derive(node: &Value, rows: &[PlacementFact]) -> Vec<Value> {
             "unknown"
         };
         out.push(json!({
-            "role": r.role,
+            "role": role,
             "backend": r.backend,
             "model": r.model,
             "state": state,
@@ -182,6 +203,21 @@ pub async fn all_facts(db: &sqlx::PgPool) -> Result<Vec<PlacementFact>, sqlx::Er
         *g = Some((Instant::now(), facts.clone()));
     }
     Ok(facts)
+}
+
+/// The model `node_id`'s running placement for `role` declares, read through
+/// [`effective_role`]. For naming what a reranker serves when its agent
+/// reports no `model_presence` for it (only ollama reports presence).
+pub fn placed_model(facts: &[PlacementFact], node_id: &str, role: &str) -> Option<String> {
+    facts
+        .iter()
+        .filter(|f| f.node_id == node_id && f.desired_state == "running" && effective_role(&f.backend, &f.role) == role)
+        .find_map(|f| f.model.clone().filter(|m| !m.trim().is_empty()))
+}
+
+/// [`placed_model`] over the cached placement facts; None when unreadable.
+pub async fn node_placed_model(db: &sqlx::PgPool, node_id: &str, role: &str) -> Option<String> {
+    placed_model(&all_facts(db).await.ok()?, node_id, role)
 }
 
 /// Drop the cache after a placement write, so routing sees the write at once.
@@ -276,6 +312,45 @@ mod tests {
         assert!(!serves(&derive(&host6(), &[stopped]), "embed"));
         let node = json!({"running_backends": {"vllm": "m"}});
         assert!(!serves(&derive(&node, &[fact("ollama", "harrier", "embed")]), "embed"));
+    }
+
+    /// The documented placement (0.6.30-rc.5 rehearsal): `noo cluster place
+    /// <node> reranker <file>.gguf`, no `--role`. The gateway stores role
+    /// rerank, and once the agent reports the container running the node
+    /// serves rerank (and never chat). Until rc.6 this stored `chat`, and
+    /// `/api/external/rerank` always fell back to the chat model.
+    #[test]
+    fn a_bare_placed_reranker_serves_rerank_once_its_container_runs() {
+        let role = crate::routes::cluster::resolve_role("reranker", None).expect("a bare reranker place is accepted");
+        assert_eq!(role, "rerank", "a bare reranker place stores the rerank role");
+        let rows = [fact("reranker", "bge-reranker-v2-m3-Q8_0.gguf", &role)];
+        let running = json!({"running_backends": {"reranker": "bge-reranker-v2-m3-Q8_0.gguf"}});
+        let caps = derive(&running, &rows);
+        let wanted = role_for_capability("rerank").expect("rerank is a routed role");
+        assert!(serves(&caps, wanted), "{caps:?}");
+        assert_eq!(caps[0]["state"], "live", "a non-ollama backend whose container runs is live");
+        assert!(!serves(&caps, "chat"), "a reranker serves no chat: {caps:?}");
+        assert_eq!(placed_model(&rows, "host6", "rerank").as_deref(), Some("bge-reranker-v2-m3-Q8_0.gguf"));
+        // Not running yet: placed, not routable.
+        assert!(!serves(&derive(&json!({"running_backends": {"ollama": "gemma4:12b"}}), &rows), wanted));
+    }
+
+    /// A row stored by an rc.5 (or older) gateway: backend reranker, role chat.
+    /// No migration rewrites it; every reader sees rerank.
+    #[test]
+    fn an_old_chat_roled_reranker_row_reads_as_rerank() {
+        let rows = [fact("reranker", "bge-reranker-v2-m3-Q8_0.gguf", "chat")];
+        let caps = derive(&json!({"running_backends": {"reranker": "bge-reranker-v2-m3-Q8_0.gguf"}}), &rows);
+        assert!(serves(&caps, "rerank") && !serves(&caps, "chat"), "{caps:?}");
+        assert_eq!(summary(&caps), "rerank:bge-reranker-v2-m3-Q8_0.gguf");
+        assert_eq!(placed_model(&rows, "host6", "rerank").as_deref(), Some("bge-reranker-v2-m3-Q8_0.gguf"));
+        assert_eq!(placed_model(&rows, "host6", "chat"), None);
+        // Only the reranker is read this way: an llamacpp placed for rerank
+        // keeps its stored role, and so does an llamacpp chat row.
+        assert_eq!(effective_role("reranker", "chat"), "rerank");
+        assert_eq!(effective_role("llamacpp", "rerank"), "rerank");
+        assert_eq!(effective_role("llamacpp", "chat"), "chat");
+        assert_eq!(effective_role("ollama", "embed"), "embed");
     }
 
     #[test]

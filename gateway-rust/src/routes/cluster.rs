@@ -242,6 +242,122 @@ pub(crate) fn acceptable_node_ip(ip: &str) -> bool {
     }
 }
 
+/// What a node's reported address is checked against (i1174): the hosts
+/// other nodes' agents are reached at, and the controller's own.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct AddressClaims {
+    /// `(node, host)` for every agent address the gateway's address book
+    /// gives to ANOTHER node (`node_pin::hosts_claimed_by_others`).
+    pub others: Vec<(String, String)>,
+    /// The controller's own hosts: its self node's agent, its self-agent
+    /// URL and its controller URL.
+    pub controller: Vec<String>,
+    /// The self node's id, when known.
+    pub self_node: Option<String>,
+}
+
+impl AddressClaims {
+    /// The claims as the gateway holds them now, for `node_id`. The self
+    /// node is the one the address book knows; before the book knows one
+    /// (a gateway that just started), a node whose report says `self_node`.
+    pub(crate) fn current(node_id: &str, says_self: bool) -> Self {
+        let mut controller = crate::node_pin::self_node_hosts();
+        for url in [crate::routes::self_agent_base().unwrap_or_default(), super::bootstrap::controller_url()] {
+            if let Some(host) = reqwest::Url::parse(url.trim()).ok().and_then(|u| u.host_str().map(str::to_string)) {
+                controller.push(host.trim_matches(|c| c == '[' || c == ']').to_ascii_lowercase());
+            }
+        }
+        controller.sort();
+        controller.dedup();
+        let self_node = crate::node_pin::self_node().or_else(|| says_self.then(|| node_id.to_string()));
+        Self { others: crate::node_pin::hosts_claimed_by_others(node_id), controller, self_node }
+    }
+}
+
+fn same_addr(a: &str, b: &str) -> bool {
+    let norm = |s: &str| s.trim().trim_matches(|c| c == '[' || c == ']').to_ascii_lowercase();
+    match (norm(a).parse::<std::net::IpAddr>(), norm(b).parse::<std::net::IpAddr>()) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => norm(a) == norm(b),
+    }
+}
+
+/// Why a heartbeat (or registration) may NOT store `offered` as `node_id`'s
+/// address, or `None` when it may: a heartbeat cannot claim another node's
+/// address, nor the controller's own (i1174).
+///
+/// - The controller's own addresses belong to the self node (and its sensor
+///   companion) only.
+/// - An address the gateway already gives to another node is refused,
+///   UNLESS the node's own CA-signed leaf (`leaf_ips`, the client
+///   certificate this very heartbeat presented) carries it: the cluster CA
+///   vetted it for this node, which is how an address that legitimately
+///   moved (DHCP) is taken over.
+pub(crate) fn address_refusal(node_id: &str, offered: &str, claims: &AddressClaims, leaf_ips: &[String]) -> Option<String> {
+    let is_self = claims.self_node.as_deref().is_some_and(|s| crate::node_pin::same_machine(s, node_id));
+    if !is_self && claims.controller.iter().any(|c| same_addr(c, offered)) {
+        return Some(format!("{offered} is the controller's own address"));
+    }
+    let vetted = leaf_ips.iter().any(|ip| same_addr(ip, offered));
+    if let Some((other, _)) = claims.others.iter().find(|(_, host)| same_addr(host, offered)) {
+        if !vetted {
+            return Some(format!("{offered} is claimed by {other}"));
+        }
+    }
+    None
+}
+
+/// A tailnet address (100.64.0.0/10, fd7a:115c:a1e0::/48): unique to one
+/// machine on the tailnet, so two different ones are two machines.
+pub(crate) fn is_tailnet_addr(ip: &str) -> bool {
+    match ip.trim().trim_matches(|c| c == '[' || c == ']').parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(v4)) => v4.octets()[0] == 100 && (v4.octets()[1] & 0xc0) == 64,
+        Ok(std::net::IpAddr::V6(v6)) => v6.segments()[0] == 0xfd7a && v6.segments()[1] == 0x115c && v6.segments()[2] == 0xa1e0,
+        Err(_) => false,
+    }
+}
+
+/// The heartbeat's reported address against the connection's PEER address.
+/// Only a tailnet peer is meaningful here: behind docker's userland proxy,
+/// NAT or a bridge the peer is a gateway or router address and legitimately
+/// differs from what the node reports. A node reaches the controller from
+/// ONE tailnet address, so a tailnet peer and a DIFFERENT tailnet address
+/// reported is refused; any other difference is not judged.
+pub(crate) fn peer_refusal(offered: &str, peer: Option<&str>) -> Option<String> {
+    let peer = peer?;
+    (is_tailnet_addr(offered) && is_tailnet_addr(peer) && !same_addr(offered, peer))
+        .then(|| format!("the heartbeat came from tailnet address {peer}, not {offered}"))
+}
+
+/// The record (`data`) after the node's reported address was refused for
+/// `why`; the heartbeat and the registration both answer a refusal here.
+/// A refused address is never stored: the record keeps the address of the
+/// node's STORED record (`stored`, its last accepted one), unless that one is
+/// itself refused now (another node's, or the controller's): then the record
+/// drops it and its `agent_url`, and the node is reached over its bus or
+/// tunnel until it reports one that is its own. With no stored record (a
+/// first registration) the record has no address.
+pub(crate) fn keep_stored_address(data: &mut Value, stored: Option<&Value>, node_id: &str, claims: &AddressClaims, leaf_ips: &[String], why: &str) {
+    data["ip_address_refused"] = json!(why);
+    let kept = stored
+        .and_then(|s| s.get("ip_address"))
+        .and_then(Value::as_str)
+        .filter(|ip| !ip.is_empty() && address_refusal(node_id, ip, claims, leaf_ips).is_none())
+        .map(str::to_string);
+    match kept {
+        Some(ip) => data["ip_address"] = json!(ip),
+        None => {
+            if let Some(m) = data.as_object_mut() {
+                m.remove("ip_address");
+                m.remove("agent_url");
+            }
+        }
+    }
+}
+
+/// How often the same node's refused address is alerted.
+const ADDRESS_REFUSED_ALERT_COOLDOWN_SECS: i64 = 3_600;
+
 /// A node's `agent_url` must be https on an explicit port at its registered
 /// address: the URL's host is an IP literal equal to `ip` (itself a dialable
 /// node address), with no user info, query, fragment or path. The agent
@@ -321,6 +437,26 @@ pub(crate) fn apply_agent_url(data: &mut Value, offered: Option<&str>, node_id: 
     if !stored.is_empty() && acceptable_agent_url(&stored, &ip_now).is_err() {
         if let Some(m) = data.as_object_mut() {
             m.remove("agent_url");
+        }
+    }
+}
+
+/// The target-node fields (i1174), written EVERY beat and false when
+/// absent: a capability the gateway acts on (desired-config's
+/// `require_target_node`), so an agent rolled back to a build that does not
+/// report it must read as not checking, never inherit the record's `true`.
+pub(crate) fn carry_target_node(data: &mut Value, body: &Value) {
+    for key in [crate::node_pin::CHECKS_TARGET_FIELD, crate::node_pin::REQUIRES_TARGET_FIELD] {
+        data[key] = json!(body.get(key).and_then(Value::as_bool) == Some(true));
+    }
+    // The agent's latest `wrong_node` refusal, while it reports one: gone
+    // from the record the beat it stops.
+    match body.get(crate::node_pin::WRONG_NODE_FIELD).filter(|v| v.is_object()) {
+        Some(w) => data[crate::node_pin::WRONG_NODE_FIELD] = w.clone(),
+        None => {
+            if let Some(m) = data.as_object_mut() {
+                m.remove(crate::node_pin::WRONG_NODE_FIELD);
+            }
         }
     }
 }
@@ -477,6 +613,10 @@ const I300_BEAT_KEYS: &[(&str, BeatShape)] = &[
     // controller's store (`{model, state, anchor, model_layer, reason,
     // remedy?, checked_at}`), read by the `ollama models` verify row.
     ("ollama_verify", BeatShape::Objects(64)),
+    // Each GGUF backend started on a local file without the controller's
+    // manifest (`{backend, model, reason, since}`; node-agent-go
+    // docker/gguf_unvouched.go), read by the `gguf verification` verify row.
+    ("gguf_unverified", BeatShape::Objects(16)),
     // Per llamacpp started on the GPU, what llama-server's own startup lines
     // said (`{backend, model, target, state, offloaded?, total?,
     // cuda_devices?, device?, compute_cap?, failure?, cause?, checked_at}`;
@@ -484,10 +624,19 @@ const I300_BEAT_KEYS: &[(&str, BeatShape)] = &[
     // offload` verify row: 0 offloaded on a GPU start is a WARN.
     ("llamacpp_offload", BeatShape::Objects(8)),
     // i1058: the node's Docker Engine, `{state: ok, version, kind}` (kind
-    // dockerd | docker-desktop | podman), `{state: none}` (no Docker) or
-    // `{state: unreadable, error}`; read by the `docker engine` verify row.
-    // Absent is an agent that predates it.
-    ("docker_engine", BeatShape::StateObject(&["ok", "none", "unreadable"])),
+    // dockerd | docker-desktop | podman), `{state: none}` (Docker not
+    // installed), `{state: down, installed_by}` (installed, its daemon's
+    // socket gone) or `{state: unreadable, error}`; read by the `docker
+    // engine` verify row. Absent is an agent that predates it.
+    ("docker_engine", BeatShape::StateObject(&["ok", "none", "down", "unreadable"])),
+    // A backend container the agent owns that no placement wants and no
+    // unplace names: `{backend, container, since}`. Reported, never removed
+    // (absence never reaps); read by the `unplaced backends` verify row.
+    ("orphan_backends", BeatShape::Objects(16)),
+    // What the agent removed on an explicit unplace in the last 24 h:
+    // `{backend, at, unplaced_at}`. Read by the same row; each entry also
+    // acknowledges (deletes) the tombstone it acted on (`ack_reaped`).
+    ("reaped_backends", BeatShape::Objects(64)),
 ];
 
 fn beat_shape_ok(v: &Value, shape: BeatShape) -> bool {
@@ -523,6 +672,32 @@ pub(crate) fn carry_i300(data: &mut Value, body: &Value) {
                 }
             }
         }
+    }
+}
+
+/// A beat's `reaped_backends` acknowledges the unplace tombstones the agent
+/// acted on: each of THIS node's tombstones (the route is the node's own)
+/// whose backend and exact `unplaced_at` an entry names is deleted. Delete
+/// only: a node's report can remove a tombstone, never write one. Nothing is
+/// read when the beat reaped nothing; a failure is logged and the tombstone
+/// ages out at its 24 h.
+async fn ack_reaped(state: &AppState, node_id: &str, body: &Value) {
+    let Some(reaped) = body.get("reaped_backends").filter(|v| v.as_array().is_some_and(|a| !a.is_empty())) else {
+        return;
+    };
+    let acked = match crate::repo::backend_unplaced::for_node(&state.db, node_id).await {
+        Ok(t) => crate::repo::backend_unplaced::acked(&t, reaped),
+        Err(e) => {
+            tracing::warn!(node = %node_id, error = %e, "unplace_records_unreadable");
+            return;
+        }
+    };
+    if acked.is_empty() {
+        return;
+    }
+    match crate::repo::backend_unplaced::delete_keys(&state.db, &acked).await {
+        Ok(n) => tracing::info!(node = %node_id, removed = n, "unplace_records_acknowledged"),
+        Err(e) => tracing::warn!(node = %node_id, error = %e, "unplace_records_ack_failed"),
     }
 }
 
@@ -648,6 +823,8 @@ pub(crate) fn heartbeat_body(
 async fn node_heartbeat(
     State(state): State<Arc<AppState>>,
     Path(node_id): Path<String>,
+    verified: Option<axum::Extension<Option<crate::node_identity::VerifiedPeer>>>,
+    connect: Option<axum::Extension<axum::extract::ConnectInfo<std::net::SocketAddr>>>,
     headers: axum::http::HeaderMap,
     raw: axum::body::Bytes,
 ) -> Result<AppJson, (axum::http::StatusCode, Json<Value>)> {
@@ -689,6 +866,7 @@ async fn node_heartbeat(
     data["running_backends"] = body.get("running_backends").cloned().unwrap_or(json!({}));
     carry_lanes(&mut data, &body);
     carry_i300(&mut data, &body);
+    ack_reaped(&state, &node_id, &body).await;
     // The node on the controller's own device says so (NOO_SELF_NODE);
     // fleet views and node verbs branch on it.
     if let Some(v) = body.get("self_node") { if !v.is_null() { data["self_node"] = v.clone(); } }
@@ -706,9 +884,54 @@ async fn node_heartbeat(
     // `127.0.1.1` — what host3's hostname resolves to, and what its agent
     // registered on 2026-09-22 whenever source-IP detection failed — had the
     // gateway dial itself and answer ~200 chat completions a minute with 502.
+    // i1174: a heartbeat cannot claim another node's address or the
+    // controller's own (`address_refusal`), and a tailnet peer must be the
+    // address reported (`peer_refusal`). A refusal keeps the last good
+    // address, is recorded as `ip_address_refused` and alerted.
+    let leaf_ips: Vec<String> = verified
+        .as_ref()
+        .and_then(|axum::Extension(p)| p.as_ref())
+        .filter(|p| p.node.eq_ignore_ascii_case(&node_id))
+        .map(|p| p.ips.clone())
+        .unwrap_or_default();
+    let peer_ip = connect.as_ref().map(|axum::Extension(axum::extract::ConnectInfo(a))| a.ip().to_string());
+    let claims = AddressClaims::current(&node_id, body.get("self_node").and_then(Value::as_bool) == Some(true));
     if let Some(v) = body.get("ip_address") {
         match v.as_str() {
-            Some(ip) if acceptable_node_ip(ip) => data["ip_address"] = v.clone(),
+            Some(ip) if acceptable_node_ip(ip) => {
+                let refused = address_refusal(&node_id, ip, &claims, &leaf_ips)
+                    .or_else(|| peer_refusal(ip, peer_ip.as_deref()));
+                match refused {
+                    None => {
+                        data["ip_address"] = v.clone();
+                        if let Some(m) = data.as_object_mut() {
+                            m.remove("ip_address_refused");
+                        }
+                    }
+                    Some(why) => {
+                        tracing::warn!(node = %node_id, offered = %ip, reason = %why, "ip_address_refused");
+                        // `data` is still the stored record here: the
+                        // offered address was not written.
+                        let stored = data.clone();
+                        keep_stored_address(&mut data, Some(&stored), &node_id, &claims, &leaf_ips, &why);
+                        crate::operator_alert::send_operator_alert_with(
+                            &state,
+                            crate::operator_alert::OperatorAlert::new(
+                                "node.ip_address_refused",
+                                &node_id,
+                                format!(
+                                    "Node `{node_id}` reported an address the controller did not accept \
+                                     ({why}). Its calls keep going to its last accepted address."
+                                ),
+                            )
+                            .detail(why.clone())
+                            .investigate(format!("noo cluster verify {node_id}")),
+                            ADDRESS_REFUSED_ALERT_COOLDOWN_SECS,
+                        )
+                        .await;
+                    }
+                }
+            }
             Some(ip) if !ip.trim().is_empty() => tracing::warn!(
                 node = %node_id, offered = %ip,
                 "heartbeat named an address the controller cannot dial a node at — keeping the registered one"
@@ -813,6 +1036,17 @@ async fn node_heartbeat(
     // tunnel). Written every beat; an agent that does not say is an older
     // one and reads as the HTTPS listener only.
     data[crate::node_link::TRANSPORTS_FIELD] = crate::node_link::reported_transports(&body);
+    // Whether the agent checks `X-Noo-Node` and whether it refuses a
+    // header-less controller call now (i1174): desired-config turns the
+    // second on per node once the first is reported; verify's `target-node
+    // check` row reads both.
+    carry_target_node(&mut data, &body);
+    // The peers this agent refused calls from as addressed to another node:
+    // its report on each CALLER, alerted on the caller (i1174).
+    for alert in crate::node_pin::misaddressed_alerts(&node_id, &body) {
+        crate::operator_alert::send_operator_alert_with(&state, alert, crate::node_pin::MISADDRESSED_ALERT_COOLDOWN_SECS)
+            .await;
+    }
     // Which image the node's backend-door sidecars run on
     // B: "published", or "fallback-alpine" — stunnel installed from the
     // alpine mirror at every sidecar start. `noo cluster verify <node>`
@@ -988,6 +1222,8 @@ async fn node_heartbeat(
 
     // Which credential the gateway presents to this agent from now on.
     crate::node_agent_auth::note(&node_id, &data);
+    // Which agent addresses this node owns: the pin's address book (i1174).
+    crate::node_pin::note(&node_id, &data);
 
     // Write to NATS KV mesh_nodes bucket (live source of truth)
     if let Ok(kv) = state.js.get_key_value("mesh_nodes").await {
@@ -1244,6 +1480,8 @@ async fn node_forget(
         kv_had_entry = matches!(kv.entry(&node_id).await, Ok(Some(_)));
         kv_purged = kv.purge(&node_id).await.is_ok();
     }
+    // Its agent addresses are no longer its own (i1174's address book).
+    crate::node_pin::forget(&node_id);
     // Nothing anywhere answered to that name: say so, rather than report a
     // typo as a node forgotten. A verb that returns "ok" for a name it
     // never held teaches the operator nothing about the row they meant.
@@ -1413,14 +1651,33 @@ async fn node_register_body(
     // tunnel). Written every beat; an agent that does not say is an older
     // one and reads as the HTTPS listener only.
     data[crate::node_link::TRANSPORTS_FIELD] = crate::node_link::reported_transports(&body);
+    // The node's stored record: a refused address keeps its last accepted
+    // one (below), and the write carries routing fields from it.
+    let kv = state.js.get_key_value("mesh_nodes").await.ok();
+    let stored = match &kv {
+        Some(kv) => kv.get(node_id).await.ok().flatten().and_then(|v| serde_json::from_slice::<Value>(&v).ok()),
+        None => None,
+    };
+    // i1174: a registration cannot claim another node's address or the
+    // controller's own either (no leaf override here: a registration
+    // rebuilds the record, and the next heartbeat may take a vetted one).
+    // A refusal keeps the stored address, as a heartbeat's does.
+    if let Some(ip) = data.get("ip_address").and_then(Value::as_str).map(str::to_string) {
+        let claims = AddressClaims::current(node_id, body.get("self_node").and_then(Value::as_bool) == Some(true));
+        if let Some(why) = address_refusal(node_id, &ip, &claims, &[]) {
+            tracing::warn!(node = %node_id, offered = %ip, reason = %why, "ip_address_refused");
+            keep_stored_address(&mut data, stored.as_ref(), node_id, &claims, &[], &why);
+        }
+    }
+    carry_target_node(&mut data, &body);
     crate::node_agent_auth::note(node_id, &data);
+    crate::node_pin::note(node_id, &data);
 
     // Write full registration to NATS KV, keeping the routing fields the
     // node offered a second ago (`carry_stored`). A forgotten node's record
     // was purged (`node_forget`), so a re-enrolled one inherits nothing.
     let mut kept: Vec<&str> = Vec::new();
-    if let Ok(kv) = state.js.get_key_value("mesh_nodes").await {
-        let stored = kv.get(node_id).await.ok().flatten().and_then(|v| serde_json::from_slice::<Value>(&v).ok());
+    if let Some(kv) = &kv {
         let from = stored_for_carry(stored.as_ref(), node_id, now);
         for &key in REGISTER_KEEPS_FROM_STORED {
             carry_stored(&mut data, from, &body, key);
@@ -1568,6 +1825,30 @@ fn demote_if_heartbeat_stale(data: &mut Value, now: f64) {
     ));
 }
 
+/// The listing's `running_backends`: the heartbeat's map with gossip's
+/// entries laid over it. Gossip's model wins for every backend it carries, but
+/// the agent gossips only backends with a compose door, so a running
+/// `reranker` or `vllm-secondary` is never in it. Replacing the map with
+/// gossip's dropped them from `cluster status`/`show`, and the role derived
+/// from it read `down` while the backend served.
+///
+/// A key only the heartbeat reports is kept while that heartbeat is current
+/// (`is_node_offline` false: within the node class's offline threshold). Each
+/// beat rewrites the map, so a stopped backend is shown running for at most one
+/// heartbeat interval, and never once the heartbeat is stale: then only
+/// gossip's entries are listed, as before.
+fn merge_gossip_backends(data: &mut Value, gossip: impl IntoIterator<Item = (String, String)>, now: f64) {
+    let current = !crate::autonomy_evaluators::is_node_offline(data, now);
+    let mut rb = match data.get("running_backends").and_then(|v| v.as_object()) {
+        Some(m) if current => m.clone(),
+        _ => serde_json::Map::new(),
+    };
+    for (bt, model) in gossip {
+        rb.insert(bt, json!(model));
+    }
+    data["running_backends"] = Value::Object(rb);
+}
+
 pub(crate) async fn collect_cluster_nodes(state: &Arc<AppState>) -> (Vec<Value>, Option<String>) {
     let mut nodes: Vec<Value> = Vec::new();
     // The declared harness policy per node. It lives in `noo_node_config`, so
@@ -1630,13 +1911,14 @@ pub(crate) async fn collect_cluster_nodes(state: &Arc<AppState>) -> (Vec<Value>,
                             // touch `last_heartbeat`, so a node silent for
                             // minutes still gossips "alive".
                             demote_if_heartbeat_stale(&mut data, unix_now_f64());
-                            // Update backends from gossip (more current than KV)
+                            // Gossip's backends laid over the heartbeat's,
+                            // never replacing them (see merge_gossip_backends).
                             if !peer.backends.is_empty() {
-                                let mut rb = serde_json::Map::new();
-                                for (bt, info) in &peer.backends {
-                                    rb.insert(bt.clone(), json!(info.model));
-                                }
-                                data["running_backends"] = Value::Object(rb);
+                                merge_gossip_backends(
+                                    &mut data,
+                                    peer.backends.iter().map(|(bt, info)| (bt.clone(), info.model.clone())),
+                                    unix_now_f64(),
+                                );
                             }
                         } else {
                             // Absent from gossip. The old code left whatever
@@ -2024,6 +2306,11 @@ pub(crate) async fn cluster_nodes(State(state): State<Arc<AppState>>) -> AppJson
     for n in nodes.iter_mut() {
         if let Some(id) = n.get("id").and_then(Value::as_str).map(str::to_string) {
             n["control_calls"] = crate::node_rpc::counts_json(&id);
+            // The latest call for this node the pin refused (i1174), for
+            // verify's `node identity` row; absent when none in ten minutes.
+            if let Some(m) = crate::node_pin::last_mismatch(&id) {
+                n[crate::node_pin::MISMATCH_FIELD] = m;
+            }
         }
     }
 
@@ -3624,7 +3911,6 @@ pub(crate) fn backend_image_ref(backend: &str, get: &dyn Fn(&str) -> Option<Stri
         // release ref (prefix:tag, rail-staged); only an operator override
         // is forwarded.
         "llamacpp" => ("LLAMACPP_IMAGE", ""),
-        "embedding" => ("TEI_IMAGE", ""),
         _ => return None,
     };
     [operator, locked]
@@ -4421,9 +4707,15 @@ async fn desired_config_get(
     // Withheld (key absent) when the gateway cannot say right now: the agent
     // then touches nothing, never reads it as "remove them".
     let node_workloads = super::node_workload_placements::desired_for(&state, &node_id).await;
+    let unplaced = unplaced_for(&state, &node_id, &placement_json).await;
     let mut body = json!({
         "node": node_json,
         "placements": placement_json,
+        // This node's explicit unplaces (repo/backend_unplaced.rs), at most
+        // 24 h old, none whose (backend, role) is placed: the ONLY thing on
+        // which the agent removes a backend container. Its own array, never
+        // `placements`: an agent that predates it ignores the key.
+        "unplaced": unplaced,
         "mcp_servers": mcp_json,
         // The resolved harness profile (config/harness-profiles.json):
         // `{tier, first_byte_secs, stream_idle_secs, thinking,
@@ -4444,7 +4736,9 @@ async fn desired_config_get(
         // agent refuses new calls with `node_restarting` during its stop
         // drain only when its controller lists that here; otherwise new
         // calls behave as they did before the drain existed.
-        "gateway_features": [crate::node_restart::FEATURE],
+        // `reap_unplaced_backends`: this gateway ships `unplaced`; an agent
+        // acts on it only when this is listed.
+        "gateway_features": [crate::node_restart::FEATURE, crate::repo::backend_unplaced::FEATURE],
         // i802, for `noo cluster show`: per Ollama chat model, the context the
         // daemon runs now, the decided one, why, and the model's ceiling.
         "chat_context_detail": chat_context_detail,
@@ -4461,7 +4755,41 @@ async fn desired_config_get(
     // `node_workloads` fragment is decoded strictly by the agent, a new field
     // inside it would make an old agent refuse). Omitted at epoch 0.
     super::model_set_retry::apply(&mut body, super::model_set_retry::retry_for(&state, &node_id).await.as_ref());
+    // i1174: this gateway sends `X-Noo-Node` on every call to an agent, so
+    // a node whose agent reports it checks the header is told to refuse a
+    // controller call that names no node. Per node: an older or silent node
+    // stays tolerant itself and strands nobody else. A step-back controller
+    // omits the field and the agent goes tolerant again.
+    body[crate::node_pin::REQUIRE_TARGET_DESIRED] = json!(require_target_node(&record));
     Ok(Json(body))
+}
+
+/// desired-config's `unplaced` for `node_id` (`backend_unplaced::ship`
+/// over its tombstones), deleting the ones past their 24 h on the way. A
+/// read error ships none: no tombstone, nothing is removed (the safe
+/// direction), and the placements still go out.
+async fn unplaced_for(state: &AppState, node_id: &str, placements: &[Value]) -> Vec<Value> {
+    let tombstones = match crate::repo::backend_unplaced::for_node(&state.db, node_id).await {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!(node = %node_id, error = %e, "unplace_records_unreadable");
+            return Vec::new();
+        }
+    };
+    let (unplaced, expired) = crate::repo::backend_unplaced::ship(&tombstones, placements, chrono::Utc::now().timestamp());
+    if !expired.is_empty() {
+        if let Err(e) = crate::repo::backend_unplaced::delete_keys(&state.db, &expired).await {
+            tracing::warn!(node = %node_id, error = %e, "unplace_records_expiry_failed");
+        }
+    }
+    unplaced
+}
+
+/// Whether desired-config tells this node to refuse a header-less
+/// controller call: exactly when its agent reports it checks the target
+/// node (`checks_target_node`, i1174).
+pub(crate) fn require_target_node(record: &Value) -> bool {
+    record.get(crate::node_pin::CHECKS_TARGET_FIELD).and_then(Value::as_bool) == Some(true)
 }
 
 /// One row per RUNNING Ollama chat placement with a model (i802), for `noo
@@ -5095,11 +5423,20 @@ fn staged_image_space_facts(dir: &std::path::Path, node: &Value, backend: &str, 
 pub const PLACEMENT_ROLES: &[&str] = &["chat", "embed", "rerank", "harness"];
 
 /// The role a placement request names: explicit, else the backend's default
-/// (`harness` for the harness backend, `chat` for everything else).
+/// (`harness` for the harness backend, `rerank` for the reranker, `chat` for
+/// everything else).
+///
+/// A `reranker` (llama.cpp `--reranking`) serves the rerank role only: a bare
+/// place (`noo cluster place <node> reranker <file>.gguf`, the documented
+/// form) is `rerank`, and any other role is refused. Until 0.6.30-rc.6 the
+/// bare form stored `chat`, so the reranker never routed. Any other backend
+/// may still be placed for `rerank`, as before.
 pub(crate) fn resolve_role(backend: &str, role: Option<&str>) -> Result<String, String> {
     let r = match (backend, role.map(str::trim).filter(|r| !r.is_empty())) {
         ("harness", None) | ("harness", Some("harness")) => "harness",
         ("harness", Some(other)) => return Err(format!("the harness has no role {other:?}")),
+        ("reranker", None) | ("reranker", Some("rerank")) => "rerank",
+        ("reranker", Some(other)) => return Err(reranker_role_refusal(other)),
         (_, None) => "chat",
         (_, Some(r)) => r,
     };
@@ -5110,6 +5447,11 @@ pub(crate) fn resolve_role(backend: &str, role: Option<&str>) -> Result<String, 
         return Err("role 'harness' belongs to the 'harness' backend only".into());
     }
     Ok(r.to_string())
+}
+
+/// Why a `reranker` placement may not name `role`. The CLI says the same.
+pub(crate) fn reranker_role_refusal(role: &str) -> String {
+    format!("a reranker serves the rerank role only, not {role:?}: place it with no role (or role rerank)")
 }
 
 /// The placement upsert, keyed (node, backend, ROLE) -- and, for role=embed
@@ -5240,6 +5582,10 @@ pub(crate) fn fit_specs(existing: &[StoredPlacement], replacing: Option<(&str, &
         .iter()
         .filter(|e| e.desired_state == "running" && e.backend != "harness")
         .filter(|e| replacing.map(|(b, r, m)| !same_placement_slot(e, b, r, m)).unwrap_or(true))
+        // A reranker place replaces EVERY reranker row on the node
+        // (`normalise_reranker_rows` folds a release candidate's chat-stored
+        // row into the one rerank row), so none of them is counted twice.
+        .filter(|e| !(e.backend == "reranker" && replacing.is_some_and(|(b, _, _)| b == "reranker")))
         .filter_map(spec_of)
         .collect();
     if let Some(n) = new.filter(|n| n.desired_state == "running" && n.backend != "harness") {
@@ -5575,6 +5921,36 @@ pub(super) fn nudge_reconcile(state: Arc<AppState>, node_id: String) {
     });
 }
 
+/// The TEI engine was removed in 0.6.30 (i1182a). A NEW running placement of
+/// it is refused with the replacement, never auto-mapped: an HF id is not an
+/// Ollama model name, and the embedding model is an embedding-space decision.
+///
+/// - backend `embedding` (the TEI path): always.
+/// - backend `reranker` with a model that is not a `.gguf` file (an HF repo
+///   id), or an explicit TEI image: refused. A `.gguf` reranker, and a
+///   reranker edit that names no model and no image, pass.
+///
+/// Pure; `placement_put` calls it before anything is read or written.
+pub(crate) fn removed_engine_refusal(node_id: &str, backend: &str, model: Option<&str>, image: Option<&str>) -> Option<String> {
+    match backend {
+        "embedding" => Some(format!(
+            "the TEI embedding engine was removed in 0.6.30: new placements are refused; place an Ollama embedder instead: `noo cluster place {node_id} ollama <model> --role embed`"
+        )),
+        "reranker" => {
+            let tei_image = image.is_some_and(|i| i.to_ascii_lowercase().contains("text-embeddings-inference"));
+            let not_gguf = model
+                .map(str::trim)
+                .filter(|m| !m.is_empty())
+                .is_some_and(|m| !m.to_ascii_lowercase().ends_with(".gguf"));
+            (tei_image || not_gguf).then(|| format!(
+                "the TEI reranker was removed in 0.6.30: new placements are refused; place a GGUF cross-encoder: `noo cluster place {node_id} reranker <file>.gguf` \
+                 (e.g. bge-reranker-v2-m3-Q8_0.gguf; ship it with `noo cluster sync-model-files {node_id} -m <file>`)"
+            ))
+        }
+        _ => None,
+    }
+}
+
 async fn placement_put(
     State(state): State<Arc<AppState>>,
     Path((node_id, backend)): Path<(String, String)>,
@@ -5589,6 +5965,13 @@ async fn placement_put(
     // The harness placement: backend `harness` is always role
     // `harness` and nothing else may claim that role.
     let role = resolve_role(&backend, body.role.as_deref()).map_err(AppError::BadRequest)?;
+    // i1182a: a new placement of the unsupported TEI engine is refused (a stop
+    // still goes through, so an operator can wind an old one down).
+    if desired == "running" {
+        if let Some(why) = removed_engine_refusal(&node_id, &backend, body.model.as_deref(), body.image.as_deref()) {
+            return Err(AppError::BadRequest(why));
+        }
+    }
     // i150 E1: a node may serve several embedding spaces, so an embed row is
     // keyed by its model too. A body that names none (a bare stop/start, a
     // tuning edit) can only mean "the" embed row there is exactly one of.
@@ -5787,6 +6170,18 @@ async fn placement_put(
     // just the primary row of any other backend), so a second embed model on
     // TEI/llamacpp REPLACES the first, as it always did, instead of adding a
     // row the node could not serve.
+    // The replace, the upsert and the kill of this slot's unplace tombstone
+    // commit together: a place after an unplace can never be followed by a
+    // node removing the container (repo/backend_unplaced.rs).
+    let mut tx = state.db.begin().await.map_err(|e| AppError::Internal(format!("placement upsert: {e}")))?;
+    // A reranker a 0.6.30 release candidate stored under role chat is
+    // corrected in place by this place of it (rerank), so the upsert below
+    // hits that one row, keeping its env, target and keep_warm.
+    if backend == "reranker" {
+        crate::repo::cluster::normalise_reranker_rows(&mut tx, &node_id)
+            .await
+            .map_err(|e| AppError::Internal(format!("placement upsert: reranker role: {e}")))?;
+    }
     if role == "embed" && desired == "running" && backend != "ollama" {
         sqlx::query(
             "DELETE FROM noo_backend_placements WHERE node_id = $1 AND backend = $2 AND role = 'embed' AND model IS DISTINCT FROM $3",
@@ -5794,7 +6189,7 @@ async fn placement_put(
         .bind(&node_id)
         .bind(&backend)
         .bind(&body.model)
-        .execute(&state.db)
+        .execute(&mut *tx)
         .await
         .map_err(|e| AppError::Internal(format!("placement replace: {e}")))?;
     }
@@ -5812,9 +6207,13 @@ async fn placement_put(
         .bind(target)
         .bind(memory_limit.as_ref().map(|(b, _)| *b as i64))
         .bind(body.keep_warm)
-        .execute(&state.db)
+        .execute(&mut *tx)
         .await
         .map_err(|e| AppError::Internal(format!("placement upsert: {e}")))?;
+    crate::repo::backend_unplaced::kill(&mut *tx, &node_id, &backend, &role)
+        .await
+        .map_err(|e| AppError::Internal(format!("placement upsert: unplace record: {e}")))?;
+    tx.commit().await.map_err(|e| AppError::Internal(format!("placement upsert: {e}")))?;
     crate::role_capability::invalidate();
 
     tracing::info!(node = %node_id, backend = %backend, role = %role, desired = %desired, "placement_updated");
@@ -5845,6 +6244,8 @@ struct PlacementRoleQuery {
 /// naming them.
 async fn placement_delete(
     State(state): State<Arc<AppState>>,
+    ctx: Option<axum::Extension<crate::auth::RequesterCtx>>,
+    caller: Option<axum::Extension<crate::auth::ClusterNode>>,
     Path((node_id, backend)): Path<(String, String)>,
     Query(q): Query<PlacementRoleQuery>,
 ) -> AppResult {
@@ -5881,21 +6282,47 @@ async fn placement_delete(
             )));
         }
     }
-    let res = match target.as_deref() {
-        Some("embed") if model.is_some() => sqlx::query(
-            "DELETE FROM noo_backend_placements WHERE node_id = $1 AND backend = $2 AND role = 'embed' AND model = $3",
-        )
-        .bind(&node_id).bind(&backend).bind(model).execute(&state.db).await,
-        Some(r) => sqlx::query("DELETE FROM noo_backend_placements WHERE node_id = $1 AND backend = $2 AND role = $3")
-            .bind(&node_id).bind(&backend).bind(r).execute(&state.db).await,
-        None => sqlx::query("DELETE FROM noo_backend_placements WHERE node_id = $1 AND backend = $2")
-            .bind(&node_id).bind(&backend).execute(&state.db).await,
+    // The DELETE and its unplace tombstones commit together: a node removes
+    // a backend's container only on an explicit tombstone for exactly
+    // (node, backend, role), never because a placement is absent
+    // (repo/backend_unplaced.rs). One per role a row was removed for; none
+    // when nothing was removed.
+    let by = unplace_principal(ctx.as_deref(), caller.as_deref());
+    let unplaced_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let mut tx = state.db.begin().await.map_err(|e| AppError::Internal(format!("placement delete: {e}")))?;
+    let removed = crate::repo::backend_unplaced::delete_placements(&mut *tx, &node_id, &backend, target.as_deref(), model)
+        .await
+        .map_err(|e| AppError::Internal(format!("placement delete: {e}")))?;
+    for role in tombstone_roles(&removed) {
+        crate::repo::backend_unplaced::write(&mut *tx, &node_id, &backend, &role, &unplaced_at, &by)
+            .await
+            .map_err(|e| AppError::Internal(format!("placement delete: unplace record: {e}")))?;
     }
-    .map_err(|e| AppError::Internal(format!("placement delete: {e}")))?;
+    tx.commit().await.map_err(|e| AppError::Internal(format!("placement delete: {e}")))?;
     crate::role_capability::invalidate();
+    if !removed.is_empty() {
+        tracing::info!(node = %node_id, backend = %backend, roles = ?tombstone_roles(&removed), unplaced_at = %unplaced_at, by = %by, "placement_unplaced");
+    }
 
     nudge_reconcile(state.clone(), node_id.clone());
-    Ok(Json(json!({"ok": true, "deleted": res.rows_affected()})))
+    Ok(Json(json!({"ok": true, "deleted": removed.len()})))
+}
+
+/// The roles an unplace writes a tombstone for: each role a row was removed
+/// for, once. Empty when nothing was removed (no tombstone without a DELETE).
+pub(crate) fn tombstone_roles(removed: &[String]) -> Vec<String> {
+    let mut roles: Vec<String> = removed.to_vec();
+    roles.sort();
+    roles.dedup();
+    roles
+}
+
+/// Who unplaced: the JWT subject, else the cluster caller's name (the
+/// operator CLI on the controller), else `cluster-cli`.
+fn unplace_principal(ctx: Option<&crate::auth::RequesterCtx>, caller: Option<&crate::auth::ClusterNode>) -> String {
+    ctx.map(|c| c.sub.clone())
+        .or_else(|| caller.map(|c| c.0.clone()))
+        .unwrap_or_else(|| "cluster-cli".to_string())
 }
 
 #[derive(Deserialize)]
@@ -9181,6 +9608,41 @@ mod placement_role_tests {
         assert!(sizes_of(&json!({})).is_empty());
     }
 
+    /// i1182a: the TEI engine was removed in 0.6.30; a new `embedding` placement or a
+    /// non-GGUF / TEI-image reranker is refused naming the replacement, a
+    /// GGUF reranker is not.
+    #[test]
+    fn the_unsupported_tei_engine_is_refused_with_the_replacement() {
+        let why = removed_engine_refusal("n1", "embedding", Some("BAAI/bge-small-en-v1.5"), None).expect("refused");
+        assert!(why.contains("the TEI embedding engine was removed in 0.6.30: new placements are refused"), "{why}");
+        assert!(why.contains("`noo cluster place n1 ollama <model> --role embed`"), "{why}");
+        assert!(removed_engine_refusal("n1", "embedding", None, None).is_some(), "a bare embedding place too");
+        let hf = removed_engine_refusal("n1", "reranker", Some("BAAI/bge-reranker-v2-m3"), None).expect("an HF id is refused");
+        assert!(hf.contains("the TEI reranker was removed in 0.6.30") && hf.contains("`noo cluster place n1 reranker <file>.gguf`"), "{hf}");
+        assert!(hf.contains("bge-reranker-v2-m3-Q8_0.gguf") && hf.contains("noo cluster sync-model-files n1 -m <file>"), "{hf}");
+        let img = removed_engine_refusal("n1", "reranker", Some("x.gguf"), Some("ghcr.io/huggingface/text-embeddings-inference:cpu-1.9.4")).expect("a TEI image is refused");
+        assert!(img.contains("the TEI reranker was removed in 0.6.30"), "{img}");
+        assert!(removed_engine_refusal("n1", "reranker", Some("bge-reranker-v2-m3-Q8_0.gguf"), None).is_none(), "a GGUF reranker is accepted");
+        assert!(removed_engine_refusal("n1", "reranker", Some("Model.GGUF"), Some("ghcr.io/noomesh/llamacpp:v1")).is_none());
+        assert!(removed_engine_refusal("n1", "reranker", None, None).is_none(), "an edit that names no model is not judged");
+        assert!(removed_engine_refusal("n1", "ollama", Some("harrier"), None).is_none());
+        assert!(removed_engine_refusal("n1", "llamacpp", Some("a/b"), None).is_none());
+    }
+
+    /// i1182a: the handler asks before it reads or writes anything, and only
+    /// for a running placement.
+    #[test]
+    fn placement_put_refuses_a_removed_engine_before_any_read_or_write() {
+        let own = crate::test_src::own_code(include_str!("cluster.rs"));
+        let put = crate::test_src::fn_body(&own, "async fn placement_put(");
+        let at = put.find("removed_engine_refusal(").expect("the handler asks");
+        assert!(put[..at].contains("desired == \"running\""), "only a running placement is refused");
+        assert!(at < put.find("stored_placements(").unwrap(), "before the first read");
+        // The write, found by its statement name (no `sqlx` + `::query` text here: the
+        // repo-layer ratchet counts that text, and a test line must not raise the count).
+        assert!(at < put.find("(PLACEMENT_UPSERT)").unwrap(), "before the write");
+    }
+
     #[test]
     fn no_role_means_the_default_role_never_what_the_row_had() {
         assert_eq!(resolve_role("ollama", None).unwrap(), "chat");
@@ -9190,6 +9652,48 @@ mod placement_role_tests {
         assert!(resolve_role("harness", Some("chat")).is_err());
         assert!(resolve_role("ollama", Some("harness")).is_err());
         assert!(resolve_role("ollama", Some("bogus")).is_err());
+    }
+
+    /// The documented reranker place names no role: it is rerank, never the
+    /// chat default (0.6.30-rc.5 rehearsal).
+    #[test]
+    fn a_bare_reranker_place_is_the_rerank_role() {
+        assert_eq!(resolve_role("reranker", None).unwrap(), "rerank");
+        assert_eq!(resolve_role("reranker", Some(" ")).unwrap(), "rerank");
+        assert_eq!(resolve_role("reranker", Some("rerank")).unwrap(), "rerank");
+    }
+
+    /// A reranker serves rerank only: chat or embed is refused, with the
+    /// message the CLI gives too.
+    #[test]
+    fn a_reranker_with_another_role_is_refused() {
+        for r in ["chat", "embed", "harness"] {
+            let e = resolve_role("reranker", Some(r)).expect_err(r);
+            assert_eq!(e, reranker_role_refusal(r));
+            assert!(e.contains("a reranker serves the rerank role only"), "{e}");
+        }
+    }
+
+    /// The reranker normalisation runs in the upsert's transaction, before it,
+    /// for the reranker only.
+    #[test]
+    fn placement_put_corrects_an_rc_reranker_row_before_the_upsert() {
+        let own = crate::test_src::own_code(include_str!("cluster.rs"));
+        let put = crate::test_src::fn_body(&own, "async fn placement_put(");
+        let begin = put.find("let mut tx = state.db.begin()").expect("the transaction");
+        let fix = put.find("crate::repo::cluster::normalise_reranker_rows(&mut tx, &node_id)").expect("the normalisation");
+        assert!(begin < fix && fix < put.find("(PLACEMENT_UPSERT)").expect("the write"), "in the transaction, before the write");
+        assert!(put[begin..fix].contains("if backend == \"reranker\" {"), "only for the reranker");
+    }
+
+    /// The reverse stays open (as before rc.6): any other model backend may be
+    /// placed for rerank, and its bare place is still chat.
+    #[test]
+    fn a_non_reranker_backend_may_still_serve_rerank() {
+        for b in ["llamacpp", "ollama", "vllm"] {
+            assert_eq!(resolve_role(b, Some("rerank")).unwrap(), "rerank", "{b}");
+            assert_eq!(resolve_role(b, None).unwrap(), "chat", "{b}");
+        }
     }
 
     #[test]
@@ -9221,6 +9725,25 @@ mod placement_role_tests {
         let specs = fit_specs(&existing, Some(("ollama", "embed", Some("harrier"))), Some(&new));
         let names: Vec<_> = specs.iter().map(|s| format!("{}/{}", s.role, s.model)).collect();
         assert_eq!(names, vec!["chat/gemma4:26b-a4b-it-qat", "embed/bge-m3"], "harness holds no model memory");
+    }
+
+    #[test]
+    fn a_reranker_place_counts_no_old_reranker_row_beside_the_new_one() {
+        // A release candidate stored the reranker under role chat; placing it
+        // again folds that row into the rerank row (normalise_reranker_rows),
+        // so the fit set holds the new reranker once, not old + new.
+        let existing = vec![
+            stored("ollama", "chat", "gemma4:26b-a4b-it-qat", json!({})),
+            stored("reranker", "chat", "bge-reranker-v2-m3-Q8_0.gguf", json!({})),
+        ];
+        let new = stored("reranker", "rerank", "bge-reranker-v2-m3-Q8_0.gguf", json!({}));
+        let specs = fit_specs(&existing, Some(("reranker", "rerank", Some("bge-reranker-v2-m3-Q8_0.gguf"))), Some(&new));
+        let names: Vec<_> = specs.iter().map(|s| format!("{}/{}/{}", s.backend, s.role, s.model)).collect();
+        assert_eq!(names, vec!["ollama/chat/gemma4:26b-a4b-it-qat", "reranker/rerank/bge-reranker-v2-m3-Q8_0.gguf"]);
+        // Placing another backend still counts the reranker.
+        let other = stored("ollama", "embed", "harrier", json!({}));
+        let specs = fit_specs(&existing, Some(("ollama", "embed", Some("harrier"))), Some(&other));
+        assert!(specs.iter().any(|s| s.backend == "reranker"), "a non-reranker place keeps the reranker in the fit set");
     }
 
     #[test]
@@ -9306,16 +9829,59 @@ mod placement_role_tests {
     }
 
     /// The live incident, on the real upsert and the real migrated schema.
-    #[tokio::test]
-    async fn two_roles_on_one_backend_coexist_and_nothing_carries_over() {
-        let Some((admin, db)) = scratch("mrp_roles_test").await else { return };
+    /// A scratch database with the real migrated schema (None without a DSN).
+    async fn migrated(name: &str) -> Option<(sqlx::PgPool, sqlx::PgPool)> {
+        let (admin, db) = scratch(name).await?;
         std::env::set_var("NOO_APP_DB_PASSWORD", "ephemeral-not-a-secret");
         for ext in ["vector", "pg_trgm"] {
             sqlx::query(sqlx::AssertSqlSafe(format!("CREATE EXTENSION IF NOT EXISTS {ext}"))).execute(&db).await.expect("extension");
         }
         crate::mesh_migrate::apply(&db).await.expect("apply");
         db.close().await;
-        let db = pool(&std::env::var("NOO_BROKER_TEST_DSN").unwrap(), "mrp_roles_test").await;
+        Some((admin, pool(&std::env::var("NOO_BROKER_TEST_DSN").unwrap(), name).await))
+    }
+
+    /// The rc.6 roll on the real schema: a reranker a 0.6.30 release
+    /// candidate stored under role chat is corrected in place by the next
+    /// place of it (no role): one row, role rerank, its env kept. A chat row
+    /// beside a rerank one is removed. Same transaction statements as
+    /// `placement_put` (the repo function, then `PLACEMENT_UPSERT`).
+    #[tokio::test]
+    async fn a_reranker_place_corrects_an_rc_chat_row_in_place() {
+        let Some((admin, db)) = migrated("mrp_reranker_roll_test").await else { return };
+        let gguf = "bge-reranker-v2-m3-Q8_0.gguf";
+        let env = json!({"N_PARALLEL": "1"});
+        upsert(&db, "reranker", Some(gguf), Some(env.clone()), "chat").await;
+        let mut conn = db.acquire().await.unwrap();
+        crate::repo::cluster::normalise_reranker_rows(&mut conn, "host6").await.unwrap();
+        drop(conn);
+        upsert(&db, "reranker", Some(gguf), None, &resolve_role("reranker", None).unwrap()).await;
+        let r = rows(&db).await;
+        assert_eq!(r.len(), 1, "one reranker row: {r:?}");
+        assert_eq!((r[0].0.as_str(), r[0].1.as_str(), r[0].3.clone()), ("reranker", "rerank", env), "role rerank, env kept");
+
+        // chat + rerank rows (an rc row, then a second place beside it): one row.
+        upsert(&db, "reranker", Some(gguf), None, "chat").await;
+        assert_eq!(rows(&db).await.len(), 2);
+        let mut conn = db.acquire().await.unwrap();
+        crate::repo::cluster::normalise_reranker_rows(&mut conn, "host6").await.unwrap();
+        drop(conn);
+        upsert(&db, "reranker", Some(gguf), None, "rerank").await;
+        let r = rows(&db).await;
+        assert_eq!(r.iter().map(|x| (x.0.as_str(), x.1.as_str())).collect::<Vec<_>>(), vec![("reranker", "rerank")]);
+
+        // Another backend's chat row on the node is never touched.
+        upsert(&db, "llamacpp", Some("chat.gguf"), None, "chat").await;
+        let mut conn = db.acquire().await.unwrap();
+        crate::repo::cluster::normalise_reranker_rows(&mut conn, "host6").await.unwrap();
+        drop(conn);
+        assert_eq!(rows(&db).await.len(), 2);
+        drop_db(&admin, db, "mrp_reranker_roll_test").await;
+    }
+
+    #[tokio::test]
+    async fn two_roles_on_one_backend_coexist_and_nothing_carries_over() {
+        let Some((admin, db)) = migrated("mrp_roles_test").await else { return };
 
         // chat first, then the embedder beside it: the second place must not replace the first.
         upsert(&db, "ollama", Some("gemma4:26b-a4b-it-qat"), None, "chat").await;
@@ -9755,9 +10321,12 @@ mod i300_beat_tests {
             ],
             "node_workloads": [{"addon": "rhaddon", "name": "worker", "state": "provisioned", "ready": false, "door_port": 41001}],
             "ollama_verify": [{"model": "harrier", "state": "verified", "anchor": "gguf", "model_layer": "sha256:5f26", "reason": "", "checked_at": "t"}],
+            "gguf_unverified": [{"backend": "llamacpp", "model": "m.gguf", "reason": "the controller is still hashing m.gguf", "since": "2026-11-23T10:00:00Z"}],
             "llamacpp_offload": [{"backend": "llamacpp", "model": "m.gguf", "target": "gpu", "state": "gpu", "offloaded": 33, "total": 33,
                 "cuda_devices": 1, "device": "NVIDIA GeForce GTX 1080", "compute_cap": "6.1", "checked_at": "t"}],
             "docker_engine": {"state": "ok", "version": "27.5.1", "kind": "dockerd"},
+            "orphan_backends": [{"backend": "reranker", "container": "noo-reranker", "since": "2026-11-20T10:00:00Z"}],
+            "reaped_backends": [{"backend": "vllm", "at": "2026-11-23T10:00:00.000Z", "unplaced_at": "2026-11-23T09:59:00.000Z"}],
         })
     }
 
@@ -9770,6 +10339,7 @@ mod i300_beat_tests {
         for good in [
             json!({"state": "ok", "version": "26.1.4", "kind": "docker-desktop"}),
             json!({"state": "none"}),
+            json!({"state": "down", "installed_by": "dockerd at /usr/bin/dockerd"}),
             json!({"state": "unreadable", "error": "Cannot connect to the Docker daemon"}),
         ] {
             carry_i300(&mut data, &json!({"docker_engine": good.clone()}));
@@ -11104,5 +11674,374 @@ mod ollama_tag_check_tests {
         assert!(put.contains("let self_node = crate::self_node::is_self_node(&node_id) || record.as_ref().is_some_and(|r| r[\"self_node\"].as_bool() == Some(true));"),
             "self is this gateway's NOO_SELF_NODE or the node's own heartbeat");
         assert!(put.contains("if ollama_tag_check_applies(&backend, &desired, self_node) {"), "the route asks");
+    }
+}
+
+#[cfg(test)]
+mod address_claim_tests {
+    //! i1174: a heartbeat cannot claim another node's address, nor the
+    //! controller's own; a tailnet peer must be the address reported; and
+    //! desired-config makes a node strict only once it reports the check.
+    use super::*;
+
+    fn claims() -> AddressClaims {
+        AddressClaims {
+            others: vec![("node_b".into(), "100.64.0.12".into())],
+            controller: vec!["100.64.0.1".into(), "ctrl.example".into()],
+            self_node: Some("ctrl".into()),
+        }
+    }
+
+    #[test]
+    fn a_heartbeat_cannot_claim_another_nodes_address() {
+        let why = address_refusal("node_a", "100.64.0.12", &claims(), &[]).expect("refused");
+        assert!(why.contains("claimed by node_b"), "{why}");
+        assert_eq!(address_refusal("node_a", "100.64.0.11", &claims(), &[]), None, "its own address");
+    }
+
+    #[test]
+    fn an_address_the_nodes_own_leaf_carries_is_vetted() {
+        let leaf = vec!["100.64.0.12".to_string()];
+        assert_eq!(address_refusal("node_a", "100.64.0.12", &claims(), &leaf), None);
+    }
+
+    #[test]
+    fn a_heartbeat_cannot_claim_the_controllers_address() {
+        let why = address_refusal("node_a", "100.64.0.1", &claims(), &[]).expect("refused");
+        assert!(why.contains("controller's own address"), "{why}");
+        // Not even with a leaf that carries it.
+        assert!(address_refusal("node_a", "100.64.0.1", &claims(), &["100.64.0.1".to_string()]).is_some());
+        // The self node and its companion own it.
+        assert_eq!(address_refusal("ctrl", "100.64.0.1", &claims(), &[]), None);
+        assert_eq!(address_refusal("ctrl-sensors", "100.64.0.1", &claims(), &[]), None);
+    }
+
+    #[test]
+    fn a_tailnet_peer_must_be_the_address_reported() {
+        assert!(peer_refusal("100.64.0.12", Some("100.64.0.11")).is_some());
+        assert_eq!(peer_refusal("100.64.0.11", Some("100.64.0.11")), None);
+        // NAT, a bridge, docker's userland proxy: the peer is not the node's
+        // own address and is not judged.
+        assert_eq!(peer_refusal("100.64.0.12", Some("172.20.0.1")), None);
+        assert_eq!(peer_refusal("192.0.2.10", Some("100.64.0.11")), None);
+        assert_eq!(peer_refusal("100.64.0.12", None), None);
+    }
+
+    #[test]
+    fn a_stored_address_another_node_holds_is_dropped_not_kept() {
+        let stored = json!({"ip_address": "100.64.0.12", "agent_url": "https://100.64.0.12:8081"});
+        let mut data = stored.clone();
+        keep_stored_address(&mut data, Some(&stored), "node_a", &claims(), &[], "100.64.0.1 is the controller's own address");
+        assert!(data.get("ip_address").is_none() && data.get("agent_url").is_none(), "{data}");
+        assert_eq!(data["ip_address_refused"], "100.64.0.1 is the controller's own address");
+        // A heartbeat: `data` is the stored record.
+        let good = json!({"ip_address": "100.64.0.11", "agent_url": "https://100.64.0.11:8081"});
+        let mut beat = good.clone();
+        keep_stored_address(&mut beat, Some(&good), "node_a", &claims(), &[], "100.64.0.12 is claimed by node_b");
+        assert_eq!(beat["ip_address"], "100.64.0.11", "the last good address stays");
+        assert_eq!(beat["agent_url"], "https://100.64.0.11:8081", "with its agent_url");
+        assert_eq!(beat["ip_address_refused"], "100.64.0.12 is claimed by node_b");
+    }
+
+    /// The rc.2 rehearsal: a restarted agent re-registered with an address
+    /// another node holds, and the registration wiped its good stored one.
+    /// A registration's refusal keeps the stored address, as a beat's does.
+    #[test]
+    fn a_reregistration_with_a_claimed_address_keeps_the_stored_one() {
+        let stored = json!({"id": "node_a", "ip_address": "100.64.0.11"});
+        // The registration rebuilt the record with the address it offered.
+        let mut data = json!({"id": "node_a", "ip_address": "100.64.0.12"});
+        let why = address_refusal("node_a", "100.64.0.12", &claims(), &[]).expect("refused");
+        keep_stored_address(&mut data, Some(&stored), "node_a", &claims(), &[], &why);
+        assert_eq!(data["ip_address"], "100.64.0.11", "{data}");
+        assert_eq!(data["ip_address_refused"], "100.64.0.12 is claimed by node_b");
+        assert!(!data.to_string().contains("100.64.0.12\""), "the offered address is never stored: {data}");
+    }
+
+    #[test]
+    fn a_first_registration_with_a_claimed_address_stores_none() {
+        let mut data = json!({"id": "node_a", "ip_address": "100.64.0.12"});
+        keep_stored_address(&mut data, None, "node_a", &claims(), &[], "100.64.0.12 is claimed by node_b");
+        assert!(data.get("ip_address").is_none(), "{data}");
+        assert_eq!(data["ip_address_refused"], "100.64.0.12 is claimed by node_b");
+    }
+
+    #[test]
+    fn a_reregistration_whose_stored_address_is_now_claimed_stores_none() {
+        let stored = json!({"id": "node_a", "ip_address": "100.64.0.12", "agent_url": "https://100.64.0.12:8081"});
+        let mut data = json!({"id": "node_a", "ip_address": "100.64.0.1"});
+        keep_stored_address(&mut data, Some(&stored), "node_a", &claims(), &[], "100.64.0.1 is the controller's own address");
+        assert!(data.get("ip_address").is_none() && data.get("agent_url").is_none(), "{data}");
+    }
+
+    /// Both paths answer a refusal with the one helper, so they cannot
+    /// drift: the beat with its stored record (`data` before the offered
+    /// address is written), the registration with the record it read from KV.
+    #[test]
+    fn the_heartbeat_and_the_registration_keep_the_stored_address_alike() {
+        let code = crate::test_src::own_code(include_str!("cluster.rs"));
+        let beat = crate::test_src::fn_body(&code, "async fn node_heartbeat(");
+        assert!(beat.contains("keep_stored_address(&mut data, Some(&stored), &node_id, &claims, &leaf_ips, &why);"), "{beat}");
+        let reg = crate::test_src::fn_body(&code, "async fn node_register_body(");
+        let read = reg.find("let stored = match &kv {").expect("the stored record is read");
+        let keep = reg.find("keep_stored_address(&mut data, stored.as_ref(), node_id, &claims, &[], &why);").expect("the refusal keeps it");
+        assert!(read < keep, "{reg}");
+        assert!(!reg.contains("data[\"ip_address\"] = Value::Null;"), "{reg}");
+    }
+
+    #[test]
+    fn the_heartbeat_checks_the_claim_and_the_peer_before_storing() {
+        let code = crate::test_src::own_code(include_str!("cluster.rs"));
+        let beat = crate::test_src::fn_body(&code, "async fn node_heartbeat(");
+        let check = beat.find("address_refusal(&node_id, ip, &claims, &leaf_ips)").expect("the claim check");
+        let peer = beat.find("peer_refusal(ip, peer_ip.as_deref())").expect("the peer check");
+        let store = beat.find("data[\"ip_address\"] = v.clone();").expect("the store");
+        assert!(check < store && peer < store, "{beat}");
+        assert!(beat.contains("crate::node_pin::note(&node_id, &data);"));
+        assert!(beat.contains("carry_target_node(&mut data, &body);"));
+        let reg = crate::test_src::fn_body(&code, "async fn node_register_body(");
+        assert!(reg.contains("address_refusal(node_id, &ip, &claims, &[])"), "{reg}");
+        assert!(reg.contains("crate::node_pin::note(node_id, &data);"));
+    }
+
+    #[test]
+    fn a_node_is_told_to_require_the_target_only_once_it_checks_it() {
+        assert!(require_target_node(&json!({"checks_target_node": true})));
+        assert!(!require_target_node(&json!({"checks_target_node": false})));
+        assert!(!require_target_node(&json!({})), "an older agent stays tolerant");
+        let mut data = json!({"checks_target_node": true, "requires_target_node": true});
+        carry_target_node(&mut data, &json!({}));
+        assert_eq!(data["checks_target_node"], false, "a rolled-back agent never inherits true");
+        assert_eq!(data["requires_target_node"], false);
+        carry_target_node(&mut data, &json!({"checks_target_node": true, "requires_target_node": false}));
+        assert_eq!(data["checks_target_node"], true);
+    }
+
+    /// i1174: an agent's latest `wrong_node` refusal reaches the node record
+    /// (verify's `target-node check` row reads it), and leaves it the beat
+    /// the agent stops reporting one.
+    #[test]
+    fn a_wrong_node_refusal_rides_the_record_while_reported() {
+        let mut data = json!({});
+        let w = json!({"target": "node_b", "path": "/start", "at": 1});
+        carry_target_node(&mut data, &json!({"checks_target_node": true, "wrong_node_refused": w}));
+        assert_eq!(data["wrong_node_refused"], w);
+        carry_target_node(&mut data, &json!({"checks_target_node": true}));
+        assert!(data.get("wrong_node_refused").is_none(), "{data}");
+    }
+
+    /// i1174: the node list carries the pin's latest refusal per node, the
+    /// field verify's `node identity` row reads.
+    #[test]
+    fn the_node_list_carries_the_latest_identity_refusal() {
+        let code = crate::test_src::own_code(include_str!("cluster.rs"));
+        let list = crate::test_src::fn_body(&code, "pub(crate) async fn cluster_nodes(");
+        assert!(list.contains("if let Some(m) = crate::node_pin::last_mismatch(&id) {"), "{list}");
+        assert!(list.contains("n[crate::node_pin::MISMATCH_FIELD] = m;"), "{list}");
+        assert_eq!(crate::node_pin::MISMATCH_FIELD, "node_identity_mismatch");
+    }
+}
+
+#[cfg(test)]
+mod unplace_tombstone_tests {
+    //! The unplace tombstone (repo/backend_unplaced.rs): written with the
+    //! DELETE, killed with the PUT, shipped beside `placements` and never in
+    //! it, acknowledged by the heartbeat, written by nothing else.
+    use super::*;
+
+    fn own() -> String {
+        crate::test_src::own_code(include_str!("cluster.rs"))
+    }
+
+    /// One tombstone per role a row was removed for; none without a DELETE.
+    #[test]
+    fn an_unplace_writes_one_tombstone_per_removed_role_and_none_without_a_delete() {
+        assert!(tombstone_roles(&[]).is_empty(), "nothing removed, nothing written");
+        let removed = vec!["embed".to_string(), "chat".to_string(), "embed".to_string()];
+        assert_eq!(tombstone_roles(&removed), vec!["chat".to_string(), "embed".to_string()]);
+    }
+
+    /// The DELETE and the tombstones are one transaction, committed after both.
+    #[test]
+    fn the_unplace_writes_its_tombstones_in_the_delete_transaction() {
+        let own = own();
+        let del = crate::test_src::fn_body(&own, "async fn placement_delete(");
+        let begin = del.find("let mut tx = state.db.begin()").expect("a transaction");
+        let delete = del.find("backend_unplaced::delete_placements(&mut *tx,").expect("the DELETE in it");
+        let write = del.find("crate::repo::backend_unplaced::write(&mut *tx, &node_id, &backend, &role, &unplaced_at, &by)").expect("the tombstone in it");
+        let commit = del.find("tx.commit()").expect("committed");
+        assert!(begin < delete && delete < write && write < commit);
+        assert!(del.contains("for role in tombstone_roles(&removed) {"), "only for removed rows");
+        assert!(!del[begin..commit].contains("&state.db)"), "no statement of the unplace outside its transaction");
+    }
+
+    /// A re-place deletes the slot's tombstone in the upsert's transaction.
+    #[test]
+    fn a_re_place_kills_the_tombstone_in_the_upsert_transaction() {
+        let own = own();
+        let put = crate::test_src::fn_body(&own, "async fn placement_put(");
+        let begin = put.find("let mut tx = state.db.begin()").expect("a transaction");
+        let upsert = put.find("(PLACEMENT_UPSERT)").expect("the upsert");
+        let kill = put.find("crate::repo::backend_unplaced::kill(&mut *tx, &node_id, &backend, &role)").expect("the kill");
+        let commit = put.find("tx.commit()").expect("committed");
+        assert!(begin < upsert && upsert < kill && kill < commit);
+        assert!(put[upsert..kill].contains(".execute(&mut *tx)"), "the upsert is in the transaction");
+    }
+
+    /// desired-config ships `unplaced` from the placements it sends (after the
+    /// harness policy), as its own key, and the feature beside it.
+    #[test]
+    fn desired_config_ships_unplaced_beside_placements_never_in_them() {
+        let own = own();
+        let dc = crate::test_src::fn_body(&own, "async fn desired_config_get(");
+        let policy = dc.find("let placement_json = apply_harness_policy(&harness_policy, placement_json);").expect("final placements");
+        let ship = dc.find("let unplaced = unplaced_for(&state, &node_id, &placement_json).await;").expect("computed");
+        assert!(policy < ship, "filtered against the placements actually sent");
+        assert!(dc.contains("\"placements\": placement_json,"));
+        assert!(dc.contains("\"unplaced\": unplaced,"));
+        assert!(!dc.contains("placement_json.push(") && !dc.contains("placement_json.extend("), "nothing is added to placements");
+        assert!(dc.contains("crate::repo::backend_unplaced::FEATURE]"), "the feature is advertised");
+        let f = crate::test_src::fn_body(&own, "async fn unplaced_for(");
+        assert!(f.contains("backend_unplaced::ship(&tombstones, placements, chrono::Utc::now().timestamp())"), "TTL on read");
+        assert!(f.contains("delete_keys(&state.db, &expired)"), "expired ones are deleted");
+        assert_eq!(crate::repo::backend_unplaced::FEATURE, "reap_unplaced_backends", "the agent reads this name");
+    }
+
+    /// The heartbeat acknowledges by deleting only; it never writes one.
+    #[test]
+    fn the_heartbeat_ack_only_deletes() {
+        let own = own();
+        let beat = crate::test_src::fn_body(&own, "async fn node_heartbeat(");
+        assert!(beat.contains("ack_reaped(&state, &node_id, &body).await;"));
+        let ack = crate::test_src::fn_body(&own, "async fn ack_reaped(");
+        assert!(ack.contains("backend_unplaced::acked(&t, reaped)") && ack.contains("backend_unplaced::delete_keys(&state.db, &acked)"));
+        assert!(!ack.contains("backend_unplaced::write(") && !ack.contains("settings::upsert("));
+        let mut data = json!({"id": "n1"});
+        carry_i300(&mut data, &json!({"reaped_backends": [{"backend": "vllm", "at": "t", "unplaced_at": "u"}], "orphan_backends": []}));
+        assert_eq!(data["reaped_backends"][0]["backend"], "vllm", "the report reaches the record");
+        assert_eq!(data["orphan_backends"], json!([]));
+    }
+
+    /// Removing a whole node writes no tombstone: its agent is going away.
+    #[test]
+    fn node_removal_writes_no_tombstone() {
+        let own = own();
+        let forget = crate::test_src::fn_body(&own, "async fn node_forget(");
+        assert!(forget.contains("DELETE FROM noo_backend_placements WHERE node_id = $1"), "it removes the placements");
+        assert!(!forget.contains("backend_unplaced"), "and writes no unplace record");
+    }
+
+    fn rs_files(dir: &std::path::Path, out: &mut Vec<(String, String)>) {
+        for e in std::fs::read_dir(dir).expect("src dir") {
+            let p = e.expect("entry").path();
+            if p.is_dir() {
+                rs_files(&p, out);
+            } else if p.extension().is_some_and(|x| x == "rs") {
+                let rel = p.strip_prefix(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src")).unwrap().to_string_lossy().replace('\\', "/");
+                out.push((rel, crate::test_src::own_code(&std::fs::read_to_string(&p).expect("read"))));
+            }
+        }
+    }
+
+    /// The unplace handler is the ONLY tombstone writer, and no route a node
+    /// may call (`auth::NODE_ROUTES`: register, heartbeat, desired-config...)
+    /// writes `noo_settings`: the generic setting writer is called from the
+    /// settings routes alone, which are not node routes.
+    #[test]
+    fn only_the_unplace_handler_writes_a_tombstone_and_no_node_route_writes_settings() {
+        let mut files = Vec::new();
+        rs_files(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"), &mut files);
+        let writers: Vec<&str> = files.iter().filter(|(_, c)| c.contains("backend_unplaced::write(")).map(|(f, _)| f.as_str()).collect();
+        assert_eq!(writers, vec!["routes/cluster.rs"], "{writers:?}");
+        let own = own();
+        assert_eq!(own.matches("backend_unplaced::write(").count(), 1);
+        assert!(crate::test_src::fn_body(&own, "async fn placement_delete(").contains("backend_unplaced::write("));
+        let upserters: Vec<&str> = files.iter().filter(|(f, c)| !f.starts_with("repo/") && c.contains("settings::upsert(")).map(|(f, _)| f.as_str()).collect();
+        assert_eq!(upserters, vec!["routes/settings.rs"], "{upserters:?}");
+        for (_, pattern) in crate::auth::NODE_ROUTES {
+            assert!(!pattern.starts_with("/api/settings") && !pattern.starts_with("/api/config"), "{pattern} is a node route");
+        }
+        for f in ["async fn node_heartbeat(", "async fn desired_config_get(", "async fn ack_reaped(", "async fn unplaced_for("] {
+            let b = crate::test_src::fn_body(&own, f);
+            assert!(!b.contains("settings::upsert(") && !b.contains("backend_unplaced::write("), "{f} writes no setting");
+        }
+    }
+}
+
+#[cfg(test)]
+mod listing_backends_tests {
+    use super::*;
+
+    fn node(age_secs: f64, now: f64) -> Value {
+        json!({"id": "node_a", "tier": 2, "last_heartbeat": now - age_secs,
+            "running_backends": {"ollama": "old-tag", "reranker": "bge-reranker-v2-m3-Q8_0.gguf", "vllm-secondary": "small-model"}})
+    }
+
+    fn gossip() -> Vec<(String, String)> {
+        vec![("ollama".to_string(), "gemma4:26b".to_string())]
+    }
+
+    #[test]
+    fn a_reranker_and_a_vllm_secondary_survive_gossip_which_does_not_carry_them() {
+        let now = 1_000_000.0;
+        let mut n = node(5.0, now);
+        merge_gossip_backends(&mut n, gossip(), now);
+        let rb = n["running_backends"].as_object().unwrap();
+        assert_eq!(rb.get("reranker"), Some(&json!("bge-reranker-v2-m3-Q8_0.gguf")), "{n}");
+        assert_eq!(rb.get("vllm-secondary"), Some(&json!("small-model")), "{n}");
+        assert_eq!(rb.get("ollama"), Some(&json!("gemma4:26b")), "gossip's model wins for a key it carries");
+    }
+
+    #[test]
+    fn a_running_reranker_derives_as_serving_not_down() {
+        let now = 1_000_000.0;
+        let mut n = node(5.0, now);
+        merge_gossip_backends(&mut n, gossip(), now);
+        let fact = crate::role_capability::PlacementFact {
+            node_id: "node_a".into(), backend: "reranker".into(),
+            model: Some("bge-reranker-v2-m3-Q8_0.gguf".into()), role: "rerank".into(), desired_state: "running".into(),
+        };
+        let caps = crate::role_capability::derive(&n, &[fact]);
+        assert_ne!(caps[0]["state"], json!("down"), "{caps:?}");
+        assert!(crate::role_capability::serves(&caps, "rerank"), "{caps:?}");
+        assert!(!crate::role_capability::summary(&caps).contains("(down)"), "status shows no (down)");
+    }
+
+    #[test]
+    fn a_stale_heartbeat_keeps_none_of_its_own_backends() {
+        // Past the worker offline threshold: a backend only the old beat
+        // reported is not shown running; gossip's entries still are.
+        let now = 1_000_000.0;
+        let mut n = node(10_000.0, now);
+        merge_gossip_backends(&mut n, gossip(), now);
+        let rb = n["running_backends"].as_object().unwrap();
+        assert!(!rb.contains_key("reranker") && !rb.contains_key("vllm-secondary"), "{n}");
+        assert_eq!(rb.get("ollama"), Some(&json!("gemma4:26b")));
+    }
+
+    #[test]
+    fn the_fence_is_the_node_class_offline_threshold() {
+        let now = 1_000_000.0;
+        let kept = |tier: u64, age: f64| {
+            let mut n = node(age, now);
+            n["tier"] = json!(tier);
+            merge_gossip_backends(&mut n, gossip(), now);
+            n["running_backends"].as_object().unwrap().contains_key("reranker")
+        };
+        // A worker: 120 s.
+        assert!(kept(2, 119.0), "a worker beat 119 s old is current");
+        assert!(!kept(2, 121.0), "a worker beat 121 s old is stale");
+        // An edge node: 300 s.
+        assert!(kept(4, 200.0), "an edge beat 200 s old is current");
+        assert!(!kept(4, 301.0), "an edge beat 301 s old is stale");
+    }
+
+    #[test]
+    fn the_listing_merges_gossip_into_the_heartbeat_map_and_never_replaces_it() {
+        let src = include_str!("cluster.rs");
+        let own = crate::test_src::own_code(src);
+        let body = crate::test_src::fn_body(&own, "pub(crate) async fn collect_cluster_nodes(");
+        assert!(body.contains("merge_gossip_backends("), "the listing merges");
+        assert!(!body.contains("data[\"running_backends\"] = Value::Object("), "no wholesale replacement");
     }
 }

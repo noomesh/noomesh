@@ -277,7 +277,7 @@ x-trellion-env: &trellion-env
   # container-relative. Override with NOO_TRELLION_EMBEDDING_URL if the
   # embedder should target something other than the gateway.
   PAGEINDEX_EMBEDDING_URL: '${NOO_TRELLION_EMBEDDING_URL:-https://gateway:8080}'
-  # trellion warns-and-ignores non-gateway backends; no tei default.
+  # trellion warns-and-ignores non-gateway backends; no default.
   PAGEINDEX_EMBEDDING_BACKEND: '${PAGEINDEX_EMBEDDING_BACKEND:-}'
   PAGEINDEX_EMBEDDING_MODEL: '${PAGEINDEX_EMBEDDING_MODEL:-}'
   # No LLM URL or model here (i145). trellion's graph extraction, answer

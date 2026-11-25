@@ -15,9 +15,7 @@
 //!   - POST /api/external/embeddings        → mesh-routed embedder via
 //!                                             node-agent (default: ollama/
 //!                                             harrier; OpenAI-shaped
-//!                                             response). TEI is an
-//!                                             optional/legacy wire format,
-//!                                             not the deployed default.
+//!                                             response).
 //!   - POST /api/external/embeddings/jobs   → a bulk batch claimed by workers
 //!                                             (or run by the gateway when none
 //!                                             pull); 202 {job_id, path, model}
@@ -25,9 +23,7 @@
 //!                                             vectors (the submitter's own jobs)
 //!   - POST /api/external/rerank            → mesh-routed reranker via
 //!                                             node-agent (hardened
-//!                                             llama.cpp is the current
-//!                                             default; TEI is a legacy
-//!                                             wire format still accepted)
+//!                                             llama.cpp is the default)
 //!   - POST /api/external/classify          → chat model + structured output
 //!   - POST /api/external/chat/completions  → vLLM (streaming passthrough)
 //!   - POST /api/external/inference         → typed multiplexer over the above
@@ -574,13 +570,18 @@ async fn do_rerank(
     let wanted = crate::coordinator::model_hint(wanted);
     let mut cands = Vec::new();
     for t in mesh_targets(state, "rerank", "rerank", 8).await {
-        let declared = crate::model_presence::node_role_model(state, &t.node_id, "rerank").await;
+        // What the node reports for rerank, else what its rerank placement
+        // declares: a llama.cpp reranker's agent reports no model presence.
+        let declared = match crate::model_presence::node_role_model(state, &t.node_id, "rerank").await {
+            Some(m) => Some(m),
+            None => crate::role_capability::node_placed_model(&state.db, &t.node_id, "rerank").await,
+        };
         cands.push((t, declared));
     }
     let ordered = rerank_order(cands, wanted);
     let mut failures: Vec<String> = Vec::new();
     for (t, declared, stand_in) in &ordered {
-        match tei_rerank(query, &docs, &t.url, &t.headers).await {
+        match node_rerank(query, &docs, &t.url, &t.headers).await {
             Ok(results) => {
                 let n = results.len();
                 if !failures.is_empty() {
@@ -598,9 +599,22 @@ async fn do_rerank(
     if !ordered.is_empty() {
         tracing::warn!(failed = ?failures, "rerank_all_nodes_failed: answering with the LLM reranker");
     }
-    let results = llm_rerank_fallback(state, query, &docs).await?;
-    let n = results.len();
-    Ok((json!({"results": results, "noo": rerank_noo("llm", None, wanted, true)}), n))
+    let answer = llm_rerank_fallback(state, query, &docs).await?;
+    let n = answer.results.len();
+    let noo = degraded_noo(rerank_noo("llm", None, wanted, true), answer.degraded.as_deref());
+    Ok((json!({"results": answer.results, "noo": noo}), n))
+}
+
+/// i1182a: when the LLM reranker ranked nothing, the answer is the input
+/// order with `score: null`, and `noo` says so: `degraded: "identity"` and
+/// the reason. `fallback: true` alone also marks a genuine LLM ranking, so
+/// it cannot tell a caller that nothing was ranked.
+pub(crate) fn degraded_noo(mut noo: Value, reason: Option<&str>) -> Value {
+    if let Some(why) = reason {
+        noo["degraded"] = json!("identity");
+        noo["degraded_reason"] = json!(why);
+    }
+    noo
 }
 
 /// The reranker order: nodes serving the requested model first (in the
@@ -614,6 +628,21 @@ pub(crate) fn rerank_order<T>(cands: Vec<(T, Option<String>)>, wanted: Option<&s
     let serves = |m: &Option<String>| m.as_deref().is_some_and(|m| crate::embedding_spaces::same_model(m, w));
     let (first, rest): (Vec<_>, Vec<_>) = cands.into_iter().partition(|(_, m)| serves(m));
     first.into_iter().map(|(t, m)| (t, m, false)).chain(rest.into_iter().map(|(t, m)| (t, m, true))).collect()
+}
+
+/// `capabilities.rerank`: `available` only when a reranker is routable now.
+/// `state` is `ready`, `loading` (a node advertises the capability but no lane
+/// routes yet: its model is loading or its agent is not reachable) or `none`;
+/// `reason` says which nodes, when it is not ready.
+pub(crate) fn rerank_capability(advertising: &[String], routable: &[String]) -> Value {
+    if !routable.is_empty() {
+        return json!({"available": true, "models": ["default"], "state": "ready"});
+    }
+    if !advertising.is_empty() {
+        return json!({"available": false, "models": [], "state": "loading",
+            "reason": format!("placed on {}, loading: not serving yet (its model is loading or its agent is not reachable); a request now is answered by the chat model, labelled", advertising.join(", "))});
+    }
+    json!({"available": false, "models": [], "state": "none", "reason": "no reranker placed; a request is answered by the chat model, labelled"})
 }
 
 /// The `noo` block of a rerank answer.
@@ -641,8 +670,9 @@ fn norm_rerank_rows(arr: &[Value]) -> Vec<Value> {
         .collect()
 }
 
-/// TEI-family reranker over HTTP (co-located stunnel or a node-agent proxy).
-async fn tei_rerank(
+/// The reranker over HTTP: a node-agent's `/rerank` proxy (the agent proxy
+/// contract: `{query, texts, return_text}` in, `[{index, score}]` out).
+async fn node_rerank(
     query: &str,
     docs: &[String],
     url: &str,
@@ -682,13 +712,13 @@ async fn tei_rerank(
 /// back to this gateway's own `/v1/chat/completions` to reach the model. The
 /// loopback is gone: `llm_rerank` resolves the backend and calls it directly.
 ///
-/// Never fails: degrades to identity order, matching the contract the Python
-/// implementation documented ("never returns empty").
+/// Never fails: when the model ranks nothing it answers the input order with
+/// `score: null` and the reason (i1182a).
 async fn llm_rerank_fallback(
     state: &Arc<AppState>,
     query: &str,
     docs: &[String],
-) -> Result<Vec<Value>, ExtFail> {
+) -> Result<crate::llm_rerank::LlmRerank, ExtFail> {
     Ok(crate::llm_rerank::rerank(state, query, docs, None).await)
 }
 
@@ -807,13 +837,13 @@ pub(crate) async fn mesh_targets(
 
 /// Mesh URL source for embeddings — the same mesh leg [`do_rerank`] walks,
 /// for the `embed` capability. Picks the least-loaded peer whose node-agent
-/// fronts a local embedding container (nodes advertise `embed` only when a
-/// TEI container is actually running) and returns the node-agent's `/embed`
+/// fronts a local embedding container (nodes advertise `embed` only when an
+/// embedder is actually running) and returns the node-agent's `/embed`
 /// proxy URL plus the HMAC auth header for the mTLS hop. The proxy speaks
 /// the OpenAI `/v1/embeddings` contract (POST OpenAI body → OpenAI reply).
 ///
 /// Deliberately does NOT consult `NOO_EMBEDDING_URL` — precedence between a
-/// co-located TEI and mesh routing is owned by the embedding client; this is
+/// co-located embedder and mesh routing is owned by the embedding client; this is
 /// just the "find me an embed-capable node" leg for it to use as a URL
 /// source. Use `crate::tls::cluster_client()` for the request (cluster-CA
 /// verified), attaching the returned headers.
@@ -1104,10 +1134,10 @@ async fn typed_inference(
             match do_embeddings(&state, &inner, space).await {
                 Ok((resp, n, model)) => {
                     audit(&state, &consumer.name, EP, Some("embedding"), Some(&model),
-                          Some("tei"), Some(json!({"inputs": n})), 200, started, None);
+                          Some("embedder"), Some(json!({"inputs": n})), 200, started, None);
                     (StatusCode::OK, Json(resp)).into_response()
                 }
-                Err(e) => refuse(&state, &consumer.name, EP, Some("embedding"), None, Some("tei"), started, e),
+                Err(e) => refuse(&state, &consumer.name, EP, Some("embedding"), None, Some("embedder"), started, e),
             }
         }
         "rerank" => {
@@ -1246,8 +1276,19 @@ async fn capabilities(State(state): State<Arc<AppState>>) -> Response {
 
     // rerank is available iff some alive mesh node advertises the capability.
     // (The co-located NOO_RERANK_URL path is gone — see `rerank_target`.)
-    let rerank_ok = !state.gossip.find_peers_by_capability("rerank", 1).is_empty();
-    let rerank_models: Value = if rerank_ok { json!(["default"]) } else { json!([]) };
+    // rerank is available when a reranker is ROUTABLE now: the lanes
+    // `do_rerank` would try (`mesh_targets`: the node's agent reachable and
+    // the reranker's model loaded), not merely a node advertising the
+    // capability. A container that is up while its model still loads is
+    // "loading", with the nodes named, and a request then is the labelled
+    // chat-model fallback.
+    let advertising: Vec<String> = state.gossip.find_peers_by_capability("rerank", 8).into_iter().map(|p| p.node_id).collect();
+    let routable: Vec<String> = if advertising.is_empty() {
+        Vec::new()
+    } else {
+        mesh_targets(&state, "rerank", "rerank", 8).await.into_iter().map(|t| t.node_id).collect()
+    };
+    let rerank = rerank_capability(&advertising, &routable);
 
     Json(json!({
         "chat": {
@@ -1256,10 +1297,7 @@ async fn capabilities(State(state): State<Arc<AppState>>) -> Response {
             "models": chat_models
         },
         "embeddings": embeddings,
-        "rerank": {
-            "available": rerank_ok,
-            "models": rerank_models
-        },
+        "rerank": rerank,
         "classify": {
             "available": chat_ok,
             "models": chat_models,
@@ -1429,6 +1467,40 @@ mod usage_projection_tests {
 }
 
 #[cfg(test)]
+mod node_rerank_wire_tests {
+    use super::node_rerank;
+    use serde_json::{json, Value};
+    use std::sync::{Arc, Mutex};
+
+    /// i1182a: `tei_rerank` became `node_rerank`; the agent proxy contract is
+    /// unchanged. It POSTs `{query, texts, return_text:false}` and reads a
+    /// bare `[{index, score}]` array back.
+    #[tokio::test]
+    async fn node_rerank_keeps_the_agent_proxy_wire_shape() {
+        let seen: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let s2 = seen.clone();
+        let app = axum::Router::new().fallback(axum::routing::post(move |axum::Json(body): axum::Json<Value>| {
+            let s = s2.clone();
+            async move {
+                s.lock().unwrap().push(body);
+                axum::Json(json!([{"index": 1, "score": 0.9, "extra": "dropped"}, {"index": 0, "score": 0.1}]))
+            }
+        }));
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+        let docs = vec!["a".to_string(), "b".to_string()];
+        let rows = match node_rerank("q", &docs, &format!("http://{addr}/rerank"), &[]).await {
+            Ok(r) => r,
+            Err(e) => panic!("node_rerank failed: {}", e.detail),
+        };
+        assert_eq!(rows, vec![json!({"index": 1, "score": 0.9}), json!({"index": 0, "score": 0.1})]);
+        let body = seen.lock().unwrap()[0].clone();
+        assert_eq!(body, json!({"query": "q", "texts": ["a", "b"], "return_text": false}), "{body}");
+    }
+}
+
+#[cfg(test)]
 mod rerank_preference_tests {
     use super::{rerank_noo, rerank_order};
 
@@ -1448,6 +1520,59 @@ mod rerank_preference_tests {
         assert_eq!((n["served_by"].as_str(), n["model"].as_str(), n["fallback"].as_bool()), (Some("llm"), Some("llm"), Some(true)));
         assert_eq!(n["requested_model"], "qwen3-reranker");
         assert!(rerank_noo("gpu-1", Some("bge"), None, false).get("requested_model").is_none());
+    }
+
+    /// `available` means routable now: during a reranker's load window (the
+    /// node advertises, no lane routes) it is false, `state: loading`, naming
+    /// the node; only a routable lane makes it true.
+    #[test]
+    fn rerank_is_available_only_when_a_lane_routes() {
+        use super::rerank_capability;
+        let loading = rerank_capability(&["node-a".into()], &[]);
+        assert_eq!((loading["available"].clone(), loading["state"].clone()), (serde_json::json!(false), serde_json::json!("loading")));
+        assert!(loading["reason"].as_str().unwrap().starts_with("placed on node-a, loading"), "{loading}");
+        assert_eq!(loading["models"], serde_json::json!([]));
+        let ready = rerank_capability(&["node-a".into()], &["node-a".into()]);
+        assert_eq!((ready["available"].clone(), ready["state"].clone(), ready["models"].clone()), (serde_json::json!(true), serde_json::json!("ready"), serde_json::json!(["default"])));
+        assert!(ready.get("reason").is_none());
+        let none = rerank_capability(&[], &[]);
+        assert_eq!((none["available"].clone(), none["state"].clone()), (serde_json::json!(false), serde_json::json!("none")));
+    }
+
+    /// The capabilities answer reads the same routing `do_rerank` uses, never
+    /// the advertisement alone.
+    #[test]
+    fn capabilities_reads_rerank_from_the_routing() {
+        let own = crate::test_src::own_code(include_str!("external.rs"));
+        let caps = crate::test_src::fn_body(&own, "async fn capabilities(");
+        assert!(caps.contains("mesh_targets(&state, \"rerank\", \"rerank\", 8).await"), "{caps}");
+        assert!(caps.contains("let rerank = rerank_capability(&advertising, &routable);"));
+        assert!(caps.contains("\"rerank\": rerank,"));
+    }
+
+    /// The model a rerank answer names: the node's reported rerank model,
+    /// else its running rerank placement's model (a llama.cpp reranker's agent
+    /// reports no model presence). `role_capability::placed_model` is the
+    /// pure half (its tests read an rc.5 `chat` row as rerank).
+    #[test]
+    fn do_rerank_names_the_placed_model_when_the_node_reports_none() {
+        let own = crate::test_src::own_code(include_str!("external.rs"));
+        let body = crate::test_src::fn_body(&own, "async fn do_rerank(");
+        let reported = body.find("crate::model_presence::node_role_model(state, &t.node_id, \"rerank\").await").expect("the reported model first");
+        let placed = body.find("None => crate::role_capability::node_placed_model(&state.db, &t.node_id, \"rerank\").await,").expect("then the placement's");
+        assert!(reported < placed && placed < body.find("cands.push((t, declared));").expect("before the candidate"));
+    }
+
+    /// i1182a: an unranked answer says so; a ranked one carries no flag.
+    #[test]
+    fn an_unranked_llm_answer_is_marked_degraded_with_its_reason() {
+        use super::degraded_noo;
+        let n = degraded_noo(rerank_noo("llm", None, None, true), Some("the chat model scored every document 0, so there is no ranking"));
+        assert_eq!(n["degraded"], "identity");
+        assert_eq!(n["degraded_reason"], "the chat model scored every document 0, so there is no ranking");
+        assert_eq!(n["fallback"], true);
+        let ranked = degraded_noo(rerank_noo("llm", None, None, true), None);
+        assert!(ranked.get("degraded").is_none() && ranked.get("degraded_reason").is_none(), "{ranked}");
     }
 }
 

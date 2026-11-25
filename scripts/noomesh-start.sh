@@ -343,8 +343,6 @@ service_profile() {
         airllm)       echo "gpu-tier1" ;;
         llamacpp)     echo "llamacpp" ;;   # own profile — gpu-tier2 no longer includes it (no-GGUF restart loop)
         ollama)       echo "gpu-tier2" ;;
-        tei)          echo "controller" ;;
-        tei-gpu)      echo "gpu-tier2" ;;
         *)            echo "" ;;
     esac
 }
@@ -565,12 +563,16 @@ check_data_root_mount || exit 1
 # Parse arguments
 PROFILE=""
 EXTRA_PROFILES=()
-# Dist mode always refreshes from the registry, so it implies --pull —
-# EXCEPT in pull-free mode (no registry login, all images pre-seeded:
-# sandbox rehearsals, air-gapped installs), where a forced pull would die
-# on the first third-party registry needing auth (dhi.io monitoring
-# images) despite every image already being present.
-if [ "$DIST" = true ] && [ "${DIST_PULL_FREE:-false}" != true ]; then PULL=true; else PULL=false; fi
+# i1184: dist mode pulls only what is MISSING. A start or restart whose
+# images are all present at their locked digests makes no registry
+# connection at all: a start before the network is up (after a power cut)
+# must not fail with every image on disk, and nothing is fetched that is
+# already here. An upgrade (new digests) and a first start (nothing local)
+# find their images missing and pull them. `--pull` still forces a pull.
+# Pull-free mode (no registry login, images pre-seeded) skips even the check.
+PULL=false
+PULL_MISSING=false
+if [ "$DIST" = true ] && [ "${DIST_PULL_FREE:-false}" != true ]; then PULL_MISSING=true; fi
 BUILD=false
 SERVICES=()
 
@@ -776,7 +778,29 @@ fi
 # prerequisite failure, not a pull failure — exit, never retry.
 require_compose_v2 || exit 1
 
+    # The images `up` will run: same tag, same lock digests (re-asserted
+    # after the last env loader above), checked against compose's own
+    # rendering on EVERY dist start, pull or no pull: a ref of another
+    # release must never be fetched, and never started from a stale local
+    # copy either. No registry connection.
+    if [ "$DIST" = true ]; then
+        # shellcheck disable=SC2086
+        dist_assert_pull_refs $COMPOSE_FILES $PROFILE_ARGS || exit 1
+    fi
+    # i1184: in dist mode, only what is missing is pulled (see PULL_MISSING).
+    _pull_needed=false
     if [ "$PULL" = true ]; then
+        _pull_needed=true
+    elif [ "$PULL_MISSING" = true ] && [ "$DIST" = true ]; then
+        # shellcheck disable=SC2086
+        dist_missing_images $COMPOSE_FILES $PROFILE_ARGS
+        if [ -n "$DIST_MISSING" ]; then
+            _pull_needed=true
+        else
+            echo "  every image this start runs is present at its locked digest: nothing to pull"
+        fi
+    fi
+    if [ "$_pull_needed" = true ]; then
         echo ""
         ui_step "Pulling images"
         if [ "$DIST" = true ]; then
@@ -801,11 +825,8 @@ require_compose_v2 || exit 1
             # twice on host8 (2026-09-03), each time on the largest layer,
             # and each re-run resumed from the layers already on disk. A
             # transient must not surface as a failed start.
-            # The pull must fetch what `up` will run: same tag, same lock
-            # digests (re-asserted after the last env loader above). Checked
-            # against compose's own rendering before a byte is downloaded.
-            # shellcheck disable=SC2086
-            dist_assert_pull_refs $COMPOSE_FILES $PROFILE_ARGS || exit 1
+            # (The refs were held to the tag and the lock above, before the
+            # decision to pull.)
             _attempt=1
             _pull_err="$(mktemp)"
             # Off a terminal compose's output is teed to a file so a failed
@@ -814,6 +835,20 @@ require_compose_v2 || exit 1
             # shellcheck disable=SC2086
             until { _pull_rc=0; compose_pull "$_pull_err" $COMPOSE_FILES $PROFILE_ARGS pull $_dist_services || _pull_rc=$?; [ "$_pull_rc" -eq 0 ]; }; do
                 _pull_why="$(last_error_line "$_pull_err")"
+                # i1184: a failed pull of images that ARE present never fails
+                # the start. After a failure, ask again what is still
+                # missing: nothing means every image `up` needs is here at
+                # its locked digest (the registry or the network is down,
+                # or a layer of something already pulled timed out), so the
+                # start goes on with them, saying so. Only a missing image
+                # is worth more attempts.
+                # shellcheck disable=SC2086
+                dist_missing_images $COMPOSE_FILES $PROFILE_ARGS
+                if [ -z "$DIST_MISSING" ]; then
+                    ui_warned "the pull failed, but every image this start runs is present at its locked digest: starting with them" >&2
+                    [ -n "$_pull_why" ] && ui_note "$_pull_why" >&2
+                    break
+                fi
                 if [ "$_attempt" -ge 3 ]; then
                     if [ "$_pull_rc" -eq 125 ]; then
                         # 125 = docker/compose itself refused the command (bad
@@ -822,6 +857,8 @@ require_compose_v2 || exit 1
                     else
                         echo "ERROR: image pull failed 3 times (exit $_pull_rc) — check the registry login and network, then re-run" >&2
                     fi
+                    echo "       still missing:" >&2
+                    printf '%s' "$DIST_MISSING" | sed 's/^/         /' >&2
                     [ -n "$_pull_why" ] && echo "       last line from compose: $_pull_why" >&2
                     rm -f "$_pull_err"
                     exit 1

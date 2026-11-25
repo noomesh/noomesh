@@ -476,6 +476,7 @@ pub fn cluster_show(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         ("docker engine", match n["docker_engine"]["state"].as_str() {
             Some("ok") => format!("{} ({})", str_of(&n["docker_engine"]["version"]), str_of(&n["docker_engine"]["kind"])),
             Some("none") => "none (native backends only)".to_string(),
+            Some("down") => ui::warn(&format!("installed, daemon not answering ({})", str_of(&n["docker_engine"]["installed_by"]))).to_string(),
             Some("unreadable") => ui::warn(&format!("unreadable: {}", str_of(&n["docker_engine"]["error"]))).to_string(),
             _ => ui::muted("not reported (agent predates this release)").to_string(),
         }),
@@ -1129,6 +1130,48 @@ pub(crate) fn auto_model_refusal(backend: &str, model: &str) -> Option<&'static 
         .then_some("auto picks a model only for harness: name a model, see `noo models recommended`")
 }
 
+/// The TEI engine was removed in 0.6.30 (i1182a): a new `embedding` placement,
+/// or a `reranker` whose model is not a `.gguf` file (an HF repo id) or whose
+/// image is the TEI one, is refused with the replacement. Not an auto-map: an
+/// HF id is not an Ollama model name, and the embedding model is an
+/// embedding-space decision. The gateway refuses the same (authoritative: the
+/// API and MCP reach it too); this is the early, offline copy with the same
+/// text. Pure.
+pub(crate) fn removed_engine_refusal(node: &str, backend: &str, model: &str, image: Option<&str>) -> Option<String> {
+    match backend {
+        "embedding" => Some(format!(
+            "the TEI embedding engine was removed in 0.6.30: new placements are refused; place an Ollama embedder instead: `noo cluster place {node} ollama <model> --role embed`"
+        )),
+        "reranker" => {
+            let tei_image = image.is_some_and(|i| i.to_ascii_lowercase().contains("text-embeddings-inference"));
+            let m = model.trim();
+            let not_gguf = !m.is_empty() && !m.to_ascii_lowercase().ends_with(".gguf");
+            (tei_image || not_gguf).then(|| format!(
+                "the TEI reranker was removed in 0.6.30: new placements are refused; place a GGUF cross-encoder: `noo cluster place {node} reranker <file>.gguf` \
+                 (e.g. bge-reranker-v2-m3-Q8_0.gguf; ship it with `noo cluster sync-model-files {node} -m <file>`)"
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// The role a `place` of `backend` sends. A reranker (llama.cpp
+/// `--reranking`) serves the rerank role only: a bare place, the documented
+/// `noo cluster place <node> reranker <file>.gguf`, means `rerank`, and any
+/// other `--role` is refused with the gateway's own message. Until
+/// 0.6.30-rc.6 the bare form stored `chat` and the reranker never routed.
+/// Every other backend keeps what was given (none = the chat default; an
+/// llamacpp or ollama may still be placed `--role rerank`).
+pub(crate) fn reranker_role(backend: &str, role: Option<&str>) -> Result<Option<String>, String> {
+    if backend != "reranker" {
+        return Ok(role.map(str::to_string));
+    }
+    match role.map(str::trim).filter(|r| !r.is_empty()) {
+        None | Some("rerank") => Ok(Some("rerank".to_string())),
+        Some(other) => Err(format!("a reranker serves the rerank role only, not {other:?}: place it with no role (or role rerank)")),
+    }
+}
+
 /// `noo cluster place NODE BACKEND MODEL [--on cpu|gpu] [--env KEY=VALUE]... [--port P] [--tls]
 /// [--image IMG] [--stopped]` — PUT /api/cluster/nodes/{node}/placements/{backend}.
 /// Declares that NODE should run BACKEND with MODEL; the node-agent
@@ -1144,6 +1187,12 @@ pub fn cluster_place(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     let (node, backend, model) = (&node, &backend, &model);
     if let Some(why) = auto_model_refusal(backend, model) {
         crate::output::fail(g.json, crate::output::ExitCode::Usage, "bad_model", why, Some("noo models recommended"));
+    }
+    // A `--stopped` place goes through: it winds an old placement down.
+    if !stopped {
+        if let Some(why) = removed_engine_refusal(node, backend, model, image.as_deref()) {
+            crate::output::fail(g.json, crate::output::ExitCode::Usage, "removed_engine", &why, None);
+        }
     }
     if let Some(k) = &kind {
         if backend != "harness" {
@@ -1166,6 +1215,11 @@ pub fn cluster_place(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             Some(_) => crate::output::fail(g.json, crate::output::ExitCode::Usage, "bad_role",
                 "the harness has no --role: `noo cluster place <node> harness <model|auto>`", None),
         }
+    }
+    match reranker_role(backend, role.as_deref()) {
+        Ok(r) => role = r,
+        Err(why) => crate::output::fail(g.json, crate::output::ExitCode::Usage, "bad_role", &why,
+            Some(&format!("noo cluster place {node} reranker {model}"))),
     }
     if let Some(r) = &role {
         if !matches!(r.as_str(), "chat" | "embed" | "rerank" | "harness") {
@@ -1193,7 +1247,8 @@ pub fn cluster_place(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     } else {
         serde_json::Value::Null
     };
-    // A bare `place` means the chat role (#837). If this node already runs
+    // A bare `place` means the chat role (#837; a reranker's is rerank, set
+    // above, so it never reaches this guard). If this node already runs
     // THIS model on THIS backend under another role, re-placing it without
     // --role would add a CHAT row serving that model (an embedder answering
     // chat). The operator meant the existing role: refuse and name it.
@@ -1708,8 +1763,58 @@ mod placement_env_tests {
         assert_eq!(other_role_for_same_model(&legacy, "ollama", "harrier"), None);
     }
 
-    use super::{capabilities_cell, chat_context_line, current_env_for, merge_placement_env, other_role_for_same_model, parse_env_change, render_fit, role_capabilities_section, role_capabilities_section_with, target_cell, usage_cell, memory_limit_line, mem_cell, harness_cell, harness_show_cell, vendor_kinds_row};
+    /// The documented `noo cluster place <node> reranker <file>.gguf` (no
+    /// --role) sends role rerank; `--role rerank` is the same.
+    #[test]
+    fn a_bare_reranker_place_sends_the_rerank_role() {
+        assert_eq!(super::reranker_role("reranker", None).unwrap().as_deref(), Some("rerank"));
+        assert_eq!(super::reranker_role("reranker", Some("rerank")).unwrap().as_deref(), Some("rerank"));
+        assert_eq!(super::reranker_role("reranker", Some("")).unwrap().as_deref(), Some("rerank"));
+    }
+
+    /// `--role chat|embed` on a reranker is refused, with the gateway's text.
+    #[test]
+    fn a_reranker_with_another_role_is_refused() {
+        for r in ["chat", "embed"] {
+            let e = super::reranker_role("reranker", Some(r)).expect_err(r);
+            assert_eq!(e, format!("a reranker serves the rerank role only, not {r:?}: place it with no role (or role rerank)"));
+        }
+    }
+
+    /// Every other backend is untouched: a bare place is the chat default
+    /// (None), and an llamacpp may still be placed for rerank.
+    #[test]
+    fn other_backends_keep_the_role_they_were_given() {
+        assert_eq!(super::reranker_role("llamacpp", None).unwrap(), None);
+        assert_eq!(super::reranker_role("llamacpp", Some("rerank")).unwrap().as_deref(), Some("rerank"));
+        assert_eq!(super::reranker_role("ollama", Some("embed")).unwrap().as_deref(), Some("embed"));
+        assert_eq!(super::reranker_role("harness", Some("harness")).unwrap().as_deref(), Some("harness"));
+    }
+
+    use super::{capabilities_cell, chat_context_line, current_env_for, merge_placement_env, other_role_for_same_model, parse_env_change, removed_engine_refusal, render_fit, role_capabilities_section, role_capabilities_section_with, target_cell, usage_cell, memory_limit_line, mem_cell, harness_cell, harness_show_cell, vendor_kinds_row};
     use serde_json::json;
+
+    /// i1182a: the TEI engine was removed in 0.6.30; the CLI refuses early with the
+    /// gateway's text, naming the Ollama embedder or the GGUF reranker.
+    #[test]
+    fn place_refuses_the_unsupported_tei_engine_with_the_replacement() {
+        let e = removed_engine_refusal("n1", "embedding", "BAAI/bge-small-en-v1.5", None).expect("refused");
+        assert_eq!(
+            e,
+            "the TEI embedding engine was removed in 0.6.30: new placements are refused; place an Ollama embedder instead: `noo cluster place n1 ollama <model> --role embed`"
+        );
+        let r = removed_engine_refusal("n1", "reranker", "BAAI/bge-reranker-v2-m3", None).expect("an HF id is refused");
+        assert!(r.starts_with("the TEI reranker was removed in 0.6.30: new placements are refused; place a GGUF cross-encoder: `noo cluster place n1 reranker <file>.gguf`"), "{r}");
+        assert!(r.contains("bge-reranker-v2-m3-Q8_0.gguf") && r.contains("`noo cluster sync-model-files n1 -m <file>`"), "{r}");
+        assert!(removed_engine_refusal("n1", "reranker", "x.gguf", Some("ghcr.io/huggingface/text-embeddings-inference:cpu-1.9.4")).is_some(), "a TEI image");
+        assert!(removed_engine_refusal("n1", "reranker", "bge-reranker-v2-m3-Q8_0.gguf", None).is_none(), "a GGUF reranker is unchanged");
+        assert!(removed_engine_refusal("n1", "ollama", "harrier", None).is_none());
+        let own = crate::test_src::own_code(include_str!("cluster.rs"));
+        let place = crate::test_src::fn_body(&own, "pub fn cluster_place(");
+        let at = place.find("removed_engine_refusal(").expect("cluster_place asks");
+        assert!(place[..at].contains("if !stopped"), "a --stopped place still goes through");
+        assert!(at < place.find("get_json(").unwrap(), "before any request");
+    }
 
     #[test]
     fn place_merges_env_only_from_the_same_role_and_model() {
@@ -1910,13 +2015,13 @@ pub(crate) fn parse_unplace_with(a: &mut Args) -> Result<UnplaceArgs, ArgError> 
 /// DELETE /api/cluster/nodes/{node}/placements/{backend}. The agent stops
 /// managing the backend.
 ///
-/// A CONTAINER is left running: it stays visible in `docker ps`, and the
-/// operator can see what they left behind. The HARNESS is stopped (#355).
-/// The asymmetry is deliberate — the harness is a host service running as
-/// a dedicated user with node credentials and a bus subscription, and
-/// once the placement is gone nothing reports it and nothing converges
-/// it. A container nobody manages is visible; an unmanaged harness is
-/// not, which is why one is left and the other is not.
+/// The gateway records the unplace with the DELETE (an unplace tombstone,
+/// shipped to that node only, for 24 h). The node agent removes the
+/// backend's container once it has seen it in two consecutive reads and no
+/// placement wants the backend any more; it never removes a container just
+/// because a placement is absent (that one is reported by `noo cluster
+/// verify`, and removed by `noo cluster stop-backend`). The HARNESS is
+/// stopped as before.
 pub fn cluster_unplace(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     let parsed = parse_unplace_with(&mut Args::new(args))?;
     let (node, backend) = (&parsed.node, &parsed.backend);
@@ -1936,8 +2041,22 @@ pub fn cluster_unplace(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             path.push_str(&format!("&model={}", super::urlencode(m)));
         }
     }
-    let resp = delete_json(g, &path, true, 10);
+    let mut resp = delete_json(g, &path, true, 10);
+    // What happens to the container next depends on the controller: one
+    // that advertises `reap_unplaced_backends` has the agent remove it; an
+    // older one does not. Its desired-config says which, and whether another
+    // placement still wants the backend.
+    let deleted = resp["deleted"].as_u64().unwrap_or(0);
+    let desired = if deleted > 0 && backend != "harness" {
+        crate::http::get_json_opt(g, &format!("/api/cluster/nodes/{}/desired-config", super::urlencode(node)), true, 15)
+    } else {
+        None
+    };
+    let note = unplace_note(node, backend, deleted, desired.as_ref());
     if g.json {
+        if let (Some(n), Some(o)) = (&note, resp.as_object_mut()) {
+            o.insert("note".into(), serde_json::json!(n));
+        }
         println!("{resp}");
         return Ok(0);
     }
@@ -1946,7 +2065,36 @@ pub fn cluster_unplace(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         (Some(r), None) => ui::done(&format!("{node}: {backend} {r} placement removed")),
         _ => ui::done(&format!("{node}: {backend} placement removed")),
     }
+    if let Some(n) = note {
+        println!("{}", ui::note(&n));
+    }
     Ok(0)
+}
+
+/// The one line `noo cluster unplace` adds after a removal: when the agent
+/// stops the container (the controller advertises `reap_unplaced_backends`:
+/// two reconcile passes, about 10 minutes), or that this controller does
+/// not, with the command that stops it now. `desired` is the node's
+/// desired-config read after the DELETE (`None`: unreadable). Nothing for a
+/// removal that removed nothing, or for the harness (stopped as before).
+pub(crate) fn unplace_note(node: &str, backend: &str, deleted: u64, desired: Option<&serde_json::Value>) -> Option<String> {
+    if deleted == 0 || backend == "harness" {
+        return None;
+    }
+    let stop = format!("noo cluster stop-backend {node} {backend}");
+    let Some(d) = desired else {
+        return Some(format!("unplaced; to stop the container now: {stop}"));
+    };
+    let still = d["placements"].as_array().is_some_and(|ps| ps.iter().any(|p| p["backend"].as_str() == Some(backend)));
+    if still {
+        return Some(format!("unplaced; {backend} keeps running on {node}: another placement of it remains"));
+    }
+    let reaps = d["gateway_features"].as_array().is_some_and(|f| f.iter().any(|x| x.as_str() == Some("reap_unplaced_backends")));
+    Some(if reaps {
+        format!("unplaced: {node} stops {backend} within about 10 minutes (after two reconcile passes); to stop it now: {stop}")
+    } else {
+        format!("unplaced; this controller does not stop the container: {stop}")
+    })
 }
 
 /// `noo cluster fit NODE [--with BACKEND MODEL [--on cpu|gpu] [--role R] [--env K=V]...]` -
@@ -2257,6 +2405,9 @@ fn print_node_logs(g: &Globals, node_id: &str, container: &str, tail: u64) -> i3
                     println!("{t}");
                 }
             }
+            if let Some(n) = logs_notice(node_id, &body) {
+                eprintln!("{}", ui::warn(&n));
+            }
             0
         }
         // Absence is not emptiness: a body with no `logs` key is a
@@ -2269,6 +2420,13 @@ fn print_node_logs(g: &Globals, node_id: &str, container: &str, tail: u64) -> i3
             1
         }
     }
+}
+
+/// The agent's `notice` (i1225): Docker could not read lines it holds, so
+/// an empty or old answer is not a quiet backend. To stderr, so a pipe of
+/// the lines stays pure.
+fn logs_notice(node_id: &str, body: &serde_json::Value) -> Option<String> {
+    body["notice"].as_str().filter(|n| !n.is_empty()).map(|n| format!("{node_id}: {n}"))
 }
 
 /// `noo cluster restart-agent NODE` —
@@ -2291,6 +2449,39 @@ pub fn cluster_restart_agent(g: &Globals, args: &[String]) -> Result<i32, Unhand
         return Ok(0);
     }
     ui::done(resp["message"].as_str().unwrap_or("agent restart triggered"));
+    Ok(0)
+}
+
+pub(crate) fn parse_stop_backend_with(a: &mut Args) -> Result<(String, String, bool), ArgError> {
+    let yes = a.flag(&["--yes", "-y"]);
+    let [node, backend]: [String; 2] = a.positionals()?.try_into().map_err(|_| ArgError::new("expected <node> <backend>"))?;
+    Ok((node, backend, yes))
+}
+
+/// The body `noo cluster stop-backend` posts to `/api/cluster/backends/stop`.
+pub(crate) fn stop_backend_body(node: &str, backend: &str) -> serde_json::Value {
+    serde_json::json!({"backend": backend, "node_id": node})
+}
+
+/// `noo cluster stop-backend NODE BACKEND [-y/--yes]` — POST
+/// /api/cluster/backends/stop for one node: the agent stops the backend's
+/// container (with its drain timeout) and removes it and its door. It
+/// changes no placement: the remedy for a container `noo cluster verify`
+/// reports running with no placement. A placed backend comes back on the
+/// agent's next pass; unplace it instead (`noo cluster unplace`).
+pub fn cluster_stop_backend(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
+    let (node, backend, yes) = parse_stop_backend_with(&mut Args::new(args))?;
+    super::confirm_destructive(g, yes, "stop backend", &format!("{backend} on {node}"));
+    let resp = post_json(g, "/api/cluster/backends/stop", &stop_backend_body(&node, &backend), true, 60);
+    if g.json {
+        println!("{resp}");
+        return Ok(0);
+    }
+    ui::done(&format!("stop {backend} on {node}: {}", ui::state(resp["status"].as_str().unwrap_or("unknown"))));
+    ui::guide(&[
+        (&format!("noo cluster verify {node}"), "the `unplaced backends` row reads clear once the node reports"),
+        (&format!("noo cluster place {node} {backend} <model>"), "declares it instead, if it should run"),
+    ]);
     Ok(0)
 }
 
@@ -4269,5 +4460,82 @@ mod ollama_tag_refusal_tests {
         assert!(check < stop && stop < retry, "the refusal stops before the retry PUT");
         let stops = crate::test_src::fn_body(&own, "fn place_refused_with_next(");
         assert!(stops.contains("std::process::exit(ExitCode::RemoteError as i32);"), "it exits as a refusal does");
+    }
+}
+
+#[cfg(test)]
+mod logs_notice_tests {
+    use super::logs_notice;
+    use serde_json::json;
+
+    #[test]
+    fn the_agents_notice_is_printed_with_the_node() {
+        let body = json!({"container": "noo-vllm", "logs": [], "notice": "Docker could not read noo-vllm's log past its start"});
+        assert_eq!(
+            logs_notice("node_a", &body).as_deref(),
+            Some("node_a: Docker could not read noo-vllm's log past its start")
+        );
+    }
+
+    #[test]
+    fn no_notice_says_nothing() {
+        assert_eq!(logs_notice("node_a", &json!({"logs": ["a"]})), None);
+        assert_eq!(logs_notice("node_a", &json!({"logs": [], "notice": ""})), None);
+    }
+}
+
+#[cfg(test)]
+mod stop_backend_tests {
+    use super::*;
+
+    fn argv(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// `noo cluster stop-backend <node> <backend> [-y]` parses to the node and
+    /// backend, and posts the stop route's body for that one node.
+    #[test]
+    fn stop_backend_parses_and_names_the_node_and_backend() {
+        let a = argv(&["node-a", "reranker", "-y"]);
+        let (node, backend, yes) = parse_stop_backend_with(&mut Args::new(&a)).expect("parses");
+        assert_eq!((node.as_str(), backend.as_str(), yes), ("node-a", "reranker", true));
+        let a = argv(&["node-a", "reranker"]);
+        assert!(!parse_stop_backend_with(&mut Args::new(&a)).expect("parses").2, "asks without -y");
+        let a = argv(&["node-a"]);
+        assert!(parse_stop_backend_with(&mut Args::new(&a)).is_err(), "a backend is required");
+        assert_eq!(stop_backend_body("node-a", "reranker"), serde_json::json!({"backend": "reranker", "node_id": "node-a"}));
+        let src = crate::test_src::own_code(include_str!("cluster.rs"));
+        let f = crate::test_src::fn_body(&src, "pub fn cluster_stop_backend(");
+        assert!(f.contains("post_json(g, \"/api/cluster/backends/stop\", &stop_backend_body(&node, &backend), true, 60)"), "the existing stop route");
+        assert!(f.contains("confirm_destructive(g, yes, "), "asks first");
+        assert!(crate::usage::lookup(&["cluster", "stop-backend"]).is_some(), "in the usage table");
+    }
+}
+
+#[cfg(test)]
+mod unplace_note_tests {
+    use super::unplace_note;
+    use serde_json::json;
+
+    /// The line names the real node and backend, the bound and the stop
+    /// command when the controller reaps; the other wording when it does not.
+    #[test]
+    fn the_unplace_note_says_what_happens_to_the_container() {
+        let reaps = json!({"placements": [], "gateway_features": ["node_restarting", "reap_unplaced_backends"]});
+        assert_eq!(
+            unplace_note("gpu-2", "reranker", 1, Some(&reaps)).as_deref(),
+            Some("unplaced: gpu-2 stops reranker within about 10 minutes (after two reconcile passes); to stop it now: noo cluster stop-backend gpu-2 reranker")
+        );
+        let older = json!({"placements": [], "gateway_features": ["node_restarting"]});
+        assert_eq!(
+            unplace_note("gpu-2", "reranker", 1, Some(&older)).as_deref(),
+            Some("unplaced; this controller does not stop the container: noo cluster stop-backend gpu-2 reranker")
+        );
+        let still = json!({"placements": [{"backend": "ollama", "role": "embed"}], "gateway_features": ["reap_unplaced_backends"]});
+        assert_eq!(unplace_note("gpu-2", "ollama", 1, Some(&still)).as_deref(), Some("unplaced; ollama keeps running on gpu-2: another placement of it remains"));
+        assert_eq!(unplace_note("gpu-2", "reranker", 1, None).as_deref(), Some("unplaced; to stop the container now: noo cluster stop-backend gpu-2 reranker"));
+        assert_eq!(unplace_note("gpu-2", "reranker", 0, Some(&reaps)), None, "nothing removed, nothing to say");
+        assert_eq!(unplace_note("gpu-2", "harness", 1, Some(&reaps)), None, "the harness is stopped as before");
+        assert!(!unplace_note("gpu-2", "reranker", 1, Some(&reaps)).unwrap().contains('\n'), "one line");
     }
 }

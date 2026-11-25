@@ -86,7 +86,9 @@ func (c *Client) PullModelArtifact(ctx context.Context, name string) (*PullModel
 	sha := m.SHA256
 
 	dir := ModelsDir()
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	// Gated: never create the models dir on an empty mount point (the data
+	// disk not mounted) — it would land on the root disk (dataroots.MkdirAll).
+	if err := dataroots.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("models dir %s: %w", dir, err)
 	}
 	dest := filepath.Join(dir, name)

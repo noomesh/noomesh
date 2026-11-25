@@ -111,7 +111,7 @@ func TestReconcileStampsTheContentKeyedHashItDecidedOn(t *testing.T) {
 	s := string(src)
 	decide := strings.Index(s, "desiredHash, hashKnown := specHashWith(p, func(ref string) (string, bool) { return dockerpkg.ContentKey(ctx, ref) })")
 	unknown := strings.Index(s, `slog.Info("reconcile.spec_hash_unknown"`)
-	drift := strings.Index(s, "switch decideBackendDrift(hasLabel, curHash, desiredHash, r.driftRecreated[p.Backend], t.floating[p.Backend])")
+	drift := strings.Index(s, "drift := decideBackendDrift(hasLabel, curHash, desiredHash, r.driftRecreated[p.Backend], t.floating[p.Backend])")
 	stamp := strings.Index(s, "SpecHash:    desiredHash,")
 	if decide < 0 || unknown < 0 || drift < 0 || stamp < 0 {
 		t.Fatalf("reconcile no longer decides on and stamps the content-keyed hash (decide %d unknown %d drift %d stamp %d)", decide, unknown, drift, stamp)

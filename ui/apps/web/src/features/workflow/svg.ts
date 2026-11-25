@@ -53,7 +53,7 @@ export const WORKFLOW_SVG = `
   <text x="80" y="240" font-size="8" fill="rgba(6,182,212,0.4)" font-weight="600">VECTOR PATH</text>
   <g class="wf-node" data-id="ingest"><rect x="60" y="248" width="110" height="32" rx="16" fill="rgba(6,182,212,0.1)" stroke="rgba(6,182,212,0.4)" stroke-width="1"/><text x="115" y="268" text-anchor="middle" fill="#06b6d4" font-size="11">ingest_file()</text></g>
   <g class="wf-node" data-id="chunker"><rect x="225" y="248" width="100" height="32" rx="16" fill="rgba(6,182,212,0.1)" stroke="rgba(6,182,212,0.4)" stroke-width="1"/><text x="275" y="268" text-anchor="middle" fill="#06b6d4" font-size="11">Chunker</text></g>
-  <g class="wf-node" data-id="tei-embed"><rect x="380" y="248" width="110" height="32" rx="16" fill="rgba(6,182,212,0.1)" stroke="rgba(6,182,212,0.4)" stroke-width="1"/><text x="435" y="268" text-anchor="middle" fill="#06b6d4" font-size="11">TEI Embed</text></g>
+  <g class="wf-node" data-id="embedder"><rect x="380" y="248" width="110" height="32" rx="16" fill="rgba(6,182,212,0.1)" stroke="rgba(6,182,212,0.4)" stroke-width="1"/><text x="435" y="268" text-anchor="middle" fill="#06b6d4" font-size="11">Embedder</text></g>
   <g class="wf-node" data-id="pgvector"><rect x="545" y="248" width="110" height="32" rx="16" fill="rgba(6,182,212,0.1)" stroke="rgba(6,182,212,0.4)" stroke-width="1"/><text x="600" y="268" text-anchor="middle" fill="#06b6d4" font-size="11">pgvector</text></g>
 
   <line x1="170" y1="264" x2="223" y2="264" stroke="#06b6d4" stroke-width="1.5" stroke-opacity="0.6" marker-end="url(#wf-ah-cyan)"/>
@@ -175,13 +175,13 @@ export const WORKFLOW_INFO: Record<string, NodeInfo> = {
   'record-ex': { t: '_record_exchange()', l: 'Lane 1 · Request Processing', c: '#38bdf8', d: 'Persists completed exchange to conversation memory with metadata.', f: 'gateway-rust/src/coordinator/' },
   ingest: { t: 'ingest_file()', l: 'Lane 2 · Memory Pipeline', c: '#06b6d4', d: 'Entry point for document ingestion. Detects file type, extracts content, feeds into vector and graph paths.', f: 'trellion live/rag_integration.py' },
   chunker: { t: 'Chunker', l: 'Lane 2 · Memory Pipeline', c: '#06b6d4', d: 'Splits text into overlapping chunks of ~512 tokens with sentence-boundary-aware splitting.', f: 'trellion live/embedding_worker.py' },
-  'tei-embed': { t: 'TEI Embed', l: 'Lane 2 · Memory Pipeline', c: '#06b6d4', d: 'Embedding backend on GPU nodes. Trellion reaches it through the gateway embed endpoint, not TEI directly.', f: 'trellion live/embedding_worker.py' },
+  'embedder': { t: 'Embedder', l: 'Lane 2 · Memory Pipeline', c: '#06b6d4', d: 'Embedding backend on mesh nodes. Trellion reaches it through the gateway embed endpoint, not directly.', f: 'trellion live/embedding_worker.py' },
   pgvector: { t: 'pgvector Store', l: 'Lane 2 · Memory Pipeline', c: '#06b6d4', d: 'PostgreSQL with pgvector. Stores document (768-dim) and conversation (384-dim) embeddings.', f: 'trellion live/pgvector_store.py' },
   'entity-extract': { t: 'EntityExtractor', l: 'Lane 2 · Memory Pipeline', c: '#06b6d4', d: 'LLM-based entity extraction from document chunks.', f: 'trellion live/graph_builder.py' },
   'graph-build': { t: 'GraphBuilder', l: 'Lane 2 · Memory Pipeline', c: '#06b6d4', d: 'Constructs typed relationship edges between entities.', f: 'trellion live/graph_builder.py' },
   'knowledge-graph': { t: 'Knowledge Graph', l: 'Lane 2 · Memory Pipeline', c: '#06b6d4', d: 'Neo4j-style graph in PostgreSQL. Entities as nodes, typed relationships as edges.', f: 'trellion live/graph_builder.py' },
   'conv-store': { t: 'ConversationStore', l: 'Lane 2 · Memory Pipeline', c: '#06b6d4', d: 'PostgreSQL-backed chat history with 384-dim semantic search.', f: 'trellion live/conversation_store.py' },
-  'embed-worker': { t: 'EmbeddingWorker', l: 'Lane 2 · Memory Pipeline', c: '#06b6d4', d: 'Async background worker that batches unembedded items and sends to TEI.', f: 'trellion live/embedding_worker.py' },
+  'embed-worker': { t: 'EmbeddingWorker', l: 'Lane 2 · Memory Pipeline', c: '#06b6d4', d: 'Async background worker that batches unembedded items and sends to the embedder.', f: 'trellion live/embedding_worker.py' },
   'intelli-router': { t: 'IntelligentRouter', l: 'Lane 2 · Memory Pipeline', c: '#06b6d4', d: 'Query-time routing for memory retrieval. Chooses best search strategy.', f: 'trellion live/intelligent_router.py' },
   'node-agent': { t: 'Node Agent', l: 'Lane 3 · Self-Regulation', c: '#10b981', d: 'Runs on each GPU worker node. Reports metrics every 30s.', f: 'node-agent-go/' },
   'node-registry': { t: 'NodeRegistry', l: 'Lane 3 · Self-Regulation', c: '#10b981', d: 'In-memory registry of all known nodes with status and capabilities.', f: 'gateway-rust/src/routes/cluster.rs' },

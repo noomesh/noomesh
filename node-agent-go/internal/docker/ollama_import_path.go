@@ -28,6 +28,19 @@ import (
 // from Docker (a timeout on a loaded node) is an error, never a guess that
 // falls through to the host binary.
 func (c *Client) ollamaImportHost(ctx context.Context) (bin string, host bool, err error) {
+	// A Mac (followup i1156): the native Ollama is the only lane, so Docker
+	// is never asked. A stopped Docker Desktop answered the inspect with a
+	// docker.sock error even while the native Ollama served, and a missing
+	// socket counted as "no container" only through isGone's "no such".
+	// The import needs the binary AND the server: `ollama create` and the
+	// mirror push both talk to 127.0.0.1:11434.
+	if nativeOnlyBackend("ollama") {
+		bin, host = ollamaBinary()
+		if !host || !nativeOllamaServing(ctx) {
+			return "", false, nativeDown("ollama", host)
+		}
+		return bin, true, nil
+	}
 	if c != nil && c.docker != nil {
 		_, ierr := c.docker.ContainerInspect(ctx, OllamaContainer, client.ContainerInspectOptions{})
 		switch {

@@ -56,11 +56,13 @@ mod addon_lock;
 mod addons;
 mod args;
 mod auth;
+mod bounded;
 mod catalog;
 mod child_stdin;
 mod commands;
 mod credentials;
 mod docker_group;
+mod docker_hold;
 #[cfg(test)]
 mod config_readers;
 mod entitlement;
@@ -72,6 +74,7 @@ mod model_set;
 mod registry;
 mod release_fetch;
 mod netns_unit;
+mod hostd_boot;
 mod release_sig;
 mod release_gate;
 mod envfile;
@@ -291,6 +294,7 @@ const NATIVE: &[(&[&str], Handler)] = &[
     (&["migrate", "export"], commands::migrate_export),
     (&["migrate", "import"], commands::migrate_import),
     (&["cluster", "down"], commands::cluster_down),
+    (&["cluster", "stop-backend"], commands::cluster_stop_backend),
     (&["cluster", "scale"], commands::cluster_scale),
     (&["cluster", "desired"], commands::cluster_desired),
     (&["cluster", "proposals"], commands::cluster_proposals),

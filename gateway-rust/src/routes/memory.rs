@@ -5,7 +5,7 @@
 //!
 //! Native Rust: storage stats, cleanup, relationships,
 //!              conversations-with-preview, conversation stats/feedback/detail,
-//!              health, search (TEI + pgvector), status, per-user stats,
+//!              health, search (embedder + pgvector), status, per-user stats,
 //!              embed start/stop/status (Redis flag + SQL counts).
 //! NATS delegation: batch-index.
 
@@ -58,7 +58,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/api/conversations/{conversation_id}", get(conv_detail))
         .route("/api/conversations/{conversation_id}/feedback", post(conv_feedback))
 
-        // ── Native Rust (SQL + TEI HTTP) — ported from NATS delegation 2026-03-31 ──
+        // ── Native Rust (SQL + embedder HTTP) — ported from NATS delegation 2026-03-31 ──
         .route("/api/memory/health", get(memory_health))
         .route("/api/memory/status", get(memory_status))
         .route("/api/memory/stats/{user_id}", get(memory_stats))
@@ -153,7 +153,7 @@ async fn storage_stats(State(state): State<Arc<AppState>>) -> AppResult {
 
 // ═══════════════════════════════════════════════════════════════
 // Ported from NATS delegation → native Rust
-// health, search (TEI + pgvector), status, per-user stats
+// health, search (embedder + pgvector), status, per-user stats
 // ═══════════════════════════════════════════════════════════════
 
 /// GET /api/memory/health — SQL health checks on noo_entries + noo_conversations.

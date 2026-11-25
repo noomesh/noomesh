@@ -6,7 +6,7 @@
 
 Our scans cover the images we BUILD (infra-staged.yml daily, the release
 lanes). An image we only pin by digest (stack-lock-third-party.py THIRD_PARTY:
-nats, nginx, the DHI set, tei, tei-cpu, vllm) was scanned nowhere after the day
+nats, nginx, the DHI set, vllm) was scanned nowhere after the day
 it was pinned: nginx sat at 3 CRITICAL / 67 HIGH on an EOL line unnoticed. The
 weekly .github/workflows/third-party-scan.yml scans every pinned digest (dev's
 compose and the latest final's lock) with Trivy and runs this script:

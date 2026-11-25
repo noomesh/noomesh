@@ -71,10 +71,11 @@ as much as on a worker.
 | `noo stack start --profile <p>` | one-off | an extra compose profile on top of the base: `vllm-secondary`, `ollama`, `llamacpp`, `gpu-tier2`, `monitoring` are additive; any other name *replaces* the base profile |
 
 How the add-ons are licensed and switched on is
-[getting-started/add-ons.md](../getting-started/add-ons.md). `tei-compose`
-(HuggingFace TEI embedders and reranker) and `sensors` (a second, tier-5
-node-agent container) exist in the compose file but no launcher flag
-selects them; embeddings resolve through Ollama or a node-agent by default.
+[getting-started/add-ons.md](../getting-started/add-ons.md). `sensors` (a second, tier-5
+node-agent container) exists in the compose file but no launcher flag
+selects it. Embeddings resolve through Ollama or a node-agent, and the
+reranker is the llama.cpp GGUF reranker (the TEI embedders and reranker
+profile was removed in 0.6.30).
 
 ### Where configuration lives
 
@@ -169,7 +170,11 @@ noo stack rebuild-status --follow
 `--background` needs noo-hostd, the controller-mode user unit `noo
 onboard` installs at a terminal or with `--ci --root-ok` (plain `--ci` skips it) (`systemctl --user status noo-hostd`; reinstall with
 `noo onboard --only services`). The same executor runs scheduled
-backups, certificate rotation and disk reclaim from the spool. A
+backups, certificate rotation and disk reclaim from the spool, and
+restores the stack after a reboot. A user unit starts at boot only when
+its user lingers: onboard turns linger on (`loginctl enable-linger`, through
+its sudo), and `noo cluster verify`'s `hostd at boot` row WARNs with
+`sudo loginctl enable-linger <user>` when it is off. A
 background rebuild logs to `.noo-host-spool/<name>.rebuild.log` and refuses `--profile`
 and the engine flags. On a dist install `rebuild` builds but refuses to
 recreate — upgrade instead.
@@ -190,6 +195,14 @@ noo upgrade --stack [--tag vX.Y.Z]  # materialise the paired assets, write stack
 noo upgrade --nodes                 # re-provision every pull-capable node with the new agent
 noo upgrade --all                   # both
 ```
+
+The node phase restarts nodes that share a model class or embedding space
+one at a time, and stages the next only once the previous one serves again
+(placed, healthy, lane serving, as `noo cluster class list` shows it). If it
+does not within 10 min to apply plus 15 min to serve, the phase stops rather
+than leave a class with nothing serving, names the node, and
+`noo upgrade --nodes` resumes; `--allow-unserved` rolls on without waiting
+([details](../cli/setup-and-host.md)).
 
 After any of the above rolls a node or the stack, `noo cluster verify` is
 the post-upgrade health view: it checks every node and the controller

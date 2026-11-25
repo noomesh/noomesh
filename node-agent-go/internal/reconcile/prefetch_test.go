@@ -38,20 +38,20 @@ func TestPrefetchSelectsOnlyPlacementsTheStartLoopWillStart(t *testing.T) {
 	labels := map[string]string{"embedding": specHash(converged)}
 	native := map[string]string{"ollama": "q"}
 
-	refs, n := imagesToPrefetch(effective, running, labels, nil, native, map[string]string{})
+	refs, n := imagesToPrefetch(effective, running, labels, nil, native, nil, map[string]string{})
 	if want := []string{"img/llamacpp:1"}; !reflect.DeepEqual(refs, want) || n != 1 {
 		t.Fatalf("refs=%v n=%d, want %v 1", refs, n, want)
 	}
 
 	// Same placement, drifted label: a recreate, so its image is wanted.
 	labels["embedding"] = "stale"
-	refs, n = imagesToPrefetch(effective, running, labels, nil, native, map[string]string{})
+	refs, n = imagesToPrefetch(effective, running, labels, nil, native, nil, map[string]string{})
 	if want := []string{"img/llamacpp:1", "img/embedding:1"}; !reflect.DeepEqual(refs, want) || n != 2 {
 		t.Fatalf("drifted: refs=%v n=%d, want %v 2", refs, n, want)
 	}
 
 	// Already recreated once for this hash (drift-stuck): not started.
-	refs, _ = imagesToPrefetch(effective, running, labels, nil, native, map[string]string{"embedding": specHash(converged)})
+	refs, _ = imagesToPrefetch(effective, running, labels, nil, native, nil, map[string]string{"embedding": specHash(converged)})
 	if want := []string{"img/llamacpp:1"}; !reflect.DeepEqual(refs, want) {
 		t.Fatalf("stuck: refs=%v, want %v", refs, want)
 	}
@@ -60,7 +60,7 @@ func TestPrefetchSelectsOnlyPlacementsTheStartLoopWillStart(t *testing.T) {
 	// agent picked (node-b's noo-ollama on ollama/ollama:latest): a recreate.
 	labels["embedding"] = specHash(converged)
 	floating := map[string]string{"embedding": "ollama/ollama:latest"}
-	refs, n = imagesToPrefetch(effective, running, labels, floating, native, map[string]string{})
+	refs, n = imagesToPrefetch(effective, running, labels, floating, native, nil, map[string]string{})
 	if want := []string{"img/llamacpp:1", "img/embedding:1"}; !reflect.DeepEqual(refs, want) || n != 2 {
 		t.Fatalf("floating: refs=%v n=%d, want %v 2", refs, n, want)
 	}
@@ -71,8 +71,29 @@ func TestPrefetchSkipsPlacementsWhoseImageCannotBeNamed(t *testing.T) {
 	placementImageFn = func(string, string, string) string { return "" }
 	t.Cleanup(func() { placementImageFn = prev })
 	refs, n := imagesToPrefetch([]placement{{Backend: "vllm", Model: "m", DesiredState: "running"}},
-		map[string]string{}, map[string]string{}, nil, map[string]string{}, map[string]string{})
+		map[string]string{}, map[string]string{}, nil, map[string]string{}, nil, map[string]string{})
 	if len(refs) != 0 || n != 0 {
 		t.Fatalf("refs=%v n=%d, want none", refs, n)
+	}
+}
+
+// A Mac whose native Ollama is down (followup i1156): ollama is not in
+// native (nothing answers), but the native lane is its only lane, so its
+// image is never queued; another backend's still is.
+func TestPrefetchSkipsANativeOnlyBackendWhoseLaneIsDown(t *testing.T) {
+	fakeImages(t)
+	effective := []placement{
+		{Backend: "ollama", Model: "q", DesiredState: "running"},
+		{Backend: "llamacpp", Model: "m.gguf", DesiredState: "running"},
+	}
+	nativeOnly := func(b string) bool { return b == "ollama" }
+	refs, n := imagesToPrefetch(effective, map[string]string{}, map[string]string{}, nil, map[string]string{}, nativeOnly, map[string]string{})
+	if want := []string{"img/llamacpp:1"}; !reflect.DeepEqual(refs, want) || n != 1 {
+		t.Fatalf("native-only ollama down: refs=%v n=%d, want %v 1", refs, n, want)
+	}
+	// Linux (no native-only backend): unchanged, the ollama image is queued.
+	refs, _ = imagesToPrefetch(effective, map[string]string{}, map[string]string{}, nil, map[string]string{}, nil, map[string]string{})
+	if want := []string{"img/ollama:1", "img/llamacpp:1"}; !reflect.DeepEqual(refs, want) {
+		t.Fatalf("linux: refs=%v, want %v", refs, want)
 	}
 }

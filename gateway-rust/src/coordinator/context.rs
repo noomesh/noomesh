@@ -1086,6 +1086,57 @@ pub(super) const CLUSTER_GUIDANCE: &str = "\n\n## Cluster Nodes (live)\n\
      - To send a prompt to a SPECIFIC node's model (\"ask <node> ...\"), call noo_inference with node=\"<node_id>\". Without the node argument the prompt routes to the default backend, NOT the node the user named.\n\
      - Never attribute a model response to a node unless the call was pinned to it with node=\"...\".";
 
+/// Label of the knowledge-base layer in the data frame.
+pub(super) const KB_FRAME_LABEL: &str = "Knowledge base";
+
+/// Step 1 of the fallback persona's knowledge workflow (the persona files
+/// have no such step), kept as a constant so a turn whose data frame already
+/// carries the knowledge base can swap it for [`KB_SHOWN_STEP`] (i1178a).
+const KB_FIRST_STEP: &str = "  1. Call noo_rag_query FIRST to ground your answer in the user's curated material.";
+/// What step 1 says when THIS turn's frame already holds the knowledge base.
+const KB_SHOWN_STEP: &str = "  1. The user's curated material for this question is already shown first in the user's message (the knowledge base block). Answer from it; a retrieval tool is offered from your next step on, only if it is not enough.";
+/// The same instruction appended to a persona that has no step 1 (the
+/// persona files), so the model is told where the material is either way.
+const KB_SHOWN_NOTE: &str = "\n\n## Knowledge base (already retrieved)\nThe user's curated material for this question is already shown first in the user's message (the knowledge base block). Answer from it. A retrieval tool is offered from your next step on, only if it is not enough.";
+
+/// Whether THIS turn's injected frame carries a knowledge-base layer: the
+/// frame was attached AND the layer had text (an empty layer is skipped by
+/// [`build_data_frame`]). Decided from the layer we fetched, never by
+/// searching the frame, whose bodies are third-party text.
+pub(super) fn kb_in_frame(frame: Option<&str>, rag_layer: Option<&str>) -> bool {
+    frame.is_some() && rag_layer.is_some_and(|t| !t.trim().is_empty())
+}
+
+/// The persona for a turn whose frame holds the knowledge base: step 1
+/// "Call noo_rag_query FIRST" becomes "use the material shown first; call
+/// the tool only if it is not enough"; a persona without that step gets the
+/// note. The persona is built BEFORE the layers are fetched, so the loops
+/// call this after attaching the frame and before the first model call.
+pub(super) fn persona_with_kb_shown(persona: &str) -> String {
+    if persona.contains(KB_FIRST_STEP) {
+        persona.replace(KB_FIRST_STEP, KB_SHOWN_STEP)
+    } else if persona.contains(KB_SHOWN_STEP) || persona.contains(KB_SHOWN_NOTE) {
+        persona.to_string()
+    } else {
+        format!("{persona}{KB_SHOWN_NOTE}")
+    }
+}
+
+/// Apply [`persona_with_kb_shown`] to the system message at the head of
+/// `messages`, when this turn's frame holds the knowledge base.
+pub(super) fn mark_kb_shown(messages: &mut [Value], frame: Option<&str>, rag_layer: Option<&str>) {
+    if !kb_in_frame(frame, rag_layer) {
+        return;
+    }
+    let Some(first) = messages.first_mut() else { return };
+    if first.get("role").and_then(|r| r.as_str()) != Some("system") {
+        return;
+    }
+    let existing = first.get("content").and_then(|c| c.as_str()).unwrap_or("");
+    let updated = persona_with_kb_shown(existing);
+    *first = json!({"role": "system", "content": updated});
+}
+
 /// Tell the model about available data directories and knowledge base.
 /// Without this, the LLM doesn't know it has internal knowledge and defaults
 /// to web_search for everything.
@@ -1094,7 +1145,7 @@ fn format_data_awareness(state: &AppState) -> String {
 
     parts.push("You have an internal knowledge base (PageIndex) containing ingested documents.".into());
     parts.push("KNOWLEDGE WORKFLOW — both sources are valuable; use them in this order:".into());
-    parts.push("  1. Call noo_rag_query FIRST to ground your answer in the user's curated material.".into());
+    parts.push(KB_FIRST_STEP.into());
     parts.push("  2. THEN call web_search to augment, fill gaps, or add current/external perspective.".into());
     parts.push("Do NOT skip step 1 because the topic is broad, strategic, or 'likely needs external knowledge' — that's exactly when the user has often ingested relevant material, and starting from their context produces a better, more grounded answer than a pure web summary.".into());
     parts.push("Cite which source each part of the answer came from when both were used.".into());
@@ -2148,5 +2199,91 @@ mod prompt_tier_tests {
         let body = crate::test_src::fn_body(&code, "pub(super) async fn load_persona_prompt(");
         assert!(body.contains("persona_for(PromptTier::Full)"), "{body}");
         assert!(!body.contains("coordinator.md"), "{body}");
+    }
+}
+
+/// i1178a half (a): the persona stops saying "call noo_rag_query FIRST" when
+/// this turn's data frame already carries the knowledge base.
+#[cfg(test)]
+mod kb_shape_tests {
+    use super::*;
+
+    fn persona() -> String {
+        format!("You are the assistant.\n{KB_FIRST_STEP}\n  2. THEN call web_search to augment.")
+    }
+
+    fn turn() -> Vec<Value> {
+        vec![
+            json!({"role": "system", "content": persona()}),
+            json!({"role": "user", "content": "summarise what you know from anything.md"}),
+        ]
+    }
+
+    fn system(msgs: &[Value]) -> &str {
+        msgs[0]["content"].as_str().unwrap()
+    }
+
+    /// With a knowledge-base layer in the frame there is no "FIRST" and the
+    /// tool stays available as a fallback.
+    #[test]
+    fn a_frame_with_a_kb_layer_drops_the_call_first_step() {
+        let mut msgs = turn();
+        let kb = "Kestrel note: ZIRCON-4471";
+        let frame = attach_retrieved_data(&mut msgs, &[(KB_FRAME_LABEL, Some(kb))]);
+        mark_kb_shown(&mut msgs, frame.as_deref(), Some(kb));
+        let sys = system(&msgs);
+        assert!(!sys.contains("FIRST"), "{sys}");
+        assert!(sys.contains("already shown first") && sys.contains("only if it is not enough"), "{sys}");
+        assert!(sys.contains("2. THEN call web_search"), "the rest of the workflow stays: {sys}");
+    }
+
+    /// No knowledge-base layer: today's instruction, byte for byte.
+    #[test]
+    fn a_frame_without_a_kb_layer_keeps_the_call_first_step() {
+        let mut msgs = turn();
+        let frame = attach_retrieved_data(&mut msgs, &[("Memory", Some("a fact")), (KB_FRAME_LABEL, None)]);
+        assert!(frame.is_some());
+        mark_kb_shown(&mut msgs, frame.as_deref(), None);
+        assert_eq!(system(&msgs), persona());
+        assert!(system(&msgs).contains("FIRST"));
+        // no frame at all, and a blank KB layer that the frame skipped
+        let mut none = turn();
+        mark_kb_shown(&mut none, None, Some("kb text the frame never carried"));
+        assert_eq!(system(&none), persona());
+        let mut blank = turn();
+        let f = attach_retrieved_data(&mut blank, &[("Memory", Some("m")), (KB_FRAME_LABEL, Some("  "))]);
+        mark_kb_shown(&mut blank, f.as_deref(), Some("  "));
+        assert_eq!(system(&blank), persona());
+    }
+
+    /// A persona from the files has no step 1: it gets the note, once.
+    #[test]
+    fn a_file_persona_gets_the_note_once() {
+        let once = persona_with_kb_shown("core persona");
+        assert!(once.starts_with("core persona") && once.contains("already shown first"), "{once}");
+        assert_eq!(persona_with_kb_shown(&once), once);
+        assert!(!once.contains("FIRST"));
+    }
+
+    /// The label the loops use is the one the check reads, and the fallback
+    /// persona's step is the constant this module rewrites.
+    #[test]
+    fn the_loops_and_the_fallback_persona_use_these_constants() {
+        let code = crate::test_src::own_code(include_str!("agent_loop.rs"));
+        assert_eq!(code.matches("super::context::mark_kb_shown(&mut session.messages").count(), 2);
+        assert_eq!(code.matches("(super::context::KB_FRAME_LABEL, rag_ctx.as_deref())").count(), 2);
+        let ctx = crate::test_src::own_code(include_str!("context.rs"));
+        let body = crate::test_src::fn_body(&ctx, "fn format_data_awareness(");
+        assert!(body.contains("parts.push(KB_FIRST_STEP.into())"), "{body}");
+        assert!(KB_FIRST_STEP.contains("noo_rag_query FIRST"));
+    }
+
+    /// Both loops feed retrieval output to the rule and nudge on it.
+    #[test]
+    fn both_loops_apply_the_retrieval_use_rule() {
+        let code = crate::test_src::own_code(include_str!("agent_loop.rs"));
+        assert_eq!(code.matches("super::retrieval_use::ignores_retrieval(").count(), 2);
+        assert_eq!(code.matches("super::retrieval_use::note_retrieval(&mut retrieved_text").count(), 2);
+        assert_eq!(code.matches("super::retrieval_use::RETRIEVAL_UNUSED_NUDGE").count(), 2);
     }
 }

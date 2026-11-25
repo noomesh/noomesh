@@ -35,7 +35,7 @@ func TestEmbedLocalRunsTheSameProxyInProcess(t *testing.T) {
 	}
 
 	// The proxy's own refusals come back as a status, not an error.
-	withEmbedTarget(t, embedtarget.Target{Backend: "embedding", Model: "harrier"})
+	withEmbedTarget(t, embedtarget.Target{Backend: "llamacpp", Model: "harrier"})
 	status, body, err = s.EmbedLocal(context.Background(), []byte(`{"input":["hello"]}`))
 	if err != nil || status != http.StatusServiceUnavailable || !strings.Contains(string(body), "no_local_embedder") {
 		t.Errorf("status=%d err=%v body=%s", status, err, body)

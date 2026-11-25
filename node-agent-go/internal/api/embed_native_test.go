@@ -72,7 +72,7 @@ func TestEmbedReachesANativeEmbedderWithoutDocker(t *testing.T) {
 // The guard still holds where it means something: no native lane for the
 // declared backend and no container -> the precise 503, not a dial to nowhere.
 func TestEmbedStillRefusesWhenNothingServesTheDeclaredEmbedder(t *testing.T) {
-	withEmbedTarget(t, embedtarget.Target{Backend: "embedding", Model: "harrier"})
+	withEmbedTarget(t, embedtarget.Target{Backend: "llamacpp", Model: "harrier"})
 	var calls int32
 	s := &Server{cfg: &config.Config{}, mux: http.NewServeMux(), native: nativeEmbedder(t, &calls)}
 
@@ -94,7 +94,7 @@ func TestEmbedTargetForRoutesByBodyModel(t *testing.T) {
 	t.Cleanup(func() { embedtarget.SetAll(prev) })
 	embedtarget.SetAll([]embedtarget.Target{
 		{Backend: "ollama", Model: "harrier"},
-		{Backend: "embedding", Model: "nomic-embed-code"},
+		{Backend: "llamacpp", Model: "nomic-embed-code"},
 	})
 	cases := map[string]string{
 		`{"input":"x","model":"nomic-embed-code"}`:  "nomic-embed-code",

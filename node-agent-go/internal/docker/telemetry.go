@@ -37,7 +37,7 @@ var (
 		"DO_NOT_TRACK":             "1",
 		"HF_HUB_DISABLE_TELEMETRY": "1",
 	}
-	// huggingface_hub / transformers (airllm, and TEI's hf-hub fetch).
+	// huggingface_hub / transformers (airllm).
 	telemetryOffHF = map[string]string{
 		"HF_HUB_DISABLE_TELEMETRY": "1",
 		"DO_NOT_TRACK":             "1",
@@ -60,21 +60,12 @@ var (
 const BackendEnvGeneration = 1
 
 // TelemetrySwitchesFor is the set of KEY=value switches a backend's
-// container must carry. isTEI selects the reranker's engine (the reranker
-// key covers both a TEI cross-encoder and llama.cpp --reranking); it is
-// ignored for every other backend. nil = the software has no phone-home
-// to switch off (llama.cpp).
-func TelemetrySwitchesFor(backend string, isTEI bool) map[string]string {
+// container must carry. nil = the software has no phone-home to switch off
+// (llama.cpp, which is also the reranker).
+func TelemetrySwitchesFor(backend string) map[string]string {
 	switch backend {
 	case "vllm", "vllm-secondary":
 		return telemetryOffVLLM
-	case "embedding":
-		return telemetryOffHF
-	case "reranker":
-		if isTEI {
-			return telemetryOffHF
-		}
-		return nil
 	case "airllm":
 		return telemetryOffHF
 	case "ollama":
@@ -102,10 +93,7 @@ func TelemetryMissing(backend string, env []string) []string {
 		k, v, _ := strings.Cut(kv, "=")
 		have[k] = v
 	}
-	// A reranker is TEI when it carries TEI's MODEL_ID (the llama.cpp
-	// engine reads MODEL_PATH), the same test StartBackendSDK uses.
-	_, isTEI := have["MODEL_ID"]
-	want := TelemetrySwitchesFor(backend, isTEI)
+	want := TelemetrySwitchesFor(backend)
 	missing := []string{}
 	for k, v := range want {
 		if have[k] != v {

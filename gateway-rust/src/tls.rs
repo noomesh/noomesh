@@ -9,11 +9,7 @@
 //!                                     traffic (default embedder: ollama/
 //!                                     harrier; default reranker: hardened
 //!                                     llama.cpp) rides this leg, not a
-//!                                     dedicated TEI path. TEI is optional/
-//!                                     legacy: still reachable as a wire
-//!                                     format if an install still runs it
-//!                                     (HTTPS via stunnel), but is no longer
-//!                                     the deployed default.
+//!                                     dedicated embedder path.
 //!   Gateway ←→ NATS                  (TLS)
 //!   Gateway ←→ Postgres              (TLS)
 //!   Dashboard ←→ Gateway             (HTTPS, browser trusts cluster CA)
@@ -241,7 +237,7 @@ pub fn plain_client(t: ClientTimeouts) -> reqwest::Client {
 }
 
 /// Shared intra-cluster client: cluster CA + mTLS identity, one connection
-/// pool reused across all gateway → node-agent/backend/TEI traffic.
+/// pool reused across all gateway → node-agent/backend traffic.
 ///
 /// TLS material is loaded once at first use — after `noo security pki
 /// rotate-all` the gateway must be restarted to pick up new leaf certs
@@ -521,8 +517,15 @@ pub fn cluster_rustls_config() -> Result<Option<std::sync::Arc<rustls::ClientCon
             root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
         }
 
+        // webpki's verification against these roots, then the node-name pin:
+        // a node leaf must name the node the gateway's records place at the
+        // dialed address (`node_pin`, i1174). Every client built from this
+        // config carries it.
+        let verifier = crate::node_pin::NodePinVerifier::new(std::sync::Arc::new(root_store))
+            .map_err(|e| anyhow::anyhow!("cluster TLS verifier: {e}"))?;
         let config_builder = rustls::ClientConfig::builder()
-            .with_root_certificates(root_store);
+            .dangerous()
+            .with_custom_certificate_verifier(std::sync::Arc::new(verifier));
 
         let tls_config = if has_identity {
             // Load client cert chain
@@ -821,7 +824,7 @@ pub(crate) mod loopback_verification_tests {
     use std::sync::Arc;
 
     /// `NOO_TLS_CA` is process-global; `cargo test` runs these on threads.
-    pub(super) static ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    pub(crate) static ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     pub(crate) fn issue(ca_cn: &str, san: &str) -> (rcgen::CertifiedKey<rcgen::KeyPair>, rcgen::CertifiedKey<rcgen::KeyPair>) {
         let mut ca_params = rcgen::CertificateParams::new(vec![ca_cn.to_string()]).unwrap();

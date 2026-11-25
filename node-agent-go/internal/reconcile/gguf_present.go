@@ -6,10 +6,10 @@ package reconcile
 import (
 	"context"
 	"log/slog"
-	"os"
 	"path/filepath"
 	"strings"
 
+	"github.com/noomesh/noomesh/node-agent-go/internal/dataroots"
 	dockerpkg "github.com/noomesh/noomesh/node-agent-go/internal/docker"
 	"github.com/noomesh/noomesh/node-agent-go/internal/refusals"
 )
@@ -110,9 +110,10 @@ func (r *Reconciler) ggufFileOnNode(ctx context.Context, t *tick, p placement) b
 
 // newestQuarantined returns the path of the newest `<model>.quarantined-<UTC
 // stamp>` in dir (docker.ggufFetchOutcome's name; the stamp sorts by time),
-// or "" when there is none or dir cannot be read.
+// or "" when there is none or dir cannot be read. Bounded
+// (dataroots.ReadDirBounded): a hung mount must not stall the reconcile tick.
 func newestQuarantined(dir, model string) string {
-	entries, err := os.ReadDir(dir)
+	entries, err := dataroots.ReadDirBounded(dir)
 	if err != nil {
 		return ""
 	}
@@ -126,4 +127,40 @@ func newestQuarantined(dir, model string) string {
 		return ""
 	}
 	return filepath.Join(dir, newest)
+}
+
+// reverifyUnvouched re-asks the controller about a GGUF backend that started
+// on its local file without a manifest (docker.ReverifyUnvouchedGGUF). A match
+// clears the state. A mismatch stops the backend and records a backend_start
+// refusal naming the model, the expected sha256 and the actual one, and
+// reports true: the next start takes the normal path (a verified copy, or the
+// refusal). The file is not deleted; the verified copy replaces it.
+func (r *Reconciler) reverifyUnvouched(ctx context.Context, p placement) bool {
+	if !strings.HasSuffix(p.Model, ".gguf") {
+		return false
+	}
+	reverify := r.reverifyFn
+	if reverify == nil {
+		reverify = dockerpkg.ReverifyUnvouchedGGUF
+	}
+	mm := reverify(ctx, p.Backend, p.Model)
+	if mm == nil {
+		return false
+	}
+	stop := r.stopBackendFn
+	if stop == nil && r.docker != nil {
+		stop = r.docker.StopBackend
+	}
+	if stop != nil {
+		if err := stop(ctx, p.Backend); err != nil {
+			slog.Warn("reconcile.stop_failed", "backend", p.Backend, "error", err)
+		}
+	}
+	reason := "backend_start: " + mm.Error()
+	if r.ggufMissing == nil {
+		r.ggufMissing = map[string]string{}
+	}
+	r.ggufMissing[p.Backend] = reason
+	refusals.Record("backend_start", p.Backend, reason)
+	return true
 }

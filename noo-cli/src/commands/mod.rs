@@ -104,6 +104,7 @@ pub mod offboard;
 pub mod postgres_memory;
 pub mod provision;
 pub mod security_local;
+pub(crate) mod node_prove;
 pub mod security_scan_node;
 pub mod skills;
 pub mod stack_db_compat;
@@ -134,7 +135,7 @@ pub use chat::chat;
 pub use nats_users::{cluster_nats_creds_rotate, cluster_nats_users_render};
 pub use cluster::{
     cluster_add_companion, cluster_add_monitor, cluster_assign, cluster_clean_node, cluster_stage_images,
-    cluster_clear_cooldowns, cluster_desired, cluster_down, cluster_fit, cluster_proposals, cluster_forget, cluster_init_secret,
+    cluster_clear_cooldowns, cluster_desired, cluster_down, cluster_stop_backend, cluster_fit, cluster_proposals, cluster_forget, cluster_init_secret,
     cluster_logs, cluster_show, cluster_place, cluster_restart_agent, cluster_maintenance,
     cluster_scale, cluster_set_config, cluster_status, cluster_sync_model_files,
     cluster_exec, cluster_reconnect, cluster_sync_models, cluster_unplace, cluster_up,

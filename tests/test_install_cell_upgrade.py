@@ -573,3 +573,425 @@ def test_the_events_capture_keeps_only_pull_and_create_events():
     line = next(l for l in src.splitlines() if "events --format" in l)
     assert "--filter event=pull" in line and "--filter event=create" in line, line
     assert "exec" not in line, line
+
+
+# ── K1/K2: the roll's "N recreated (…), M kept (…)" line against the ids ────
+import re as _re  # noqa: E402
+
+import recreated as rc_mod  # noqa: E402
+
+_THIRD = ["nats", "redis", "model-cache", "loki", "tempo", "prometheus", "alertmanager", "grafana", "node-exporter"]
+_FIRST = ["gateway", "worker", "postgres", "sandbox"]
+
+
+def _snap(ids, labelled, services=None, imgs=None):
+    """A recreated.py snapshot: name id service depends_on L|- [image id]."""
+    rows = []
+    for svc in services or _FIRST + _THIRD:
+        img = " sha256:" + (imgs or {}).get(svc, svc + "img1" + "0" * 20) if imgs is not None else ""
+        rows.append("noo-%s %s %s - %s%s\n" % (svc, ids.get(svc, svc + "-1"), svc, "L" if labelled else "-", img))
+    return "".join(rows)
+
+
+def _line(rec, kept, created=(), forced=False):
+    def part(n, w):
+        return "%d %s (%s)" % (len(n), w, ", ".join(n)) if n else "0 %s" % w
+    s = part(rec, "recreated") + ", " + part(kept, "kept")
+    if created:
+        s += ", " + part(created, "created")
+    return "+ " + s + (" — --recreate: every container" if forced else "; --recreate restarts everything")
+
+
+def _k(tmp, before, after, roll_line=None, stack_line=None, target="noo-cli-v0.6.30-rc.1", stack_after=None,
+       k4_before=None, k4_after=None, k4_line=None):
+    out = tmp / "out"
+    rc, got = cell(tmp, roll=ROLL_OK + (roll_line + "\n" if roll_line else ""),
+                   stack=STACK_OK + (stack_line + "\n" if stack_line else ""))
+    j = out / "judge"
+    (j / "roll.before").write_text(before)
+    (j / "roll.after").write_text(after)
+    (j / "stack.after").write_text(after if stack_after is None else stack_after)
+    (j / "target").write_text(target)
+    if k4_line is not None:
+        (out / "logs" / "upgrade-recreate.log").write_text("> Applying\n" + k4_line + "\n")
+    if k4_before is not None:
+        (j / "k4.before").write_text(k4_before)
+    if k4_after is not None:
+        (j / "k4.after").write_text(k4_after)
+    env = dict(os.environ, OUT=str(out), J=str(j), SELF=SELF, NETNS_UNIT_ENABLED="enabled",
+               ROLL_T0=ROLL_T0, STACK_T0=STACK_T0, STACK_T1=STACK_T1, NETNS_UNIT=str(tmp / "noo-netns-restore.service"),
+               NETNS_UNIT_OWNER="%d:%d" % (os.getuid(), os.getgid()))
+    r = subprocess.run([sys.executable, str(JUDGE), "judge"], env=env, capture_output=True, text=True)
+    return {l.split()[1]: l for l in r.stdout.splitlines() if l.startswith("UPGRADE ")}
+
+
+_NEW = {s: s + "-2" for s in _FIRST}
+_ALLNEW = {s: s + "-2" for s in _FIRST + _THIRD}
+
+
+def test_the_parser_reads_every_shape_of_the_line():
+    p = uj.parse_apply_line
+    g = p(_line(["gateway", "worker"], ["nats", "redis"], ["voice"]))
+    assert (g["recreated"], g["kept"], g["created"], g["forced"]) == (["gateway", "worker"], ["nats", "redis"], ["voice"], False)
+    assert g["counts"] == (2, 2, 1)
+    z = p("\x1b[32m+\x1b[0m 0 recreated, 4 kept (gateway, nats, redis, worker); --recreate restarts everything")
+    assert (z["recreated"], z["kept"], z["created"]) == ([], ["gateway", "nats", "redis", "worker"], [])
+    f = p(_line(["a", "b"], [], forced=True))
+    assert f["forced"] and f["kept"] == [] and f["counts"] == (2, 0, 0)
+    assert p("1 running, 0 recreated\nstack now on v0.6.30") is None and p("") is None and p(None) is None
+
+
+def test_k1_labelled_to_labelled_keeps_third_party_and_recreates_first_party(tmp_path):
+    line = _line(_FIRST, _THIRD)
+    got = _k(tmp_path,
+             _snap({}, True), _snap(_NEW, True), roll_line=line, stack_line=_line([], sorted(_FIRST + _THIRD)))
+    assert got["K1"].startswith("UPGRADE K1 PASS:"), got["K1"]
+    assert "labelled -> labelled (noo.inputs on 13 of 13 BEFORE services, read from the containers' labels, not the version)" in got["K1"]
+    assert line[2:] in got["K1"], got["K1"]
+    assert got["K2"].startswith("UPGRADE K2 PASS:") and "0 recreated" in got["K2"], got["K2"]
+
+
+def test_k1_fails_when_a_kept_service_changed_ids_or_a_first_party_one_did_not(tmp_path):
+    # nats recreated although labelled -> must keep; the line agrees with the ids
+    ids = dict(_NEW, nats="nats-2")
+    got = _k(tmp_path / "a", _snap({}, True), _snap(ids, True),
+             roll_line=_line(_FIRST + ["nats"], [t for t in _THIRD if t != "nats"]))
+    assert got["K1"].startswith("UPGRADE K1 FAIL:") and "recreated but must keep its id: nats" in got["K1"], got["K1"]
+    # worker kept although first-party
+    ids = {s: s + "-2" for s in _FIRST if s != "worker"}
+    got = _k(tmp_path / "b", _snap({}, True), _snap(ids, True),
+             roll_line=_line([s for s in _FIRST if s != "worker"], ["worker"] + _THIRD))
+    assert "FAIL" in got["K1"] and "kept but must be recreated: worker" in got["K1"], got["K1"]
+
+
+def test_k1_fails_when_the_line_disagrees_with_the_ids(tmp_path):
+    # the ids say worker was kept, the line says it was recreated
+    ids = {s: s + "-2" for s in _FIRST if s != "worker"}
+    got = _k(tmp_path, _snap({}, True), _snap(ids, True), roll_line=_line(_FIRST, _THIRD))
+    assert got["K1"].startswith("UPGRADE K1 FAIL:"), got["K1"]
+    assert "line recreated != ids recreated; line only: worker" in got["K1"], got["K1"]
+    assert "line kept != ids kept; ids only: worker" in got["K1"], got["K1"]
+
+
+def test_k1_unlabelled_to_labelled_recreates_everything_and_keeps_nothing(tmp_path):
+    allsvc = sorted(_FIRST + _THIRD)
+    got = _k(tmp_path / "ok", _snap({}, False), _snap(_ALLNEW, True), roll_line=_line(allsvc, []))
+    assert got["K1"].startswith("UPGRADE K1 PASS:") and "unlabelled -> labelled (noo.inputs on 0 of 13" in got["K1"], got["K1"]
+    assert "every service recreated, none kept" in got["K1"], got["K1"]
+    # nats kept from an unlabelled start: a FAIL, even though the line agrees
+    ids = dict(_ALLNEW)
+    del ids["nats"]
+    got = _k(tmp_path / "bad", _snap({}, False), _snap(ids, True),
+             roll_line=_line([s for s in allsvc if s != "nats"], ["nats"]))
+    assert got["K1"].startswith("UPGRADE K1 FAIL:") and "kept but must be recreated: nats" in got["K1"], got["K1"]
+
+
+def test_k1_forced_recreates_everything_even_third_party(tmp_path):
+    allsvc = sorted(_FIRST + _THIRD)
+    got = _k(tmp_path, _snap({}, True), _snap(_ALLNEW, True), roll_line=_line(allsvc, [], forced=True))
+    assert got["K1"].startswith("UPGRADE K1 PASS:"), got["K1"]
+    assert "--recreate: every container" in got["K1"], got["K1"]
+
+
+def test_k1_a_created_service_is_named_and_matched(tmp_path):
+    after = _snap(_NEW, True) + "noo-voice voice-1 voice - L\n"
+    got = _k(tmp_path / "ok", _snap({}, True), after, roll_line=_line(_FIRST, _THIRD, ["voice"]))
+    assert got["K1"].startswith("UPGRADE K1 PASS:") and "1 created" in got["K1"], got["K1"]
+    got = _k(tmp_path / "bad", _snap({}, True), after, roll_line=_line(_FIRST, _THIRD))
+    assert got["K1"].startswith("UPGRADE K1 FAIL:") and "line created != ids created; ids only: voice" in got["K1"], got["K1"]
+
+
+def test_k_no_line_from_a_build_that_predates_1470_is_a_note_never_a_fail(tmp_path):
+    for i, tag in enumerate(("noo-cli-v0.6.28", "noo-cli-v0.6.29", "noo-cli-v0.6.29-rc.4")):
+        got = _k(tmp_path / str(i), _snap({}, False), _snap(_ALLNEW, True), target=tag)
+        assert got["K1"].startswith("UPGRADE K1 NOTE:") and "predates the apply line" in got["K1"] and tag in got["K1"], got["K1"]
+        assert got["K2"].startswith("UPGRADE K2 NOTE:"), got["K2"]
+
+
+def test_k_no_line_from_a_build_that_should_print_it_fails(tmp_path):
+    got = _k(tmp_path, _snap({}, True), _snap(_NEW, True), target="noo-cli-v0.6.30")
+    assert got["K1"].startswith("UPGRADE K1 FAIL:") and "printed no 'N recreated" in got["K1"], got["K1"]
+
+
+def test_k1_without_snapshots_is_not_reached(tmp_path):
+    rc, got = cell(tmp_path, roll=ROLL_OK + _line(_FIRST, _THIRD) + "\n")
+    assert got["K1"].startswith("UPGRADE K1 NOT REACHED:") or got["K1"].startswith("UPGRADE K1 NOTE:"), got["K1"]
+
+
+def test_k2_the_same_tag_stack_must_recreate_nothing(tmp_path):
+    allsvc = sorted(_FIRST + _THIRD)
+    ids = dict(_NEW)
+    # recreated gateway on a same-tag re-apply: FAIL, whether or not the line says so
+    got = _k(tmp_path / "a", _snap({}, True), _snap(_NEW, True), roll_line=_line(_FIRST, _THIRD),
+             stack_line=_line(["gateway"], [s for s in allsvc if s != "gateway"]),
+             stack_after=_snap(dict(ids, gateway="gateway-3"), True))
+    assert got["K2"].startswith("UPGRADE K2 FAIL:") and "same-tag --stack recreated gateway" in got["K2"], got["K2"]
+    # the ids held but the line claims a recreate
+    got = _k(tmp_path / "b", _snap({}, True), _snap(_NEW, True), roll_line=_line(_FIRST, _THIRD),
+             stack_line=_line(["gateway"], [s for s in allsvc if s != "gateway"]))
+    assert got["K2"].startswith("UPGRADE K2 FAIL:") and "line recreated != ids recreated; line only: gateway" in got["K2"], got["K2"]
+
+
+_K4IDS = {s: s + "-3" for s in _FIRST + _THIRD}
+_ALLSVC = sorted(_FIRST + _THIRD)
+
+
+def test_k4_passes_when_every_service_is_recreated_and_the_line_is_the_forced_form(tmp_path):
+    got = _k(tmp_path, _snap({}, True), _snap(_NEW, True), k4_before=_snap(_NEW, True), k4_after=_snap(_K4IDS, True),
+             k4_line=_line(_ALLSVC, [], forced=True))
+    assert got["K4"].startswith("UPGRADE K4 PASS:") and "all 13 services" in got["K4"] and "every container" in got["K4"], got["K4"]
+
+
+def test_k4_fails_when_one_service_keeps_its_id(tmp_path):
+    ids = dict(_K4IDS, redis="redis-2")
+    got = _k(tmp_path, _snap({}, True), _snap(_NEW, True), k4_before=_snap(dict(_NEW, redis="redis-2"), True),
+             k4_after=_snap(ids, True), k4_line=_line(_ALLSVC, [], forced=True))
+    assert got["K4"].startswith("UPGRADE K4 FAIL:") and "kept its container id under --recreate: redis" in got["K4"], got["K4"]
+    assert "line recreated != ids recreated; line only: redis" in got["K4"], got["K4"]
+
+
+def test_k4_fails_when_the_line_is_the_unforced_form(tmp_path):
+    got = _k(tmp_path, _snap({}, True), _snap(_NEW, True), k4_before=_snap(_NEW, True), k4_after=_snap(_K4IDS, True),
+             k4_line=_line(_ALLSVC, []))
+    assert got["K4"].startswith("UPGRADE K4 FAIL:") and "not the forced form" in got["K4"], got["K4"]
+
+
+def test_k4_is_a_note_below_0630_and_not_reached_without_snapshots(tmp_path):
+    got = _k(tmp_path / "a", _snap({}, False), _snap(_ALLNEW, True), target="noo-cli-v0.6.29")
+    assert got["K4"].startswith("UPGRADE K4 NOTE:") and "predates --recreate" in got["K4"], got["K4"]
+    got = _k(tmp_path / "b", _snap({}, True), _snap(_NEW, True))
+    assert got["K4"].startswith("UPGRADE K4 NOT REACHED:"), got["K4"]
+    got = _k(tmp_path / "c", _snap({}, True), _snap(_NEW, True), k4_line=_line(_ALLSVC, [], forced=True))
+    assert got["K4"].startswith("UPGRADE K4 NOT REACHED:"), got["K4"]
+
+
+def test_k4_gate_runs_only_for_a_target_that_takes_recreate():
+    assert uj.recreate_supported("noo-cli-v0.6.30-rc.1") and uj.recreate_supported("noo-cli-v0.7.0")
+    assert not uj.recreate_supported("noo-cli-v0.6.29") and not uj.recreate_supported("latest")
+
+
+def test_upgrade_sh_runs_k4_after_the_plain_start_before_chat_and_gated():
+    text = (JUDGE.parent / "upgrade.sh").read_text()
+    st, gate, kb, step_, ka, chat = (text.index("step start-after-upgrade"), text.index("recreate-ok"),
+                                     text.index('snap "$J/k4.before"'), text.index("step upgrade-recreate"),
+                                     text.index('snap "$J/k4.after"'), text.index("step chat-after"))
+    assert st < gate < kb < step_ < ka < chat
+    assert "--stack --recreate --version" in text
+
+
+def test_the_keep_list_is_the_compose_s_non_first_party_services():
+    text = (ROOT / "docker-compose.cluster.yml").read_text()
+    img = {}
+    cur = None
+    for l in text.splitlines():
+        m = _re.match(r"^  ([a-z0-9_-]+):\s*$", l)
+        if m:
+            cur = m.group(1)
+        m = _re.match(r"^    image:\s*(.*)", l)
+        if m and cur:
+            img[cur] = m.group(1)
+    for svc in uj.THIRD_PARTY_KEEP:
+        assert svc in img, svc
+        assert "NOO_IMAGE_TAG" not in img[svc].split("${NOO_IMAGE_DIGEST")[0], (svc, img[svc])
+    for svc in ("gateway", "worker", "node-agent"):
+        assert svc not in uj.THIRD_PARTY_KEEP and "NOO_IMAGE_TAG" in img[svc]
+
+
+def test_snapshot_rows_carry_the_noo_inputs_column_and_old_rows_still_read(tmp_path):
+    f = tmp_path / "s"
+    f.write_text("noo-a a1 a - L\nnoo-b b1 b db:service_healthy:false -\nnoo-c c1 c -\n")
+    assert rc_mod.read_labelled(str(f)) == {"noo-a": True, "noo-b": False}
+    assert rc_mod.read(str(f))["noo-b"] == ("b1", "b", "db:service_healthy:false")
+    assert rc_mod.read(str(f))["noo-c"][2] == "-"
+    assert "noo.inputs" in rc_mod.FMT
+
+
+def test_upgrade_sh_snapshots_around_the_roll_and_after_the_stack():
+    text = (JUDGE.parent / "upgrade.sh").read_text()
+    b, t0, roll, a, s0, st, t1, sa = (text.index('snap "$J/roll.before"'), text.index('ROLL_T0="$(date +%s)"'),
+                                      text.index("step upgrade-all "), text.index('snap "$J/roll.after"'),
+                                      text.index('STACK_T0="$(date +%s)"'), text.index("step upgrade-stack-same-tag"),
+                                      text.index('STACK_T1="$(date +%s)"'), text.index('snap "$J/stack.after"'))
+    assert b < t0 < roll < a < s0 < st < t1 < sa
+
+
+def test_k1_a_moved_third_party_image_must_be_recreated_and_only_that_one(tmp_path):
+    ids = dict(_NEW, redis="redis-2")
+    first = sorted(_FIRST + ["redis"])
+    keep = [t for t in _THIRD if t != "redis"]
+    bimg, aimg = {}, {"redis": "redisimg2" + "0" * 20}
+    got = _k(tmp_path / "ok", _snap({}, True, imgs=bimg), _snap(ids, True, imgs=aimg), roll_line=_line(first, keep))
+    assert got["K1"].startswith("UPGRADE K1 PASS:"), got["K1"]
+    assert "recreated: redis: its image moved redisimg1000>redisimg2000" in got["K1"], got["K1"]
+    assert "NOTE: image ids not visible" not in got["K1"], got["K1"]
+    # moved but kept: FAIL
+    got = _k(tmp_path / "kept", _snap({}, True, imgs=bimg), _snap(_NEW, True, imgs=aimg), roll_line=_line(_FIRST, _THIRD))
+    assert got["K1"].startswith("UPGRADE K1 FAIL:") and "redis: its image moved (" in got["K1"] and "but the container was kept" in got["K1"], got["K1"]
+    # unchanged nats recreated: FAIL
+    got = _k(tmp_path / "nats", _snap({}, True, imgs={}), _snap(dict(_NEW, nats="nats-2"), True, imgs={}),
+             roll_line=_line(_FIRST + ["nats"], [t for t in _THIRD if t != "nats"]))
+    assert got["K1"].startswith("UPGRADE K1 FAIL:") and "recreated but must keep its id: nats (its image is unchanged)" in got["K1"], got["K1"]
+
+
+def test_k1_without_image_ids_falls_back_to_the_plain_rule_and_says_so(tmp_path):
+    got = _k(tmp_path, _snap({}, True), _snap(_NEW, True), roll_line=_line(_FIRST, _THIRD))
+    assert got["K1"].startswith("UPGRADE K1 PASS:") and "NOTE: image ids not visible in the snapshot for" in got["K1"], got["K1"]
+
+
+def test_k1_compares_only_names_both_sides_see(tmp_path):
+    # the line names a project container the snapshot (noo-* only) never saw: a NOTE, not a FAIL
+    got = _k(tmp_path, _snap({}, True), _snap(_NEW, True), roll_line=_line(_FIRST, _THIRD + ["init-once"]))
+    assert got["K1"].startswith("UPGRADE K1 PASS:") and "NOTE: not in the snapshot (not compared): init-once" in got["K1"], got["K1"]
+
+
+def test_snapshot_image_column_reads_and_old_rows_still_parse(tmp_path):
+    f = tmp_path / "s"
+    f.write_text("noo-a a1 a - L sha256:abc\nnoo-b b1 b - -\n")
+    assert rc_mod.read_images(str(f)) == {"noo-a": "sha256:abc"}
+    assert rc_mod.read_labelled(str(f)) == {"noo-a": True, "noo-b": False}
+    assert "{{.Image}}" in rc_mod.FMT
+
+
+# ── K3: a third-party digest the RELEASE moved recreates that service only ──
+# The cell never moves a digest: a signed-lock install refuses an override.
+def _k3(tmp, ids, bimg, aimg, rec, kept):
+    got = _k(tmp, _snap({}, True, imgs=bimg), _snap(ids, True, imgs=aimg), roll_line=_line(rec, kept),
+             stack_line=_line([], sorted(_FIRST + _THIRD)))
+    return got["K3"]
+
+
+def test_k3_skips_when_no_redis_digest_moved_and_says_why(tmp_path):
+    k = _k3(tmp_path, _NEW, {}, {}, _FIRST, _THIRD)
+    assert k.startswith("UPGRADE K3 SKIP:"), k
+    assert "case 5 waits for a real third-party digest bump in an rc" in k and "refuses a digest override" in k
+    assert "noomesh-start.sh:504" in k, k
+
+
+def test_k3_passes_when_only_redis_moved_and_only_redis_was_recreated(tmp_path):
+    k = _k3(tmp_path, dict(_NEW, redis="redis-2"), {}, {"redis": "redisimg2" + "0" * 20},
+            sorted(_FIRST + ["redis"]), [t for t in _THIRD if t != "redis"])
+    assert k.startswith("UPGRADE K3 PASS:") and "redisimg1000>redisimg2000" in k, k
+
+
+def test_k3_fails_when_another_third_party_is_recreated_with_its_image_unchanged(tmp_path):
+    k = _k3(tmp_path, dict(_NEW, redis="redis-2", nats="nats-2"), {}, {"redis": "redisimg2" + "0" * 20},
+            sorted(_FIRST + ["redis", "nats"]), [t for t in _THIRD if t not in ("redis", "nats")])
+    assert k.startswith("UPGRADE K3 FAIL:") and "recreated though their image is unchanged: nats" in k, k
+
+
+def test_k3_fails_when_redis_moved_but_was_kept(tmp_path):
+    k = _k3(tmp_path, _NEW, {}, {"redis": "redisimg2" + "0" * 20}, _FIRST, _THIRD)
+    assert k.startswith("UPGRADE K3 FAIL:") and "redis: its image moved" in k and "kept" in k, k
+
+
+def test_k3_is_not_reached_without_image_ids(tmp_path):
+    got = _k(tmp_path, _snap({}, True), _snap(_NEW, True), roll_line=_line(_FIRST, _THIRD), stack_line=_line([], sorted(_FIRST + _THIRD)))
+    assert got["K3"].startswith("UPGRADE K3 NOT REACHED:"), got["K3"]
+
+
+# ── the two docker legs of the upgrade job ─────────────────────────────────
+def _upgrade_job():
+    import yaml
+    wf = (ROOT / ".github" / "workflows" / "install-matrix.yml").read_text()
+    return yaml.safe_load(wf)["jobs"]["upgrade"]
+
+
+def test_the_upgrade_job_runs_three_legs_with_distinct_artifacts():
+    job = _upgrade_job()
+    inc = job["strategy"]["matrix"]["include"]
+    assert {(i["leg"], i["runner"], i["artifact"]) for i in inc} == {
+        ("ce", "ubuntu-24.04", "install-cell-upgrade-24.04"),
+        ("distro", "ubuntu-22.04", "install-cell-upgrade-22.04-distro"),
+        ("compose-floor", "ubuntu-24.04", "install-cell-upgrade-24.04-compose-floor")}, inc
+    assert len({i["artifact"] for i in inc}) == 3 and len({i["cell"] for i in inc}) == 3
+    assert job["strategy"]["fail-fast"] is False and job["runs-on"] == "${{ matrix.runner }}"
+    # selection and bounds exactly as before
+    assert job["timeout-minutes"] == 150
+    assert job["if"] == "github.event_name == 'workflow_dispatch' && inputs.cells != 'fresh' && inputs.cells != 'reboot'"
+    run = next(s for s in job["steps"] if s.get("name") == "Run the upgrade cell")
+    assert run["env"]["LEG"] == "${{ matrix.leg }}" and run["env"]["CELL"] == "${{ matrix.cell }}"
+    up = next(s for s in job["steps"] if s.get("uses", "").startswith("actions/upload-artifact@"))
+    assert up["with"]["name"] == "${{ matrix.artifact }}"
+    assert all(len(s["uses"].split("@")[1].split()[0]) == 40 for s in job["steps"] if "uses" in s), "pinned by sha"
+
+
+def test_both_users_of_the_distro_engine_run_the_one_script():
+    d = JUDGE.parent / "distro-docker.sh"
+    assert d.exists() and "docker.io docker-compose-v2" in d.read_text()
+    for f in ("run.sh", "upgrade.sh"):
+        t = (JUDGE.parent / f).read_text()
+        assert 'sudo bash "$HERE/distro-docker.sh"' in t, f
+        assert "apt-get install" not in t, f
+    up = (JUDGE.parent / "upgrade.sh").read_text()
+    assert up.index("step distro-docker") < up.index("step install-previous")
+    assert 'case "$LEG" in ce|distro|compose-floor)' in up
+
+
+def test_the_judge_prints_the_leg_with_the_versions_the_cell_recorded(tmp_path):
+    out = tmp_path / "out"
+    rc, got = cell(tmp_path)
+    (out / "judge" / "leg").write_text("distro\n")
+    (out / "judge" / "docker-version").write_text("29.1.3\n")
+    (out / "judge" / "compose-version").write_text("2.40.3\n")
+    env = dict(os.environ, OUT=str(out), J=str(out / "judge"), SELF=SELF, NETNS_UNIT_ENABLED="enabled",
+               ROLL_T0=ROLL_T0, STACK_T0=STACK_T0, STACK_T1=STACK_T1, NETNS_UNIT=str(tmp_path / "x.service"),
+               NETNS_UNIT_OWNER="%d:%d" % (os.getuid(), os.getgid()))
+    r = subprocess.run([sys.executable, str(JUDGE), "judge"], env=env, capture_output=True, text=True)
+    assert "UPGRADE LEG distro NOTE: docker 29.1.3, compose 2.40.3" in r.stdout.splitlines(), r.stdout
+
+
+# ── the compose-floor leg: the lowest supported Compose (2.33.x) ───────────
+import hashlib
+
+
+def _floor_script():
+    return (JUDGE.parent / "compose-floor.sh").read_text()
+
+
+def test_compose_floor_pins_url_and_sha256_and_the_judge_pin_agrees():
+    s = _floor_script()
+    assert 'COMPOSE_URL="https://github.com/docker/compose/releases/download/v2.33.1/docker-compose-linux-x86_64"' in s
+    assert 'COMPOSE_SHA256="3efda1ad6caed49dedd5644cadbf7e0c9cc3d74d8844ca5237b6a43ac1ef1a46"' in s
+    assert 'COMPOSE_VERSION="2.33.1"' in s
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("uj_floor", JUDGE)
+    m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+    assert m.COMPOSE_FLOOR_PIN == "2.33.1"
+    # verified before ANY install, and the user's and the system plugin dirs
+    assert s.index('"$COMPOSE_SHA256"') < s.index("install -D")
+    assert "/.docker/cli-plugins/docker-compose" in s and "/usr/local/lib/docker/cli-plugins" in s
+    up = (JUDGE.parent / "upgrade.sh").read_text()
+    assert 'sudo bash "$HERE/compose-floor.sh"' in up and 'ce|distro|compose-floor)' in up
+    assert up.index("step compose-floor") < up.index("step install-previous")
+
+
+def test_compose_floor_refuses_a_sha256_mismatch_and_installs_nothing(tmp_path):
+    bad = tmp_path / "bin"; bad.write_bytes(b"not compose")
+    assert hashlib.sha256(b"not compose").hexdigest() not in _floor_script()
+    env = dict(os.environ, COMPOSE_URL_OVERRIDE="file://" + str(bad), SUDO_USER=os.environ.get("USER") or "root")
+    r = subprocess.run(["bash", str(JUDGE.parent / "compose-floor.sh")], env=env, capture_output=True, text=True)
+    assert r.returncode != 0 and "sha256 mismatch" in r.stdout and "nothing installed" in r.stdout, r.stdout + r.stderr
+    assert "verified" not in r.stdout
+
+
+def _leg_lines(tmp_path, cv):
+    out = tmp_path / "out"
+    rc, got = cell(tmp_path)
+    (out / "judge" / "leg").write_text("compose-floor\n")
+    (out / "judge" / "docker-version").write_text("28.5.1\n")
+    (out / "judge" / "compose-version").write_text(cv + "\n")
+    env = dict(os.environ, OUT=str(out), J=str(out / "judge"), SELF=SELF, NETNS_UNIT_ENABLED="enabled",
+               ROLL_T0=ROLL_T0, STACK_T0=STACK_T0, STACK_T1=STACK_T1, NETNS_UNIT=str(tmp_path / "x.service"),
+               NETNS_UNIT_OWNER="%d:%d" % (os.getuid(), os.getgid()))
+    r = subprocess.run([sys.executable, str(JUDGE), "judge"], env=env, capture_output=True, text=True)
+    return r.stdout.splitlines()
+
+
+def test_compose_floor_judge_passes_2_33_1_and_fails_a_newer_plugin(tmp_path):
+    ok = _leg_lines(tmp_path / "a", "2.33.1") if (tmp_path / "a").mkdir() is None else []
+    assert "UPGRADE LEG compose-floor NOTE: docker 28.5.1, compose 2.33.1" in ok
+    assert not [l for l in ok if l.startswith("UPGRADE LEG compose-floor PIN")]
+    (tmp_path / "b").mkdir()
+    bad = _leg_lines(tmp_path / "b", "2.38.2")
+    assert "UPGRADE LEG compose-floor NOTE: docker 28.5.1, compose 2.38.2" in bad
+    assert any(l.startswith("UPGRADE LEG compose-floor PIN FAIL") and "2.38.2" in l and "2.33.1" in l for l in bad), bad

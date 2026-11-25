@@ -92,7 +92,7 @@ func TestReport_PresentAbsentExpiredMisnamed(t *testing.T) {
 	good := time.Now().Add(80 * 24 * time.Hour).Truncate(time.Second)
 	expired := time.Now().Add(-24 * time.Hour).Truncate(time.Second)
 	ca.leaf(t, dir, "vllm", []string{"vllm", "localhost", "noo-vllm", "noo-vllm-secondary"}, good)
-	ca.leaf(t, dir, "tei", []string{"tei", "localhost", "noo-stunnel-tei"}, expired)
+	ca.leaf(t, dir, "ollama", []string{"ollama", "localhost", "noo-stunnel-ollama"}, expired)
 	ca.leaf(t, dir, "llamacpp", []string{"llamacpp", "noo-llamacpp"}, good) // not the door it is dialled by
 	if err := os.MkdirAll(filepath.Join(dir, "services", "reranker"), 0o755); err != nil {
 		t.Fatal(err)
@@ -100,13 +100,15 @@ func TestReport_PresentAbsentExpiredMisnamed(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "services", "reranker", "service.crt"), []byte("garbage"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	// ollama: no leaf at all. And a non-door service the agent must ignore.
+	// A non-door service the agent must ignore, and a leftover `tei` leaf from
+	// before 0.6.30 (i1182a): TEI is no longer a door service, so it is not reported.
 	ca.leaf(t, dir, "postgres", []string{"postgres"}, good)
+	ca.leaf(t, dir, "tei", []string{"tei", "localhost", "noo-stunnel-tei"}, good)
 
 	got := NewReader().Report(dir)
 	want := map[string]Leaf{
 		"vllm":     {DNS: []string{"vllm", "localhost", "noo-vllm", "noo-vllm-secondary"}, NotAfter: good.Unix()},
-		"tei":      {DNS: []string{"tei", "localhost", "noo-stunnel-tei"}, NotAfter: expired.Unix()},
+		"ollama":   {DNS: []string{"ollama", "localhost", "noo-stunnel-ollama"}, NotAfter: expired.Unix()},
 		"llamacpp": {DNS: []string{"llamacpp", "noo-llamacpp"}, NotAfter: good.Unix()},
 	}
 	if !reflect.DeepEqual(got, want) {
@@ -122,10 +124,10 @@ func TestReport_PresentAbsentExpiredMisnamed(t *testing.T) {
 	if _, ok := wire["vllm"]["dns"].([]any); !ok {
 		t.Errorf("vllm.dns is not a list on the wire: %s", b)
 	}
-	if na, ok := wire["tei"]["not_after"].(float64); !ok || int64(na) != expired.Unix() {
-		t.Errorf("tei.not_after on the wire = %v: %s", wire["tei"]["not_after"], b)
+	if na, ok := wire["ollama"]["not_after"].(float64); !ok || int64(na) != expired.Unix() {
+		t.Errorf("ollama.not_after on the wire = %v: %s", wire["ollama"]["not_after"], b)
 	}
-	for _, absent := range []string{"ollama", "reranker", "postgres"} {
+	for _, absent := range []string{"tei", "reranker", "postgres"} {
 		if _, ok := wire[absent]; ok {
 			t.Errorf("%s must be absent from the report: %s", absent, b)
 		}

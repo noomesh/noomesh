@@ -14,7 +14,7 @@ import type { Container } from './useObservability';
  * (docker-compose.cluster.yml), and the node agent uses the same names
  * (node-agent-go/internal/docker/client.go StunnelContainerPrefix,
  * SidecarContainerFor). So `<p>-stunnel-<x>` is the door for `<p>-<x>` on the
- * same node — which also covers `noo-stunnel-tei-gpu` → `noo-tei-gpu` and
+ * same node — which also covers `noo-stunnel-ollama-embed-cpu` → `noo-ollama-embed-cpu` and
  * `noo-stunnel-ollama-embed` → `noo-ollama-embed` with no special case.
  */
 const DOOR_RE = /^(.+)-stunnel-(.+)$/;
@@ -23,11 +23,11 @@ const DOOR_RE = /^(.+)-stunnel-(.+)$/;
  * Services that are served ONLY through a sidecar door — used for one thing:
  * warning when a running backend has no door at all. Mirrors the `Sidecar`
  * column of backendDoors (node-agent-go/internal/docker/client.go) plus the
- * compose-only variants (tei-gpu, ollama-embed). vLLM terminates TLS itself
+ * compose-only variant (ollama-embed). vLLM terminates TLS itself
  * and airllm is plain by named exception, so neither is here. The grouping
  * above does not read this list.
  */
-const DOORED_SERVICES = ['llamacpp', 'ollama', 'ollama-embed', 'tei', 'tei-gpu', 'reranker'];
+const DOORED_SERVICES = ['llamacpp', 'ollama', 'ollama-embed', 'reranker'];
 
 /** `noo-stunnel-ollama` → `noo-ollama`; null for a name that is not a door. */
 export function doorBackendName(name: string): string | null {

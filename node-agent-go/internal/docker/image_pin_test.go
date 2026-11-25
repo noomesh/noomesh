@@ -27,7 +27,7 @@ func clearImageEnv(t *testing.T) {
 // or an untagged third-party ref.
 func TestBackendSpecDefaultsAreVersioned(t *testing.T) {
 	clearImageEnv(t)
-	for _, name := range []string{"vllm", "ollama", "embedding"} {
+	for _, name := range []string{"vllm", "ollama"} {
 		ref := pickBackendImage(backendSpecs[name], "", !hasNvidiaGPU())
 		if isFloatingRef(ref) {
 			t.Errorf("%s default image %q floats", name, ref)

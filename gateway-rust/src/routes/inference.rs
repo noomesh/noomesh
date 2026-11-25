@@ -278,15 +278,82 @@ async fn native_inference(
     consumer: Option<Extension<Consumer>>,
     headers: axum::http::HeaderMap,
     Json(req): Json<InferenceRequest>,
-) -> impl IntoResponse {
+) -> axum::response::Response {
+    // One id for the caller and the logs (i1178a): the caller's
+    // X-Request-Id when it is a sane token, else a fresh one; echoed on every
+    // answer and named in a 504, so a timed-out caller can find its lines.
+    let request_id = request_id_from(&headers);
+    let mut resp = native_inference_inner(state, actor, cluster, consumer, headers, req, request_id.clone()).await;
+    if let Ok(v) = axum::http::HeaderValue::from_str(&request_id) {
+        resp.headers_mut().insert("x-request-id", v);
+    }
+    resp
+}
+
+/// The caller's `X-Request-Id` when it is 1-128 chars of `[A-Za-z0-9._:-]`
+/// (it goes into logs and a header), else a fresh UUID. Pure but for the
+/// UUID.
+pub(crate) fn request_id_from(headers: &axum::http::HeaderMap) -> String {
+    headers
+        .get("x-request-id")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|v| !v.is_empty() && v.len() <= 128 && v.chars().all(|c| c.is_ascii_alphanumeric() || "._:-".contains(c)))
+        .map(str::to_string)
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
+}
+
+/// A request's `max_iterations`, within [1, limit] (the limit is
+/// `coordinator.max_iterations_limit`). Pure.
+pub(crate) fn clamp_iterations(asked: Option<u32>, default: u32, limit: u32) -> u32 {
+    asked.unwrap_or(default).clamp(1, limit.max(1))
+}
+
+/// The 504 a turn over the route's cap answers (i1178a): how far it got,
+/// the ids to find its lines, any partial answer, and the streaming route
+/// that sends progress instead of silence. Pure.
+pub(crate) fn turn_deadline_body(
+    cap_secs: u64, iterations: u32, tool_calls: u32, request_id: &str, conversation_id: &str, partial: Option<&str>,
+) -> Value {
+    let mut body = json!({
+        "success": false,
+        "code": "turn_deadline",
+        "error": format!("the turn did not finish within {cap_secs}s"),
+        "iterations": iterations,
+        "tool_calls": tool_calls,
+        "request_id": request_id,
+        "conversation_id": conversation_id,
+        "stream": "/api/inference/chat",
+        "hint": "POST /api/inference/chat runs the same turn as Server-Sent Events, with progress while it works",
+    });
+    if let Some(p) = partial.filter(|p| !p.trim().is_empty()) {
+        body["partial_response"] = json!(p);
+    }
+    body
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn native_inference_inner(
+    state: Arc<AppState>,
+    actor: Option<Extension<crate::auth::AuthActor>>,
+    cluster: Option<Extension<crate::auth::ClusterNode>>,
+    consumer: Option<Extension<Consumer>>,
+    headers: axum::http::HeaderMap,
+    req: InferenceRequest,
+    request_id: String,
+) -> axum::response::Response {
     let conversation_id = req.conversation_id
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
-    let max_iterations = req.max_iterations
-        .unwrap_or(state.config.coordinator.max_iterations);
+    let max_iterations = clamp_iterations(
+        req.max_iterations,
+        state.config.coordinator.max_iterations,
+        state.config.coordinator.max_iterations_limit,
+    );
 
     tracing::info!(
+        request_id = %request_id,
         conversation_id = %conversation_id,
         channel = %req.channel,
         prompt_len = req.prompt.len(),
@@ -511,7 +578,13 @@ async fn native_inference(
     // Non-streaming: the caller gets one final string, and there is no
     // thinking panel for reasoning to go to — on gemma-4 it came back inline
     // as a bare `thought` prefix (the MCP door's agentic tool, 2026-09-27).
-    match coordinator::run_with_thinking(
+    // The route's bound (i1178a): the loop runs under the cap (it stops
+    // itself and reports how far it got), and an outer timeout of the cap
+    // plus a grace catches what runs outside the loop (pre-retrieval, a turn
+    // dispatched to a node harness).
+    let cap = std::time::Duration::from_secs(state.config.coordinator.api_turn_secs.max(1));
+    let budget = coordinator::route_budget::RouteBudget::new(cap);
+    let turn = coordinator::route_budget::scope(budget.clone(), coordinator::run_with_thinking(
         &state,
         &req.prompt,
         &conversation_id,
@@ -520,7 +593,25 @@ async fn native_inference(
         req.model.as_deref(),
         effective_uid.as_deref(),
         false,
-    ).await {
+    ));
+    let outcome = match tokio::time::timeout(cap + std::time::Duration::from_secs(30), turn).await {
+        Ok(o) => o,
+        Err(_) => {
+            tracing::warn!(request_id = %request_id, conversation_id = %conversation_id,
+                iterations = budget.iterations(), tool_calls = budget.tool_calls(), "native_inference_turn_deadline (outer)");
+            return (StatusCode::GATEWAY_TIMEOUT, Json(turn_deadline_body(
+                cap.as_secs(), budget.iterations(), budget.tool_calls(), &request_id, &conversation_id, None,
+            ))).into_response();
+        }
+    };
+    match outcome {
+        Ok(result) if budget.deadline_stopped() => {
+            tracing::warn!(request_id = %request_id, conversation_id = %conversation_id,
+                iterations = result.iterations, tool_calls = result.tool_calls.len(), "native_inference_turn_deadline");
+            (StatusCode::GATEWAY_TIMEOUT, Json(turn_deadline_body(
+                cap.as_secs(), result.iterations, result.tool_calls.len() as u32, &request_id, &conversation_id, Some(&result.response),
+            ))).into_response()
+        }
         Ok(result) => {
 
             // Token-usage accounting — fire-and-forget.
@@ -911,7 +1002,12 @@ pub(crate) async fn node_chat_backend(state: &AppState, node_id: &str) -> NodeCh
             }
         };
         match pick_chat_backend(id, rb, &non_chat) {
-            Ok((bt, m)) => return NodeChat::Serves(bt, m, crate::node_link::NodeLink::for_ip(ip).base().to_string()),
+            Ok((bt, m)) => match crate::node_link::NodeLink::for_node_ip(id, ip) {
+                Ok(link) => return NodeChat::Serves(bt, m, link.base().to_string()),
+                // The address is another node's in the gateway's book
+                // (i1174): this node is not served at it.
+                Err(_) => continue,
+            },
             Err(served) if !served.is_empty() => {
                 let roles = crate::repo::cluster::node_running_roles(&state.db, id).await.unwrap_or_default();
                 let msg = no_chat_refusal(id, &served, &roles);
@@ -971,10 +1067,12 @@ async fn backend_node_agent_url(state: &AppState, backend_type: &str) -> Option<
             .map(|m| !m.is_empty()).unwrap_or(false);
         if !has { continue; }
 
-        let url = crate::node_link::NodeLink::for_ip(ip).base().to_string();
         // Prefer the gossip-chosen node when the KV confirms it exists and
         // actually runs this backend; otherwise take the first that does.
         let id = data.get("id").and_then(|v| v.as_str()).unwrap_or(key.as_str());
+        // By node (i1174): skipped when the address is another node's.
+        let Ok(link) = crate::node_link::NodeLink::for_node_ip(id, ip) else { continue };
+        let url = link.base().to_string();
         let host = data.get("hostname").and_then(|v| v.as_str()).unwrap_or(key.as_str());
         if preferred.as_deref() == Some(id) || preferred.as_deref() == Some(host) {
             return Some(url);
@@ -2186,7 +2284,7 @@ mod pinned_sampling_tests {
     #[test]
     fn the_raw_branch_turns_thinking_off_and_judges_the_answer() {
         let code = crate::test_src::own_code(include_str!("inference.rs"));
-        let f = crate::test_src::fn_body(&code, "async fn native_inference(");
+        let f = crate::test_src::fn_body(&code, "async fn native_inference_inner(");
         assert!(f.contains("raw_chat::chat_completions_with(") && f.contains("think_off"), "the raw branch adjusts per candidate");
         assert!(f.contains("disable_on_wire(b, \"openai\", &cand.backend, cand.backend.starts_with(\"cloud-\"))"), "every engine's switch, never a cloud's");
         assert!(f.contains("match chat_answer(&data)") && f.contains("ChatAnswer::Empty"), "empty is judged");
@@ -2325,7 +2423,7 @@ mod num_ctx_tests {
     #[test]
     fn the_pinned_and_streaming_paths_resolve_and_stamp_before_sending() {
         let code = crate::test_src::own_code(include_str!("inference.rs"));
-        let f = crate::test_src::fn_body(&code, "async fn native_inference(");
+        let f = crate::test_src::fn_body(&code, "async fn native_inference_inner(");
         let ask = f.find("crate::chat_context::num_ctx_for_node(&state, node_id, &backend_type, &model).await").expect("resolves");
         let call = f.find("chat_completion_on_node(&backend_type, &model, &base_url, &req.prompt, sampling)").expect("calls");
         assert!(ask < call, "{f}");
@@ -2341,5 +2439,72 @@ mod num_ctx_tests {
         let ask = t.find("crate::chat_context::num_ctx_for_node(state, node_id, &backend_type, &model_used).await").expect("the tool resolves");
         let call = t.find("chat_completion_on_node(&backend_type, &model_used, &base_url, &prompt, sampling)").expect("and passes it");
         assert!(ask < call, "{t}");
+    }
+}
+
+#[cfg(test)]
+mod turn_deadline_tests {
+    use super::*;
+
+    /// A caller's sane X-Request-Id is kept; anything else gets a fresh id.
+    #[test]
+    fn the_request_id_is_the_callers_when_sane_else_fresh() {
+        let mut h = axum::http::HeaderMap::new();
+        h.insert("x-request-id", "abc-123_.:Z".parse().unwrap());
+        assert_eq!(request_id_from(&h), "abc-123_.:Z");
+        for bad in ["has space", "semi;colon", &"x".repeat(129)] {
+            let mut h = axum::http::HeaderMap::new();
+            h.insert("x-request-id", bad.parse().unwrap());
+            let id = request_id_from(&h);
+            assert_ne!(id, bad);
+            assert!(uuid::Uuid::parse_str(&id).is_ok(), "{id}");
+        }
+        assert!(uuid::Uuid::parse_str(&request_id_from(&axum::http::HeaderMap::new())).is_ok());
+    }
+
+    #[test]
+    fn max_iterations_is_clamped_to_the_limit() {
+        assert_eq!(clamp_iterations(None, 10, 15), 10);
+        assert_eq!(clamp_iterations(Some(500), 10, 15), 15, "an unbounded request is clamped");
+        assert_eq!(clamp_iterations(Some(0), 10, 15), 1);
+        assert_eq!(clamp_iterations(Some(3), 10, 0), 1, "a zero limit still allows one round");
+    }
+
+    #[test]
+    fn the_504_names_how_far_the_turn_got_and_the_streaming_route() {
+        let b = turn_deadline_body(240, 4, 2, "rid", "cid", Some("half an answer"));
+        assert_eq!(b["code"], "turn_deadline");
+        assert_eq!((b["iterations"].as_u64(), b["tool_calls"].as_u64()), (Some(4), Some(2)));
+        assert_eq!((b["request_id"].as_str(), b["conversation_id"].as_str()), (Some("rid"), Some("cid")));
+        assert_eq!(b["stream"], "/api/inference/chat");
+        assert_eq!(b["partial_response"], "half an answer");
+        assert!(b["error"].as_str().unwrap().contains("240s"));
+        assert!(turn_deadline_body(240, 0, 0, "r", "c", Some("  ")).get("partial_response").is_none());
+    }
+
+    /// The route runs its turn under the budget and an outer timeout, and a
+    /// deadline-stopped turn answers 504, not the success shape.
+    #[test]
+    fn the_route_bounds_its_turn() {
+        let own = crate::test_src::own_code(include_str!("inference.rs"));
+        let body = crate::test_src::fn_body(&own, "async fn native_inference_inner(");
+        let scope = body.find("coordinator::route_budget::scope(budget.clone(), coordinator::run_with_thinking(").expect("the budget scope");
+        let outer = body.find("tokio::time::timeout(cap + std::time::Duration::from_secs(30), turn)").expect("the outer timeout");
+        let stopped = body.find("Ok(result) if budget.deadline_stopped() =>").expect("the deadline-stopped arm");
+        let ok = body.find("Ok(result) => {").expect("the success arm");
+        assert!(scope < outer && outer < stopped && stopped < ok, "scope, timeout, the 504 arm before the success arm");
+        assert!(body.contains("clamp_iterations("), "max_iterations is clamped");
+    }
+
+    /// The loop reads the route's bound in all three places.
+    #[test]
+    fn the_loop_reads_the_routes_bound() {
+        let own = crate::test_src::own_code(include_str!("../coordinator/agent_loop.rs"));
+        let ends = crate::test_src::fn_body(&own, "fn turn_ends_at<");
+        assert!(ends.contains("super::route_budget::capped(super::turn_deadline(), super::route_budget::current().map(|b| b.cap))"));
+        let budget = crate::test_src::fn_body(&own, "fn model_call_budget(");
+        assert!(budget.contains("super::route_budget::call_budget("));
+        assert_eq!(own.matches("None => bounded_tool(").count(), 2, "both loops bound their tool calls");
+        assert_eq!(own.matches("rt.execute_tool(call)").count(), 2);
     }
 }

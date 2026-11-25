@@ -156,6 +156,9 @@ fi
 CA="$PKI/ca.crt"
 [ -f "$CA" ] || { echo "noo-apply: no trusted CA at $CA — enroll this node first" >&2; NOO_REFUSAL=not_enrolled; exit 78; }
 
+# i1182a: svc-tei.crt and svc-tei.key stay in the list below for one release after TEI's removal, ACCEPTED
+# so a bundle from a 0.6.29 controller still applies, and NOT installed (no `tei` in the leaf install loop).
+# Drop the two kinds in 0.6.31.
 KNOWN_KINDS="ca.crt node.crt node.key agent-env agent-unit agent-binary teardown applier hostd-binary restart-backends host-telemetry cli-binary cli-user fetcher nats-creds fleet-secrets signing-pub harness-binary harness-env harness-unit svc-vllm.crt svc-vllm.key svc-llamacpp.crt svc-llamacpp.key svc-ollama.crt svc-ollama.key svc-tei.crt svc-tei.key svc-reranker.crt svc-reranker.key vendor-cli vendor-cli-manifest vendor-cli-2 vendor-cli-2-manifest vendor-cli-3 vendor-cli-3-manifest release-sums release-sums.sig release-version release-lock release-lock.sig netns-unit"
 
 # An add-on's node workload door leaf travels as svc-addon-<addon>-<workload>
@@ -1312,8 +1315,13 @@ fi
 
 # BEGIN harness_egress
 # Enforcement step 1: the noo-harness unit, and every vendor CLI it launches
-# (they run in its cgroup and mount namespace), reach only local and tailnet
-# addresses and cannot look up an internet name (docs/security/telemetry.md).
+# (they run in its cgroup and mount namespace), reach only loopback and the
+# controller's own addresses (the hosts of NOO_GATEWAY_URL and NATS_URL) and
+# cannot look up an internet name (docs/security/telemetry.md). Nothing else:
+# the harness resolves no name at run time (its hosts file is rendered here),
+# and its model endpoint is this node's agent on loopback. Containers it starts
+# through Docker (the jail) live in Docker's cgroup, outside this hold; the
+# jail's own network policy is their isolation.
 # Rendered here, as root, on every apply:
 #   /etc/noo/harness-net/{resolv.conf,hosts,nsswitch.conf}  what the unit sees
 #   .../noo-harness.service.d/50-noomesh-egress.conf        the drop-in
@@ -1340,11 +1348,13 @@ HE_RESOLVER_ADDR="192.0.2.53"
 # Explicit prefixes, never the symbolic `localhost`/`any`: a unit file takes
 # them, but `systemd-run -p` rejects them ("Failed to parse IP address prefix:
 # localhost", real systemd 249 and 255), and the pre-check must pass the
-# drop-in's exact lines.
-HE_BASE_ALLOW="127.0.0.1/32 ::1/128 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 fe80::/10 100.64.0.0/10 fd7a:115c:a1e0::/48"
+# drop-in's exact lines. Exactly 127.0.0.1, never 127/8: the resolver stub at
+# 127.0.0.53 stays outside. Every other allowed address is one of the
+# controller's, as a /32 or /128: no range, so no resolver, router, bridge or
+# link-local neighbour is reachable whatever answers DNS there.
+HE_LOOPBACK_ALLOW="127.0.0.1/32 ::1/128"
 HE_CHANGED=0
 HE_UNRESOLVED=""
-HE_ULA_ALLOWED=0
 
 # he_write FILE MODE SRC — install only when bytes, mode or owner differ
 # (config_unchanged); sets HE_CHANGED=1 when it wrote.
@@ -1380,9 +1390,31 @@ he_resolv_target() {
     fi
 }
 
+# he_resolv_dir — the directory the hold binds over, when the resolver file
+# lives outside /etc (systemd-resolved's /run/systemd/resolve). A bind over a
+# FILE detaches when the host replaces that file (every resolver rewrite is a
+# rename); a bind over its directory does not. Empty when the file is in /etc
+# itself (a plain /etc/resolv.conf: there is no directory to bind, and the
+# harness's self-test watches the file bind instead).
+he_resolv_dir() {
+    _he_d="$(dirname "$(he_resolv_target)")"
+    case "$_he_d" in /|"${HE_ETC_DIR:-/etc}"|"${HE_ETC_DIR:-/etc}/") printf '' ;; *) printf '%s\n' "$_he_d" ;; esac
+}
+# The names the held directory carries: the resolver file itself and the two a
+# resolver may read there. Sockets and anything else in it are hidden.
+he_resolv_dir_names() {
+    { basename "$(he_resolv_target)"; printf '%s\n' resolv.conf stub-resolv.conf; } | LC_ALL=C sort -u
+}
+
 he_props() {
-    printf '%s\n' "IPAddressDeny=0.0.0.0/0 ::/0" "IPAddressAllow=$2" \
-        "BindReadOnlyPaths=$1/resolv.conf:$(he_resolv_target)" \
+    _he_rd="$(he_resolv_dir)"
+    printf '%s\n' "IPAddressDeny=0.0.0.0/0 ::/0" "IPAddressAllow=$2" "Environment=NOO_HARNESS_EGRESS_HOLD=1"
+    if [ -n "$_he_rd" ]; then
+        printf '%s\n' "BindReadOnlyPaths=$1/resolvdir:$_he_rd"
+    else
+        printf '%s\n' "BindReadOnlyPaths=$1/resolv.conf:$(he_resolv_target)"
+    fi
+    printf '%s\n' \
         "BindReadOnlyPaths=$1/hosts:/etc/hosts" \
         "BindReadOnlyPaths=$1/nsswitch.conf:/etc/nsswitch.conf" \
         "InaccessiblePaths=-/run/systemd/resolve/io.systemd.Resolve -/run/systemd/resolve/io.systemd.Resolve.Monitor -/run/nscd -/var/run/nscd -/run/dbus/system_bus_socket -/var/run/dbus/system_bus_socket"
@@ -1481,40 +1513,9 @@ he_v4_int() {
     printf '%s\n' "$_he_o"
 }
 
-# he_covered ADDR — success when ADDR is already inside the base allowlist
-# (loopback included; fc00::/7 when HE_ULA_ALLOWED=1). IPv4-mapped IPv6
-# (::ffff:a.b.c.d, which glibc's `getent ahosts` prints for IPv4) is judged
-# as the IPv4 address.
-he_covered() {
-    _he_a="${1#::ffff:}"
-    case "$_he_a" in
-        *:*)
-            _he_l="$(printf '%s' "$_he_a" | tr 'A-F' 'a-f')"
-            case "$_he_l" in
-                ::1|fe[89ab]*:*|fd7a:115c:a1e0:*) return 0 ;;
-                fc*:*|fd*:*) [ "$HE_ULA_ALLOWED" = 1 ] && return 0 ;;
-            esac
-            return 1 ;;
-    esac
-    _he_i="$(he_v4_int "$_he_a")" || return 1
-    # base:size — 127/8, 10/8, 172.16/12, 192.168/16, 169.254/16, 100.64/10
-    for _he_r in 2130706432:16777216 167772160:16777216 2886729728:1048576 3232235520:65536 2851995648:65536 1681915904:4194304; do
-        _he_b="${_he_r%:*}"; _he_s="${_he_r#*:}"
-        if [ "$_he_i" -ge "$_he_b" ] && [ "$_he_i" -lt $((_he_b + _he_s)) ]; then return 0; fi
-    done
-    return 1
-}
-
-# he_ula_on_host — success when this host has a global IPv6 address inside
-# fc00::/7 that is not the tailnet's own (fd7a:115c:a1e0::/48 is allowed
-# already; counting it would open all of fc00::/7 on every tailnet host).
-he_ula_on_host() {
-    ip -6 -o addr 2>/dev/null | awk '/scope global/ {for (i = 1; i <= NF; i++) if ($i == "inet6") print $(i + 1)}' \
-        | sed 's#/.*##' | tr 'A-F' 'a-f' | grep -E '^f[cd]' | grep -qv '^fd7a:115c:a1e0:'
-}
-
-# he_render_hosts NAMES_FILE OUT — the hosts file. Appends the addresses
-# outside the base allowlist to $HE_EXTRA and unresolvable names to HE_UNRESOLVED.
+# he_render_hosts NAMES_FILE OUT — the hosts file. Appends every address it
+# writes to $HE_EXTRA (each becomes an allowed /32 or /128) and unresolvable
+# names to HE_UNRESOLVED.
 he_render_hosts() {
     _he_names="$(cat "$1")"
     {
@@ -1530,7 +1531,7 @@ he_render_hosts() {
             fi
             for _he_ad in $_he_addrs; do
                 printf '%s %s\n' "$_he_ad" "$_he_n"
-                he_covered "$_he_ad" || printf '%s\n' "$_he_ad" >> "$HE_EXTRA"
+                printf '%s\n' "$_he_ad" >> "$HE_EXTRA"
             done
         done
     } > "$2"
@@ -1578,32 +1579,37 @@ harness_egress_apply() {
         printf 'passwd: files\ngroup: files\nshadow: files\nhosts: files\n' > "$_he_tmp/nsswitch.conf"
     fi
     he_names > "$_he_tmp/names"
-    if he_ula_on_host; then HE_ULA_ALLOWED=1; else HE_ULA_ALLOWED=0; fi
     he_render_hosts "$_he_tmp/names" "$_he_tmp/hosts"
     # A controller URL that is a literal IPv4 address names nothing to resolve:
-    # allow the address itself when the base list does not cover it, as a name
-    # resolving to it would be.
+    # allow the address itself, as a name resolving to it would be.
     he_targets | while read -r _he_h _he_p; do
         case "$_he_h" in ""|*[!0-9.]*) continue ;; esac
         he_v4_int "$_he_h" >/dev/null || continue
-        he_covered "$_he_h" || printf '%s\n' "$_he_h"
+        printf '%s\n' "$_he_h"
     done >> "$HE_EXTRA"
+    # The held resolver directory (systemd-resolved hosts): the same held
+    # resolv.conf under every name a resolver reads there.
+    rm -rf -- "${_he_tmp:?}/resolvdir"; mkdir -m 755 "$_he_tmp/resolvdir"
+    for _he_rn in $(he_resolv_dir_names); do cp "$_he_tmp/resolv.conf" "$_he_tmp/resolvdir/$_he_rn"; done
     # The timestamp line alone is not a change: keep the installed header.
     if [ -f "$HE_NET_DIR/hosts" ] && [ "$(sed 1d "$_he_tmp/hosts")" = "$(sed 1d "$HE_NET_DIR/hosts")" ]; then
         cp "$HE_NET_DIR/hosts" "$_he_tmp/hosts"
     fi
 
-    _he_allow="$HE_BASE_ALLOW"
-    [ "$HE_ULA_ALLOWED" = 1 ] && _he_allow="$_he_allow fc00::/7"
+    _he_allow="$HE_LOOPBACK_ALLOW"
     while IFS= read -r _he_x; do
         [ -n "$_he_x" ] || continue
         case "$_he_x" in *:*) _he_allow="$_he_allow $_he_x/128" ;; *) _he_allow="$_he_allow $_he_x/32" ;; esac
     done < "$HE_EXTRA"
     # shellcheck disable=SC2086
     _he_allow="$(printf '%s\n' $_he_allow | LC_ALL=C sort -u | tr '\n' ' ' | sed 's/ *$//')"
+    # The allowed addresses, one per line, for the harness's own self-test: it
+    # asks each for DNS every minute, and an answer means not held.
+    # shellcheck disable=SC2086
+    printf '%s\n' $_he_allow | sed 's#/[0-9]*$##' > "$_he_tmp/allow"
     {
-        printf '%s\n' "# Rendered by noo-apply: the harness and every CLI it launches reach only local and tailnet" \
-            "# addresses and cannot resolve internet names (docs/security/telemetry.md)." \
+        printf '%s\n' "# Rendered by noo-apply: the harness and every CLI it launches reach only loopback and" \
+            "# the controller's addresses, and cannot resolve internet names (docs/security/telemetry.md)." \
             "[Service]"
         he_props "$HE_NET_DIR" "$_he_allow"
         printf '%s\n' "RuntimeDirectory=noo-harness" "RuntimeDirectoryMode=0755"
@@ -1615,16 +1621,24 @@ harness_egress_apply() {
     he_same "$HE_NET_DIR/hosts" 644 "$_he_tmp/hosts" || he_pending=1
     he_same "$HE_NET_DIR/nsswitch.conf" 644 "$_he_tmp/nsswitch.conf" || he_pending=1
     he_same "$HE_DROPIN" 644 "$_he_tmp/dropin" || he_pending=1
-    chmod 644 "$_he_tmp/resolv.conf" "$_he_tmp/hosts" "$_he_tmp/nsswitch.conf"
+    he_same "$HE_NET_DIR/allow" 644 "$_he_tmp/allow" || he_pending=1
+    for _he_rn in $(he_resolv_dir_names); do
+        he_same "$HE_NET_DIR/resolvdir/$_he_rn" 644 "$_he_tmp/resolvdir/$_he_rn" || he_pending=1
+    done
+    chmod 644 "$_he_tmp/resolv.conf" "$_he_tmp/hosts" "$_he_tmp/nsswitch.conf" "$_he_tmp/allow" "$_he_tmp"/resolvdir/*
     if [ "$he_pending" = 1 ]; then
         if ! _he_why="$(he_precheck "$_he_tmp" "$_he_allow")"; then
+            # Which address failed, read from the staged hosts file before the
+            # stage is removed below.
+            _he_fn="${_he_why#selfcheck-}"; _he_fn="${_he_fn%-*}"
+            _he_fa="$(awk -v n="$_he_fn" '$2 == n {print $1}' "$_he_tmp/hosts" 2>/dev/null | tr '\n' ' ' | sed 's/ *$//')"
             _he_had=0
             { [ -e "$HE_DROPIN" ] || [ -e "$HE_NET_DIR" ]; } && _he_had=1
             harness_egress_remove
             case "${_he_tmp:?}" in */noo-he-stage.??????) rm -rf -- "$_he_tmp" ;; esac
             case "$_he_why" in
                 selfcheck-unavailable) _he_how="the pre-check could not run under the hold (no systemd-run here) or answered nothing" ;;
-                *) _he_how="a controller name did not resolve or its port did not answer under the hold" ;;
+                *) _he_how="a controller name did not resolve or its port did not answer under the hold: ${_he_fn} at ${_he_fa:-$_he_fn} (allowed: $_he_allow)" ;;
             esac
             echo "noo-apply: harness-egress: the hold was NOT applied ($_he_why: $_he_how); the harness runs unrestricted and codex placements are refused" >&2
             if [ "$_he_had" = 1 ]; then need_harness_restart=1; applied="$applied harness-egress-files"; fi
@@ -1638,6 +1652,12 @@ harness_egress_apply() {
     he_write "$HE_NET_DIR/resolv.conf" 644 "$_he_tmp/resolv.conf"
     he_write "$HE_NET_DIR/hosts" 644 "$_he_tmp/hosts"
     he_write "$HE_NET_DIR/nsswitch.conf" 644 "$_he_tmp/nsswitch.conf"
+    he_write "$HE_NET_DIR/allow" 644 "$_he_tmp/allow"
+    # shellcheck disable=SC2086
+    install -d -m 755 $HE_OWNER_ARGS "$HE_NET_DIR/resolvdir"
+    for _he_rn in $(he_resolv_dir_names); do
+        he_write "$HE_NET_DIR/resolvdir/$_he_rn" 644 "$_he_tmp/resolvdir/$_he_rn"
+    done
     he_write "$HE_DROPIN" 644 "$_he_tmp/dropin"
     case "${_he_tmp:?}" in */noo-he-stage.??????) rm -rf -- "$_he_tmp" ;; esac
     if [ "$HE_CHANGED" = 1 ]; then
@@ -2004,6 +2024,162 @@ netns_unit_remove() {
 }
 # END netns_unit
 
+# BEGIN fetch_unit_timeout
+# noo-fetch.service's start timeout (i1160 risk 4). The unit is a oneshot with
+# no start timeout by default, so a hung run stayed activating and its timer
+# never fired again. prep-host writes TimeoutStartSec into the unit on a fresh
+# install; a node enrolled before that gets it here, as a fixed drop-in this
+# applier renders itself (release-listed as `applier`, i908). No kind carries
+# it and nothing in a bundle changes a byte of it:
+#   /etc/systemd/system/noo-fetch.service.d/10-timeout.conf
+# Written when absent or different (bytes, 0644, root:root), then
+# daemon-reload. Never a start, stop or restart: noo-fetch.service is the unit
+# this apply runs in.
+# A daemon-reload re-reads the unit of the RUNNING fetch too, and systemd then
+# counts the new start timeout from when that run started. So the drop-in is
+# written only while this run is younger than FETCH_RELOAD_MAX_AGE_S (an hour
+# or more is left for the rest of this apply), or when noo-fetch.service is not
+# starting at all (an apply run by hand). An older run, or one whose age cannot
+# be read, writes nothing and says so; the next run writes it. Only where
+# systemd runs and noo-fetch.service is installed. FETCH_UNIT_DIR /
+# FT_OWNER_ARGS / FT_STAT_OWNER / FT_SYSTEMD_DIR are seams for the unprivileged
+# test (tests/test_apply_fetch_unit_timeout.py).
+FETCH_UNIT_NAME=noo-fetch.service
+FETCH_UNIT_DIR="${FETCH_UNIT_DIR:-/etc/systemd/system}"
+FETCH_DROPIN_DIR="$FETCH_UNIT_DIR/$FETCH_UNIT_NAME.d"
+FETCH_DROPIN="$FETCH_DROPIN_DIR/10-timeout.conf"
+FETCH_TIMEOUT_S=7200
+FETCH_RELOAD_MAX_AGE_S=3600
+FT_OWNER_ARGS="${FT_OWNER_ARGS--o root -g root}"   # empty in tests (not root)
+FT_STAT_OWNER="${FT_STAT_OWNER-root:root}"
+
+# ft_render — the drop-in, fixed.
+ft_render() {
+    printf '%s\n' "# Written by noo-apply: a stalled bundle pull ends, and the timer runs again." \
+        "[Service]" "TimeoutStartSec=$FETCH_TIMEOUT_S"
+}
+
+# ft_same INSTALLED CANDIDATE — bytes, mode 644 and owner (config_unchanged).
+ft_same() {
+    if [ -n "$FT_STAT_OWNER" ]; then
+        config_unchanged "$2" "$1" 644 "$FT_STAT_OWNER"
+    else
+        [ -f "$1" ] && cmp -s "$2" "$1"
+    fi
+}
+
+# ft_run_age — seconds the running start of noo-fetch.service has taken; 0
+# when it is not starting; nothing when that cannot be read.
+ft_run_age() {
+    _ft_state="$(systemctl show -p ActiveState --value "$FETCH_UNIT_NAME" 2>/dev/null)" || return 0
+    [ -n "$_ft_state" ] || return 0
+    [ "$_ft_state" = activating ] || { echo 0; return 0; }
+    _ft_pid="$(systemctl show -p MainPID --value "$FETCH_UNIT_NAME" 2>/dev/null)" || return 0
+    case "$_ft_pid" in ''|*[!0-9]*|0) return 0 ;; esac
+    ps -o etimes= -p "$_ft_pid" 2>/dev/null | tr -d ' ' || true
+}
+
+# fetch_unit_timeout_apply — write the drop-in when absent or different, then
+# daemon-reload. Never fails the apply.
+fetch_unit_timeout_apply() {
+    [ -d "${FT_SYSTEMD_DIR:-/run/systemd/system}" ] || return 0
+    [ -f "$FETCH_UNIT_DIR/$FETCH_UNIT_NAME" ] || return 0
+    _ft_tmp="$(mktemp)"
+    ft_render > "$_ft_tmp"
+    if ft_same "$FETCH_DROPIN" "$_ft_tmp"; then
+        rm -f -- "$_ft_tmp"
+        return 0
+    fi
+    _ft_age="$(ft_run_age)"
+    case "$_ft_age" in
+        ''|*[!0-9]*)
+            rm -f -- "$_ft_tmp"
+            echo "noo-apply: noo-fetch unit: start timeout not set yet (this run's age cannot be read, and a reload would time it); the next run sets it"
+            return 0 ;;
+    esac
+    if [ "$_ft_age" -ge "$FETCH_RELOAD_MAX_AGE_S" ]; then
+        rm -f -- "$_ft_tmp"
+        echo "noo-apply: noo-fetch unit: start timeout not set yet (this run started ${_ft_age} s ago, and a reload would time it); the next run sets it"
+        return 0
+    fi
+    # shellcheck disable=SC2086
+    if ! install -d -m 755 $FT_OWNER_ARGS "$FETCH_DROPIN_DIR" \
+        || ! install -m 644 $FT_OWNER_ARGS "$_ft_tmp" "$FETCH_DROPIN"; then
+        rm -f -- "$_ft_tmp"
+        echo "noo-apply: noo-fetch unit: could not write $FETCH_DROPIN; the start timeout is not set" >&2
+        return 0
+    fi
+    rm -f -- "$_ft_tmp"
+    systemctl daemon-reload 2>/dev/null || true
+    echo "noo-apply: noo-fetch unit: start timeout set ($FETCH_TIMEOUT_S s)"
+    logger -t noo-apply "noo-fetch unit: start timeout set ($FETCH_TIMEOUT_S s)" 2>/dev/null || true
+}
+# END fetch_unit_timeout
+
+# BEGIN addons_unit_bounds
+# noo-addons-after-boot.service's bounds (i1160 risk 7), for a controller whose
+# onboard wrote that unit before them. `noo onboard` writes the unit (only on a
+# controller, at /etc/systemd/system); a fresh one carries the same lines. As
+# a oneshot WantedBy=multi-user.target with the service defaults, it held
+# multi-user.target for its whole run, with no start timeout. The controller's
+# self node runs this applier, so the applier renders a FIXED drop-in itself
+# (no kind carries it, nothing in a bundle changes a byte of it):
+#   /etc/systemd/system/noo-addons-after-boot.service.d/10-bounds.conf
+# Its [Unit] lines set DefaultDependencies=no and restore a service's other
+# defaults by hand; its [Service] line bounds the run. Drop-ins merge into the
+# unit before systemd adds default dependencies, so the drop-in alone makes an
+# old unit equal to the new one. Written whenever it is absent or different,
+# whatever the unit already says (bytes, 0644, root:root), then daemon-reload.
+# Never a start, stop or restart: the unit runs once per boot. Only where
+# systemd runs and the unit is installed. AB_UNIT_DIR / AB_OWNER_ARGS /
+# AB_STAT_OWNER / AB_SYSTEMD_DIR are seams for the unprivileged test
+# (tests/test_apply_addons_unit_bounds.py).
+AB_UNIT_NAME=noo-addons-after-boot.service
+AB_UNIT_DIR="${AB_UNIT_DIR:-/etc/systemd/system}"
+AB_DROPIN_DIR="$AB_UNIT_DIR/$AB_UNIT_NAME.d"
+AB_DROPIN="$AB_DROPIN_DIR/10-bounds.conf"
+AB_TIMEOUT_S=3600
+AB_OWNER_ARGS="${AB_OWNER_ARGS--o root -g root}"   # empty in tests (not root)
+AB_STAT_OWNER="${AB_STAT_OWNER-root:root}"
+
+# ab_render — the drop-in, fixed.
+ab_render() {
+    printf '%s\n' "# Written by noo-apply: the boot does not wait for add-on starts, and a stalled start ends." \
+        "[Unit]" "DefaultDependencies=no" "Requires=sysinit.target" "After=sysinit.target basic.target" \
+        "Conflicts=shutdown.target" "Before=shutdown.target" "" \
+        "[Service]" "TimeoutStartSec=$AB_TIMEOUT_S"
+}
+
+# addons_unit_bounds_apply — write the drop-in when absent or different, then
+# daemon-reload. Never fails the apply.
+addons_unit_bounds_apply() {
+    [ -d "${AB_SYSTEMD_DIR:-/run/systemd/system}" ] || return 0
+    [ -f "$AB_UNIT_DIR/$AB_UNIT_NAME" ] || return 0
+    _ab_tmp="$(mktemp)"
+    ab_render > "$_ab_tmp"
+    if [ -n "$AB_STAT_OWNER" ]; then
+        if config_unchanged "$_ab_tmp" "$AB_DROPIN" 644 "$AB_STAT_OWNER"; then
+            rm -f -- "$_ab_tmp"
+            return 0
+        fi
+    elif [ -f "$AB_DROPIN" ] && cmp -s "$_ab_tmp" "$AB_DROPIN"; then
+        rm -f -- "$_ab_tmp"
+        return 0
+    fi
+    # shellcheck disable=SC2086
+    if ! install -d -m 755 $AB_OWNER_ARGS "$AB_DROPIN_DIR" \
+        || ! install -m 644 $AB_OWNER_ARGS "$_ab_tmp" "$AB_DROPIN"; then
+        rm -f -- "$_ab_tmp"
+        echo "noo-apply: noo-addons-after-boot unit: could not write $AB_DROPIN; its bounds are not set" >&2
+        return 0
+    fi
+    rm -f -- "$_ab_tmp"
+    systemctl daemon-reload 2>/dev/null || true
+    echo "noo-apply: noo-addons-after-boot unit: bounds set (start timeout $AB_TIMEOUT_S s; multi-user.target does not wait)"
+    logger -t noo-apply "noo-addons-after-boot unit: bounds set (start timeout $AB_TIMEOUT_S s)" 2>/dev/null || true
+}
+# END addons_unit_bounds
+
 # ── teardown — the graceful, controller-initiated node destroy ─────────────
 # A signed `teardown` kind means "return this node to never-met-the-fleet".
 # It runs the local de-enroll — but that script deletes noo-apply itself,
@@ -2119,7 +2295,48 @@ done
 # reconciler re-checks the door every tick and starts the backend once its
 # leaf is here; a RUNNING door keeps the leaf it started with until its
 # backend is next recreated.
-for _svc in vllm llamacpp ollama tei reranker; do
+# The TEI engine was removed in 0.6.30. An older controller's bundle may still
+# carry svc-tei.*: it is accepted and installs nothing. A 0.6.29 install left
+# its own leaf behind, so this applier removes exactly that leaf, on every
+# apply, bundle or no bundle. Targets are the four paths below and nothing
+# else: no glob, no `rm -r`. A symlinked directory, a symlinked or
+# non-regular file, and any other file in the directory are left alone and
+# reported; the directory is `rmdir`-ed only once it is empty.
+# BEGIN retired_tei_leaf
+if [ -f "$WORK/files/svc-tei.crt" ] || [ -f "$WORK/files/svc-tei.key" ]; then
+    echo "noo-apply: svc-tei (the TEI engine was removed in 0.6.30) is accepted from an older controller's bundle and not installed"
+fi
+for _rt in tei tei-gpu; do
+    _rd="$PKI/services/$_rt"
+    [ -e "$_rd" ] || [ -L "$_rd" ] || continue
+    if [ -L "$_rd" ]; then
+        echo "noo-apply: $_rd is a symlink — left alone (retired TEI leaf not removed)" >&2
+        continue
+    fi
+    for _rf in service.key service.crt; do
+        _rp="$_rd/$_rf"
+        [ -e "$_rp" ] || [ -L "$_rp" ] || continue
+        if [ -f "$_rp" ] && [ ! -L "$_rp" ]; then
+            if rm -f "$_rp"; then
+                echo "noo-apply: removed retired TEI leaf $_rp"
+                applied="$applied retired-tei-leaf-removed=services/$_rt/$_rf"
+            else
+                echo "noo-apply: could not remove retired TEI leaf $_rp" >&2
+            fi
+        else
+            echo "noo-apply: $_rp is a symlink or not a regular file — left alone" >&2
+        fi
+    done
+    if [ -d "$_rd" ]; then
+        if rmdir "$_rd" 2>/dev/null; then
+            echo "noo-apply: removed empty retired TEI directory $_rd"
+        else
+            echo "noo-apply: $_rd still holds other files — left alone" >&2
+        fi
+    fi
+done
+# END retired_tei_leaf
+for _svc in vllm llamacpp ollama reranker; do
     _c="$WORK/files/svc-$_svc.crt"; _k="$WORK/files/svc-$_svc.key"
     [ -f "$_c" ] || [ -f "$_k" ] || continue
     [ -f "$_c" ] && [ -f "$_k" ] || { echo "noo-apply: svc-$_svc carries half a leaf (cert and key travel together) — refusing" >&2; NOO_REFUSAL=service_leaf_invalid; exit 65; }
@@ -3267,9 +3484,17 @@ echo "verified-by: $SIG_VIA"
 # operator reading the controller's copy of this report (`noo cluster
 # provision <node> --wait`) sees the lane's state from the applier itself.
 echo "ca-lane: retired"
+# noo-fetch.service's start timeout, for nodes enrolled before prep-host wrote
+# it (see fetch_unit_timeout). After every install and the floor: it never
+# changes what this apply did.
+fetch_unit_timeout_apply
+# noo-addons-after-boot.service's bounds, for a controller onboarded before
+# them (see addons_unit_bounds). Same place, same reason.
+addons_unit_bounds_apply
 
 
 # ── 4. Orchestrate — the agent must LOAD what changed ─────
+# BEGIN harness_restart (tests/ci/harness-egress-systemd.sh runs this block)
 [ "$need_daemon_reload" = 1 ] && systemctl daemon-reload
 # The harness is restarted only if it is RUNNING: a placement the agent has
 # not made (or has withdrawn) must not be started by a config refresh.
@@ -3277,6 +3502,7 @@ if [ "${need_harness_restart:-0}" = 1 ] && systemctl is-active --quiet noo-harne
     systemctl restart noo-harness
     applied="$applied (harness restarted)"
 fi
+# END harness_restart
 if [ "$fresh_unit" = 1 ]; then
     # First install on this host: the old containerised agent may still hold
     # :8081, and a unit that cannot bind restarts forever while the container

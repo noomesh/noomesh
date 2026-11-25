@@ -56,7 +56,7 @@ def _local_gateway_url() -> str:
 def _default_url(service: str) -> str:
     """Return the default internal URL of a controller-local backend: https.
 
-    Ollama, TEI and llama.cpp have no TLS listener of their own, so their
+    Ollama and llama.cpp have no TLS listener of their own, so their
     doors are the stunnel sidecars (client certificate required, #538);
     vLLM serves HTTPS natively and requires a client certificate too. The
     plain ``http://noo-<svc>`` forms that ``NOO_TLS_CA`` used to select are
@@ -67,7 +67,6 @@ def _default_url(service: str) -> str:
     _p = BACKEND_PORTS  # shorthand
     urls = {
         "ollama":   f"https://stunnel-ollama:{_p['ollama']}",
-        "tei":      "https://stunnel-tei:443",
         "vllm":     f"https://noo-vllm:{_p['vllm']}",
         # llama-server has no TLS listener: the door is its stunnel sidecar
         # (client certificate required), same port.
@@ -87,14 +86,14 @@ def get_node_agent_url(node) -> str:
 def get_backend_url(node, backend: str, port: int) -> str:
     """Get the URL to reach a backend on a node.
 
-    For local nodes, Docker-managed backends (vLLM, llamacpp, tei, embedding)
+    For local nodes, Docker-managed backends (vLLM, llamacpp)
     are reached via their Docker service/container name on the shared
     ``noo-cluster`` network.  Host-native backends (Ollama) are reached via
     ``host.docker.internal`` so the gateway container can traverse the Docker
     bridge.  Remote nodes always use their IP address.
 
     Always https. vLLM serves TLS natively (client certificate required);
-    the backends that cannot (Ollama, TEI, llama.cpp) are routed to their
+    the backends that cannot (Ollama, llama.cpp) are routed to their
     stunnel sidecar's name. The plain ``noo-<svc>`` forms that ``NOO_TLS_CA``
     used to select are gone with the gateway's plaintext listener:
     no such door answers, and the gateway cannot run
@@ -105,17 +104,12 @@ def get_backend_url(node, backend: str, port: int) -> str:
         "vllm": "noo-vllm",
         "llamacpp": "noo-stunnel-llamacpp",
         "ollama": "stunnel-ollama",
-        "embedding": "stunnel-tei",
-        "tei": "stunnel-tei",
     }
 
     is_local = node.agent_url and "node-agent" in node.agent_url
     if is_local:
         service = _DOCKER_SERVICE_NAMES.get(backend)
         if service:
-            # TEI stunnel listens on 443, not the backend's native port
-            if backend in ("embedding", "tei"):
-                return f"https://{service}:443"
             return f"https://{service}:{port}"
         # Unknown backend — fall back to host bridge
         return f"https://host.docker.internal:{port}"

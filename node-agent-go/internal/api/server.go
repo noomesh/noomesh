@@ -389,14 +389,14 @@ func (s *Server) registerRoutes() {
 	s.mux.Handle("GET /backend-alive/{backend}", ctrlMW(http.HandlerFunc(s.handleBackendAlive)))
 	s.mux.Handle("GET /v1/models", modelMW(http.HandlerFunc(s.handleListModels)))
 
-	// Rerank proxy — forwards to this node's local reranker (TEI cross-encoder
-	// or llama-server --reranking; the proxy translates request/response shape).
+	// Rerank proxy — forwards to this node's local reranker (llama-server
+	// --reranking; the proxy translates request/response shape).
 	// Lets the gateway mesh-route /api/external/rerank by NODE without exposing
 	// the reranker on the host. See handleRerankProxy in inference_proxy.go.
 	s.mux.Handle("POST /rerank", ctrlMW(http.HandlerFunc(s.handleRerankProxy)))
 	s.mux.Handle("POST /v1/rerank", ctrlMW(http.HandlerFunc(s.handleRerankProxy)))
 
-	// Embed proxy — forwards to this node's local embedding container (TEI)
+	// Embed proxy — forwards to this node's local embedding container
 	// in OpenAI /v1/embeddings shape. Lets the gateway mesh-route embeddings
 	// by NODE (capability `embed`) without exposing the embedder on the host.
 	// Distinct from POST /v1/embeddings above, which targets LLM backends.
@@ -451,7 +451,7 @@ func (s *Server) ListenAndServe() error {
 			return err
 		}
 		server := &http.Server{
-			Handler:   s.mux,
+			Handler:   auth.TargetNode(s.cfg)(s.mux),
 			ErrorLog:  log.New(quietTLSLogger{}, "", 0),
 			TLSConfig: tlsCfg,
 		}
@@ -504,7 +504,7 @@ func (s *Server) ListenAndServeWithTLS(tlsCfg *tls.Config) error {
 	addr := fmt.Sprintf(":%d", port)
 	server := &http.Server{
 		Addr:      addr,
-		Handler:   s.mux,
+		Handler:   auth.TargetNode(s.cfg)(s.mux),
 		TLSConfig: tlsCfg,
 	}
 	slog.Info("control API starting with TLS", "addr", addr)

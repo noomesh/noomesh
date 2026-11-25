@@ -228,6 +228,8 @@ def parse_log_line(line: str) -> dict | None:
             return None
         out = {k: _debug_value(v) for k, v in fields.items() if k != "message"}
         out["event"] = msg
+        if isinstance(obj.get("timestamp"), str):
+            out["_ts"] = obj["timestamp"]
         return out
     m = re.search(r":\s(%s)\b" % "|".join(EVENTS), line)
     if not m:
@@ -281,13 +283,96 @@ def with_auth_reason(error: str | None, facts: dict) -> str | None:
     return f"{error} [gateway reason: {'; '.join(why)}]"
 
 
-def log_facts(lines: list[str] | None) -> dict:
+# The gateway's turn-loop lines (loop.*, coordinator.*), kept per turn so a
+# turn that stops can be placed (which iteration, after which tool, a nudge, a
+# stall). Only these fields: the evidence is uploaded, and a body field
+# (prompt, answer, tool output) never is.
+LOOP_EVENT = re.compile(r"^(loop|coordinator)\.")
+LOOP_FIELDS = ("iteration", "tool", "has_rag", "called", "reason", "kind", "attempt", "attempts", "elapsed_ms",
+               "ms", "phase", "stage", "model", "backend", "count", "tier", "nudge", "cause", "outcome", "status",
+               "stream", "stalled_s", "budget", "remaining", "max_iterations", "step")
+
+
+def loop_lines(ev: list[dict]) -> list[dict]:
+    out = []
+    for e in ev:
+        if not LOOP_EVENT.match(str(e.get("event", ""))):
+            continue
+        rec = {"event": e["event"], "ts": e.get("_ts")}
+        for k in LOOP_FIELDS:
+            if k in e:
+                v = e[k]
+                rec[k] = v if isinstance(v, (int, float, bool)) or v is None else str(v)[:120]
+        out.append(rec)
+    return out
+
+
+# Turn markers: what starts a coordinator turn in the gateway's log. A WS
+# turn (this judge's) logs only its connection; an HTTP turn its stream start
+# or its completed request. backend_call, context_injected and the loop lines
+# name no conversation, so a turn's window is attributed by time, and any
+# OTHER turn start inside it makes the window's figures unattributable.
+TURN_PATHS = ("/api/inference", "/api/inference/chat", "/v1/chat/completions",
+              "/api/external/chat/completions", "/api/agent/run")
+INJECTED_FIELDS = ("dropped", "pre_dedup_chars", "post_dedup_chars")
+
+
+# The lines that name their turn (gateway: conversation_id as the turn's
+# caller sent it, bounded to 64 chars of [A-Za-z0-9._:-]) on backend_call,
+# context_injected, request_size, coordinator.kb_tool_deferred and every loop.*
+# event. Other lines (other coordinator.*) stay the window's.
+ID_EVENTS = ("backend_call", "context_injected", "request_size", "coordinator.kb_tool_deferred")
+
+
+def carries_id(event: str) -> bool:
+    return event in ID_EVENTS or event.startswith("loop.")
+
+
+def turn_markers(ev: list[dict], cid: str | None = None) -> dict:
+    ws = sum(e["event"] == "ws_coordinator connected" for e in ev)
+    other = [f"chat stream {e.get('conversation_id', '?')}" for e in ev if e["event"] == "coordinator_chat_stream_start"]
+    other += [f"{e.get('method', '')} {e.get('path')}" for e in ev
+              if e["event"] == "request" and str(e.get("path", "")).split("?")[0] in TURN_PATHS]
+    # The gateway's own heartbeat/scheduled turns log no start line; their
+    # loop does: a tick with work due, a parallel dispatch, a run queued, or an
+    # LLM call waiting for the shared slot (the case a 300 s first answer on a
+    # one-slot CPU backend looks like).
+    hb = []
+    for e in ev:
+        n = e["event"]
+        if (n == "heartbeat_loop_tick" and (e.get("due_count") or 0) > 0) \
+                or (n == "heartbeat_loop_dispatched_parallel" and (e.get("spawned") or 0) > 0) \
+                or n in ("heartbeat_run_queued_pending_completion", "heartbeat_llm_waiting_for_slot"):
+            hb.append({k: e.get(k) for k in ("event", "_ts", "task_id", "action", "due_count", "spawned") if e.get(k) is not None})
+    if cid:
+        others = sorted({str(e["conversation_id"]) for e in ev
+                         if carries_id(e["event"]) and e.get("conversation_id") not in (None, cid)})
+        return {"by": "conversation_id", "conversation_id": cid, "other_conversations": others[:10],
+                "heartbeat": hb[:10], "overlapped": False}
+    return {"by": "time window: backend_call, context_injected and loop lines name no conversation",
+            "ws_connects": ws, "other_turn_starts": other[:10], "heartbeat": hb[:10],
+            "overlapped": ws > 1 or bool(other) or bool(hb)}
+
+
+def log_facts(lines: list[str] | None, cid: str | None = None) -> dict:
     """What a turn's gateway log says. `readable` False when the log could
-    not be read at all (every other figure is then unknown)."""
+    not be read at all (every other figure is then unknown). With the turn's
+    conversation id `cid`, and a gateway that puts conversation_id on its turn
+    lines, the turn's lines are those naming it (attribution by id); otherwise
+    the whole window, said so, with any overlap marked."""
     if lines is None:
         return {"readable": False, "request_size": [], "backend_calls": [], "cuts": 0, "too_small": 0,
-                "tiers": [], "has_tier": False, "prefill_s": None, "auth_failures": []}
+                "tiers": [], "has_tier": False, "prefill_s": None, "auth_failures": [], "loop": [],
+                "injected": [], "attribution": None}
     ev = [e for e in (parse_log_line(l) for l in lines) if e]
+    # By id only when some turn line names THIS id exactly: a gateway without
+    # the field, or one that coerces the id, keeps the window (said so).
+    by_id = bool(cid) and any(e.get("conversation_id") == cid for e in ev if carries_id(e["event"]))
+    window = ev
+    if by_id:
+        # The turn's own lines: every id-bearing line naming it; a line of the
+        # kinds that carry an id but names another turn is someone else's.
+        ev = [e for e in ev if not carries_id(e["event"]) or e.get("conversation_id") == cid]
     sizes = [e for e in ev if e["event"] == "request_size"]
     calls = [e for e in ev if e["event"] == "backend_call"]
     tiers = [str(e["tier"]) for e in sizes if e.get("tier") is not None]
@@ -297,7 +382,10 @@ def log_facts(lines: list[str] | None) -> dict:
             "too_small": sum(e["event"] == "context_too_small_for_instructions" for e in ev),
             "tiers": tiers, "has_tier": bool(tiers),
             "prefill_s": round(sum(prefills) / 1000, 3) if prefills else None,
-            "auth_failures": auth_failure_reasons(lines)}
+            "auth_failures": auth_failure_reasons(lines), "loop": loop_lines(ev),
+            "injected": [{k: v for k, v in e.items() if k.startswith("has_") or k in INJECTED_FIELDS}
+                         for e in ev if e["event"] == "context_injected"],
+            "attribution": turn_markers(window, cid if by_id else None)}
 
 
 def pick_contexts(items: list[dict], model: str | None) -> list[dict]:
@@ -550,7 +638,9 @@ def turn_record(name: str, verdict, reason: str, elapsed_s: float, facts: dict, 
             "cached": bool(done.get("cached")), "tools": [c.get("name") for c in chat.get("calls", [])],
             "approval_request": bool(chat.get("approval")), "error": chat.get("error"),
             "answer": _excerpt(chat.get("text", ""), 800), "wire": turn_wires(facts),
-            **turn_tokens(facts)}
+            "loop": facts.get("loop", []), "context_injected": facts.get("injected", []),
+            "kb_tool_deferred": sum(e.get("event") == "coordinator.kb_tool_deferred" for e in facts.get("loop", [])),
+            "attribution": facts.get("attribution"), **turn_tokens(facts)}
 
 
 def turn_tokens(facts: dict) -> dict:
@@ -561,7 +651,7 @@ def turn_tokens(facts: dict) -> dict:
     evaluated well under sent_estimate on a call that was not cut is cache
     reuse (a cut reads ctx/2 + 5 instead). Sums are null with no calls."""
     calls = [{"sent_estimate": c.get("sent_estimate"), "evaluated": c.get("evaluated"),
-              "prefill_ms": c.get("prefill_ms"), "ctx": c.get("ctx"), "wire": c.get("wire")}
+              "prefill_ms": c.get("prefill_ms"), "ctx": c.get("ctx"), "wire": c.get("wire"), "ts": c.get("_ts")}
              for c in facts.get("backend_calls", [])]
 
     def total(k):
@@ -656,9 +746,11 @@ def ws_frame(text: str) -> bytes:
     return head + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
 
 
-def chat_turn(prompt: str, base: str, timeout: float = 300) -> dict:
-    """One turn on /ws/coordinator, a fresh conversation (no conversation_id),
-    as ws_chat.ask does, keeping the frames a judge needs."""
+def chat_turn(prompt: str, base: str, timeout: float = 300, conversation_id: str = "") -> dict:
+    """One turn on /ws/coordinator, a fresh conversation, keeping the frames a
+    judge needs. `conversation_id` (a new random id per turn) is the id the gateway
+    then uses for the turn (ws_coordinator: empty means it makes one), so the
+    turn's gateway lines can be attributed by id."""
     import ssl
     ws = _load("ws_chat")
     out = {"text": "", "calls": [], "approval": False, "done": None, "error": None}
@@ -677,7 +769,10 @@ def chat_turn(prompt: str, base: str, timeout: float = 300) -> dict:
             head += ws.read_exact(s, 1)
         if b" 101 " not in head.split(b"\r\n", 1)[0]:
             raise RuntimeError("handshake refused: " + head.split(b"\r\n", 1)[0].decode(errors="replace"))
-        s.sendall(ws_frame(json.dumps({"prompt": prompt})))
+        msg = {"prompt": prompt}
+        if conversation_id:
+            msg["conversation_id"] = conversation_id
+        s.sendall(ws_frame(json.dumps(msg)))
         s.settimeout(60)
         end = time.time() + timeout
         while time.time() < end:
@@ -739,10 +834,11 @@ def gateway_log(since: float, until: float) -> list[str] | None:
 
 def timed_turn(prompt: str, base: str, timeout: float) -> tuple[dict, dict, float]:
     t0 = time.time()
-    chat = chat_turn(prompt, base, timeout)
+    cid = "cf-" + os.urandom(16).hex()
+    chat = chat_turn(prompt, base, timeout, cid)
     t1 = time.time()
     time.sleep(1)  # the turn's last lines reach docker's log
-    facts = log_facts(gateway_log(t0 - 0.5, t1))
+    facts = log_facts(gateway_log(t0 - 0.5, t1), cid)
     chat["error"] = with_auth_reason(chat.get("error"), facts)
     return chat, facts, t1 - t0
 

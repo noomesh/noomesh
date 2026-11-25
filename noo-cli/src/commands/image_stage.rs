@@ -70,7 +70,7 @@ pub(crate) const CONTROLLER_ONLY: &[&str] = &[
 /// for every architecture would slow every roll. A node that needs one is
 /// staged by name (`noo cluster sync-images <node> -i <image>`).
 pub(crate) const THIRD_PARTY_LOCK_ROWS: &[&str] = &[
-    "nats", "nginx", "redis", "loki", "tempo", "prometheus", "alertmanager", "grafana", "node-exporter", "tei", "tei-cpu", "vllm",
+    "nats", "nginx", "redis", "loki", "tempo", "prometheus", "alertmanager", "grafana", "node-exporter", "vllm",
 ];
 
 /// Lock rows that pin an ARTIFACT image: files the CLI unpacks with `docker
@@ -855,9 +855,184 @@ pub(crate) fn stage_image(g: &Globals, image: &str, arch: &str, lock_digest: Opt
 }
 
 /// Ask the gateway for the tar's manifest once, with a long timeout, so it
-/// hashes now (multi-GB) rather than inside a node's 15 s probe.
+/// hashes now (multi-GB) rather than inside a node's 15 s probe. One kick, the
+/// answer ignored: a 202 is not "ready" (see [`warm_release_tars`], which
+/// waits for the 200 on the gateway a roll leaves running).
 pub(crate) fn prewarm(g: &Globals, tar: &str) {
     let _ = crate::http::get_json_opt(g, &format!("/api/artifacts/manifest/image/{}", crate::commands::urlencode(tar)), true, 900);
+}
+
+/// What one ask of the manifest route means to a caller that waits for it.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub(crate) enum WarmStep {
+    /// 200: the gateway holds the digest.
+    Ready,
+    /// 202 "hashing": ask again in this many seconds.
+    Wait(u64),
+    /// Anything else (no answer, 404, 5xx): waiting will not change it.
+    GiveUp,
+}
+
+/// Each sleep between asks never exceeds this, whatever the gateway says.
+pub(crate) const WARM_MAX_SLEEP_SECS: u64 = 15;
+/// The roll's total wait for every staged tar's digest (multi-GB on a busy
+/// disk); the roll goes on past it and the nodes' own retries cope.
+pub(crate) const WARM_BUDGET_SECS: u64 = 20 * 60;
+/// Seconds between progress lines for one tar.
+const WARM_PROGRESS_EVERY_SECS: u64 = 60;
+
+/// Read one manifest answer: `(status, body)` as [`crate::http::get_raw_opt`]
+/// returns it. A 202 carries `retry_after_secs` in its body (default 5).
+pub(crate) fn warm_step(answer: Option<(u16, String)>) -> WarmStep {
+    match answer {
+        Some((200, _)) => WarmStep::Ready,
+        Some((202, body)) => {
+            let secs = serde_json::from_str::<serde_json::Value>(&body)
+                .ok()
+                .and_then(|v| v.get("retry_after_secs").and_then(|n| n.as_u64()))
+                .filter(|n| *n > 0)
+                .unwrap_or(5);
+            WarmStep::Wait(secs.min(WARM_MAX_SLEEP_SECS))
+        }
+        _ => WarmStep::GiveUp,
+    }
+}
+
+/// How a wait for one tar's digest ended.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub(crate) enum Warmed {
+    Ready,
+    /// The gateway answered something other than 200/202 (or nothing).
+    GaveUp,
+    /// Still hashing when the budget ran out.
+    TimedOut,
+}
+
+/// Ask until the gateway answers 200, sleeping what each 202 says, until
+/// `elapsed()` plus the next sleep would pass `budget_secs`. The ask, the
+/// sleep, the clock and the progress line are injected, so a test never
+/// sleeps. `progress(elapsed)` is called on the first wait and then at most
+/// once per [`WARM_PROGRESS_EVERY_SECS`].
+pub(crate) fn warm_until(
+    budget_secs: u64,
+    mut ask: impl FnMut() -> Option<(u16, String)>,
+    mut sleep: impl FnMut(u64),
+    mut elapsed: impl FnMut() -> u64,
+    mut progress: impl FnMut(u64),
+) -> Warmed {
+    let mut last_said: Option<u64> = None;
+    loop {
+        match warm_step(ask()) {
+            WarmStep::Ready => return Warmed::Ready,
+            WarmStep::GiveUp => return Warmed::GaveUp,
+            WarmStep::Wait(n) => {
+                let e = elapsed();
+                if e + n > budget_secs {
+                    return Warmed::TimedOut;
+                }
+                if match last_said { None => true, Some(l) => e >= l + WARM_PROGRESS_EVERY_SECS } {
+                    progress(e);
+                    last_said = Some(e);
+                }
+                sleep(n);
+            }
+        }
+    }
+}
+
+/// `1.3 GB` / `420.0 MB` for the progress line.
+fn size_label(bytes: u64) -> String {
+    if bytes >= 1_000_000_000 {
+        format!("{:.1} GB", bytes as f64 / 1e9)
+    } else {
+        format!("{:.1} MB", bytes as f64 / 1e6)
+    }
+}
+
+/// Wait until the gateway that is serving NOW has hashed `tar`, printing
+/// "hashing <tar> on the controller (<size>)… <n>s" while it does. `started`
+/// is when the whole warm began, so the budget is shared by every tar.
+fn warm_wait(g: &Globals, tar: &str, started: std::time::Instant, budget_secs: u64) -> Warmed {
+    let path = format!("/api/artifacts/manifest/image/{}", crate::commands::urlencode(tar));
+    let size = std::fs::metadata(images_store_dir().join(tar)).map(|m| size_label(m.len())).unwrap_or_else(|_| "size unknown".to_string());
+    warm_until(
+        budget_secs,
+        || crate::http::get_raw_opt(g, &path, true, 900),
+        |n| std::thread::sleep(std::time::Duration::from_secs(n)),
+        || started.elapsed().as_secs(),
+        |e| {
+            if !g.json {
+                ui::step(&format!("hashing {tar} on the controller ({size})\u{2026} {e}s"));
+            }
+        },
+    )
+}
+
+/// The tars this release's lock staged: its own rows and the door pins.
+pub(crate) fn release_tars(idx: &StagedIndex, tag: &str) -> Vec<String> {
+    let mut tars: Vec<String> = idx
+        .images
+        .iter()
+        .filter(|r| r.release_tag == tag || r.source == DOOR_PIN_SOURCE)
+        .map(|r| r.tar.clone())
+        .collect();
+    tars.sort();
+    tars.dedup();
+    tars
+}
+
+/// After the NEW gateway is up and before any node is rolled: wait until it
+/// has hashed every tar this release staged. The hash lives in the gateway's
+/// process, so the pre-launch pre-warm (against the gateway the roll is about
+/// to replace) is lost with it, and the first node to ask would get "still
+/// hashing" for its pinned image (i1167a). Never fails the roll: past the
+/// budget it warns and the nodes' own retries take over.
+pub(crate) fn warm_release_tars(g: &Globals, tag: &str) {
+    warm_release_tars_within(g, tag, WARM_BUDGET_SECS);
+}
+
+/// The release tag the lock's rows were staged under: the lock's own
+/// `# tag` line, as `stage_lock` records it (via `lock_release`), else
+/// NOO_IMAGE_TAG. Never fails: a missing lock falls back, so the roll goes on.
+pub(crate) fn staged_release_tag() -> String {
+    match std::fs::read_to_string(crate::envfile::repo_root().join("stack.lock")) {
+        Ok(l) => lock_release(l).2,
+        Err(_) => crate::commands::provision::release_var("NOO_IMAGE_TAG"),
+    }
+}
+
+pub(crate) fn warm_release_tars_within(g: &Globals, tag: &str, budget_secs: u64) {
+    let tars = release_tars(&read_index(&images_store_dir()), tag);
+    if tars.is_empty() {
+        // Said, not silent: a tag that matches no staged row would otherwise
+        // skip the wait without a word.
+        if !g.json {
+            crate::ui::step(&format!("no staged image tar is recorded under release {tag}; nothing to wait for"));
+        }
+        return;
+    }
+    let started = std::time::Instant::now();
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let timed_out: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    let workers = tars.len().min(4);
+    std::thread::scope(|sc| {
+        for _ in 0..workers {
+            sc.spawn(|| loop {
+                let i = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let Some(tar) = tars.get(i) else { break };
+                if warm_wait(g, tar, started, budget_secs) == Warmed::TimedOut {
+                    timed_out.lock().unwrap_or_else(|e| e.into_inner()).push(tar.clone());
+                }
+            });
+        }
+    });
+    let late = timed_out.into_inner().unwrap_or_else(|e| e.into_inner());
+    if !late.is_empty() && !g.json {
+        ui::warned(&format!(
+            "the controller is still hashing {} after {} min; the roll continues, and each node retries until the controller has it (its running image keeps serving)",
+            late.join(", "), budget_secs / 60
+        ));
+    }
 }
 
 /// Stage one image for one arch end to end (pull, export, index, pre-warm).
@@ -2378,5 +2553,107 @@ gateway@{D}
         let cluster = crate::test_src::own_code(include_str!("cluster.rs"));
         assert!(cluster.contains("image_stage::stage_and_record(g, &img, &arch, \"place\")"));
         assert!(!cluster.contains("image_stage::stage_image(") && !sync.contains("image_stage::stage_image("), "no by-name stage around it");
+    }
+}
+
+/// i1167a: the roll's pre-warm asked the gateway it was about to replace and
+/// took a 202 "hashing" for done. The wait is a pure loop over the answers.
+#[cfg(test)]
+mod warm_tests {
+    use super::*;
+    use std::cell::Cell;
+    use std::collections::VecDeque;
+
+    fn hashing(secs: u64) -> Option<(u16, String)> {
+        Some((202, format!("{{\"status\":\"hashing\",\"retry_after_secs\":{secs}}}")))
+    }
+    fn ready() -> Option<(u16, String)> {
+        Some((200, "{\"sha256\":\"x\"}".to_string()))
+    }
+
+    /// Run `warm_until` over `answers` on a fake clock; returns the verdict,
+    /// the sleeps taken and the progress lines.
+    fn run(answers: Vec<Option<(u16, String)>>, budget: u64) -> (Warmed, Vec<u64>, Vec<u64>) {
+        let mut q: VecDeque<_> = answers.into();
+        let clock = Cell::new(0u64);
+        let sleeps = std::cell::RefCell::new(Vec::new());
+        let said = std::cell::RefCell::new(Vec::new());
+        let verdict = warm_until(
+            budget,
+            || q.pop_front().unwrap_or(None),
+            |n| {
+                sleeps.borrow_mut().push(n);
+                clock.set(clock.get() + n);
+            },
+            || clock.get(),
+            |e| said.borrow_mut().push(e),
+        );
+        (verdict, sleeps.into_inner(), said.into_inner())
+    }
+
+    #[test]
+    fn a_202_is_not_done_the_loop_waits_for_the_200() {
+        let (v, sleeps, said) = run(vec![hashing(5), hashing(5), ready()], 1200);
+        assert_eq!(v, Warmed::Ready);
+        assert_eq!(sleeps, vec![5, 5], "slept after each 202, not after the 200");
+        assert_eq!(said, vec![0], "one progress line inside a minute");
+    }
+
+    #[test]
+    fn a_200_first_asks_once_and_says_nothing() {
+        let (v, sleeps, said) = run(vec![ready()], 1200);
+        assert_eq!((v, sleeps.len(), said.len()), (Warmed::Ready, 0, 0));
+    }
+
+    #[test]
+    fn each_sleep_honours_retry_after_and_is_capped() {
+        assert_eq!(warm_step(hashing(7)), WarmStep::Wait(7));
+        assert_eq!(warm_step(hashing(600)), WarmStep::Wait(WARM_MAX_SLEEP_SECS));
+        assert_eq!(warm_step(Some((202, "not json".into()))), WarmStep::Wait(5), "default without a body");
+        assert_eq!(warm_step(hashing(0)), WarmStep::Wait(5), "zero is not a spin");
+    }
+
+    #[test]
+    fn the_budget_running_out_ends_the_wait_and_says_so() {
+        let answers = std::iter::repeat_with(|| hashing(15)).take(100).collect();
+        let (v, sleeps, said) = run(answers, 60);
+        assert_eq!(v, Warmed::TimedOut);
+        assert_eq!(sleeps.iter().sum::<u64>(), 60, "slept to the budget, never past it");
+        assert_eq!(said, vec![0], "progress lines are spaced a minute apart");
+    }
+
+    #[test]
+    fn progress_repeats_once_a_minute() {
+        let answers = std::iter::repeat_with(|| hashing(15)).take(10).chain(std::iter::once(ready())).collect();
+        let (v, _, said) = run(answers, 1200);
+        assert_eq!(v, Warmed::Ready);
+        assert_eq!(said, vec![0, 60, 120]);
+    }
+
+    #[test]
+    fn an_answer_that_is_neither_200_nor_202_gives_up_without_waiting() {
+        for a in [None, Some((404u16, String::new())), Some((502, String::new())), Some((409, "refused".to_string()))] {
+            let (v, sleeps, _) = run(vec![a.clone()], 1200);
+            assert_eq!((v, sleeps.len()), (Warmed::GaveUp, 0), "{a:?}");
+        }
+    }
+
+    #[test]
+    fn the_release_tars_are_its_lock_rows_and_the_door_pins() {
+        let rec = |tar: &str, tag: &str, source: &str| StagedRecord {
+            image: format!("r/{tar}"), arch: "amd64".into(), tar: tar.into(), image_id: String::new(),
+            lock_digest: String::new(), source: source.into(), release_tag: tag.into(), staged_at: 0, unpacked_bytes: None,
+        };
+        let idx = StagedIndex {
+            images: vec![
+                rec("a.tar.gz", "v2", "lock"),
+                rec("a.tar.gz", "v2", "lock"),
+                rec("old.tar.gz", "v1", "lock"),
+                rec("door.tar.gz", "v0", DOOR_PIN_SOURCE),
+                rec("byname.tar.gz", "", "sync-images"),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(release_tars(&idx, "v2"), vec!["a.tar.gz".to_string(), "door.tar.gz".to_string()]);
     }
 }

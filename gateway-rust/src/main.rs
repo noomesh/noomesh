@@ -91,6 +91,7 @@ mod fd_watch;
 mod proc_self;
 mod node_agent_auth;
 mod node_link;
+mod node_pin;
 mod node_rpc;
 mod tunnel;
 mod tunnel_door;
@@ -392,6 +393,7 @@ async fn main() -> Result<()> {
     startup_tasks::run_all();
 
     tracing::info!("Mesh Gateway (Rust) starting");
+    routes::artifacts::log_digest_cache_at_startup();
 
     // Refuse to start without TLS material — HERE, after stage_pki has
     // published NOO_TLS_* and before migrations, AppState or any loop: the

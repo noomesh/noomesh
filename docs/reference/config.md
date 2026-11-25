@@ -168,7 +168,7 @@ override is listed.
 | `loki_url` | `NOO_LOKI_URL` | `""` | the env wins; compose sets it to `https://loki:3100`, so this is the fallback for a gateway run outside compose. Empty in both = `noo logs status` "not configured" |
 | `nvidia_exporter_url` | `NVIDIA_EXPORTER_URL` | `https://nvidia-exporter:9400/metrics` | GPU metrics |
 | `embedding_url` | `PAGEINDEX_EMBEDDING_URL` | `""` → `https://stunnel-ollama:11434` (ollama-first; the stunnel-fronted door) | the one embedder every embed call uses |
-| `embedding_backend` | `PAGEINDEX_EMBEDDING_BACKEND` | `ollama` | the wire format: `ollama` (`/api/embed`), `openai` (`/v1/embeddings`), `tei` (`/embed`, legacy — TEI is no longer deployed) |
+| `embedding_backend` | `PAGEINDEX_EMBEDDING_BACKEND` | `ollama` | the wire format: `ollama` (`/api/embed`), `openai` (`/v1/embeddings`), `tei` (`/embed`, a legacy wire format only: no TEI engine ships since 0.6.30) |
 | `embedding_model` | `PAGEINDEX_EMBEDDING_MODEL` | `""` | sent in the body for `ollama` / `openai`; `tei` pins its model server-side |
 | `embedding_dim` | `EMBEDDING_DIM` | `0` | expected vector width. `0` means **unknown**, and the dimension-mismatch check is skipped entirely — leaving this key out of the YAML (or setting it to `0`) turns that check off. Set it to the real width to have preflight refuse embed writes that don't match the store's `vector(N)` columns |
 | `embedding_extra_urls` | `PAGEINDEX_EMBEDDING_EXTRA_URLS` | `""` | comma-separated extra static embed endpoints, same model and format as `embedding_url`. The gateway spreads embeds (least in-flight, round-robin ties) over every healthy mesh node **and** every static endpoint; a target that fails is skipped for 30 s. Used to declare the optional CPU embedder |
@@ -200,6 +200,8 @@ writes the values that match the deployed profile.
 | `enabled` | `true` | |
 | `system_prompt` | `"You are Mesh, a helpful AI assistant …"` | |
 | `max_iterations` | `10` | tool-call rounds per turn |
+| `max_iterations_limit` | `15` | the most rounds a request's `max_iterations` may ask for (larger values are clamped) |
+| `api_turn_secs` | `240` | the longest one turn on the plain `POST /api/inference` may run before it answers `504` with `code: turn_deadline` (that route sends nothing until the turn ends; `/api/inference/chat` streams progress and is not bounded by this) |
 | `max_session_messages` | `20` | |
 | `max_context_tokens` | unset (12288 = 16K minus the 4K reserve) | input budget |
 

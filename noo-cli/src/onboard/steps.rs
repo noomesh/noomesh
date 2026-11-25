@@ -148,6 +148,14 @@ pub(crate) const TAILSCALE_NO: &str =
 pub(crate) const LAN_ONLY_CHOSEN: &str =
     "LAN-only install, as chosen. To add Tailscale later: install it, run `tailscale up`, then `noo onboard --reconfigure`.";
 
+/// i1173 (operator 2026-11-21: the tailnet is the default, LAN-only the
+/// advanced path): said with every LAN-only outcome, because nodes keep
+/// this machine's address and are never told a new one.
+pub(crate) const LAN_ONLY_STABLE_ADDRESS: &str =
+    "Without a tailnet, other machines reach this one by its local address and keep it. If your router gives \
+     this machine a new address (after a power cut, say), they lose it and each must be enrolled again. \
+     Reserve its address in your router (a DHCP reservation), or use the tailnet, the default path.";
+
 pub(crate) const NON_INTERACTIVE_LAN_ONLY: &str =
     "No Tailscale here: continuing as a LAN-only install. --skip-tailscale says so explicitly; \
      to join a tailnet instead, install Tailscale and run `tailscale up` before onboarding.";
@@ -391,11 +399,23 @@ pub fn prerequisites(ctx: &mut Ctx) -> bool {
                 // never piped into a shell. See crate::vendor.
                 let docker_cmd = crate::vendor::install_script_cmd(crate::vendor::DOCKER_INSTALL_URL);
                 let log = install_log_path("onboard-docker.log");
+                // i1098 row 12 (operator 2026-11-21): onboard holds the Docker
+                // packages THIS install adds, read from dpkg before and after;
+                // a Docker already here is the person's and is never held.
+                let mut hold_host = crate::docker_hold::LiveHold { may_prompt: ctx_sudo_may_prompt(ctx) };
+                let docker_before = crate::docker_hold::installed_now(&mut hold_host);
                 let ok = run_logged(ctx_sudo(ctx).args(["sh", "-c", &docker_cmd]), &log);
                 if ok {
                     let user = std::env::var("USER").unwrap_or_default();
                     let _ = ctx_sudo(ctx).args(["usermod", "-aG", "docker", &user]).status();
                     ctx.success(&format!("Docker installed; your user was added to the docker group (log: {})", log.display()));
+                    // Before the relaunch below: this process exits there.
+                    let held = crate::docker_hold::hold_what_this_run_installed(&mut hold_host, &docker_before);
+                    match crate::docker_hold::outcome_line(&held) {
+                        Some((true, line)) => ctx.success(&line),
+                        Some((false, line)) => ctx.warn(&line),
+                        None => {}
+                    }
                     // The running shell can't pick up new group membership —
                     // but `sg docker` reads /etc/group directly (usermod just
                     // updated it), so the wizard RELAUNCHES ITSELF through it
@@ -476,7 +496,7 @@ pub fn prerequisites(ctx: &mut Ctx) -> bool {
             // the controller's `docker compose` verify row.
             Ok(v) => {
                 use crate::commands::cluster_verify::{compose_version_from_text, docker_compose_check, Verdict};
-                let row = docker_compose_check(&compose_version_from_text(&v), "");
+                let row = docker_compose_check(&compose_version_from_text(&v), "", &compose_upgrade_remedy_here());
                 match row.verdict {
                     Verdict::Ok => ctx.success(&format!("docker compose: {v}")),
                     _ => {
@@ -723,6 +743,12 @@ pub(crate) fn compose_remedy_here() -> String {
     compose_remedy(&os_release_text(), docker_ce_installed())
 }
 
+/// The upgrade remedy for a Compose below the minimum on this machine (the
+/// `docker compose` verify row's WARN and onboard's say the same).
+pub(crate) fn compose_upgrade_remedy_here() -> String {
+    crate::commands::cluster_verify::compose_upgrade_remedy(compose_package(&os_release_text(), docker_ce_installed()))
+}
+
 fn os_release_text() -> String {
     std::fs::read_to_string("/etc/os-release").unwrap_or_default()
 }
@@ -732,7 +758,7 @@ fn docker_ce_installed() -> bool {
     Command::new("dpkg-query").args(["-W", "docker-ce"]).output().map(|o| o.status.success()).unwrap_or(false)
 }
 
-fn tool_version(tool: &str) -> Option<String> {
+pub(crate) fn tool_version(tool: &str) -> Option<String> {
     let out = Command::new(tool).arg("--version").output().ok()?;
     if !out.status.success() && out.stdout.is_empty() && out.stderr.is_empty() {
         return None;
@@ -810,8 +836,7 @@ fn apply_topology_env(ctx: &mut Ctx) {
         if ctx.state.tier == 2 {
             ctx.update_env("OLLAMA_URL", "https://stunnel-ollama:11434");
         }
-        // No PAGEINDEX_EMBEDDING_URL: tei is opt-in (tei-compose) and the
-        // embedding client resolves ollama-first / mesh-routed without it.
+        // No PAGEINDEX_EMBEDDING_URL: the embedding client resolves ollama-first / mesh-routed without it.
     }
 }
 
@@ -1697,6 +1722,7 @@ pub fn tailscale(ctx: &mut Ctx) -> bool {
             // The answer was n: a decision, not a failure.
             ctx.state.tailscale_declined = true;
             ctx.info(LAN_ONLY_CHOSEN);
+            ctx.info(LAN_ONLY_STABLE_ADDRESS);
             return true;
         }
         Err(_) if ctx.non_interactive => {
@@ -1704,6 +1730,7 @@ pub fn tailscale(ctx: &mut Ctx) -> bool {
             // expected case, said once as what happens and which flag says it
             // (general 11-14: nothing that runs --ci today breaks).
             ctx.info(NON_INTERACTIVE_LAN_ONLY);
+            ctx.info(LAN_ONLY_STABLE_ADDRESS);
             return true;
         }
         Err(why) => {
@@ -1722,6 +1749,7 @@ pub fn tailscale(ctx: &mut Ctx) -> bool {
                 ctx.info("Setup aborted — join the tailnet and re-run 'noo onboard'.");
                 return false;
             }
+            ctx.info(LAN_ONLY_STABLE_ADDRESS);
             return true;
         }
     };
@@ -3096,7 +3124,7 @@ fn controller_services(ctx: &mut Ctx) -> Option<Vec<String>> {
 
 /// Externally-reachable services need the controller LAN IP in their SAN.
 pub(crate) const SVC_LIST: &[&str] = &[
-    "redis", "nats", "postgres", "vllm", "llamacpp", "ollama", "tei", "reranker", "loki",
+    "redis", "nats", "postgres", "vllm", "llamacpp", "ollama", "reranker", "loki",
     // The standalone profile's embedder, presented by its stunnel sidecar
     // (docker/stunnel-ollama-embed.conf). Its own leaf, not `ollama`'s:
     // `noo upgrade --stack` issues a MISSING leaf on its own
@@ -3172,7 +3200,6 @@ pub(crate) fn svc_extra_hostnames(svc: &str) -> Vec<String> {
         // container name (STANDALONE_OLLAMA_EMBED_URL) or compose alias.
         "ollama-embed" => &["noo-ollama-embed", "stunnel-ollama-embed", "noo-stunnel-ollama-embed"],
         "ollama-embed-cpu" => &["noo-ollama-embed-cpu", "stunnel-ollama-embed-cpu", "noo-stunnel-ollama-embed-cpu"],
-        "tei" => &["noo-tei", "stunnel-tei"],
         "reranker" => &["noo-reranker", "stunnel-reranker"],
         "redis" => &["noo-redis"],
         "nats" => &["noo-nats"],
@@ -6830,7 +6857,7 @@ fn hostd_can_run_here(ctx: &mut Ctx) -> bool {
 /// Controller mode: a user unit on this install's spool.
 fn ensure_hostd_controller(ctx: &mut Ctx) {
     if ctx.dry_run {
-        ctx.dry("install noo-hostd (controller mode: a user unit on this install's spool; the watcher stops first)");
+        ctx.dry("turn on linger for this user (sudo loginctl enable-linger, unless on), then install noo-hostd (controller mode: a user unit on this install's spool; the watcher stops first)");
         return;
     }
     if !hostd_can_run_here(ctx) {
@@ -6846,6 +6873,9 @@ fn ensure_hostd_controller(ctx: &mut Ctx) {
     if watcher_running() {
         stop_watcher(ctx);
     }
+    // Before the install, so `noo-hostd install` finds linger on and does
+    // not print its by-hand line.
+    ensure_hostd_linger(ctx);
     ctx.progress("Installing noo-hostd, controller mode (compose, backup, rotate — a user unit)...");
     let root = ctx.repo_root.to_string_lossy().into_owned();
     let ok = Command::new(&bin).args(hostd_install_args("controller", &root)).status().map(|s| s.success()).unwrap_or(false);
@@ -6853,6 +6883,38 @@ fn ensure_hostd_controller(ctx: &mut Ctx) {
         ctx.success("noo-hostd (controller mode) installed and running");
     } else {
         ctx.warn(&format!("noo-hostd install (controller mode) failed — run: {HOSTD_BIN} install --root {root} --mode controller"));
+    }
+}
+
+/// i1160 risk 5: the controller's hostd is a systemd user unit, which starts
+/// at boot only when its user lingers; without it, after a power cut nothing
+/// restores the stack (hostd's BootRestore) until that user logs in. Turn
+/// linger on for the user running onboard (who the unit runs as), through
+/// the same sudo as every root step here; [`hostd_can_run_here`] has already
+/// decided root steps may run. Reads `loginctl show-user` first: nothing is
+/// run when linger is already on.
+fn ensure_hostd_linger(ctx: &mut Ctx) {
+    use crate::hostd_boot as hb;
+    if !crate::netns_unit::systemd_here() {
+        return;
+    }
+    let user = crate::netns_unit::owner();
+    if user.is_empty() {
+        ctx.warn("linger not checked: the user running onboard could not be read (id -un); after a reboot noo-hostd may not start until someone logs in");
+        return;
+    }
+    let Some(cmd) = hb::enable_plan(&user, &hb::read_linger(&user)) else {
+        return;
+    };
+    let ok = ctx_sudo(ctx).args(&cmd).status().map(|s| s.success()).unwrap_or(false);
+    if ok {
+        ctx.success(&format!("Linger on for {user}: noo-hostd starts at boot, with no login"));
+    } else {
+        ctx.warn(&format!(
+            "linger not enabled for {user}: after a reboot nothing restores the stack until {user} logs in — run: {}",
+            hb::remedy(&user)
+        ));
+        sudo_refused(ctx, "linger for noo-hostd", &hb::remedy(&user));
     }
 }
 
@@ -9747,22 +9809,37 @@ fn compose_container_ids(ctx: &Ctx) -> String {
     if code == 0 { out } else { String::new() }
 }
 
+/// The same "service container-id" listing for every container of compose
+/// project `project` (by its project label, so another instance's containers
+/// are never counted). `noo upgrade`'s roll reads it around its launcher.
+/// Empty when docker cannot say.
+pub(crate) fn project_container_ids(project: &str) -> String {
+    let label = format!("label=com.docker.compose.project={project}");
+    let (code, out) = sh::docker(&[
+        "ps", "-a", "--filter", &label, "--filter", "label=com.docker.compose.service",
+        "--format", "{{.Label \"com.docker.compose.service\"}} {{.ID}}",
+    ]);
+    if code == 0 { out } else { String::new() }
+}
+
+/// service -> container id, from a `compose_container_ids` listing. Pure.
+fn container_ids(s: &str) -> std::collections::BTreeMap<String, String> {
+    s.lines()
+        .filter_map(|l| {
+            let mut it = l.split_whitespace();
+            let svc = it.next()?;
+            let id = it.next()?;
+            Some((svc.to_string(), id.to_string()))
+        })
+        .collect()
+}
+
 /// (recreated, created) services between two `compose_container_ids`
 /// listings: recreated = the same service under a new container id; created
 /// = a service that had no container before. Nothing is called created when
 /// the first listing is empty (docker could not say). Pure.
 pub(crate) fn recreated_by(before: &str, after: &str) -> (Vec<String>, Vec<String>) {
-    let parse = |s: &str| -> std::collections::BTreeMap<String, String> {
-        s.lines()
-            .filter_map(|l| {
-                let mut it = l.split_whitespace();
-                let svc = it.next()?;
-                let id = it.next()?;
-                Some((svc.to_string(), id.to_string()))
-            })
-            .collect()
-    };
-    let (b, a) = (parse(before), parse(after));
+    let (b, a) = (container_ids(before), container_ids(after));
     let recreated: Vec<String> = a
         .iter()
         .filter(|(s, id)| b.get(*s).is_some_and(|old| old != *id))
@@ -9774,6 +9851,16 @@ pub(crate) fn recreated_by(before: &str, after: &str) -> (Vec<String>, Vec<Strin
         a.keys().filter(|s| !b.contains_key(*s)).cloned().collect()
     };
     (recreated, created)
+}
+
+/// The services [`recreated_by`] did not move: the same service under the
+/// same container id in both listings. Pure.
+pub(crate) fn kept_by(before: &str, after: &str) -> Vec<String> {
+    let (b, a) = (container_ids(before), container_ids(after));
+    a.iter()
+        .filter(|(s, id)| b.get(*s).is_some_and(|old| old == *id))
+        .map(|(s, _)| s.clone())
+        .collect()
 }
 
 /// The wizard's line for `converge_stack`, naming what moved. Pure.
@@ -9790,7 +9877,7 @@ pub(crate) fn converge_line(recreated: &[String], created: &[String]) -> String 
 
 #[cfg(test)]
 mod converge_tests {
-    use super::{converge_line, recreated_by};
+    use super::{converge_line, kept_by, recreated_by};
 
     /// The listings around onboard's last start: the services whose id
     /// changed are named, the rest are not; a new service is "created".
@@ -9816,6 +9903,16 @@ mod converge_tests {
         let (recreated, created) = recreated_by("", same);
         assert!(recreated.is_empty() && created.is_empty(), "{recreated:?} {created:?}");
         assert!(recreated_by("gateway aaa\n", "").0.is_empty(), "a container gone is not a recreate");
+    }
+
+    /// Kept = the same id in both listings; a recreated, created or removed
+    /// service is never kept.
+    #[test]
+    fn kept_is_exactly_the_services_whose_container_id_held() {
+        let before = "gateway aaa\nnats bbb\nredis eee\nretired zzz\n";
+        let after = "gateway a2\nnats bbb\nredis eee\nvoice fff\n";
+        assert_eq!(kept_by(before, after), ["nats", "redis"]);
+        assert!(kept_by("", after).is_empty(), "no listing before: nothing is called kept");
     }
 
     /// The last start is the PLAIN start `noo stack start` runs: no
@@ -11333,6 +11430,9 @@ mod required_tools_tests {
         assert!(TAILSCALE_NO.starts_with("this machine only") && !TAILSCALE_NO.contains("here and on your local network"));
         assert!(TAILSCALE_NO.contains("the next question can open it to your local network"));
         assert!(LAN_ONLY_CHOSEN.contains("noo onboard --reconfigure"));
+        // i1173: every LAN-only outcome says the address must not move.
+        assert_eq!(own.matches("ctx.info(LAN_ONLY_STABLE_ADDRESS);").count(), 3, "the chosen, --ci and continued (either way) arms");
+        assert!(LAN_ONLY_STABLE_ADDRESS.contains("DHCP reservation") && LAN_ONLY_STABLE_ADDRESS.contains("the default path"));
     }
 
     #[test]
@@ -11844,5 +11944,26 @@ mod quiet_truthful_output_tests {
         assert!(!run_logged(&mut bad, &log));
         assert_eq!(std::fs::read_to_string(&log).unwrap_or_default(), "why\n", "each run starts the log fresh");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod hostd_linger_tests {
+    /// i1160 risk 5: onboard turns linger on for the controller's hostd user
+    /// before installing the user unit, through the run's sudo, and only
+    /// when `loginctl` says it is not on (the plan itself is pinned in
+    /// hostd_boot.rs).
+    #[test]
+    fn onboard_enables_linger_before_the_controller_hostd_install() {
+        let src = crate::test_src::own_code(include_str!("steps.rs"));
+        let ctl = crate::test_src::fn_body(&src, "fn ensure_hostd_controller(");
+        let linger = ctl.find("ensure_hostd_linger(ctx);").expect("the controller install enables linger");
+        let install = ctl.find("hostd_install_args(\"controller\"").expect("the install");
+        assert!(linger < install, "linger is enabled before the install, so install does not print the by-hand line");
+        let step = crate::test_src::fn_body(&src, "fn ensure_hostd_linger(");
+        let plan = step.find("hb::enable_plan(&user, &hb::read_linger(&user))").expect("the plan reads loginctl first");
+        let run = step.find("ctx_sudo(ctx).args(&cmd)").expect("the command runs through the run's sudo");
+        assert!(plan < run, "{step}");
+        assert!(step.contains("sudo_refused(ctx,"), "a refused sudo in a non-interactive run is a hard failure");
     }
 }

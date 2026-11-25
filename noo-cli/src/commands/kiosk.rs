@@ -359,11 +359,50 @@ pub(crate) fn render_serve_service_in(user: &str, bin: &str) -> String {
 /// mode exists to avoid.
 ///
 /// `bin` is where `noo-kiosk-launch` is exec'd from (as for the proxy).
+///
+/// **Plymouth (i1153).** A dedicated unit IS this box's display manager, so
+/// it hands the boot splash over the way gdm does (gdm's
+/// `data/gdm.service.in`: `Conflicts=plymouth-quit.service`,
+/// `After=plymouth-quit.service`, `After=rc-local.service
+/// plymouth-start.service systemd-user-sessions.service`,
+/// `OnFailure=plymouth-quit.service`, and gdm runs `plymouth quit
+/// --retain-splash` itself). It never orders after
+/// `plymouth-quit-wait.service`: that unit (TimeoutSec=0) returns only once
+/// SOMETHING quits plymouth, and when a boot transaction drops
+/// plymouth-quit (a display manager's own Conflicts= does), nothing does.
+/// A seat then booted to a black screen with kiosk.service queued forever.
+/// Shared mode keeps waiting for the splash to end: there the desktop's
+/// display manager owns the handover and still runs.
 pub(crate) fn render_kiosk_service_in(user: &str, mode: Mode, vt: u8, bin: &str) -> String {
     let conflicts = match mode {
         Mode::Dedicated => format!("Conflicts=getty@tty{vt}.service display-manager.service\n"),
         // Deliberately none. See the doc comment.
         Mode::Shared => String::new(),
+    };
+    // Dedicated: the display starts whatever target the box boots to. A
+    // server image defaults to multi-user.target, where a unit wanted only
+    // by graphical.target never starts. Not `set-default graphical.target`:
+    // that changes what the whole machine boots into; this changes only
+    // when THIS unit starts. Shared stays graphical: there a desktop is the
+    // point, and the display is something you switch to.
+    let wanted_by = match mode {
+        Mode::Dedicated => "graphical.target multi-user.target",
+        Mode::Shared => "graphical.target",
+    };
+    let (after_plymouth, plymouth, quit_splash) = match mode {
+        Mode::Dedicated => (
+            "",
+            "# The display manager pattern (gdm's unit): this unit replaces\n\
+             # plymouth-quit and quits the splash itself, so it never waits for\n\
+             # plymouth-quit-wait, which returns only once someone quits it.\n\
+             Conflicts=plymouth-quit.service\n\
+             After=plymouth-quit.service rc-local.service plymouth-start.service\n\
+             OnFailure=plymouth-quit.service\n",
+            // `+`: as root (plymouthd is root's); `-`: no plymouth on this
+            // box, or none running (a restart), is not a failure.
+            "ExecStartPre=-+/bin/plymouth quit --retain-splash\n",
+        ),
+        Mode::Shared => (" plymouth-quit-wait.service", "", ""),
     };
     let why = match mode {
         Mode::Dedicated =>
@@ -379,15 +418,17 @@ pub(crate) fn render_kiosk_service_in(user: &str, mode: Mode, vt: u8, bin: &str)
          {why}\
          [Unit]\n\
          Description=noomesh kiosk display (cage + chromium, {mode} on tty{vt})\n\
-         After=systemd-user-sessions.service network-online.target plymouth-quit-wait.service kiosk-serve.service\n\
+         After=systemd-user-sessions.service network-online.target{after_plymouth} kiosk-serve.service\n\
          Wants=network-online.target\n\
          Requires=kiosk-serve.service\n\
          {conflicts}\
+         {plymouth}\
          \n\
          [Service]\n\
          Type=simple\n\
          User={user}\n\
          EnvironmentFile={env}\n\
+         {quit_splash}\
          ExecStart={bin}/noo-kiosk-launch\n\
          Restart=always\n\
          RestartSec=5\n\
@@ -407,8 +448,10 @@ pub(crate) fn render_kiosk_service_in(user: &str, mode: Mode, vt: u8, bin: &str)
          UtmpMode=user\n\
          \n\
          [Install]\n\
-         WantedBy=graphical.target\n",
+         WantedBy={wanted_by}\n",
+        wanted_by = wanted_by,
         why = why, mode = mode.as_str(), vt = vt, conflicts = conflicts,
+        after_plymouth = after_plymouth, plymouth = plymouth, quit_splash = quit_splash,
         user = user, env = ENV_FILE, bin = bin,
     )
 }
@@ -418,10 +461,13 @@ pub(crate) fn render_watchdog_service() -> String {
         "# Written by `noo kiosk setup`. Root: it may restart kiosk.service.\n\
          [Unit]\n\
          Description=noomesh kiosk watchdog (token renewal, stale reload, dead-session restart)\n\
-         After=kiosk.service\n\
+         # No After=kiosk.service: the rescue must never queue behind the\n\
+         # display's own stuck start job (i1153). Bounded, so a hung tick\n\
+         # cannot stop the timer firing again.\n\
          \n\
          [Service]\n\
          Type=oneshot\n\
+         TimeoutStartSec=150\n\
          EnvironmentFile={env}\n\
          ExecStart={bin}/noo-kiosk-watchdog\n",
         env = ENV_FILE, bin = BIN_DIR,
@@ -487,7 +533,7 @@ pub(crate) fn render_logind_conf(mode: Mode) -> String {
 /// Does this setup disable the display manager? Only dedicated mode, and
 /// only when it is enabled now.
 fn display_manager_will_be_disabled(mode: Mode, is_enabled: Option<&str>) -> bool {
-    mode == Mode::Dedicated && is_enabled == Some("enabled")
+    mode == Mode::Dedicated && is_enabled_means_on(is_enabled)
 }
 
 /// A yes/no that RETURNS rather than exiting, because declining to mask the
@@ -583,6 +629,152 @@ fn sh_out(cmd: &str) -> Option<String> {
 /// broken.
 fn sh_out_any(cmd: &str) -> Option<String> {
     crate::host_exec::run_sh(cmd).any_stdout().map(str::to_string)
+}
+
+// ── the display manager (i1153) ────────────────────────────────────────
+
+/// Where setup records the display manager it disabled, so teardown
+/// re-enables THAT unit (root's file; the name is checked before use).
+const DM_RECORD: &str = "/etc/default/kiosk.display-manager";
+/// Debian/Ubuntu's alias for the configured display manager.
+const DM_ALIAS: &str = "/etc/systemd/system/display-manager.service";
+
+/// Does `systemctl is-enabled` say the unit starts at boot? systemd prints
+/// `alias` for an alias name such as `display-manager.service` (Ubuntu's
+/// link to gdm3.service), not `enabled`: setup once tested `== "enabled"`
+/// and never disabled the display manager on a desktop seat (i1153).
+/// `enabled-runtime` is an enablement under /run.
+pub(crate) fn is_enabled_means_on(answer: Option<&str>) -> bool {
+    matches!(answer.map(str::trim), Some("enabled" | "alias" | "enabled-runtime"))
+}
+
+/// A unit name safe to put in a `sudo systemctl` line: `<name>.service`,
+/// nothing a shell would read.
+pub(crate) fn plain_service_name(n: &str) -> bool {
+    n.len() > ".service".len() && n.len() <= 128 && n.ends_with(".service")
+        && n.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '@'))
+}
+
+/// The unit `display-manager.service` stands for: systemd's own answer
+/// (`systemctl show -p Id --value display-manager.service`, e.g.
+/// `gdm3.service`), else the alias link's target name, else the alias.
+/// Disabling the alias name leaves the real unit enabled.
+pub(crate) fn display_manager_unit(show_id: Option<&str>, link_target: Option<&str>) -> String {
+    let named = |s: Option<&str>| {
+        s.map(|v| v.trim().rsplit('/').next().unwrap_or("").to_string())
+            .filter(|v| v != "display-manager.service" && plain_service_name(v))
+    };
+    named(show_id).or_else(|| named(link_target)).unwrap_or_else(|| "display-manager.service".into())
+}
+
+// ── a start that waits on something (i1153) ────────────────────────────
+
+/// How long a kiosk.service restart may wait for its start job before it
+/// says what the job is queued behind.
+pub(crate) const KIOSK_START_BOUND_SECS: u32 = 60;
+
+/// One look at a unit: `systemctl show -p ActiveState -p Job <unit>`.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct UnitPoll {
+    pub active: String,
+    /// A job (start, restart) is queued or running for the unit.
+    pub job: bool,
+}
+
+/// systemd prints `Job=<id>` only while a job exists (no line, or `Job=`,
+/// otherwise).
+pub(crate) fn parse_unit_poll(show: &str) -> UnitPoll {
+    let mut p = UnitPoll { active: "unknown".into(), job: false };
+    for l in show.lines() {
+        if let Some(v) = l.strip_prefix("ActiveState=") {
+            p.active = v.trim().to_string();
+        } else if let Some(v) = l.strip_prefix("Job=") {
+            p.job = v.split_whitespace().next().and_then(|n| n.parse::<u64>().ok()).is_some_and(|n| n > 0);
+        }
+    }
+    p
+}
+
+#[derive(Debug, PartialEq)]
+pub(crate) enum StartWait {
+    /// The job finished; the unit's ActiveState then.
+    Done(String),
+    /// Still queued after the bound.
+    Queued,
+}
+
+/// What a blocking `systemctl restart` waits for (the job to finish), with
+/// a bound: at most `tries` polls, `pause` between them. A start job queued
+/// behind a unit that never finishes (plymouth-quit-wait, TimeoutSec=0)
+/// hung the seat's sync, `--migrate` and the watchdog (i1153).
+pub(crate) fn wait_for_start(poll: &dyn Fn() -> UnitPoll, pause: &dyn Fn(), tries: u32) -> StartWait {
+    for i in 0..tries {
+        let p = poll();
+        if !p.job {
+            return StartWait::Done(p.active);
+        }
+        if i + 1 < tries {
+            pause();
+        }
+    }
+    StartWait::Queued
+}
+
+/// The unit a queued job of `unit` waits behind: a unit it is ordered
+/// After= (`systemctl show -p After --value`) that has a job of its own in
+/// `systemctl list-jobs --no-legend` (id, unit, type, state), a `running`
+/// one first. None when no such job is listed: never a guess.
+pub(crate) fn queued_blocker(list_jobs: &str, after: &str, unit: &str) -> Option<String> {
+    let after: Vec<&str> = after.split_whitespace().collect();
+    let jobs: Vec<(&str, &str)> = list_jobs
+        .lines()
+        .filter_map(|l| {
+            let f: Vec<&str> = l.split_whitespace().collect();
+            (f.len() >= 4 && f[1] != unit && after.contains(&f[1])).then(|| (f[1], f[3]))
+        })
+        .collect();
+    jobs.iter().find(|(_, st)| *st == "running").or(jobs.first()).map(|(u, _)| u.to_string())
+}
+
+/// The words for a start that did not happen within the bound.
+pub(crate) fn queued_message(unit: &str, secs: u32, blocker: Option<&str>) -> String {
+    match blocker {
+        Some(b) => format!("{unit} did not start within {secs} s: a start job is queued behind {b}"),
+        None => format!("{unit} did not start within {secs} s: a start job is queued (`systemctl list-jobs` shows what it waits for)"),
+    }
+}
+
+/// `noo kiosk status`'s kiosk.service cell when the unit is inactive with
+/// a queued start job: "Inactive" alone was true and hid the job.
+pub(crate) fn queued_start_cell(blocker: Option<&str>) -> String {
+    match blocker {
+        Some(b) => format!("inactive: a start job is queued behind {b}"),
+        None => "inactive: a start job is queued (`systemctl list-jobs` shows what it waits for)".into(),
+    }
+}
+
+pub(crate) fn kiosk_poll() -> UnitPoll {
+    parse_unit_poll(&sh_out_any("systemctl show -p ActiveState -p Job kiosk.service 2>/dev/null").unwrap_or_default())
+}
+
+/// What kiosk.service's queued job waits behind, read unprivileged.
+pub(crate) fn kiosk_job_blocker() -> Option<String> {
+    let jobs = sh_out_any("systemctl list-jobs --no-legend --full --no-pager 2>/dev/null")?;
+    let after = sh_out_any("systemctl show -p After --value kiosk.service 2>/dev/null").unwrap_or_default();
+    queued_blocker(&jobs, &after, "kiosk.service")
+}
+
+/// `systemctl restart kiosk.service --no-block` (through sudo when asked),
+/// then wait for the job, bounded by [`KIOSK_START_BOUND_SECS`]. `Ok` with
+/// the ActiveState once the job is done (as a blocking restart would have
+/// returned), `Err` saying so when it failed or is still queued.
+pub(crate) fn restart_kiosk_bounded(sudo: bool) -> Result<String, String> {
+    sh(&format!("{}systemctl restart kiosk.service --no-block", if sudo { "sudo " } else { "" }))?;
+    match wait_for_start(&kiosk_poll, &|| std::thread::sleep(std::time::Duration::from_secs(1)), KIOSK_START_BOUND_SECS) {
+        StartWait::Done(s) if s == "failed" => Err("kiosk.service failed to start".into()),
+        StartWait::Done(s) => Ok(s),
+        StartWait::Queued => Err(queued_message("kiosk.service", KIOSK_START_BOUND_SECS, kiosk_job_blocker().as_deref())),
+    }
 }
 
 /// The "mint path" row, as a decision of its own so it can be TESTED
@@ -739,7 +931,7 @@ pub fn kiosk_setup(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
 
     // Dedicated mode turns the desktop login off. Ask BEFORE anything is
     // written, so declining leaves the box untouched.
-    if display_manager_will_be_disabled(a.mode, sh_out("systemctl is-enabled display-manager.service 2>/dev/null").as_deref()) {
+    if display_manager_will_be_disabled(a.mode, sh_out_any("systemctl is-enabled display-manager.service 2>/dev/null").as_deref()) {
         super::confirm_destructive(
             g,
             a.yes,
@@ -829,10 +1021,29 @@ pub fn kiosk_setup(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         // display can never get past — and its desktop session would
         // idle-lock over the top of cage. The unit Conflicts= it; disabling
         // it here stops a reboot racing the two for the seat.
-        if sh_out("systemctl is-enabled display-manager.service 2>/dev/null").as_deref() == Some("enabled") {
-            ui::step("disabling the display manager (a greeter on tty1 would be a lock screen)");
-            if let Err(e) = sh("sudo systemctl disable --now display-manager.service") {
-                ui::warned(&format!("{e} — the kiosk unit still Conflicts= it, but disable it before rebooting"));
+        //
+        // `display-manager.service` is an alias (`is-enabled` prints `alias`):
+        // disable the unit it stands for, and record which, for teardown.
+        if is_enabled_means_on(sh_out_any("systemctl is-enabled display-manager.service 2>/dev/null").as_deref()) {
+            let link = std::fs::read_link(DM_ALIAS).ok().map(|p| p.to_string_lossy().into_owned());
+            let dm = display_manager_unit(
+                sh_out("systemctl show -p Id --value display-manager.service 2>/dev/null").as_deref(),
+                link.as_deref(),
+            );
+            ui::step(&format!("disabling the display manager, {dm} (a greeter on tty1 would be a lock screen)"));
+            match sh(&format!("sudo systemctl disable --now {dm}")) {
+                Ok(()) => {
+                    if let Err(e) = sh(&format!("echo {dm} | sudo tee {DM_RECORD} >/dev/null")) {
+                        ui::warned(&format!("{e} — teardown will not know to re-enable {dm}"));
+                    }
+                }
+                Err(e) => ui::warned(&format!("{e} — the kiosk unit still Conflicts= it, but disable it before rebooting")),
+            }
+            if is_enabled_means_on(sh_out_any("systemctl is-enabled display-manager.service 2>/dev/null").as_deref()) {
+                ui::warned(&format!(
+                    "display-manager.service still starts {dm} at boot (its unit has nothing for `disable` to undo). \
+                     The kiosk unit Conflicts= it and quits the boot splash itself, so the display still comes up"
+                ));
             }
         }
         // Masking the getty is the one step that can lock a person out of
@@ -882,12 +1093,18 @@ pub fn kiosk_setup(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         "sudo systemctl restart kiosk-serve.service",
         "sudo systemctl enable kiosk-watchdog.timer",
         "sudo systemctl enable kiosk.service",
-        "sudo systemctl restart kiosk.service",
-        "sudo systemctl start kiosk-watchdog.timer",
     ] {
         if let Err(e) = sh(cmd) {
             fail(g.json, ExitCode::Generic, "systemctl", &e, Some("journalctl -u kiosk.service -n 50"));
         }
+    }
+    // Bounded: a start job queued behind something that never finishes
+    // hung setup with it (i1153). The message names what it waits behind.
+    if let Err(e) = restart_kiosk_bounded(true) {
+        fail(g.json, ExitCode::Generic, "systemctl", &e, Some("systemctl list-jobs   (and: journalctl -u kiosk.service -n 50)"));
+    }
+    if let Err(e) = sh("sudo systemctl start kiosk-watchdog.timer") {
+        fail(g.json, ExitCode::Generic, "systemctl", &e, Some("journalctl -u kiosk-watchdog.service -n 50"));
     }
     // A display is a viewer, not an enrolled node: no noo-hostd runs here, so
     // nothing reports its tailscaled to `noo cluster verify`. Setup is the one
@@ -1280,6 +1497,11 @@ pub fn kiosk_status(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     }
     let unit = |u: &str| sh_out(&format!("systemctl is-active {u}")).unwrap_or_else(|| "inactive".into());
     let kiosk = unit("kiosk.service");
+    // Inactive with a start job queued is a different answer from
+    // inactive: the job waits behind another unit, and the journal is
+    // empty because nothing has run (i1153). Both reads need no privilege.
+    let queued = kiosk != "active" && kiosk_poll().job;
+    let blocker = if queued { kiosk_job_blocker() } else { None };
     let proxy = unit("kiosk-serve.service");
     let timer = unit("kiosk-watchdog.timer");
     let cdp = sh_out("noo-kiosk-cdp probe 2>/dev/null").is_some();
@@ -1385,7 +1607,8 @@ pub fn kiosk_status(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     if g.json {
         println!("{}", json!({
             "seat_installed": seat_installed,
-            "kiosk_service": kiosk, "watchdog_timer": timer, "cdp": cdp,
+            "kiosk_service": kiosk, "kiosk_job_queued": queued, "kiosk_job_blocked_by": blocker,
+            "watchdog_timer": timer, "cdp": cdp,
             "proxy_service": proxy, "proxy_listening": proxy_listening, "proxy_port": port,
             "token_expires_at": expires, "heartbeat_ms": heartbeat, "graph_frame": frame,
             "console_build": console_build, "stale_seat_assets": stale,
@@ -1430,7 +1653,7 @@ pub fn kiosk_status(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     };
     let telem = telemetry_rows();
     println!("{}", ui::kv(&[
-        ("kiosk.service", ui::state(&kiosk)),
+        ("kiosk.service", if queued { ui::bad(&queued_start_cell(blocker.as_deref())) } else { ui::state(&kiosk) }),
         ("mode", mode_cell),
         // Which screen is actually up. The operator asked "why is the
         // graph not showing" about a seat installed with the default
@@ -1486,7 +1709,17 @@ pub fn kiosk_status(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             None => unsaid.clone(),
         }),
     ]));
-    if kiosk != "active" {
+    if queued {
+        let mut steps = vec![("systemctl list-jobs", "the queued start job and the job it waits for")];
+        if blocker.as_deref().is_some_and(|b| b.starts_with("plymouth-")) {
+            // Named, not run: status itself needs no privilege.
+            steps.push((
+                "plymouth quit   (as root)",
+                "ends the boot splash nobody quit; this release's dedicated unit quits it itself (re-run `noo kiosk setup`, or on an enrolled seat the root step `kiosk seat-sync --migrate`)",
+            ));
+        }
+        ui::guide(&steps);
+    } else if kiosk != "active" {
         ui::guide(&[("journalctl -u kiosk.service -n 50", "why the session is not up")]);
     }
     if !proxy_listening {
@@ -1827,8 +2060,8 @@ pub fn kiosk_set(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     if let Err(e) = install_text(&next, ENV_FILE, ENV_MODE, "root -g root") {
         fail(g.json, ExitCode::Generic, "write", &e, Some("noo kiosk status"));
     }
-    if let Err(e) = sh("sudo systemctl restart kiosk.service") {
-        fail(g.json, ExitCode::Generic, "systemctl", &e, Some("journalctl -u kiosk.service -n 50"));
+    if let Err(e) = restart_kiosk_bounded(true) {
+        fail(g.json, ExitCode::Generic, "systemctl", &e, Some("systemctl list-jobs   (and: journalctl -u kiosk.service -n 50)"));
     }
     if g.json {
         println!("{}", json!({"quality": shown, "changed": true}));
@@ -2050,7 +2283,15 @@ pub fn kiosk_teardown(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             ui::warned(&format!("{e} — run `sudo systemctl unmask getty@.service` by hand or this box has no console login"));
         }
     }
-    if sh_out_any("systemctl is-enabled display-manager.service 2>/dev/null").as_deref() == Some("disabled") {
+    // The unit setup disabled, by name (the alias may be gone with it).
+    let recorded_dm = std::fs::read_to_string(DM_RECORD).ok().map(|t| t.trim().to_string()).filter(|n| plain_service_name(n));
+    if let Some(dm) = recorded_dm {
+        ui::step(&format!("re-enabling the display manager, {dm}"));
+        if let Err(e) = sh(&format!("sudo systemctl enable {dm}")) {
+            ui::warned(&format!("{e} — re-enable it by hand if this box should boot to a desktop"));
+        }
+        let _ = sh(&format!("sudo rm -f {DM_RECORD}"));
+    } else if sh_out_any("systemctl is-enabled display-manager.service 2>/dev/null").as_deref() == Some("disabled") {
         ui::step("re-enabling the display manager");
         if let Err(e) = sh("sudo systemctl enable display-manager.service") {
             ui::warned(&format!("{e} — re-enable it by hand if this box should boot to a desktop"));
@@ -3260,6 +3501,73 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The watchdog's kiosk.service restart is bounded (i1153): run for real
+    /// against a fake systemctl whose start job stays queued for ever, it
+    /// restarts with --no-block, polls the job exactly RESTART_BOUND times,
+    /// gives up and names the unit the job waits behind. The same case as
+    /// tests/test_kiosk_watchdog_bounded_restart.py, from the script as the
+    /// crate ships it, so a change under noo-cli/ alone is checked here too.
+    #[test]
+    fn the_watchdog_restart_gives_up_at_the_bound_and_names_the_blocker() {
+        use std::os::unix::fs::PermissionsExt as _;
+        if !cfg!(target_os = "linux") { return; }
+        // The functions, from the bound to the first line that uses them.
+        let start = WATCHDOG.find("RESTART_BOUND=").expect("the watchdog bounds its restart");
+        let end = WATCHDOG.find("if ! as_kiosk noo-kiosk-cdp probe").expect("the watchdog probes CDP");
+        assert!(start < end, "the restart is defined before the probe");
+        let funcs = &WATCHDOG[start..end];
+        let dir = std::env::temp_dir().join(format!("noo-wd-restart-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let log = dir.join("systemctl.log");
+        let exe = |name: &str, body: &str| {
+            let p = bin.join(name);
+            std::fs::write(&p, format!("#!/bin/sh\n{body}")).unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        // A start job (7) that never finishes, queued behind plymouth-quit-wait.
+        // Past 200 polls it reports none, so an unbounded loop ends (red: 200
+        // polls, rc=0) instead of hanging the test run: Command has no timeout.
+        exe(
+            "systemctl",
+            &format!(
+                "echo \"$*\" >> {log}\n\
+                 case \"$*\" in\n\
+                 \x20 \"show -p Job --value kiosk.service\") [ \"$(grep -c '^show -p Job' {log})\" -gt 200 ] || echo 7 ;;\n\
+                 \x20 \"show -p After --value kiosk.service\") echo \"systemd-user-sessions.service plymouth-quit-wait.service kiosk-serve.service\" ;;\n\
+                 \x20 \"list-jobs --no-legend --full --no-pager\") printf '%s\\n' \"7 kiosk.service start waiting\" \"3 plymouth-quit-wait.service start running\" \"9 other.service start running\" ;;\n\
+                 esac\n\
+                 exit 0\n",
+                log = log.display()
+            ),
+        );
+        exe("sleep", "exit 0\n");
+        let script = format!("fail() {{ echo \"FAIL: $1\"; }}\n{funcs}restart_kiosk_bounded; echo \"rc=$?\"\n");
+        let out = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(&script)
+            .env_clear()
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(stdout.contains("rc=1"), "a start job queued for ever is given up on: {stdout} / {}", String::from_utf8_lossy(&out.stderr));
+        assert!(
+            stdout.contains("FAIL: kiosk.service did not start within 60 s: a start job is queued behind plymouth-quit-wait.service"),
+            "the give-up names the blocker: {stdout}"
+        );
+        let calls = std::fs::read_to_string(&log).unwrap();
+        let calls: Vec<&str> = calls.lines().collect();
+        assert_eq!(calls.first().copied(), Some("restart kiosk.service --no-block"), "{calls:?}");
+        assert_eq!(
+            calls.iter().filter(|c| **c == "show -p Job --value kiosk.service").count(),
+            60,
+            "bounded: 60 polls, no more"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn watchdog_ticks_every_minute_as_a_oneshot() {
         assert!(render_watchdog_timer().contains("OnUnitActiveSec=60s"));
@@ -3491,6 +3799,8 @@ mod tests {
         assert!(!display_manager_will_be_disabled(Mode::Dedicated, Some("disabled")));
         assert!(!display_manager_will_be_disabled(Mode::Dedicated, None));
         assert!(!display_manager_will_be_disabled(Mode::Shared, Some("enabled")));
+        // systemd's answer for Ubuntu's display-manager.service alias (i1153).
+        assert!(display_manager_will_be_disabled(Mode::Dedicated, Some("alias")));
     }
 
     /// Teardown asks `is-enabled` about states that EXIT NON-ZERO (`masked`,
@@ -3515,7 +3825,7 @@ mod tests {
         let src = include_str!("kiosk.rs");
         let body = crate::test_src::own_code(src);
         let confirm = body.find("display_manager_will_be_disabled(a.mode").expect("setup must gate the disable");
-        let disable = body.find("sudo systemctl disable --now display-manager.service").unwrap();
+        let disable = body.find("sudo systemctl disable --now {dm}").unwrap();
         // The first write is step 1's useradd (anchored on its code: the
         // comment that names the step is blanked, followup 215).
         let first_write = body.find("\"sudo useradd --system --create-home --home-dir").expect("setup's first write, the useradd");
@@ -3611,5 +3921,188 @@ mod seat_display_pointer_tests {
             Some("noo kiosk seats set node-h quality full"));
         assert_eq!(seat_display_pointer(Some("node-h"), &args(&["quality", "bogus"])).as_deref(),
             Some("noo kiosk seats set node-h quality lean"));
+    }
+}
+
+/// A dedicated seat that stayed black after a reboot (i1153): the unit, the
+/// display-manager gate, and the bounded restart.
+#[cfg(test)]
+mod boot_tests {
+    use super::*;
+
+    /// The unit's directives: comments and blank lines dropped, so a check
+    /// never passes or fails on the prose that explains it.
+    fn directives(u: &str) -> Vec<String> {
+        u.lines().filter(|l| !l.trim_start().starts_with('#') && !l.trim().is_empty()).map(str::to_string).collect()
+    }
+
+    #[test]
+    fn a_dedicated_unit_takes_the_vt_as_a_display_manager_does() {
+        let d = directives(&render_kiosk_service_in("kiosk", Mode::Dedicated, DEDICATED_VT, "/usr/local/bin"));
+        let has = |l: &str| d.iter().any(|x| x == l);
+        assert!(!d.iter().any(|l| l.contains("plymouth-quit-wait")),
+            "plymouth-quit-wait returns only once someone quits plymouth; waiting on it is the black screen:\n{d:#?}");
+        // gdm's pattern (data/gdm.service.in), line for line.
+        for l in [
+            "Conflicts=plymouth-quit.service",
+            "After=plymouth-quit.service rc-local.service plymouth-start.service",
+            "OnFailure=plymouth-quit.service",
+            "ExecStartPre=-+/bin/plymouth quit --retain-splash",
+        ] {
+            assert!(has(l), "missing {l}:\n{d:#?}");
+        }
+        // The rest of the ordering is unchanged.
+        for l in [
+            "After=systemd-user-sessions.service network-online.target kiosk-serve.service",
+            "Wants=network-online.target",
+            "Requires=kiosk-serve.service",
+            "Conflicts=getty@tty1.service display-manager.service",
+            "ExecStart=/usr/local/bin/noo-kiosk-launch",
+            "Restart=always",
+        ] {
+            assert!(has(l), "missing {l}:\n{d:#?}");
+        }
+        // The splash is quit BEFORE the display starts, as root.
+        let pre = d.iter().position(|l| l.starts_with("ExecStartPre=")).unwrap();
+        let start = d.iter().position(|l| l.starts_with("ExecStart=")).unwrap();
+        assert!(pre < start);
+    }
+
+    /// Shared mode: the desktop's display manager owns the splash handover,
+    /// so the display still waits for it and conflicts with nothing.
+    #[test]
+    fn a_shared_unit_leaves_the_splash_to_the_desktop() {
+        let s = directives(&render_kiosk_service_in("kiosk", Mode::Shared, SHARED_DEFAULT_VT, "/usr/local/bin"));
+        assert!(s.iter().any(|l| l == "After=systemd-user-sessions.service network-online.target plymouth-quit-wait.service kiosk-serve.service"), "{s:#?}");
+        assert!(!s.iter().any(|l| l.starts_with("Conflicts=") || l.starts_with("ExecStartPre=") || l.starts_with("OnFailure=")), "{s:#?}");
+    }
+
+    /// A box that boots to multi-user.target (a server image) still starts
+    /// a dedicated display; the machine's default target is never changed.
+    #[test]
+    fn a_dedicated_display_starts_on_a_box_that_boots_to_multi_user() {
+        let d = directives(&render_kiosk_service_in("kiosk", Mode::Dedicated, DEDICATED_VT, "/usr/local/bin"));
+        assert!(d.iter().any(|l| l == "WantedBy=graphical.target multi-user.target"), "{d:#?}");
+        let s = directives(&render_kiosk_service_in("kiosk", Mode::Shared, SHARED_DEFAULT_VT, "/usr/local/bin"));
+        assert!(s.iter().any(|l| l == "WantedBy=graphical.target"), "{s:#?}");
+        // Setup never switches the box's default target.
+        let own = crate::test_src::own_code(include_str!("kiosk.rs"));
+        assert!(!own.contains("set-default"), "setup changes what the whole machine boots into");
+    }
+
+    #[test]
+    fn the_watchdog_never_queues_behind_the_display_and_is_bounded() {
+        let w = directives(&render_watchdog_service());
+        assert!(!w.iter().any(|l| l.starts_with("After=") && l.contains("kiosk.service")),
+            "the rescue queues behind the display's stuck start job:\n{w:#?}");
+        assert!(w.iter().any(|l| l == "TimeoutStartSec=150"), "a hung tick would stop the timer for good:\n{w:#?}");
+        // Its own restart is the bounded one (the script's case is in
+        // tests/test_kiosk_watchdog_bounded_restart.py).
+        assert!(WATCHDOG.contains("systemctl restart kiosk.service --no-block"));
+    }
+
+    #[test]
+    fn the_display_manager_alias_counts_as_enabled() {
+        for on in ["enabled", "alias", "enabled-runtime", "alias\n"] {
+            assert!(is_enabled_means_on(Some(on)), "{on}");
+        }
+        for off in ["disabled", "masked", "static", ""] {
+            assert!(!is_enabled_means_on(Some(off)), "{off}");
+        }
+        assert!(!is_enabled_means_on(None));
+        assert!(display_manager_will_be_disabled(Mode::Dedicated, Some("alias")), "Ubuntu's display-manager.service is an alias");
+        assert!(!display_manager_will_be_disabled(Mode::Shared, Some("alias")));
+    }
+
+    #[test]
+    fn setup_disables_the_unit_the_alias_stands_for() {
+        assert_eq!(display_manager_unit(Some("gdm3.service\n"), None), "gdm3.service");
+        // systemd did not resolve it: the alias link's target.
+        assert_eq!(display_manager_unit(Some("display-manager.service"), Some("/lib/systemd/system/lightdm.service")), "lightdm.service");
+        assert_eq!(display_manager_unit(None, Some("/usr/lib/systemd/system/sddm.service")), "sddm.service");
+        // Nothing usable (or something a shell would read): the alias.
+        assert_eq!(display_manager_unit(Some("gdm3.service; rm -rf /"), None), "display-manager.service");
+        assert_eq!(display_manager_unit(None, None), "display-manager.service");
+        let own = crate::test_src::own_code(include_str!("kiosk.rs"));
+        let setup = crate::test_src::fn_body(&own, "pub fn kiosk_setup(");
+        assert!(setup.contains(r#"sh(&format!("sudo systemctl disable --now {dm}"))"#), "setup disables the resolved unit");
+        assert!(!setup.contains("== Some(\"enabled\")"), "an exact `enabled` test misses `alias`");
+        let teardown = crate::test_src::fn_body(&own, "pub fn kiosk_teardown(");
+        assert!(teardown.contains(r#"sh(&format!("sudo systemctl enable {dm}"))"#), "teardown re-enables the unit setup recorded");
+    }
+
+    #[test]
+    fn a_unit_poll_reads_the_job_systemd_lists() {
+        assert_eq!(parse_unit_poll("ActiveState=inactive\nJob=7\n"), UnitPoll { active: "inactive".into(), job: true });
+        assert_eq!(parse_unit_poll("ActiveState=active\n"), UnitPoll { active: "active".into(), job: false });
+        assert_eq!(parse_unit_poll("Job=\nActiveState=failed\n"), UnitPoll { active: "failed".into(), job: false });
+        assert_eq!(parse_unit_poll(""), UnitPoll { active: "unknown".into(), job: false });
+    }
+
+    #[test]
+    fn a_start_is_waited_for_within_the_bound() {
+        use std::cell::Cell;
+        let n = Cell::new(0u32);
+        // The job finishes on the third poll: Done, at once.
+        let poll = || {
+            n.set(n.get() + 1);
+            UnitPoll { active: if n.get() >= 3 { "active" } else { "activating" }.into(), job: n.get() < 3 }
+        };
+        assert_eq!(wait_for_start(&poll, &|| {}, 60), StartWait::Done("active".into()));
+        assert_eq!(n.get(), 3);
+    }
+
+    #[test]
+    fn a_queued_start_is_given_up_at_the_bound() {
+        use std::cell::Cell;
+        let n = Cell::new(0u32);
+        let pauses = Cell::new(0u32);
+        let poll = || {
+            n.set(n.get() + 1);
+            assert!(n.get() <= 10_000, "unbounded: still polling a job that never finishes");
+            UnitPoll { active: "inactive".into(), job: true }
+        };
+        assert_eq!(wait_for_start(&poll, &|| pauses.set(pauses.get() + 1), KIOSK_START_BOUND_SECS), StartWait::Queued);
+        assert_eq!((n.get(), pauses.get()), (KIOSK_START_BOUND_SECS, KIOSK_START_BOUND_SECS - 1));
+        assert_eq!(
+            queued_message("kiosk.service", KIOSK_START_BOUND_SECS, Some("plymouth-quit-wait.service")),
+            "kiosk.service did not start within 60 s: a start job is queued behind plymouth-quit-wait.service"
+        );
+        assert!(queued_message("kiosk.service", 60, None).contains("`systemctl list-jobs` shows what it waits for"));
+    }
+
+    #[test]
+    fn the_blocker_is_a_unit_the_display_is_ordered_after() {
+        let jobs = "7 kiosk.service start waiting\n9 other.service start running\n3 plymouth-quit-wait.service start running\n";
+        let after = "systemd-user-sessions.service network-online.target plymouth-quit-wait.service kiosk-serve.service";
+        assert_eq!(queued_blocker(jobs, after, "kiosk.service").as_deref(), Some("plymouth-quit-wait.service"));
+        // A running job first, then a waiting one.
+        let jobs2 = "4 kiosk-serve.service start waiting\n5 network-online.target start running\n";
+        assert_eq!(queued_blocker(jobs2, after, "kiosk.service").as_deref(), Some("network-online.target"));
+        // Nothing it is ordered after has a job: no guess.
+        assert_eq!(queued_blocker("9 other.service start running\n", after, "kiosk.service"), None);
+        assert_eq!(queued_blocker("", after, "kiosk.service"), None);
+    }
+
+    #[test]
+    fn status_says_a_start_is_queued_and_behind_what() {
+        assert_eq!(queued_start_cell(Some("plymouth-quit-wait.service")),
+            "inactive: a start job is queued behind plymouth-quit-wait.service");
+        assert!(queued_start_cell(None).starts_with("inactive: a start job is queued"));
+        let own = crate::test_src::own_code(include_str!("kiosk.rs"));
+        let status = crate::test_src::fn_body(&own, "pub fn kiosk_status(");
+        assert!(status.contains("queued_start_cell(blocker.as_deref())") && status.contains("\"kiosk_job_blocked_by\": blocker"), "{status}");
+    }
+
+    /// Every kiosk.service restart this CLI runs is bounded.
+    #[test]
+    fn no_restart_of_the_display_blocks() {
+        let own = crate::test_src::own_code(include_str!("kiosk.rs"));
+        assert!(!own.contains("\"sudo systemctl restart kiosk.service\""), "a blocking restart in setup or `kiosk set`");
+        assert_eq!(own.matches("restart_kiosk_bounded(true)").count(), 2, "setup and `kiosk set`");
+        let seat = crate::test_src::own_code(include_str!("kiosk_seat.rs"));
+        assert!(!seat.contains("args([\"restart\", \"kiosk.service\"])"), "a blocking restart in seat-sync");
+        assert_eq!(seat.matches("&restart_display_bounded,").count(), 2, "the display step and its rollback");
+        assert!(!seat.contains("systemctl restart kiosk.service ||"), "a blocking restart in --migrate");
     }
 }

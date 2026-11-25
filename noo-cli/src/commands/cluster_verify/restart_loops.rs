@@ -69,16 +69,99 @@ pub(crate) struct Looping {
     /// `Some(code)`: not a loop but a crash, it exited `code` during the
     /// roll and stayed down (the upgrade gate only).
     pub crashed: Option<i64>,
+    /// `Some`: the container is a node agent backend
+    /// (`noo.managed-by=node-agent-go`), not a stack service.
+    pub agent_backend: Option<AgentBackend>,
+}
+
+/// The node agent backend a looping container is: its owner and cause.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct AgentBackend {
+    /// The `noo.backend` label (`reranker`).
+    pub backend: String,
+    /// The node it runs on (this controller's own); `None` when unknown.
+    pub node: Option<String>,
+    /// Whether a placement on that node wants the backend; `None` when the
+    /// placements could not be read.
+    pub placed: Option<bool>,
+}
+
+impl AgentBackend {
+    fn node(&self) -> &str {
+        self.node.as_deref().unwrap_or("<node>")
+    }
+
+    /// The command that clears it: stop the unwanted one, or read the placed
+    /// one's logs.
+    pub(crate) fn remedy(&self) -> String {
+        let (node, b) = (self.node(), self.backend.as_str());
+        match self.placed {
+            Some(false) => format!("noo cluster stop-backend {node} {b}"),
+            Some(true) => format!("noo cluster logs {node} -b {b}"),
+            None => format!("noo cluster stop-backend {node} {b}   # if no placement wants it; placed: noo cluster logs {node} -b {b}"),
+        }
+    }
+}
+
+/// `docker inspect` of the two ownership labels (`<managed-by>|<backend>`).
+pub(crate) const OWNER_TEMPLATE: &str = "{{index .Config.Labels \"noo.managed-by\"}}|{{index .Config.Labels \"noo.backend\"}}";
+
+/// The backend a container serves when the node agent owns it, from
+/// [`OWNER_TEMPLATE`]'s answer.
+pub(crate) fn parse_owner(out: &str) -> Option<String> {
+    let (by, backend) = out.trim().split_once('|')?;
+    (by.trim() == "node-agent-go" && !backend.trim().is_empty()).then(|| backend.trim().to_string())
+}
+
+fn agent_backend_of(docker: DockerRun, c: &str) -> Option<AgentBackend> {
+    match docker(&["inspect", "-f", OWNER_TEMPLATE, c]) {
+        Ok((true, out, _)) => parse_owner(&out).map(|backend| AgentBackend { backend, node: None, placed: None }),
+        _ => None,
+    }
+}
+
+/// Name the node and whether a placement wants each agent backend in `v`:
+/// `node` is this controller's own node, `placed(backend)` reads its
+/// placements (`None` when they could not be read).
+pub(crate) fn resolve_owners(v: &mut [Looping], node: Option<&str>, placed: &dyn Fn(&str) -> Option<bool>) {
+    for l in v.iter_mut() {
+        if let Some(a) = l.agent_backend.as_mut() {
+            a.node = node.map(str::to_string);
+            a.placed = placed(&a.backend);
+        }
+    }
 }
 
 impl Looping {
     /// `noo-redis is restart-looping (37 restarts): <last error>`, or
-    /// `noo-x exited 1 during the roll: <last error>`.
+    /// `noo-x exited 1 during the roll: <last error>`. A node agent
+    /// backend names its owner and the cause: no placement wants it (stop
+    /// it), or its model or engine (its logs).
     pub(crate) fn line(&self) -> String {
         let err = self.last_error.as_deref().unwrap_or("no fatal/error line in its last 50 log lines");
-        match self.crashed {
+        let head = match self.crashed {
             Some(code) => format!("{} exited {code} during the roll: {err}", self.container),
             None => format!("{} is restart-looping ({} restarts): {err}", self.container, self.restarts),
+        };
+        let Some(a) = &self.agent_backend else { return head };
+        let (node, b) = (a.node(), a.backend.as_str());
+        match a.placed {
+            Some(false) => format!(
+                "`{}` is restart-looping ({} restarts); it is the node agent's `{b}` backend and no placement wants it: `noo cluster stop-backend {node} {b}`",
+                self.container, self.restarts
+            ),
+            Some(true) => format!("{head}; it is the node agent's `{b}` backend, placed on `{node}`: the cause is its model or engine, see `noo cluster logs {node} -b {b}`"),
+            None => format!(
+                "{head}; it is the node agent's `{b}` backend: if no placement wants it, `noo cluster stop-backend {node} {b}`; if it is placed, the cause is its model or engine, see `noo cluster logs {node} -b {b}`"
+            ),
+        }
+    }
+
+    /// What the row and the upgrade gate print as the remedy for this one.
+    pub(crate) fn remedy(&self, prefix: &str) -> String {
+        match &self.agent_backend {
+            Some(a) => a.remedy(),
+            None => format!("noo stack logs {}", service_of(&self.container, prefix)),
         }
     }
 }
@@ -290,7 +373,8 @@ pub(crate) fn scan(docker: DockerRun, prefix: &str, now_unix: i64, gate: Option<
         let live = st.running || st.restarting;
         if is_looping(&st, now_unix, since) {
             let last_error = last_error_of(docker, &c);
-            looping.push(Looping { container: c, restarts: st.restart_count, last_error, crashed: None });
+            let agent_backend = agent_backend_of(docker, &c);
+            looping.push(Looping { container: c, restarts: st.restart_count, last_error, crashed: None, agent_backend });
         } else if live {
             if since.is_some_and(|t| is_suspect(&st, t)) {
                 suspects += 1;
@@ -306,7 +390,8 @@ pub(crate) fn scan(docker: DockerRun, prefix: &str, now_unix: i64, gate: Option<
                         notes.push(format!("{c} was stopped by the launcher ({why}); its last exit was {code}, not a crash of the roll"));
                     } else {
                         let last_error = last_error_of(docker, &c);
-                        looping.push(Looping { container: c, restarts: st.restart_count, last_error, crashed: Some(code) });
+                        let agent_backend = agent_backend_of(docker, &c);
+                        looping.push(Looping { container: c, restarts: st.restart_count, last_error, crashed: Some(code), agent_backend });
                     }
                 }
                 Ended::Stopped => notes.push(format!(
@@ -325,16 +410,40 @@ pub(crate) fn row(found: Result<Vec<Looping>, String>, prefix: &str) -> Check {
         Ok(v) if v.is_empty() => ok(NAME, format!("no {prefix}-* container has restarted more than {MAX_RESTARTS} times in the last {}m", RECENT_SECS / 60)),
         Ok(v) => {
             let detail = v.iter().map(Looping::line).collect::<Vec<_>>().join("; ");
-            let remedy = format!("noo stack logs {}", service_of(&v[0].container, prefix));
-            fail(NAME, detail, remedy)
+            fail(NAME, detail, v[0].remedy(prefix))
         }
     }
 }
 
+/// Whether this node's placements want `backend`, from its desired-config
+/// (`None` when it could not be read).
+pub(crate) fn placed_on(desired: Option<&serde_json::Value>, backend: &str) -> Option<bool> {
+    let placements = desired?.get("placements")?.as_array()?;
+    Some(placements.iter().any(|p| p["backend"].as_str() == Some(backend)))
+}
+
+/// The owner and cause of every node agent backend in `v`, from this
+/// controller's own node and its desired-config (read once, only when one
+/// is there).
+pub(crate) fn resolve_from_gateway(g: &crate::Globals, v: &mut [Looping]) {
+    if v.iter().all(|l| l.agent_backend.is_none()) {
+        return;
+    }
+    let node = crate::role::self_node_name();
+    let desired = node
+        .as_deref()
+        .and_then(|n| crate::http::get_json_opt(g, &format!("/api/cluster/nodes/{}/desired-config", crate::commands::urlencode(n)), true, 15));
+    resolve_owners(v, node.as_deref(), &|b| placed_on(desired.as_ref(), b));
+}
+
 /// `noo cluster verify --controller`'s row.
-pub(crate) fn restart_loops_row() -> Check {
+pub(crate) fn restart_loops_row(g: &crate::Globals) -> Check {
     let prefix = crate::envfile::container_prefix();
-    row(scan(&real_docker, &prefix, super::now_unix(), None).map(|(v, _, _)| v), &prefix)
+    let found = scan(&real_docker, &prefix, super::now_unix(), None).map(|(mut v, _, _)| {
+        resolve_from_gateway(g, &mut v);
+        v
+    });
+    row(found, &prefix)
 }
 
 /// `noo upgrade --stack`'s post-roll gate: the looping containers, judged
@@ -380,6 +489,11 @@ mod tests {
                     let mut names: Vec<&str> = inspect.keys().copied().collect();
                     names.push("other-redis"); // another stack's container: never judged
                     Ok((true, names.join("\n"), String::new()))
+                }
+                // Ownership labels: `noo-reranker` is the node agent's
+                // reranker backend; every other container is a stack service.
+                "inspect" if args[2] == OWNER_TEMPLATE => {
+                    Ok((true, if c == "noo-reranker" { "node-agent-go|reranker".into() } else { "|".into() }, String::new()))
                 }
                 "inspect" if args[2] == GATE_TEMPLATE => {
                     // Id `id-<c>`, its restart count, never finished, no OOM.
@@ -535,6 +649,47 @@ mod tests {
         let (v, _) = gate_loops(&fake(&inspect, &logs), "noo", NOW - 40, &Baseline::default(), &|| clock.get(), &mut |s| clock.set(clock.get() + s as i64)).unwrap();
         assert!(v.is_empty());
         assert!(clock.get() - NOW >= GATE_SETTLE_SECS && clock.get() - NOW < GATE_SETTLE_SECS + GATE_POLL_SECS as i64 + 1);
+    }
+
+    /// A node agent backend that restart-loops names its owner and cause:
+    /// no placement wants it (stop it), or it is placed (its model or
+    /// engine, with its logs), or the placements could not be read (both).
+    #[test]
+    fn an_agent_backend_loop_names_the_owner_and_the_cause() {
+        let inspect = HashMap::from([("noo-reranker", state(true, NOW - 30, 9, false)), ("noo-redis", state(true, NOW - 30, 9, false))]);
+        let logs = HashMap::from([("noo-reranker", "error: failed to load model '/models/bge.gguf'")]);
+        let (mut v, _, _) = scan(&fake(&inspect, &logs), "noo", NOW, None).unwrap();
+        v.sort_by(|a, b| a.container.cmp(&b.container));
+        assert_eq!(v[1].agent_backend.as_ref().map(|a| a.backend.as_str()), Some("reranker"));
+        assert!(v[0].agent_backend.is_none(), "a stack service is not an agent backend");
+        let mut unplaced = v.clone();
+        resolve_owners(&mut unplaced, Some("node-a"), &|_| Some(false));
+        assert_eq!(
+            unplaced[1].line(),
+            "`noo-reranker` is restart-looping (9 restarts); it is the node agent's `reranker` backend and no placement wants it: `noo cluster stop-backend node-a reranker`"
+        );
+        assert_eq!(unplaced[1].remedy("noo"), "noo cluster stop-backend node-a reranker");
+        assert_eq!(unplaced[0].remedy("noo"), "noo stack logs redis", "a stack service keeps its remedy");
+        let mut placed = v.clone();
+        resolve_owners(&mut placed, Some("node-a"), &|_| Some(true));
+        assert!(placed[1].line().contains("failed to load model") && placed[1].line().contains("placed on `node-a`: the cause is its model or engine, see `noo cluster logs node-a -b reranker`"), "{}", placed[1].line());
+        assert_eq!(placed[1].remedy("noo"), "noo cluster logs node-a -b reranker");
+        let mut unknown = v.clone();
+        resolve_owners(&mut unknown, None, &|_| None);
+        assert!(unknown[1].line().contains("if no placement wants it, `noo cluster stop-backend <node> reranker`"), "{}", unknown[1].line());
+        let r = row(Ok(vec![unplaced[1].clone()]), "noo");
+        assert_eq!(r.remedy.as_deref(), Some("noo cluster stop-backend node-a reranker"));
+        assert_eq!(placed_on(Some(&serde_json::json!({"placements": [{"backend": "reranker"}]})), "reranker"), Some(true));
+        assert_eq!(placed_on(Some(&serde_json::json!({"placements": []})), "reranker"), Some(false));
+        assert_eq!(placed_on(None, "reranker"), None);
+    }
+
+    #[test]
+    fn the_owner_is_the_node_agent_only_with_a_backend_label() {
+        assert_eq!(parse_owner("node-agent-go|reranker\n"), Some("reranker".into()));
+        assert_eq!(parse_owner("node-agent-go|"), None);
+        assert_eq!(parse_owner("agent|reranker"), None, "a node workload is not a backend");
+        assert_eq!(parse_owner("|"), None);
     }
 
     #[test]

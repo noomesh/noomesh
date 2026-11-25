@@ -114,10 +114,10 @@ pub(super) async fn generate_running_summary(
     // the turn's own context, so the summary never reloads the model (i802).
     crate::chat_context::stamp_opt(&mut body, num_ctx);
 
-    let client = crate::tls::cluster_client();
-
+    // Through the one door for backend calls: a node agent gets its
+    // credential and the target node (i1174).
     let url = format!("{vllm_url}/v1/chat/completions");
-    let resp = match client.post(&url).json(&body).send().await {
+    let resp = match crate::node_link::backend_request(reqwest::Method::POST, &url, "").json(&body).send().await {
         Ok(r) if r.status().is_success() => r,
         Ok(r) => {
             tracing::debug!(status = %r.status(), "summary_llm_non_2xx");
