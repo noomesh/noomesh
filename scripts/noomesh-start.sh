@@ -1015,6 +1015,12 @@ require_compose_v2 || exit 1
     # A licensed add-on declared off: its containers are removed (data kept),
     # BEFORE the up, so a failing up cannot leave them looping; a core
     # service found stopped afterwards fails the start.
+    # Before anything inspects a container (the add-on stop checks below, the
+    # `noo.inputs` snapshot): ask Docker about each one, bounded. One it does
+    # not answer for is named and left out of everything that follows
+    # (lib-stuck-container.sh); no Docker answer at all stops the start here.
+    # shellcheck disable=SC2086
+    noo_hold_hung "" compose $COMPOSE_FILES $PROFILE_ARGS || { ui_close_failed "Docker is not answering: nothing was started"; exit 1; }
     addons_stop_leftovers addons_stop_disabled || exit 1
     # shellcheck disable=SC2086
     check_bind_sources --no-deps $_bind_skip $ACTIVE_SVCS || exit 1
@@ -1104,13 +1110,21 @@ else
     fi
     addon_refuse_held "${SERVICES[@]}" || exit 1
     # A named service whose container Docker does not answer for (a process
-    # that survived SIGKILL, lib-stuck-container.sh) is named and left out;
-    # the others start, and the launcher exits $NOO_EXIT_STACK_PARTIAL.
-    noo_hold_hung "${SERVICES[*]}" compose $COMPOSE_FILES $PROFILE_ARGS
+    # that survived SIGKILL, lib-stuck-container.sh), one linked to it, or one
+    # that needs it, is named and left out; the others start, what they need
+    # that is not held is started first, and the launcher exits
+    # $NOO_EXIT_STACK_PARTIAL.
+    noo_hold_hung "" compose $COMPOSE_FILES $PROFILE_ARGS || { ui_close_failed "Docker is not answering: nothing was started"; exit 1; }
+    _dropped=""
     if [ -n "$NOO_ISOLATED_SERVICES" ]; then
         _kept=()
         for _s in "${SERVICES[@]}"; do
-            case " $NOO_ISOLATED_SERVICES " in *" $_s "*) ;; *) _kept+=("$_s") ;; esac
+            if noo_service_is_left_out "$_s" || noo_depends_on_held "$_s"; then
+                _dropped="${_dropped:+$_dropped }$_s"
+                ui_warned "not starting $_s: it is held, linked to a held container, or needs one"
+            else
+                _kept+=("$_s")
+            fi
         done
         SERVICES=(${_kept[@]+"${_kept[@]}"})
         [ ${#SERVICES[@]} -gt 0 ] || exit "$NOO_EXIT_STACK_PARTIAL"
@@ -1120,7 +1134,7 @@ else
     # not drop its label (and recreate it again on the next full start).
     start_inputs_named_up "${SERVICES[@]}"
     NOO_CREATED_GUARD_SERVICES="${SERVICES[*]}" noo_created_guard $(noo_stack_ps_ids "${SERVICES[@]}")
-    [ -n "$NOO_ISOLATED_SERVICES" ] && exit "$NOO_EXIT_STACK_PARTIAL"
+    [ -n "$_dropped" ] && exit "$NOO_EXIT_STACK_PARTIAL"
 fi
 
 # Pre-pull the Ollama inference model if Ollama is running. Default

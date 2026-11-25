@@ -1219,6 +1219,15 @@ fn rotate_controller_principals(g: &Globals, principals: &[String], restart: boo
             }
             Ok(0)
         }
+        // Exit 75: everything was recreated EXCEPT a container Docker does not
+        // answer for (named above); a holder among the left-out ones still
+        // presents the old credential until this host is rebooted.
+        Ok(s) if s.code() == Some(75) => {
+            if !g.json {
+                println!("{}", ui::status_line(Glyph::Warn, "stack recreated EXCEPT a container Docker does not answer for (named above) — the store and server ARE rotated; a holder left out keeps the old credential until this host is rebooted"));
+            }
+            Ok(1)
+        }
         _ => {
             if !g.json {
                 println!("{}", ui::status_line(Glyph::Warn, "stack recreate FAILED — the store and server ARE rotated; run: noo stack restart --force"));

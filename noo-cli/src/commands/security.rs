@@ -2664,7 +2664,14 @@ pub fn security_service_key_provision(g: &Globals, args: &[String]) -> Result<i3
         }
         None => Ok(std::process::ExitStatus::default()),
     };
-    if !matches!(st, Ok(s) if s.success()) {
+    // Exit 75: the launcher left out a container Docker does not answer for
+    // and recreated the rest; the verdicts below name each consumer that did
+    // not get the new value (the left-out one is among them when it is one).
+    let partial = matches!(&st, Ok(s) if s.code() == Some(75));
+    if partial {
+        println!("{}", ui::muted("the launcher recreated the stack EXCEPT a container Docker does not answer for (named above); a reboot of this host clears it"));
+    }
+    if !partial && !matches!(st, Ok(s) if s.success()) {
         // Name the launcher, not the consumers. "a consumer did not come back"
         // is true here and sends the reader to look at containers, when what
         // failed was the script — which printed its own reason above.

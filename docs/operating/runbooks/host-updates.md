@@ -166,17 +166,31 @@ gateway, the database, monitoring, the embed doors) and exits 75, which
 embedder (profile `embed-cpu`, when enabled) takes the embeddings
 meanwhile; the gateway already treats it as a peer endpoint.
 
-### If one container will not die and Docker stops answering about it
+### If Docker does not answer for one container
 
 A container whose process survives SIGKILL can leave Docker unable to remove
 it, and every Docker call that names that container (`docker inspect`
-included) then never returns. `noo stack start` and `noo stack restart` ask
-Docker about each of the stack's containers first, with a short bound (10 s,
-`NOO_DOCKER_PROBE_SECS`). A container that does not answer is named once, with
-what stops working without it. Everything else is started or restarted, the
-database and cache first, and the launcher exits 75 after the rest is up
-(`noo upgrade --stack` reports "stack up except <service>"). Only a reboot of
-the host removes the container; then `noo stack start` starts it again.
+included) then never returns. Before it starts or restarts anything, `noo
+stack start` and `noo stack restart` ask Docker about each of the stack's
+containers with a bound (10 s, then once more with 30 s;
+`NOO_DOCKER_PROBE_SECS`, `NOO_DOCKER_REPROBE_SECS`). A container that does
+not answer either time is named once, with what stops working without it;
+the likely cause is a process that did not exit, and only a reboot of the
+host removes it.
+
+Nothing the launcher runs afterwards names that container. Compose is also
+not asked to touch the services linked to it: the door whose network
+namespace the held container joins, a service that joins its namespace, and
+a service compose restarts together with it (read from the rendered compose
+config, never from a list). Everything else is started in stages: the data
+stores and the bus, then a bounded wait for them to be healthy or running,
+then the other services layer by layer in dependency order; a stage that is
+not ready in time is said and the start goes on. A container the start left
+in `Created` is started by name afterwards. The launcher exits 75 after the
+rest is up (`noo upgrade --stack` reports "stack up except <service>"). If a
+held container is the gateway or the database, the launcher says in so many
+words that the controller is not up. If Docker will not even list the
+containers, nothing is started and the launcher exits 1.
 
 `noo cluster verify --controller` keeps the hold visible in its
 `GPU services` row. A GPU driver fault clears with a reboot of the host;
