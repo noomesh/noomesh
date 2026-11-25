@@ -365,3 +365,85 @@ func TestTheReapPhaseRunsAfterConvergeAndCleanup(t *testing.T) {
 		t.Fatalf("reap at %d (%v)", reap, at)
 	}
 }
+
+// One role's unplace while another role keeps the backend placed is no reap
+// authority (cf's rc.7 sequence, from a controller that still ships that
+// tombstone). The embed role of ollama is unplaced at 09:35 while chat keeps
+// it placed: many reads stop nothing. Then the chat role, the last
+// placement, is unplaced at 10:00: the first read after it stops nothing,
+// the second stops ollama, and the stop names the last unplace (10:00), not
+// the 09:35 one.
+const (
+	embedUnplacedAt     = "2026-11-23T09:35:00.000Z"
+	chatPlacedEmbedTomb = `{"node":{"node_id":"node-a"},"placements":[{"backend":"ollama","role":"chat","model":"m","desired_state":"running"}],
+ "gateway_features":["node_restarting","reap_unplaced_backends"],
+ "unplaced":[{"backend":"ollama","role":"embed","unplaced_at":"2026-11-23T09:35:00.000Z"}]}`
+	bothUnplaced = `{"node":{"node_id":"node-a"},"placements":[],"gateway_features":["node_restarting","reap_unplaced_backends"],
+ "unplaced":[{"backend":"ollama","role":"embed","unplaced_at":"2026-11-23T09:35:00.000Z"},{"backend":"ollama","role":"chat","unplaced_at":"2026-11-23T10:00:00.000Z"}]}`
+)
+
+func sequenceController(t *testing.T, reads ...string) *Reconciler {
+	var mu sync.Mutex
+	i := 0
+	return reapController(t, func() string {
+		mu.Lock()
+		defer mu.Unlock()
+		b := reads[len(reads)-1]
+		if i < len(reads) {
+			b = reads[i]
+		}
+		i++
+		return b
+	})
+}
+
+func TestAnotherRolesUnplaceGivesNoGraceToTheLastUnplace(t *testing.T) {
+	backendreap.Reset()
+	t.Cleanup(backendreap.Reset)
+	r := sequenceController(t, chatPlacedEmbedTomb, chatPlacedEmbedTomb, chatPlacedEmbedTomb, chatPlacedEmbedTomb, bothUnplaced, bothUnplaced)
+	r.reapNow = func() time.Time { return time.Date(2026, 11, 23, 10, 6, 0, 0, time.UTC) }
+	cs := []dockerpkg.ManagedContainer{owned("ollama", beforeUnix)}
+	for i := 0; i < 4; i++ {
+		if got := reapPass(t, r, cs); len(got) != 0 {
+			t.Fatalf("read %d, ollama still placed for chat: stopped %v", i+1, got)
+		}
+	}
+	if got := reapPass(t, r, cs); len(got) != 0 {
+		t.Fatalf("the first read after the last unplace stopped %v: an earlier role's tombstone counted toward the two reads", got)
+	}
+	if got := reapPass(t, r, cs); len(got) != 1 || got[0] != "ollama" {
+		t.Fatalf("the second read after the last unplace: %v", got)
+	}
+	rs, _, _ := backendreap.Report(time.Date(2026, 11, 23, 10, 30, 0, 0, time.UTC))
+	if len(rs) != 1 || rs[0].UnplacedAt != unplacedAt {
+		t.Fatalf("the stop names %+v, want the last unplace %s (not the embed role's %s)", rs, unplacedAt, embedUnplacedAt)
+	}
+}
+
+// A quick unplace -> re-place of the last role (one read between them, with
+// an earlier role's tombstone shipping all along) never stops the backend.
+func TestAQuickReplaceOfTheLastRoleNeverStops(t *testing.T) {
+	backendreap.Reset()
+	t.Cleanup(backendreap.Reset)
+	r := sequenceController(t, chatPlacedEmbedTomb, chatPlacedEmbedTomb, chatPlacedEmbedTomb, bothUnplaced, chatPlacedEmbedTomb, chatPlacedEmbedTomb)
+	cs := []dockerpkg.ManagedContainer{owned("ollama", beforeUnix)}
+	for i := 0; i < 6; i++ {
+		if got := reapPass(t, r, cs); len(got) != 0 {
+			t.Fatalf("read %d stopped %v: a backend re-placed after one read was stopped", i+1, got)
+		}
+	}
+}
+
+// newestPerBackend keeps each backend's latest unplace; a time that does not
+// parse never replaces one that does.
+func TestTheNewestTombstoneOfABackendIsTheOneActedOn(t *testing.T) {
+	got := newestPerBackend([]unplacedTombstone{
+		{Backend: "ollama", Role: "embed", UnplacedAt: embedUnplacedAt},
+		{Backend: "reranker", Role: "rerank", UnplacedAt: unplacedAt},
+		{Backend: "ollama", Role: "chat", UnplacedAt: unplacedAt},
+		{Backend: "ollama", Role: "x", UnplacedAt: "not a time"},
+	})
+	if len(got) != 2 || got[0].Backend != "ollama" || got[0].UnplacedAt != unplacedAt || got[1].Backend != "reranker" {
+		t.Fatalf("newest per backend: %+v", got)
+	}
+}
