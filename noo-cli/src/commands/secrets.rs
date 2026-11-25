@@ -4487,6 +4487,10 @@ pub(crate) enum LauncherScope {
     Nothing { absent: Vec<String> },
     /// A scoped recreate would be unsafe or unanswerable; restart the stack.
     Full { reason: String },
+    /// Every holder that exists is one Docker does not answer for (held: a
+    /// process that survived SIGKILL): the launcher must not be run for them,
+    /// and the plan must not say they are absent.
+    Held { held: Vec<String> },
 }
 
 /// The questions the scope decision asks of the container runtime. A trait so
@@ -4494,6 +4498,10 @@ pub(crate) enum LauncherScope {
 pub(crate) trait StackProbe {
     /// A container of this name exists (running or not).
     fn present(&self, container: &str) -> bool;
+    /// Docker did not answer for this container in time (held). Default: no.
+    fn held(&self, _container: &str) -> bool {
+        false
+    }
     fn running(&self, container: &str) -> bool;
     /// Compose service names this container's service `depends_on`
     /// (compose records them on the container as a label).
@@ -4506,15 +4514,20 @@ impl StackProbe for DockerProbe {
     fn present(&self, container: &str) -> bool {
         container_created(container).is_some()
     }
+    fn held(&self, container: &str) -> bool {
+        container_stamp(container).as_deref() == Some(STAMP_NO_ANSWER)
+    }
     fn running(&self, container: &str) -> bool {
         container_running(container)
     }
     fn depends_on(&self, container: &str) -> Vec<String> {
-        let out = Command::new("docker")
-            .args(["inspect", "-f", "{{index .Config.Labels \"com.docker.compose.depends_on\"}}", container])
-            .output();
+        // Bounded, like every other lookup of a container here.
+        let out = crate::bounded::docker(
+            &["inspect", "-f", "{{index .Config.Labels \"com.docker.compose.depends_on\"}}", container],
+            std::time::Duration::from_secs(10),
+        );
         match out {
-            Ok(o) if o.status.success() => parse_depends_on(&String::from_utf8_lossy(&o.stdout)),
+            crate::bounded::Bounded::Answered(o) if o.status.success() => parse_depends_on(&String::from_utf8_lossy(&o.stdout)),
             _ => Vec::new(),
         }
     }
@@ -4539,8 +4552,12 @@ pub(crate) fn parse_depends_on(label: &str) -> Vec<String> {
 /// `--no-deps`, so a dependency that is down would stay down and the consumer
 /// would come up against nothing). Otherwise a full restart, with the reason.
 pub(crate) fn launcher_scope(containers: &[String], prefix: &str, probe: &dyn StackProbe) -> LauncherScope {
-    let present: Vec<&String> = containers.iter().filter(|c| probe.present(c)).collect();
+    let held: Vec<String> = containers.iter().filter(|c| probe.held(c)).cloned().collect();
+    let present: Vec<&String> = containers.iter().filter(|c| !held.contains(c) && probe.present(c)).collect();
     if present.is_empty() {
+        if !held.is_empty() {
+            return LauncherScope::Held { held };
+        }
         return LauncherScope::Nothing { absent: containers.to_vec() };
     }
     let lead = format!("{prefix}-");
@@ -4583,6 +4600,9 @@ impl LauncherScope {
                 format!("nothing — {} not present on this box", absent.join(", "))
             }
             LauncherScope::Full { reason } => format!("Restarts the stack: {reason}"),
+            LauncherScope::Held { held } => {
+                format!("nothing — {} held (Docker does not answer for it); only a reboot of this host clears it", held.join(", "))
+            }
         }
     }
 
@@ -4594,7 +4614,7 @@ impl LauncherScope {
                 v.extend(services.iter().cloned());
                 Some(v)
             }
-            LauncherScope::Nothing { .. } => None,
+            LauncherScope::Nothing { .. } | LauncherScope::Held { .. } => None,
             LauncherScope::Full { .. } => Some(vec!["--force".to_string()]),
         }
     }
@@ -6289,6 +6309,29 @@ mod tests {
     }
     fn names(v: &[&str]) -> Vec<String> { v.iter().map(|s| s.to_string()).collect() }
 
+    /// A consumer whose container Docker does not answer for is not "not
+    /// present on this box": the plan says it is held, the launcher is not run.
+    struct HeldStack;
+    impl StackProbe for HeldStack {
+        fn present(&self, _c: &str) -> bool { false }
+        fn held(&self, c: &str) -> bool { c == "noo-rhaddon" }
+        fn running(&self, _c: &str) -> bool { false }
+        fn depends_on(&self, _c: &str) -> Vec<String> { Vec::new() }
+    }
+
+    #[test]
+    fn a_held_consumer_is_named_held_in_the_plan_not_absent() {
+        let scope = launcher_scope(&names(&["noo-rhaddon", "noo-rhaddon-b"]), "noo", &HeldStack);
+        assert_eq!(scope, LauncherScope::Held { held: names(&["noo-rhaddon"]) });
+        assert_eq!(scope.launcher_args(), None, "the launcher is not run for a held container");
+        let line = scope.plan_line();
+        assert!(line.contains("noo-rhaddon held (Docker does not answer for it)"), "{line}");
+        assert!(!line.contains("not present"), "{line}");
+        // none held: today's line, unchanged
+        let absent = launcher_scope(&names(&["noo-rhaddon-b"]), "noo", &HeldStack);
+        assert_eq!(absent.plan_line(), "nothing — noo-rhaddon-b not present on this box");
+    }
+
     #[test]
     fn provisioning_a_consumer_recreates_only_its_own_service() {
         let t = provision_targets("evolve").unwrap();
@@ -6453,20 +6496,20 @@ mod tests {
     #[test]
     fn a_consumer_docker_did_not_answer_for_is_held_not_absent() {
         use super::STAMP_NO_ANSWER;
-        let consumers = vec!["noo-trellion".to_string(), "noo-trellion-intel".to_string()];
+        let consumers = vec!["noo-rhaddon".to_string(), "noo-rhaddon-b".to_string()];
         let no_answer = Some(STAMP_NO_ANSWER);
         let v = recreate_verdicts(
             &consumers,
-            &stamps(&[("noo-trellion", no_answer), ("noo-trellion-intel", None)]),
-            &stamps(&[("noo-trellion", no_answer), ("noo-trellion-intel", None)]),
+            &stamps(&[("noo-rhaddon", no_answer), ("noo-rhaddon-b", None)]),
+            &stamps(&[("noo-rhaddon", no_answer), ("noo-rhaddon-b", None)]),
         );
         assert_eq!(v[0].1, RecreateVerdict::Held);
         assert_eq!(v[1].1, RecreateVerdict::NotRunning, "genuinely absent: today's 'nothing to recreate'");
         // one side only is enough: it cannot be proven recreated
-        let v = recreate_verdicts(&consumers[..1], &stamps(&[("noo-trellion", Some("t1"))]), &stamps(&[("noo-trellion", no_answer)]));
+        let v = recreate_verdicts(&consumers[..1], &stamps(&[("noo-rhaddon", Some("t1"))]), &stamps(&[("noo-rhaddon", no_answer)]));
         assert_eq!(v[0].1, RecreateVerdict::Held);
         // exit-0 paths unchanged: a stamp that moved is still Recreated
-        let v = recreate_verdicts(&consumers[..1], &stamps(&[("noo-trellion", Some("t1"))]), &stamps(&[("noo-trellion", Some("t2"))]));
+        let v = recreate_verdicts(&consumers[..1], &stamps(&[("noo-rhaddon", Some("t1"))]), &stamps(&[("noo-rhaddon", Some("t2"))]));
         assert_eq!(v[0].1, RecreateVerdict::Recreated);
     }
 

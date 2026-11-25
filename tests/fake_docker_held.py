@@ -191,6 +191,13 @@ def main():
         f = (flags.get("-f") or flags.get("--format") or [None])[0]
         for r in ids:
             c = find(r)
+            if c is not None and c["id"] == os.environ.get("FAKE_INSPECT_KILLS_PROBE"):
+                # kill the probe subshell (the caller's caller) so it leaves no result
+                ppid = os.getppid()
+                gp = int(open("/proc/%d/stat" % ppid).read().rsplit(")", 1)[1].split()[1])
+                os.kill(gp, 9)
+                time.sleep(2)
+                sys.exit(0)
             if is_hung(c):
                 hang()
             if c is not None and c["id"] == os.environ.get("FAKE_SLOW_ID"):

@@ -31,7 +31,7 @@
 # (profile embed-cpu) is a peer embed endpoint of the gateway and takes the
 # embeddings while the GPU one is held.
 #
-# The third shape (controller ctrl, 2026-11-25, release 0.6.30): the GPU
+# The third shape (a controller, 2026-11-25, release 0.6.30): the GPU
 # embedder's process survived SIGKILL and containerd could not delete the
 # task ("cannot delete running task ... failed precondition"). From then on
 # EVERY docker call that touched that one container hung forever, `docker
@@ -165,7 +165,8 @@ _noo_core_first() {
 # shares a held service's network namespace (network_mode: service:<held>),
 # the door a held service joins, and the services a held one depends on with
 # `restart: true` (compose restarts the held one with them). `closure
-# <svc...>` prints the services and everything they depend_on. `layers
+# <svc...>` prints the services and everything they depend_on (`needs`: only
+# the required ones). `layers
 # <svc...>` prints the services as dependency layers, one per line.
 # Without python3 or a readable config it prints nothing, and the callers
 # degrade (no exclusion, one layer) and say so.
@@ -202,14 +203,17 @@ if mode == "excluded":
                 out.setdefault(d, "compose restarts " + h + " with it")
     for k in sorted(out):
         print(k + "\t" + out[k])
-elif mode == "closure":
+elif mode in ("closure", "needs"):
+    # needs: only the dependencies that are required (required: false is optional)
+    def req(s):
+        return [d for d, c in deps(s).items() if not (mode == "needs" and isinstance(c, dict) and c.get("required") is False)]
     seen, todo = [], list(args)
     while todo:
         s = todo.pop(0)
         if s in seen or s not in svcs:
             continue
         seen.append(s)
-        todo.extend(sorted(deps(s)))
+        todo.extend(sorted(req(s)))
     print(" ".join(seen))
 elif mode == "layers":
     sel, done, left = list(args), set(), list(args)
@@ -315,7 +319,7 @@ _noo_report_hung() {
     what="$(_noo_service_role "$1")"
     # The gateway itself, or anything it depends_on (read from the rendered
     # config, never a list): the controller is not working.
-    if [ "$1" = gateway ] || { c="$(_noo_rel closure gateway 2>/dev/null)" && case " $c " in *" $1 "*) true ;; *) false ;; esac; }; then
+    if [ "$1" = gateway ] || { c="$(_noo_rel needs gateway 2>/dev/null)" && case " $c " in *" $1 "*) true ;; *) false ;; esac; }; then
         ui_failed "THE CONTROLLER IS NOT UP: $3 ($1) is held and the gateway needs it; the gateway may be crash-looping or restarting without it."
     fi
     ui_failed "Docker did not answer for $3 ($1) in ${NOO_DOCKER_PROBE_SECS}s, and not again in ${NOO_DOCKER_REPROBE_SECS}s. If it still does not answer, its process most likely did not exit and Docker cannot remove it; only a reboot of this host removes it. Starting the rest of the stack without it; $what until then."
@@ -375,7 +379,7 @@ noo_service_is_left_out() {
 # depth) a held one: starting it alone would only make it fail.
 noo_depends_on_held() {
     local c h
-    c="$(_noo_rel closure "$1")" || return 1
+    c="$(_noo_rel needs "$1")" || return 1
     for h in ${NOO_ISOLATED_SERVICES:-}; do
         [ "$h" = "$1" ] && continue
         case " $c " in *" $h "*) return 0 ;; esac
