@@ -235,6 +235,9 @@ start_inputs_named_up() {
     _b="$(mktemp)"; _a="$(mktemp)"
     start_inputs_snapshot "$_b"
     # shellcheck disable=SC2086
+    # --no-deps while a service is held (lib-stuck-container.sh): compose must
+    # not walk into the container Docker does not answer for.
+    [ -z "${NOO_ISOLATED_SERVICES:-}" ] || START_UP_FORCE="$START_UP_FORCE --no-deps"
     docker compose $COMPOSE_FILES $PROFILE_ARGS up -d $START_UP_FORCE "$@" || _rc=$?
     if [ "$_rc" -ne 0 ]; then rm -f "$_b" "$_a"; return "$_rc"; fi
     start_inputs_snapshot "$_a"

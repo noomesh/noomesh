@@ -31,6 +31,20 @@
 # (profile embed-cpu) is a peer embed endpoint of the gateway and takes the
 # embeddings while the GPU one is held.
 #
+# The third shape (controller ctrl, 2026-11-25, release 0.6.30): the GPU
+# embedder's process survived SIGKILL and containerd could not delete the
+# task ("cannot delete running task ... failed precondition"). From then on
+# EVERY docker call that touched that one container hung forever, `docker
+# inspect` included, so there was no compose error text to read: `noo stack
+# restart` sat at "25 of 26 up" for 30 minutes and a later `noo stack start`
+# hung before starting what it had recreated. So the launcher no longer waits
+# to be told: before it brings anything up or restarts it, it asks Docker
+# about each of the stack's containers with a BOUNDED `docker inspect`
+# (NOO_DOCKER_PROBE_SECS, default 10). One that does not answer in time is
+# stuck: it is named once (the container, what it was, what stops working,
+# that only a reboot of this host removes it) and everything else is started
+# without it, core services first, exactly as for the other two shapes.
+#
 # Exit code (documented; noo-cli/src/commands/upgrade.rs reads it):
 #   75  NOO_EXIT_STACK_PARTIAL — the stack is up EXCEPT the named service(s);
 #       a reboot of this host clears it. If NOO_STUCK_REPORT names a file,
@@ -46,6 +60,148 @@
 
 NOO_EXIT_STACK_PARTIAL=75
 NOO_ISOLATED_SERVICES=""
+# Seconds one probe of one container may take before it counts as stuck.
+NOO_DOCKER_PROBE_SECS="${NOO_DOCKER_PROBE_SECS:-10}"
+
+# _noo_bounded <secs> cmd args... — run cmd with a deadline that HOLDS (the
+# same shape as _noo_nvidia_smi_bounded in lib-compose.sh: the child runs in
+# the background with its output in a file, nothing waits on it past the
+# deadline). Prints cmd's output and returns its status; 124 = no answer in
+# time (the child is sent KILL and left; it may never die).
+_noo_bounded() {
+    local secs="$1" d ticks rc child sub
+    shift
+    d="$(mktemp -d "${TMPDIR:-/tmp}/noo-bounded.XXXXXX" 2>/dev/null)" || { "$@"; return $?; }
+    (
+        "$@" >"$d/out" 2>&1 </dev/null &
+        child=$!
+        echo "$child" >"$d/pid"
+        wait "$child"
+        echo "$?" >"$d/rc.tmp" && mv "$d/rc.tmp" "$d/rc"
+    ) >/dev/null 2>&1 </dev/null &
+    sub=$!
+    ticks=$((secs * 10))
+    while [ ! -f "$d/rc" ] && [ "$ticks" -gt 0 ]; do
+        sleep 0.1 2>/dev/null || sleep 1
+        ticks=$((ticks - 1))
+    done
+    if [ -f "$d/rc" ]; then
+        rc="$(cat "$d/rc")"
+        cat "$d/out" 2>/dev/null
+        rm -rf "$d"
+        wait "$sub" 2>/dev/null
+        return "$rc"
+    fi
+    child="$(cat "$d/pid" 2>/dev/null)"
+    [ -n "$child" ] && kill -KILL "$child" 2>/dev/null
+    kill -KILL "$sub" 2>/dev/null
+    rm -rf "$d"
+    return 124
+}
+
+# What stops working while a service is down, in the operator's words.
+_noo_service_role() {
+    case "$1" in
+        ollama-embed|ollama) echo "GPU embeddings stop (the CPU embedder takes them when this install runs it)" ;;
+        ollama-embed-cpu) echo "CPU embeddings stop" ;;
+        postgres) echo "the database is down, so the gateway cannot work" ;;
+        redis) echo "the cache and queues are down" ;;
+        nats) echo "messaging is down" ;;
+        gateway) echo "the API and every client door are down" ;;
+        loki) echo "log search stops" ;;
+        prometheus) echo "metrics stop" ;;
+        grafana) echo "dashboards stop" ;;
+        *) echo "$1 stays down" ;;
+    esac
+}
+
+# _noo_core_first <services...> — one per line: the data stores the gateway
+# needs first, then the rest in the order given.
+_noo_core_first() {
+    local s c
+    for c in postgres redis nats; do
+        for s in "$@"; do [ "$s" = "$c" ] && printf '%s\n' "$s"; done
+    done
+    for s in "$@"; do
+        case "$s" in postgres|redis|nats) ;; *) printf '%s\n' "$s" ;; esac
+    done
+}
+
+# _noo_hung_services <docker compose args before up> — "service id name" per
+# stack container that exists and whose `docker inspect` gets no answer within
+# the bound. Empty when every container answers. Listing uses `docker ps`
+# (which does not touch each container); if even that does not answer, say so
+# and probe nothing: compose will meet the same wall and there is no name to give.
+_noo_hung_services() {
+    local all rows id name svc st rc project=()
+    all="$(docker "$@" config --services 2>/dev/null)" || return 0
+    [ -n "${COMPOSE_PROJECT_NAME:-}" ] && project=(--filter "label=com.docker.compose.project=$COMPOSE_PROJECT_NAME")
+    rows="$(_noo_bounded "$NOO_DOCKER_PROBE_SECS" docker ps -a --filter label=com.docker.compose.service \
+        ${project[@]+"${project[@]}"} --format '{{.ID}} {{.Names}} {{.Label "com.docker.compose.service"}}')"
+    rc=$?
+    if [ "$rc" -eq 124 ]; then
+        ui_failed "Docker does not list containers within ${NOO_DOCKER_PROBE_SECS}s: it is not answering; nothing here can start the stack until it does." >&2
+        return 0
+    fi
+    printf '%s\n' "$rows" | while read -r id name svc; do
+        [ -n "$id" ] && [ -n "$svc" ] || continue
+        printf '%s\n' "$all" | grep -qx "$svc" || continue
+        st="$(_noo_bounded "$NOO_DOCKER_PROBE_SECS" docker inspect -f '{{.State.Status}}' "$id")"
+        [ "$?" -eq 124 ] && printf '%s %s %s\n' "$svc" "$id" "$name"
+    done
+    return 0
+}
+
+# _noo_report_hung <service> <container id> <container name> — the one plain
+# statement, and the report file line the callers read.
+_noo_report_hung() {
+    ui_failed "$3 ($1) is stuck: its process did not exit and Docker cannot remove it (docker inspect gets no answer in ${NOO_DOCKER_PROBE_SECS}s). Starting the rest of the stack without it; $(_noo_service_role "$1") until then. Only a reboot of this host removes it."
+    if [ -n "${NOO_STUCK_REPORT:-}" ]; then
+        printf '%s\n%s\n' "$1" "$2" >> "$NOO_STUCK_REPORT" 2>/dev/null || true
+    fi
+}
+
+# noo_hold_hung "<services>" <docker compose args before up> — probe the stack
+# (or only the services named, space-separated; "" = all), report each stuck
+# one, and put them in NOO_ISOLATED_SERVICES. For callers that do not go
+# through noo_compose_up_isolating_stuck (restart, named services).
+noo_hold_hung() {
+    local only="$1" svc id name held=""
+    shift
+    NOO_ISOLATED_SERVICES=""
+    while read -r svc id name; do
+        [ -n "$svc" ] || continue
+        if [ -n "$only" ]; then case " $only " in *" $svc "*) ;; *) continue ;; esac; fi
+        case " $held " in *" $svc "*) continue ;; esac
+        _noo_report_hung "$svc" "$id" "$name"
+        held="${held:+$held }$svc"
+    done <<EOF_HUNG
+$(_noo_hung_services "$@")
+EOF_HUNG
+    NOO_ISOLATED_SERVICES="$held"
+    return 0
+}
+
+# noo_stack_ps_ids [service...] — the container ids for noo_created_guard,
+# never asking Docker about a service held above (a compose `ps` that meets
+# the stuck container hangs with it). Uses $COMPOSE_FILES and $PROFILE_ARGS.
+noo_stack_ps_ids() {
+    local svcs="$*" s keep=""
+    if [ -z "${NOO_ISOLATED_SERVICES:-}" ]; then
+        # shellcheck disable=SC2086
+        docker compose $COMPOSE_FILES $PROFILE_ARGS ps -aq $svcs
+        return 0
+    fi
+    # shellcheck disable=SC2086
+    [ -n "$svcs" ] || svcs="$(docker compose $COMPOSE_FILES $PROFILE_ARGS config --services 2>/dev/null)"
+    for s in $svcs; do
+        case " $NOO_ISOLATED_SERVICES " in *" $s "*) continue ;; esac
+        keep="${keep:+$keep }$s"
+    done
+    [ -n "$keep" ] || return 0
+    # shellcheck disable=SC2086
+    _noo_bounded "$NOO_DOCKER_PROBE_SECS" docker compose $COMPOSE_FILES $PROFILE_ARGS ps -aq $keep
+}
 
 # The daemon's words for a GPU that did not answer at container start.
 _NOO_GPU_START_ERROR='error getting device handle|failed to inject CDI devices|unresolvable CDI devices|nvidia-container-cli|could not select device driver "nvidia"|NVML|nvidia-container-runtime'
@@ -92,7 +248,30 @@ noo_compose_up_isolating_stuck() {
     # One round per failure: a second GPU service (the exporter, a second
     # backend) can fail the retry the same way. Bounded: the services held
     # by name only grow.
-    local isolated="" round ids id gpu name svc why all
+    local isolated="" round ids id gpu name svc why all hid hname
+    if [ "$seen_up" = 1 ]; then
+        # Ask about every container first (the 2026-11-25 shape: no error to
+        # read, Docker simply never answers about one of them).
+        while read -r svc hid hname; do
+            [ -n "$svc" ] || continue
+            case " $isolated " in *" $svc "*) continue ;; esac
+            _noo_report_hung "$svc" "$hid" "$hname"
+            isolated="${isolated:+$isolated }$svc"
+        done <<EOF_HUNG
+$(_noo_hung_services "${base[@]}")
+EOF_HUNG
+        if [ -n "$isolated" ]; then
+            NOO_ISOLATED_SERVICES="$isolated"
+            all="$(docker "${base[@]}" config --services 2>/dev/null)" || all=""
+            others=()
+            for svc in $(_noo_core_first $all); do
+                case " $isolated " in *" $svc "*) continue ;; esac
+                others+=("$svc")
+            done
+            [ "${#others[@]}" -gt 0 ] || { rm -f "$errf"; return "$NOO_EXIT_STACK_PARTIAL"; }
+            argv=("${base[@]}" up --no-deps "${upflags[@]}" "${others[@]}")
+        fi
+    fi
     for round in 1 2 3 4; do
         : > "$errf"
         docker "${argv[@]}" 2>&1 | tee "$errf"
@@ -141,7 +320,7 @@ noo_compose_up_isolating_stuck() {
 
         all="$(docker "${base[@]}" config --services 2>/dev/null)" || { rm -f "$errf"; return "$rc"; }
         others=()
-        for svc in $all; do
+        for svc in $(_noo_core_first $all); do
             case " $isolated " in *" $svc "*) continue ;; esac
             others+=("$svc")
         done

@@ -166,6 +166,18 @@ gateway, the database, monitoring, the embed doors) and exits 75, which
 embedder (profile `embed-cpu`, when enabled) takes the embeddings
 meanwhile; the gateway already treats it as a peer endpoint.
 
+### If one container will not die and Docker stops answering about it
+
+A container whose process survives SIGKILL can leave Docker unable to remove
+it, and every Docker call that names that container (`docker inspect`
+included) then never returns. `noo stack start` and `noo stack restart` ask
+Docker about each of the stack's containers first, with a short bound (10 s,
+`NOO_DOCKER_PROBE_SECS`). A container that does not answer is named once, with
+what stops working without it. Everything else is started or restarted, the
+database and cache first, and the launcher exits 75 after the rest is up
+(`noo upgrade --stack` reports "stack up except <service>"). Only a reboot of
+the host removes the container; then `noo stack start` starts it again.
+
 `noo cluster verify --controller` keeps the hold visible in its
 `GPU services` row. A GPU driver fault clears with a reboot of the host;
 then `noo stack start` starts the held services.
