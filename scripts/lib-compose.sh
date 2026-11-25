@@ -260,6 +260,12 @@ compose_remove_retired() {
         _crr_date="${1:-}"
         [ $# -gt 0 ] && shift
         _crr_pr="$*"
+        # A container Docker does not answer for (lib-stuck-container.sh) is
+        # never touched: `docker rm -f` on it hangs with it.
+        if declare -F noo_name_is_held >/dev/null && noo_name_is_held "$_crr_name"; then
+            echo "! not removing $_crr_name (service $_crr_svc was retired on $_crr_date ($_crr_pr)): Docker does not answer for it; after a reboot of this host: docker rm -f $_crr_name" >&2
+            continue
+        fi
         if docker rm -f "$_crr_name" >/dev/null 2>&1; then
             echo "- removed $_crr_name: service $_crr_svc was retired on $_crr_date ($_crr_pr)"
         else

@@ -985,11 +985,25 @@ require_compose_v2 || exit 1
         noo_check_port_collisions || exit 1
     fi
 
+    # Before anything touches a container (the re-own steps, the retired and
+    # add-on removals, the `noo.inputs` snapshot): ask Docker about each one,
+    # bounded. One it does not answer for is named and left out of everything
+    # that follows (lib-stuck-container.sh); no Docker answer at all stops the
+    # start here. $ACTIVE_SVCS is what this start brings up; the staged up
+    # (held path) brings up nothing outside it.
+    NOO_STACK_ACTIVE_SERVICES="$ACTIVE_SVCS"
+    # shellcheck disable=SC2086
+    noo_hold_hung "" compose $COMPOSE_FILES $PROFILE_ARGS || { ui_close_failed "Docker is not answering: nothing was started"; exit 1; }
     # redis/grafana run as uid 65532 (i64): re-own their data NOW, with the old
     # container stopped, and refuse the start if anything is still not 65532 (lib-reown.sh).
     # Before the bind-source check, which stays the last thing before `up`
     # and so sees the final ownership.
-    reown_stop_service() { docker compose $COMPOSE_FILES $PROFILE_ARGS stop "$1" >/dev/null 2>&1; }
+    # Bounded, and never for a service left out (lib-stuck-container.sh): a
+    # `compose stop` of the held container hangs with it.
+    reown_stop_service() {
+        noo_service_is_left_out "$1" && return 0
+        _noo_bounded 120 docker compose $COMPOSE_FILES $PROFILE_ARGS stop "$1" >/dev/null 2>&1
+    }
     if [ -n "$_data_root" ]; then
         # shellcheck disable=SC2046  # one service name per word
         reown_nonroot_dirs "${_state_root:-$_data_root}" $(printf '%s\n' "$ACTIVE_SVCS" | grep -xE 'redis|grafana' || true) || exit 1
@@ -1015,12 +1029,6 @@ require_compose_v2 || exit 1
     # A licensed add-on declared off: its containers are removed (data kept),
     # BEFORE the up, so a failing up cannot leave them looping; a core
     # service found stopped afterwards fails the start.
-    # Before anything inspects a container (the add-on stop checks below, the
-    # `noo.inputs` snapshot): ask Docker about each one, bounded. One it does
-    # not answer for is named and left out of everything that follows
-    # (lib-stuck-container.sh); no Docker answer at all stops the start here.
-    # shellcheck disable=SC2086
-    noo_hold_hung "" compose $COMPOSE_FILES $PROFILE_ARGS || { ui_close_failed "Docker is not answering: nothing was started"; exit 1; }
     addons_stop_leftovers addons_stop_disabled || exit 1
     # shellcheck disable=SC2086
     check_bind_sources --no-deps $_bind_skip $ACTIVE_SVCS || exit 1
@@ -1096,19 +1104,6 @@ else
         echo "Profiles: $PROFILE_ARGS"
     fi
 
-    # redis/grafana re-owned (lib-reown.sh) before the bind-source check,
-    # which stays last before `up`. Only the named services: re-owning (and so stopping) one this start
-    # does not bring back up would leave it down.
-    reown_stop_service() { docker compose $COMPOSE_FILES $PROFILE_ARGS stop "$1" >/dev/null 2>&1; }
-    if [ -n "$_data_root" ]; then
-        # shellcheck disable=SC2046
-        reown_nonroot_dirs "${_state_root:-$_data_root}" $(printf '%s\n' "${SERVICES[@]}" | grep -xE 'redis|grafana' || true) || exit 1
-    fi
-    reown_ollama_stores "$(printf '%s\n' "${SERVICES[@]}")" || exit 1
-    if printf '%s\n' "${SERVICES[@]}" | grep -qxE 'whisper|piper'; then
-        noo_voice_model_dirs
-    fi
-    addon_refuse_held "${SERVICES[@]}" || exit 1
     # A named service whose container Docker does not answer for (a process
     # that survived SIGKILL, lib-stuck-container.sh), one linked to it, or one
     # that needs it, is named and left out; the others start, what they need
@@ -1129,6 +1124,24 @@ else
         SERVICES=(${_kept[@]+"${_kept[@]}"})
         [ ${#SERVICES[@]} -gt 0 ] || exit "$NOO_EXIT_STACK_PARTIAL"
     fi
+    # redis/grafana re-owned (lib-reown.sh) before the bind-source check,
+    # which stays last before `up`. Only the named services: re-owning (and so stopping) one this start
+    # does not bring back up would leave it down.
+    # Bounded, and never for a service left out (lib-stuck-container.sh): a
+    # `compose stop` of the held container hangs with it.
+    reown_stop_service() {
+        noo_service_is_left_out "$1" && return 0
+        _noo_bounded 120 docker compose $COMPOSE_FILES $PROFILE_ARGS stop "$1" >/dev/null 2>&1
+    }
+    if [ -n "$_data_root" ]; then
+        # shellcheck disable=SC2046
+        reown_nonroot_dirs "${_state_root:-$_data_root}" $(printf '%s\n' "${SERVICES[@]}" | grep -xE 'redis|grafana' || true) || exit 1
+    fi
+    reown_ollama_stores "$(printf '%s\n' "${SERVICES[@]}")" || exit 1
+    if printf '%s\n' "${SERVICES[@]}" | grep -qxE 'whisper|piper'; then
+        noo_voice_model_dirs
+    fi
+    addon_refuse_held "${SERVICES[@]}" || exit 1
     check_bind_sources "${SERVICES[@]}" || exit 1
     # The same `noo.inputs` labels as a full start, so naming a service does
     # not drop its label (and recreate it again on the next full start).

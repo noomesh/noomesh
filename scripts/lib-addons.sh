@@ -393,6 +393,10 @@ addons_stop_disabled() {
                 continue
             fi
             for _asd_c in $_asd_names; do
+                if declare -F noo_name_is_held >/dev/null && noo_name_is_held "$_asd_c"; then
+                    echo "! not removing $_asd_c (add-on $_asd_n is declared off): Docker does not answer for it; after a reboot of this host: docker rm -f $_asd_c" >&2
+                    continue
+                fi
                 _ADDON_STOPPED="${_ADDON_STOPPED:- }${_asd_s} "
                 echo "last log lines of $_asd_c (add-on $_asd_n, declared off), kept before it is removed:" >&2
                 docker logs --tail 20 "$_asd_c" 2>&1 | sed 's/^/  | /' >&2
@@ -422,6 +426,9 @@ addons_stop_refused() {
         for _asr_s in $(addon_own_services "$_asr_o"); do
             _asr_ids="$(docker ps -q --no-trunc --filter "label=com.docker.compose.project=${_asr_proj}" \
                 --filter "label=com.docker.compose.service=${_asr_s}" 2>/dev/null)"
+            if declare -F noo_not_held_ids >/dev/null && [ -n "${NOO_HELD_IDS:-}" ]; then
+                _asr_ids="$(printf '%s\n' "$_asr_ids" | noo_not_held_ids)"
+            fi
             [ -n "$_asr_ids" ] || continue
             _ADDON_STOPPED="${_ADDON_STOPPED:- }${_asr_s} "
             # shellcheck disable=SC2086
@@ -465,6 +472,14 @@ addons_compose_stop_intended() {
     shift
     while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do _acs_args+=("$1"); shift; done
     [ "${1:-}" = "--" ] && shift
+    # A service held or linked to a held container (lib-stuck-container.sh)
+    # is not stopped by name: `compose stop` on it hangs with it.
+    if declare -F noo_service_is_left_out >/dev/null && [ -n "${NOO_ISOLATED_SERVICES:-}" ]; then
+        local _acs_keep=() _acs_s
+        for _acs_s in "$@"; do noo_service_is_left_out "$_acs_s" || _acs_keep+=("$_acs_s"); done
+        set -- ${_acs_keep[@]+"${_acs_keep[@]}"}
+        [ "$#" -gt 0 ] || return 0
+    fi
     _acs_ids="$(docker compose "${_acs_args[@]}" ps -q "$@" 2>/dev/null)"
     # shellcheck disable=SC2086
     [ -n "$_acs_ids" ] && addons_note_intended_stop "$_acs_why" $_acs_ids
