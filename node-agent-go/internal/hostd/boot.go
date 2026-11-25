@@ -134,7 +134,11 @@ _noo_dk() {
   _noo_bound "$_noo_s2" docker "$@"
 }
 _noo_skip() {
-  echo "boot-restore: Docker did not answer for container $1 within ${2}s ($3); it was left alone" >&2
+  if [ "$SECONDS" -ge "$((_noo_budget - 1))" ]; then
+    echo "boot-restore: container $1 was not handled: the run was out of time ($SECONDS s of ${_noo_budget}s), so the call ($3) was cut short; it was left alone" >&2
+  else
+    echo "boot-restore: Docker did not answer for container $1 within ${2}s ($3); it was left alone" >&2
+  fi
   skipped="${skipped:+$skipped, }$1"
 }
 # docker start, bounded. A start that times out may only be slow (a large
@@ -254,8 +258,9 @@ var (
 	// script budget, so it always ends before bootOverall.
 	bootNetnsBound = 150 * time.Second
 	// bootOverall: the Go-side backstop for the whole run, held under the
-	// compose lock: the 10 min list window plus 15 min for the container pass
-	// (the pass has its full time after a long wait) = 25 min. The script
+	// compose lock: 25 min = the 10 min list window plus about 15 min for the
+	// container pass. The script budget is absolute (25 min less 60 s), so
+	// after a full list wait the pass keeps about 14 min (840 s). The script
 	// keeps its own budget (scriptBudget: 60 s less), clamps every call to what
 	// is left of it and stops starting containers near it, so it ends itself,
 	// with its summary, before this fires. On expiry the shell is killed (not a
