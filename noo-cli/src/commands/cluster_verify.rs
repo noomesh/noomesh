@@ -748,9 +748,11 @@ const BUNDLE_FETCH_FAIL_SECS: i64 = 3600;
 const BUNDLE_FETCH_GATEWAY_GRACE_SECS: i64 = 900;
 /// A stamp this far ahead of this machine's clock is clock skew, said as such.
 const BUNDLE_FETCH_CLOCK_SKEW_SECS: i64 = 60;
-/// The first release whose fetchers send a receipt on every poll, a 304 too;
-/// before it `fetched_at` moved only when a new bundle was collected.
-const BUNDLE_RECEIPT_MIN_VERSION: (u64, u64, u64) = (0, 6, 0);
+/// The first release whose fetchers send a receipt on every poll, a 304 too
+/// (commits c93f41ec and 01a351c3, first in noo-cli-v0.6.24); before it
+/// `fetched_at` moved only when a new bundle was collected, so a node
+/// polling normally on an older agent looks silent.
+const BUNDLE_RECEIPT_MIN_VERSION: (u64, u64, u64) = (0, 6, 24);
 
 /// `v0.6.30`, `0.6.0-rc.1`, `v0.2.70` → major, minor, patch.
 fn version_triple(v: &str) -> Option<(u64, u64, u64)> {
@@ -20477,6 +20479,20 @@ mod bundle_fetch_and_refusal_rows_tests {
         assert_eq!(version_triple("v0.6.30"), Some((0, 6, 30)));
         assert_eq!(version_triple("0.6.0-rc.1"), Some((0, 6, 0)));
         assert_eq!(version_triple("v0.6"), None);
+    }
+
+    #[test]
+    fn the_receipt_floor_is_the_first_release_that_receipts_on_a_304() {
+        let mut n = polling(7200);
+        n["app_version"] = "stack-v0.6.23+abc".into();
+        assert_eq!(row(&n).unwrap().verdict, Verdict::Warn, "one below the floor");
+        n["app_version"] = "stack-v0.6.10+abc".into();
+        assert_eq!(row(&n).unwrap().verdict, Verdict::Warn);
+        n["app_version"] = "stack-v0.6.24+abc".into();
+        assert_eq!(row(&n).unwrap().verdict, Verdict::Fail, "at the floor");
+        n["app_version"] = "noo-cli-v0.6.24-rc.1+abc".into();
+        assert_eq!(row(&n).unwrap().verdict, Verdict::Fail);
+        assert_eq!(BUNDLE_RECEIPT_MIN_VERSION, (0, 6, 24));
     }
 
     #[test]
