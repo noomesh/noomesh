@@ -58,6 +58,7 @@ package backendrt
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -411,7 +412,10 @@ func (g *OllamaGuard) reportSystemDrift() error {
 const OllamaWantedEnvFile = "ollama-env.json"
 
 // recordWanted writes the tuning keys with their values as a JSON object to
-// WantedFile, only when the content changed. Best effort: a failure is
+// WantedFile, only when the content changed. It runs on every Converge of a
+// boot-service plist, drift or not, so the file always holds the current set
+// (a key that left the placements leaves the file; enroll then removes it
+// from the plist). Best effort: a failure is
 // logged and the sudo commands in the refusal still name every value.
 func (g *OllamaGuard) recordWanted() {
 	if g.WantedFile == "" {
@@ -429,7 +433,19 @@ func (g *OllamaGuard) recordWanted() {
 		slog.Warn("ollama: could not record the wanted env", "file", g.WantedFile, "err", err)
 		return
 	}
-	if err := os.WriteFile(g.WantedFile, b, 0o640); err != nil {
+	// Temp file + rename: a reader never sees a torn (empty) file.
+	tmp, err := os.CreateTemp(filepath.Dir(g.WantedFile), ".ollama-env-*")
+	if err == nil {
+		_, werr := tmp.Write(b)
+		cerr := tmp.Close()
+		if err = errors.Join(werr, cerr, os.Chmod(tmp.Name(), 0o640)); err == nil {
+			err = os.Rename(tmp.Name(), g.WantedFile)
+		}
+		if err != nil {
+			_ = os.Remove(tmp.Name())
+		}
+	}
+	if err != nil {
 		slog.Warn("ollama: could not record the wanted env", "file", g.WantedFile, "err", err)
 	}
 }

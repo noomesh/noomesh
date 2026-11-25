@@ -429,3 +429,50 @@ func TestSystemPlistDriftRecordsTheWantedEnvForEnrollResume(t *testing.T) {
 		}
 	}
 }
+
+// Production wires the wanted-file path: the agent's own constructor puts it
+// at ~/noomesh/ollama-env.json, where `noo enroll` reads it.
+func TestNewOllamaGuardRecordsTheWantedEnvUnderTheNodeHome(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	g := NewOllamaGuard()
+	if want := filepath.Join(home, "noomesh", OllamaWantedEnvFile); g.WantedFile != want {
+		t.Fatalf("WantedFile = %q, want %q", g.WantedFile, want)
+	}
+}
+
+// The file follows the wanted set whether or not the plist drifted: a key
+// that leaves the placements leaves the file, and an empty set is "{}".
+func TestWantedEnvFileTracksTheSetWithoutDriftAndLeavesNoTempFile(t *testing.T) {
+	refusals.Reset()
+	t.Cleanup(refusals.Reset)
+	sys := OllamaSystemPlistPath(newBrew)
+	f := &fakeMac{env: map[string]string{"OLLAMA_NO_CLOUD": "1", "OLLAMA_KEEP_ALIVE": "-1"}, procEnv: procWith}
+	g := &OllamaGuard{Home: "/Users/m", UID: 501, Run: f.run, Exists: func(p string) bool { return p == sys }}
+	dir := filepath.Join(t.TempDir(), "noomesh")
+	g.WantedFile = filepath.Join(dir, OllamaWantedEnvFile)
+	set := map[string]string{"OLLAMA_KEEP_ALIVE": "-1"}
+	g.Tuning = func() map[string]string { return set }
+	read := func() string {
+		b, err := os.ReadFile(g.WantedFile)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(b)
+	}
+	g.Converge() // the plist already matches: no drift
+	if got := read(); got != "{\"OLLAMA_KEEP_ALIVE\":\"-1\"}\n" {
+		t.Fatalf("file = %q", got)
+	}
+	set = map[string]string{} // the key left the placements; still no drift
+	g.Converge()
+	if got := read(); got != "{}\n" {
+		t.Fatalf("file = %q", got)
+	}
+	if st, _ := os.Stat(g.WantedFile); st.Mode().Perm() != 0o640 {
+		t.Errorf("mode = %v", st.Mode().Perm())
+	}
+	if ents, _ := os.ReadDir(dir); len(ents) != 1 {
+		t.Errorf("temp file left behind: %v", ents)
+	}
+}
