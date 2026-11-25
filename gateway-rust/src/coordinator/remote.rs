@@ -242,16 +242,16 @@ impl HarnessRuntime for RemoteRuntime {
         crate::harness::profile::chat_context_for(&pinned.model)
     }
 
-    /// The engine window for the pinned vLLM / llama.cpp model: what the
-    /// controller works out for its own in-process chats
-    /// (`chat_context::window_for`), carried to the node by the agent's
-    /// `/harness/placement` `chat_windows`. `None` (the loop keeps its global
-    /// window, as before) for any other backend, any endpoint but the
-    /// pinned one, or when the agent sent no window for the model.
+    /// The engine window for the pinned model, from the agent's
+    /// `/harness/placement` `chat_windows` (the controller's own reading for
+    /// its in-process chats, `chat_context::window_for`, carried to the node).
+    /// Looked up by the pin AS GIVEN, with no gate on the backend type: the
+    /// shipped harness is pinned `auto` / `openai` (its env file; the node's
+    /// proxy substitutes the real model), and the agent states the window of
+    /// `auto` (the smallest across the node's chat placements) under that
+    /// name. `None` (the loop keeps its global window, as before) for any
+    /// endpoint but the pinned one, or when the agent sent no entry.
     async fn chat_window(&self, backend: &ResolvedBackend) -> Option<u64> {
-        if !crate::chat_context::reads_window(&backend.backend_type) {
-            return None;
-        }
         let pinned = self.pinned.as_ref().filter(|p| p.url == backend.url)?;
         crate::harness::profile::chat_window_for(&pinned.model)
     }
@@ -1035,7 +1035,6 @@ mod tests {
         };
         let llama = ResolvedBackend { url: "http://noo-llamacpp:8085".into(), model: "win-llama-3b".into(), backend_type: "llamacpp".into(), api_format: "llamacpp".into() };
         let vllm = ResolvedBackend { url: "http://noo-vllm:8000".into(), model: "win-vllm-7b".into(), backend_type: "vllm".into(), api_format: "openai".into() };
-        let ollama = ResolvedBackend { url: "http://127.0.0.1:11434".into(), model: "win-ollama:1b".into(), backend_type: "ollama".into(), api_format: "ollama".into() };
         let (global_len, reserve) = (16384u32, 4096u32);
         let global_input = 12_288usize;
 
@@ -1046,7 +1045,7 @@ mod tests {
 
         // The agent's table, with a zero and an absurd entry beside the two real ones.
         let placement = serde_json::json!({"placed": true,
-            "chat_windows": {"win-llama-3b": 4096, "win-vllm-7b": 8192, "win-zero": 0, "win-absurd": 99_999_999_999u64}});
+            "chat_windows": {"win-llama-3b": 4096, "win-vllm-7b": 8192, "win-zero": 0, "win-absurd": 99_999_999_999u64, "auto": 4096}});
         crate::harness::profile::set_chat_windows(crate::harness::profile::chat_windows_of(&placement));
 
         assert_eq!(rt(&llama).chat_window(&llama).await, Some(4096));
@@ -1054,11 +1053,19 @@ mod tests {
         assert_eq!(rt(&vllm).chat_window(&vllm).await, Some(8192));
         assert_eq!(window_max_input(&rt(&vllm), &vllm, global_len, reserve).await, 6144, "a vLLM placement likewise");
 
-        // Ollama: its window is its decided context (`chat_num_ctx`, pinned by
-        // the test above); the engine table is never consulted for it, even
-        // when it names the model.
-        let named = ResolvedBackend { model: "win-llama-3b".into(), ..ollama.clone() };
-        assert_eq!(rt(&named).chat_window(&named).await, None, "an Ollama has no engine window");
+        // The shipped pin (noo-harness.env.tmpl): model `auto`, backend `openai`.
+        // The agent states the window of `auto` (the smallest across the
+        // node's chat placements); the turn follows it.
+        let auto = ResolvedBackend { url: "http://127.0.0.1:8080".into(), model: "auto".into(), backend_type: "openai".into(), api_format: "openai".into() };
+        assert_eq!(rt(&auto).chat_window(&auto).await, Some(4096));
+        assert_eq!(window_max_input(&rt(&auto), &auto, global_len, reserve).await, 3072, "the production pin fits 4096, not the global 12288");
+        // The lookup is the PIN's model, not the backend argument's.
+        let other_model = ResolvedBackend { model: "win-vllm-7b".into(), ..auto.clone() };
+        assert_eq!(rt(&auto).chat_window(&other_model).await, Some(4096), "keyed by the pin");
+        assert_eq!(rt(&llama).chat_window(&ResolvedBackend { model: "auto".into(), ..llama.clone() }).await, Some(4096), "the pin's own entry, not the argument's");
+
+        // Ollama keeps its own table (`chat_num_ctx`, pinned by the test above),
+        // asked before this one; the agent's `auto:latest` entry serves the shipped pin.
 
         // Only the pinned endpoint is this node's.
         let elsewhere = ResolvedBackend { url: "http://elsewhere:8085".into(), ..llama.clone() };

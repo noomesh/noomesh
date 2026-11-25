@@ -262,17 +262,51 @@ func (r *Reconciler) ChatContext(model string) int {
 // GET /harness/placement carries it so the node's harness fits a turn to
 // the same context the agent stamps on that model's calls (i802): a task
 // dispatched here must not run in a smaller window than a console turn.
+//
+// The shipped harness is pinned to the model `auto` (its env file; the
+// inference proxy substitutes the real model), and looks its context up
+// under that name, so the copy also carries `auto:latest`: autoWindow.
 func (r *Reconciler) ChatContexts() map[string]int {
 	r.harnessMu.RLock()
 	defer r.harnessMu.RUnlock()
 	if len(r.chatContexts) == 0 {
 		return nil
 	}
-	out := make(map[string]int, len(r.chatContexts))
+	out := make(map[string]int, len(r.chatContexts)+1)
 	for k, v := range r.chatContexts {
 		out[k] = v
 	}
+	if w := autoWindow(r.chatModels, r.chatWindows, r.chatContexts); w > 0 {
+		out[chatContextKey(autoModel)] = w
+	}
 	return out
+}
+
+// autoModel is the model name the shipped harness is pinned to
+// (noo-harness.env.tmpl NOO_HARNESS_MODEL): the node's inference proxy
+// replaces it with the model of the backend it picks (substituteAutoModel).
+const autoModel = "auto"
+
+// autoWindow is the window to state for `auto`: the SMALLEST known window
+// across the node's running chat placements (an engine window by model name,
+// an Ollama decided context by chatContextKey), 0 when none is known. The
+// proxy picks one backend per request (vllm, then llamacpp, then ollama,
+// among those running), and the harness cannot see which, so the smallest
+// is the one that cannot overflow whichever is picked.
+func autoWindow(models []ChatModel, windows, contexts map[string]int) int {
+	min := 0
+	for _, m := range models {
+		var v int
+		if m.Backend == "ollama" {
+			v = contexts[chatContextKey(m.Model)]
+		} else {
+			v = windows[strings.TrimSpace(m.Model)]
+		}
+		if v > 0 && (min == 0 || v < min) {
+			min = v
+		}
+	}
+	return min
 }
 
 // recordChatWindows installs desired-config's `chat_windows` (i1411): the
@@ -298,16 +332,20 @@ func (r *Reconciler) recordChatWindows(in map[string]int) {
 // ChatWindows is a copy of the engine-window table (desired-config
 // `chat_windows`), nil when none is known. GET /harness/placement carries it
 // so the node's harness fits a turn to the engine's real window, as the
-// controller does for its own chats (i1411).
+// controller does for its own chats (i1411). The shipped harness is pinned
+// to the model `auto`, so the copy also carries `auto`: autoWindow.
 func (r *Reconciler) ChatWindows() map[string]int {
 	r.harnessMu.RLock()
 	defer r.harnessMu.RUnlock()
 	if len(r.chatWindows) == 0 {
 		return nil
 	}
-	out := make(map[string]int, len(r.chatWindows))
+	out := make(map[string]int, len(r.chatWindows)+1)
 	for k, v := range r.chatWindows {
 		out[k] = v
+	}
+	if w := autoWindow(r.chatModels, r.chatWindows, r.chatContexts); w > 0 {
+		out[autoModel] = w
 	}
 	return out
 }

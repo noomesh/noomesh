@@ -11082,6 +11082,13 @@ mod chat_context_detail_tests {
         // With the profile's context, an engine that sets none gets it (as chat_window does at the gateway).
         let with_profile = chat_windows_map(&placements[6..], &record(), 16384).expect("the profile declares it");
         assert_eq!(with_profile, json!({"nothing.gguf": 16384}));
+        // One model placed twice on a node: the smaller window is the one that holds.
+        let twice = vec![
+            json!({"backend": "llamacpp", "role": "chat", "model": "twice.gguf", "env": {"N_CTX": 8192}, "desired_state": "running"}),
+            json!({"backend": "llamacpp", "role": "chat", "model": "twice.gguf", "env": {"N_CTX": 4096}, "desired_state": "running"}),
+        ];
+        assert_eq!(chat_windows_map(&twice, &record(), 0), Some(json!({"twice.gguf": 4096})));
+        assert_eq!(chat_windows_map(&[twice[1].clone(), twice[0].clone()], &record(), 0), Some(json!({"twice.gguf": 4096})), "whichever order");
         assert!(chat_windows_map(&placements[3..6], &record(), 16384).is_none(), "nothing to ship: the key is omitted");
         assert!(chat_windows_map(&[], &record(), 16384).is_none());
     }
