@@ -60,6 +60,7 @@ import (
 // everything on it) staying down while the disk is absent.
 
 const bootRestoreScript = `_noo_lib=%s
+_noo_t_list=%d _noo_t_inspect=%d _noo_t_start=%d _noo_t_netns=%d
 . "$_noo_lib" 2>/dev/null || { echo "boot-restore: cannot source lib-secrets.sh" >&2; exit 2; }
 if . "$(dirname "$_noo_lib")/lib-data-root-mount.sh" 2>/dev/null; then
   data_root_mount_boot_guard || { echo "boot-restore: the data-root guard refused (the data root is not on its recorded filesystem, or it cannot be checked) — stateful containers stopped, nothing started (reason above, and in .noo-data-root-refused)" >&2; exit 3; }
@@ -102,12 +103,36 @@ core=" $(awk 'FNR==1 { s=0; svc="" }
   s && svc != "" && /^    profiles:.*"controller"/ { print svc }' "$root"/docker-compose*.yml 2>/dev/null | sort -u | tr '\n' ' ')"
 n=0
 down=""
-for id in $(docker ps -aq --filter status=created --filter status=exited); do
+skipped=""
+# Every docker call below is bounded (_noo_dk <seconds> <docker args>): a
+# container Docker never answers for (a process that survived SIGKILL) would
+# otherwise hang this script while it holds the compose lock. A timeout is
+# 124 (or 137 after the follow-up KILL); any other failure keeps the old
+# meaning (an empty answer). Without timeout(1) the call is unbounded and only
+# the overall deadline (Go side) applies.
+_noo_wedged() { [ "$1" = 124 ] || [ "$1" = 137 ]; }
+_noo_dk() {
+  _noo_s="$1"; shift
+  if command -v timeout >/dev/null 2>&1; then timeout --foreground -k 3 "$_noo_s" docker "$@"; else docker "$@"; fi
+}
+_noo_skip() {
+  echo "boot-restore: Docker did not answer for container $1 within ${2}s ($3); it was left alone" >&2
+  skipped="${skipped:+$skipped, }$1"
+}
+ids="$(_noo_dk "$_noo_t_list" ps -aq --filter status=created --filter status=exited)"; rc=$?
+if _noo_wedged "$rc"; then
+  echo "boot-restore: Docker did not answer the container list within ${_noo_t_list}s; nothing was started (the compose lock is released; the attempt is retried)" >&2
+  exit 1
+fi
+for id in $ids; do
   want=""
-  if docker inspect -f '{{range .Mounts}}{{println .Source}}{{end}}' "$id" 2>/dev/null | grep -q "^$d/"; then
+  mounts="$(_noo_dk "$_noo_t_inspect" inspect -f '{{range .Mounts}}{{println .Source}}{{end}}' "$id" 2>/dev/null)"; rc=$?
+  if _noo_wedged "$rc"; then _noo_skip "$id" "$_noo_t_inspect" "docker inspect"; continue; fi
+  if printf '%%s\n' "$mounts" | grep -q "^$d/"; then
     want=1
   else
-    meta="$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}|{{index .Config.Labels "com.docker.compose.service"}}|{{index .Config.Labels "noo.managed-by"}}|{{.HostConfig.RestartPolicy.Name}}' "$id" 2>/dev/null)"
+    meta="$(_noo_dk "$_noo_t_inspect" inspect -f '{{index .Config.Labels "com.docker.compose.project"}}|{{index .Config.Labels "com.docker.compose.service"}}|{{index .Config.Labels "noo.managed-by"}}|{{.HostConfig.RestartPolicy.Name}}' "$id" 2>/dev/null)"; rc=$?
+    if _noo_wedged "$rc"; then _noo_skip "$id" "$_noo_t_inspect" "docker inspect"; continue; fi
     p="$(echo "$meta" | cut -d'|' -f1)"; svc="$(echo "$meta" | cut -d'|' -f2)"
     mby="$(echo "$meta" | cut -d'|' -f3)"; rp="$(echo "$meta" | cut -d'|' -f4)"
     if [ -n "$proj" ] && [ "$p" = "$proj" ] && [ -z "$mby" ] && [ -n "$svc" ] && [ "$rp" != "no" ] && [ -n "$rp" ]; then
@@ -115,9 +140,14 @@ for id in $(docker ps -aq --filter status=created --filter status=exited); do
     fi
   fi
   [ -n "$want" ] || continue
-  docker start "$id" >/dev/null && n=$((n+1))
-  if [ "$(docker inspect -f '{{.State.Running}}' "$id" 2>/dev/null)" != "true" ]; then
-    st="$(docker inspect -f '{{.Name}}|{{.State.Status}} {{.State.ExitCode}} {{.State.FinishedAt}}' "$id" 2>/dev/null)"
+  _noo_dk "$_noo_t_start" start "$id" >/dev/null; rc=$?
+  if _noo_wedged "$rc"; then _noo_skip "$id" "$_noo_t_start" "docker start"; continue; fi
+  [ "$rc" = 0 ] && n=$((n+1))
+  run="$(_noo_dk "$_noo_t_inspect" inspect -f '{{.State.Running}}' "$id" 2>/dev/null)"; rc=$?
+  if _noo_wedged "$rc"; then _noo_skip "$id" "$_noo_t_inspect" "docker inspect"; continue; fi
+  if [ "$run" != "true" ]; then
+    st="$(_noo_dk "$_noo_t_inspect" inspect -f '{{.Name}}|{{.State.Status}} {{.State.ExitCode}} {{.State.FinishedAt}}' "$id" 2>/dev/null)"; rc=$?
+    if _noo_wedged "$rc"; then _noo_skip "$id" "$_noo_t_inspect" "docker inspect"; continue; fi
     nm="$(echo "$st" | cut -d'|' -f1)"; nm="${nm#/}"; info="$(echo "$st" | cut -d'|' -f2)"
     hhmm="$(echo "${info##*T}" | cut -c1-5)"
     info="$(echo "$info" | cut -d' ' -f1,2)"
@@ -129,14 +159,41 @@ done
 # their door and never retries them. The same script noo-netns-restore.service
 # runs at every dockerd start; here it covers a host without systemd.
 if [ -f "$root/scripts/noo-netns-restore.sh" ]; then
-  bash "$root/scripts/noo-netns-restore.sh" || echo "boot-restore: the namespace restore reported a problem (above)" >&2
+  if command -v timeout >/dev/null 2>&1; then _noo_nb="timeout --foreground -k 3 $_noo_t_netns"; else _noo_nb=""; fi
+  $_noo_nb bash "$root/scripts/noo-netns-restore.sh" || echo "boot-restore: the namespace restore reported a problem (above)" >&2
 fi
 echo "boot-restore: wrote the secret files and started $n container(s)"
-if [ -n "$down" ]; then
-  echo "boot-restore: started $n; still down: $down" >&2
+if [ -n "$down" ] || [ -n "$skipped" ]; then
+  echo "boot-restore: started $n${down:+; still down: $down}${skipped:+; Docker did not answer for: $skipped (left alone)}" >&2
   exit 4
 fi
 `
+
+// The bounds on boot-restore's Docker calls. Variables, not constants, only so
+// a test can shrink them; nothing reads them from the environment.
+var (
+	// bootListBound: `docker ps` (the container list). Docker answers it in
+	// milliseconds; 20 s is generous and a miss fails the attempt, which is retried.
+	bootListBound = 20 * time.Second
+	// bootInspectBound: one `docker inspect`, per container. A miss skips that
+	// container (named in the log) and the rest are still handled.
+	bootInspectBound = 15 * time.Second
+	// bootStartBound: one `docker start`. Starting returns once the process is
+	// up, but a big container can take a few seconds, so this is the longest.
+	bootStartBound = 60 * time.Second
+	// bootNetnsBound: the whole namespace-restore script, which waits up to 60 s
+	// for docker and up to 60 s per door by its own design.
+	bootNetnsBound = 150 * time.Second
+	// bootOverall: the script's whole run, the backstop under the compose lock.
+	// Healthy runs take well under a minute; the sum of the per-call bounds is
+	// the worst case (a list, the netns pass, and per container up to a
+	// start), and 10 minutes covers dozens of containers while still ending
+	// well inside the 600 s a launcher waits for the lock. The run is killed
+	// (its whole process group) and the lock released when it passes.
+	bootOverall = 10 * time.Minute
+)
+
+func secs(d time.Duration) int { return int(d / time.Second) }
 
 // BootRestore runs the step once, retrying while docker is not up yet (this
 // unit is ordered after docker.service, but on WSL2 and SysV hosts that is
@@ -152,14 +209,24 @@ func (e *Engine) BootRestore(ctx context.Context) {
 	// `exec 1>&2` first: the Runner keeps only stderr, and the script's stdout
 	// (`started N container(s)`, `populated; nothing to do`) is what says what
 	// it did, so it must reach the log too (i301 a).
-	script := "exec 1>&2\n" + fmt.Sprintf(bootRestoreScript, shellQuote(filepath.Join(e.Root, "scripts", "lib-secrets.sh")))
+	script := "exec 1>&2\n" + fmt.Sprintf(bootRestoreScript, shellQuote(filepath.Join(e.Root, "scripts", "lib-secrets.sh")),
+		secs(bootListBound), secs(bootInspectBound), secs(bootStartBound), secs(bootNetnsBound))
 	for attempt := 1; attempt <= 12; attempt++ {
 		unlock, err := acquireComposeLock(ctx)
 		if err != nil {
 			return
 		}
-		rc, stderr := e.Runner.Run(ctx, e.Root, nil, "bash", "-c", script)
+		runCtx, cancel := context.WithTimeout(ctx, bootOverall)
+		rc, stderr := e.Runner.Run(runCtx, e.Root, nil, "bash", "-c", script)
+		timedOut := runCtx.Err() == context.DeadlineExceeded
+		cancel()
 		unlock()
+		if timedOut {
+			// Not retried: the secret files may already be written, so another
+			// pass would say "nothing to do" and hide the containers not started.
+			e.logf("BOOT-RESTORE WARN: the run did not finish within %s and was stopped (the compose lock is released; Docker may be wedged on a container): %s (run `noo stack restart` to bring the controller up; `noo stack start` if that does not)", bootOverall, strings.TrimSpace(stderr))
+			return
+		}
 		if rc == 0 {
 			e.logf("boot-restore: done")
 			if w := strings.TrimSpace(stderr); w != "" {
