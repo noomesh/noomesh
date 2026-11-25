@@ -1464,7 +1464,12 @@ enum GwHealth {
 /// What docker reports about one restarted container.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 enum DockerState {
+    /// `docker inspect` said the container is not running (an explicit `false`).
     NotRunning,
+    /// `docker inspect` failed or said nothing parseable (docker missing,
+    /// daemon hiccup, unknown name): neither healthy nor bad. Alone, it ends
+    /// Blind; it is never a reason to revert.
+    Unknown,
     /// Running, healthcheck says `unhealthy`.
     Unhealthy,
     /// Running, healthcheck has not passed yet.
@@ -1477,10 +1482,14 @@ enum DockerState {
 
 /// Parse `docker inspect -f '{{.State.Running}} {{if .State.Health}}{{.State.Health.Status}}{{end}}'`.
 /// The health word is compared whole: `unhealthy` contains `healthy`.
+/// Only an explicit `false` first word is [`DockerState::NotRunning`]; empty
+/// or unparseable output is [`DockerState::Unknown`].
 fn parse_docker_state(out: &str) -> DockerState {
     let mut w = out.split_whitespace();
-    if w.next() != Some("true") {
-        return DockerState::NotRunning;
+    match w.next() {
+        Some("true") => {}
+        Some("false") => return DockerState::NotRunning,
+        _ => return DockerState::Unknown,
     }
     match w.next() {
         Some("healthy") => DockerState::Healthy,
@@ -1495,6 +1504,7 @@ fn parse_docker_state(out: &str) -> DockerState {
 fn docker_state_word(s: DockerState) -> &'static str {
     match s {
         DockerState::NotRunning => "not running",
+        DockerState::Unknown => "state unknown (docker inspect gave no answer)",
         DockerState::Unhealthy => "running; health: unhealthy",
         DockerState::Starting => "running; health: starting",
         DockerState::Healthy => "running; health: healthy",
@@ -1575,18 +1585,10 @@ fn launcher_env_value(content: &str, key: &str) -> String {
     found
 }
 
-/// An IP address or a plausible host name; anything else (a stray quote, a
-/// comment, a path) is not something to dial.
-fn plausible_address(s: &str) -> bool {
-    let bare = s.trim_matches(|c| c == '[' || c == ']');
-    if bare.parse::<std::net::IpAddr>().is_ok() {
-        return true;
-    }
-    !s.is_empty()
-        && s.len() <= 253
-        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.')
-        && !s.starts_with(['-', '.'])
-        && !s.ends_with(['-', '.'])
+/// An IP literal (v4, or v6 with or without brackets): the launcher binds an
+/// address, so a host name or anything else is not one.
+fn ip_literal(s: &str) -> bool {
+    s.trim_matches(|c| c == '[' || c == ']').parse::<std::net::IpAddr>().is_ok()
 }
 
 /// The address the launcher (`scripts/lib-bind-addr.sh`) binds the gateway
@@ -1594,7 +1596,7 @@ fn plausible_address(s: &str) -> bool {
 /// the way the launcher's `case` does (exact, lower case): `all` / `0.0.0.0`
 /// and `local` / `loopback` / `127.0.0.1` answer on loopback, `tailnet` is
 /// this node's tailnet IP, any other value is a literal address, and a value
-/// that is not plausibly one is unknown. Pure: the settings and the tailnet
+/// that is not an IP literal (a host name, a mode in the wrong case) is unknown. Pure: the settings and the tailnet
 /// IP come in as arguments.
 fn bind_target(addr: &str, mode: &str, tailnet_ip: Option<&str>) -> BindTarget {
     let loopback_or_wildcard = |a: &str| {
@@ -1605,10 +1607,10 @@ fn bind_target(addr: &str, mode: &str, tailnet_ip: Option<&str>) -> BindTarget {
     if !addr.is_empty() {
         return if loopback_or_wildcard(addr) {
             BindTarget::Local
-        } else if plausible_address(addr) {
+        } else if ip_literal(addr) {
             BindTarget::Address(addr.to_string())
         } else {
-            BindTarget::Unknown(format!("NOO_BIND_ADDR={addr:?} is not an address"))
+            BindTarget::Unknown(format!("NOO_BIND_ADDR={addr:?} is not an IP address"))
         };
     }
     let mode = mode.trim();
@@ -1621,8 +1623,8 @@ fn bind_target(addr: &str, mode: &str, tailnet_ip: Option<&str>) -> BindTarget {
                 "NOO_BIND_MODE=tailnet, but tailscale reports no address for this host".to_string(),
             ),
         },
-        _ if plausible_address(mode) => BindTarget::Address(mode.to_string()),
-        _ => BindTarget::Unknown(format!("NOO_BIND_MODE={mode:?} is neither a mode nor an address")),
+        _ if ip_literal(mode) => BindTarget::Address(mode.to_string()),
+        _ => BindTarget::Unknown(format!("NOO_BIND_MODE={mode:?} is neither a mode nor an IP address")),
     }
 }
 
@@ -1637,15 +1639,21 @@ fn url_host(url: &str) -> String {
     auth.split(':').next().unwrap_or("").to_string()
 }
 
-/// True when `url`'s host is this machine itself: loopback, or its tailnet
-/// address. A configured gateway URL can name another host or a
+/// True when `url`'s host is this machine itself: the literal `localhost`, a
+/// loopback IP (v4 or v6), or its tailnet IP. A configured gateway URL can name another host or a
 /// tailscale-serve front, whose answer says nothing about this gateway.
 fn host_is_this_machine(url: &str, tailnet_ip: Option<&str>) -> bool {
-    let h = url_host(url).to_ascii_lowercase();
-    h == "localhost"
-        || h == "::1"
-        || h.starts_with("127.")
-        || tailnet_ip.is_some_and(|ip| !ip.trim().is_empty() && h == ip.trim().to_ascii_lowercase())
+    let h = url_host(url);
+    if h.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    // A DNS name is never this machine, whatever it starts with
+    // (`127.0.0.1.example.com`): only an IP literal is compared.
+    let Ok(ip) = h.parse::<std::net::IpAddr>() else { return false };
+    ip.is_loopback()
+        || tailnet_ip
+            .and_then(|t| t.trim().parse::<std::net::IpAddr>().ok())
+            .is_some_and(|t| t == ip)
 }
 
 /// The URL the gateway's `/health` is probed at, and whether an answer from
@@ -1774,6 +1782,7 @@ fn decide_gate(
     if !at_deadline {
         return None;
     }
+    let url = &mask_userinfo(url);
     let note = gw_note(gw, url, own);
     let tail = if note.is_empty() { String::new() } else { format!("; {note}") };
     if !bad.is_empty() {
@@ -1817,10 +1826,14 @@ fn probe_health_gate(containers: &[String], timeout_secs: u64) -> GateOutcome {
                         c,
                     ])
                     .output();
-                let state = out
-                    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-                    .unwrap_or_default();
-                (c.clone(), parse_docker_state(&state))
+                // A failed inspect says nothing about the container.
+                let state = match out {
+                    Ok(o) if o.status.success() => {
+                        parse_docker_state(&String::from_utf8_lossy(&o.stdout))
+                    }
+                    _ => DockerState::Unknown,
+                };
+                (c.clone(), state)
             })
             .collect();
         let gw = match (&target, has_gateway) {
@@ -1857,25 +1870,69 @@ fn https_health_check(url: &str) -> GwHealth {
         Ok(a) => a,
         Err(e) => return GwHealth::NoTrust(format!("no trust anchor to verify it with: {e}")),
     };
-    match agent.get(url).call() {
-        Ok(resp) => match resp.status().as_u16() {
-            200 => GwHealth::Ok,
-            st => GwHealth::Answered(st),
-        },
+    // Never follow a redirect: an answer from somewhere else is not this
+    // gateway's. A 3xx comes back as a status and is "answered, not 200".
+    let call = agent.get(url).config().max_redirects(0).build().call();
+    gw_from_probe(match call {
+        Ok(resp) => Ok(resp.status().as_u16()),
         Err(e) => {
             let class = match crate::http::classify_send_error(&e) {
                 crate::http::SendFailure::SlowAnswer => "timed out after connecting",
                 crate::http::SendFailure::Unreachable => "connection failed",
             };
-            // Nothing answered vs. something answered that this CLI could
-            // not accept (TLS, protocol): the same split the upgrade gates use.
-            if crate::http::nothing_answered(&e) {
-                GwHealth::NothingAnswered(format!("{class}: {e}"))
-            } else {
-                GwHealth::BadAnswer(format!("{class}: {e}"))
-            }
+            Err(ProbeError { nothing_answered: crate::http::nothing_answered(&e), text: format!("{class}: {e}") })
         }
+    })
+}
+
+/// A failed `/health` request, reduced to what the gate needs.
+#[derive(Debug, PartialEq, Eq, Clone)]
+struct ProbeError {
+    /// Nothing answered (refused, reset, unreachable, timed out), as against
+    /// something answering that this CLI could not accept (TLS, protocol).
+    nothing_answered: bool,
+    text: String,
+}
+
+/// A request's result as the gate's [`GwHealth`]. Pure: a status of 200 is
+/// Ok and any other status (a 3xx included) is Answered; a failure is
+/// NothingAnswered or BadAnswer, never Answered, so a client-side failure
+/// can not be mistaken for the gateway failing.
+fn gw_from_probe(r: Result<u16, ProbeError>) -> GwHealth {
+    match r {
+        Ok(200) => GwHealth::Ok,
+        Ok(st) => GwHealth::Answered(st),
+        Err(e) if e.nothing_answered => GwHealth::NothingAnswered(e.text),
+        Err(e) => GwHealth::BadAnswer(e.text),
     }
+}
+
+/// `https://user:secret@host/x` as `https://***@host/x`: a configured URL
+/// may carry credentials and this text is printed.
+fn mask_userinfo(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else { return url.to_string() };
+    let auth_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    match rest[..auth_end].rfind('@') {
+        Some(at) => format!("{scheme}://***@{}", &rest[at + 1..]),
+        None => url.to_string(),
+    }
+}
+
+/// The copy-back the operator can run to go back to the backup: restore the
+/// files, re-sync `pki/public/` (`fix-modes` does), restart the consumers.
+/// `instance` is the named instance in use, "" for the default.
+fn copy_back_command(backup: &str, pki: &str, consumers: &[String], instance: &str) -> String {
+    let noo = if instance.is_empty() {
+        "noo".to_string()
+    } else {
+        format!("noo --instance {}", shquote(instance))
+    };
+    format!(
+        "cp -a {}/. {}/ && {noo} security pki fix-modes && docker restart {}",
+        shquote(backup),
+        shquote(pki),
+        consumers.iter().map(|c| shquote(c)).collect::<Vec<_>>().join(" ")
+    )
 }
 
 /// Copy every file under `src_root` to the same relative path under
@@ -5082,11 +5139,11 @@ pub fn pki_rotate_all(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     // revert on it would undo a good rotation (and restart everything again).
     // Node certificates already delivered stay new: they chain to the same CA.
     if let (GateAction::KeepUnconfirmed, GateOutcome::Blind(detail)) = (action, &gate) {
-        let restore = format!(
-            "cp -a {}/. {}/ && noo security pki fix-modes && docker restart {}",
-            shquote(&backup_dir.display().to_string()),
-            shquote(&ca.dir.display().to_string()),
-            to_restart.iter().map(|c| shquote(c)).collect::<Vec<_>>().join(" ")
+        let restore = copy_back_command(
+            &backup_dir.display().to_string(),
+            &ca.dir.display().to_string(),
+            &to_restart,
+            &crate::envfile::instance(),
         );
         if g.json {
             let mut all_reloaded = reloaded_units.clone();
@@ -5118,8 +5175,20 @@ pub fn pki_rotate_all(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             g.json,
             ExitCode::Generic,
             "revert_failed",
-            &format!("restore from backup failed: {e}"),
-            Some(&format!("original certs are at {}", backup_dir.display())),
+            &format!(
+                "restore from backup failed part-way: the restore is PARTIAL, so some certificates \
+                 are the new ones and some the old ({e}); the complete original certificates are at {}",
+                backup_dir.display()
+            ),
+            Some(&format!(
+                "copy them back: {}",
+                copy_back_command(
+                    &backup_dir.display().to_string(),
+                    &ca.dir.display().to_string(),
+                    &to_restart,
+                    &crate::envfile::instance(),
+                )
+            )),
         );
     }
     // `pki/public/` (the gateway's certificate-only view) mirrors the live
@@ -5134,6 +5203,20 @@ pub fn pki_rotate_all(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         let _ = Command::new("docker").args(["restart", c]).output();
     }
     let gate2 = probe_health_gate(&to_restart, 150);
+    if g.json {
+        // The same summary object as the other paths; a re-sync error is in
+        // it, not dropped.
+        let mut all_reloaded = reloaded_units.clone();
+        all_reloaded.extend(to_restart.iter().cloned());
+        let healthy2 = match &gate2 {
+            GateOutcome::Healthy(_) => Some(true),
+            GateOutcome::Unhealthy(_) => Some(false),
+            GateOutcome::Blind(_) => None,
+        };
+        let mut summary = json_summary(&all_reloaded, healthy2, true);
+        summary["public_view_errors"] = serde_json::json!(view.errors);
+        println!("{summary}");
+    }
     match &gate2 {
         GateOutcome::Healthy(_) => fail(
             g.json,
@@ -7397,6 +7480,7 @@ mod rotate_gate_tests {
     use super::{
         bind_target, decide_gate, docker_summary, gate_action, health_probe_url, host_is_this_machine,
         launcher_env_value, parse_docker_state, BindTarget, DockerState, GateAction, GateOutcome, GwHealth,
+        copy_back_command, gw_from_probe, mask_userinfo, ProbeError,
     };
     use crate::envfile::GatewaySource;
 
@@ -7455,6 +7539,9 @@ mod rotate_gate_tests {
     #[test]
     fn a_value_that_is_not_an_address_is_unknown() {
         for (addr, mode) in [
+            ("", "Tailnet"),
+            ("", "node-a.example.ts.net"),
+            ("node-a.example.ts.net", ""),
             ("", "'100.64.0.7'"),
             ("", "tailnet # on"),
             ("", "100.64.0.7 extra"),
@@ -7463,7 +7550,8 @@ mod rotate_gate_tests {
         ] {
             assert!(matches!(bind_target(addr, mode, Some("100.64.0.7")), BindTarget::Unknown(_)), "{addr:?} {mode:?}");
         }
-        assert_eq!(bind_target("", "node-a.example.ts.net", None), BindTarget::Address("node-a.example.ts.net".into()));
+        // A literal address in NOO_BIND_MODE is an address (the launcher's `*` arm).
+        assert_eq!(bind_target("", "100.64.0.7", None), BindTarget::Address("100.64.0.7".into()));
     }
 
     /// `.env` is read as the launcher's `_bind_env_value` reads it: spaces
@@ -7509,10 +7597,11 @@ mod rotate_gate_tests {
     #[test]
     fn this_machine_is_loopback_or_its_tailnet_address() {
         let ts = Some("100.64.0.7");
-        for u in ["https://localhost:8080", "https://127.0.0.1:8080/x", "https://[::1]:8080", "https://100.64.0.7"] {
+        for u in ["https://localhost:8080", "https://LOCALHOST", "https://127.0.0.1:8080/x", "https://127.0.0.2", "https://[::1]:8080", "https://100.64.0.7"] {
             assert!(host_is_this_machine(u, ts), "{u}");
         }
-        for u in ["https://ctrl.example.ts.net", "https://100.64.0.8:8080", "https://user@other:8080/", "https://100.64.0.7.evil.example"] {
+        for u in ["https://ctrl.example.ts.net", "https://100.64.0.8:8080", "https://user@other:8080/", "https://100.64.0.7.evil.example",
+            "https://127.0.0.1.example.com", "https://127.example.com", "https://localhost.example.com", "https://127.0.0.1.nip.io:8080"] {
             assert!(!host_is_this_machine(u, ts), "{u}");
         }
         assert!(!host_is_this_machine("https://100.64.0.7", None));
@@ -7526,12 +7615,17 @@ mod rotate_gate_tests {
         assert_eq!(parse_docker_state("true"), DockerState::NoCheck);
         assert_eq!(parse_docker_state("true "), DockerState::NoCheck);
         assert_eq!(parse_docker_state("false healthy"), DockerState::NotRunning);
-        assert_eq!(parse_docker_state(""), DockerState::NotRunning);
+        // A failed or empty inspect says nothing: never "not running".
+        assert_eq!(parse_docker_state(""), DockerState::Unknown);
+        assert_eq!(parse_docker_state("Error: No such object"), DockerState::Unknown);
+        assert_eq!(parse_docker_state("false"), DockerState::NotRunning);
         assert_eq!(parse_docker_state("true mystery"), DockerState::Starting);
     }
 
     const URL: &str = "https://100.64.0.7:8080/health";
-    use DockerState::{Healthy as H, NoCheck as N, NotRunning as NR, Starting as S, Unhealthy as U};
+    use DockerState::{
+        Healthy as H, NoCheck as N, NotRunning as NR, Starting as S, Unhealthy as U, Unknown as K,
+    };
 
     fn run(states: &[DockerState], gw: GwHealth, own: bool, deadline: bool) -> Option<GateOutcome> {
         let d: Vec<(String, DockerState)> =
@@ -7655,5 +7749,70 @@ mod rotate_gate_tests {
             docker_summary(&[("a".to_string(), NR), ("b".to_string(), N)]),
             "a: not running, b: running; health: none"
         );
+    }
+
+    /// A failed `docker inspect` (docker missing, a daemon hiccup, an unknown
+    /// name) is Unknown: neither healthy nor bad. Alone it ends Blind; it
+    /// never reverts, and it does not hide a container docker condemns.
+    #[test]
+    fn a_failed_inspect_is_blind_and_never_a_revert() {
+        let nope = || GwHealth::NothingAnswered("refused".into());
+        assert_eq!(kind(run(&[K], nope(), true, true)), "blind");
+        assert_eq!(kind(run(&[K, H], nope(), true, true)), "blind");
+        assert_eq!(kind(run(&[K], GwHealth::NotApplicable, false, true)), "blind");
+        assert_eq!(kind(run(&[K], nope(), true, false)), "poll");
+        // One inspect failed, another explicitly unhealthy: docker's word stands.
+        assert_eq!(kind(run(&[K, U], nope(), true, true)), "unhealthy");
+        assert_eq!(kind(run(&[K, NR], nope(), true, true)), "unhealthy");
+        // The text says docker could not be asked.
+        match run(&[K], nope(), true, true) {
+            Some(GateOutcome::Blind(t)) => assert!(t.contains("docker inspect gave no answer"), "{t}"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// The probe's result, as a pure function over error kinds: a status is
+    /// Ok (200) or Answered (anything else, a 3xx included, never followed);
+    /// a failure is NothingAnswered or BadAnswer, never Answered.
+    #[test]
+    fn the_probe_classification() {
+        let e = |nothing_answered: bool| ProbeError { nothing_answered, text: "boom".into() };
+        assert_eq!(gw_from_probe(Ok(200)), GwHealth::Ok);
+        assert_eq!(gw_from_probe(Ok(503)), GwHealth::Answered(503));
+        assert_eq!(gw_from_probe(Ok(302)), GwHealth::Answered(302));
+        assert_eq!(gw_from_probe(Err(e(true))), GwHealth::NothingAnswered("boom".into()));
+        assert_eq!(gw_from_probe(Err(e(false))), GwHealth::BadAnswer("boom".into()));
+    }
+
+    #[test]
+    fn userinfo_is_masked_before_a_url_is_printed() {
+        assert_eq!(mask_userinfo("https://user:secret@host:8080/health"), "https://***@host:8080/health");
+        assert_eq!(mask_userinfo("https://host:8080/a@b"), "https://host:8080/a@b");
+        assert_eq!(mask_userinfo("https://host/health"), "https://host/health");
+        match run(&[S], GwHealth::NothingAnswered("x".into()), true, true) {
+            Some(GateOutcome::Blind(t)) => assert!(!t.contains("secret"), "{t}"),
+            other => panic!("{other:?}"),
+        }
+        let d = vec![("noo-c0".to_string(), S)];
+        let t = decide_gate(150, &d, &GwHealth::NothingAnswered("x".into()), false, "https://u:secret@h/health", true);
+        match t {
+            Some(GateOutcome::Blind(t)) => assert!(t.contains("https://***@h/health") && !t.contains("secret"), "{t}"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// The printed copy-back quotes its paths, re-syncs `pki/public/`
+    /// (`fix-modes`) before the restart, and carries the instance in use.
+    #[test]
+    fn the_copy_back_is_quoted_ordered_and_names_the_instance() {
+        let c = vec!["noo-gateway".to_string(), "noo-loki".to_string()];
+        let default = copy_back_command("/home/u/.noo/pki/.rotate-backup-1", "/home/u/.noo/pki", &c, "");
+        assert_eq!(
+            default,
+            "cp -a /home/u/.noo/pki/.rotate-backup-1/. /home/u/.noo/pki/ && noo security pki fix-modes && docker restart noo-gateway noo-loki"
+        );
+        let spaced = copy_back_command("/a b/backup", "/a b/pki", &c, "galaxy");
+        assert!(spaced.starts_with("cp -a '/a b/backup'/. '/a b/pki'/ && noo --instance galaxy security pki fix-modes"), "{spaced}");
+        assert!(spaced.find("fix-modes").unwrap() < spaced.find("docker restart").unwrap());
     }
 }

@@ -249,12 +249,19 @@ can confirm a rotation but never condemns one on a failure of its own side.**
   health: healthy|starting|none`), the URL probed and the error, to run
   `noo cluster verify --wait`, and the copy-back from the backup
   (`cp -a`, `noo security pki fix-modes` to re-sync `pki/public/`,
-  `docker restart`).
+  `docker restart`, with `--instance` when one is in use). A `docker
+  inspect` that fails or says nothing is "state unknown": neither healthy
+  nor bad, so alone it ends here, never in a revert. If a revert's
+  restore fails part-way the message says the restore is PARTIAL and names
+  the backup.
 
 `/health` is probed at the address the gateway is bound to: `NOO_BIND_ADDR`,
 else `NOO_BIND_MODE` (read from the environment, then `.env`, as the
 launcher reads them): the tailnet address on a tailnet controller,
-`127.0.0.1` for `local` or `all`. With no bind known, the configured
+`127.0.0.1` for `local` or `all`, and a literal IP address in
+`NOO_BIND_MODE` as itself (any other value, such as a host name or a mode
+in the wrong case, is not an address: the bind is then unknown). With no
+bind known, the configured
 gateway URL is tried, and its answer counts only when its host is this
 machine. `pki rotate-ca` runs the same wait but only warns
 (`rotated_with_warnings`); it never reverts. Certificate scans (`status`,
