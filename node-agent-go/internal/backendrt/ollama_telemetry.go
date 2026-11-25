@@ -57,6 +57,7 @@ package backendrt
 // "Application Support" has a space in it.
 
 import (
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
@@ -118,6 +119,9 @@ type OllamaGuard struct {
 	// OllamaTuningKeys are honoured. A native ollama is not a container, so
 	// placement env cannot reach it any other way than this plist.
 	Tuning func() map[string]string
+	// WantedFile is where the guard records the tuning a boot-service plist
+	// must carry ("" = nowhere), for `noo enroll --resume` to apply with sudo.
+	WantedFile string
 
 	mu sync.Mutex
 	// warnedNoPlist: the "agent cannot set daemon env" limit is logged once.
@@ -132,9 +136,10 @@ type OllamaGuard struct {
 func NewOllamaGuard() *OllamaGuard {
 	home, _ := os.UserHomeDir()
 	return &OllamaGuard{Home: home, UID: os.Getuid(), Run: ExecCommand,
-		Exists:    func(p string) bool { _, err := os.Stat(p); return err == nil },
-		Tuning:    OllamaTuning,
-		ModelsDir: func() string { return strings.TrimSpace(os.Getenv("OLLAMA_DATA_DIR")) },
+		Exists:     func(p string) bool { _, err := os.Stat(p); return err == nil },
+		Tuning:     OllamaTuning,
+		WantedFile: filepath.Join(home, "noomesh", OllamaWantedEnvFile),
+		ModelsDir:  func() string { return strings.TrimSpace(os.Getenv("OLLAMA_DATA_DIR")) },
 		HasModels: func(d string) bool {
 			entries, err := os.ReadDir(filepath.Join(d, "manifests"))
 			return err == nil && len(entries) > 0
@@ -364,6 +369,7 @@ func (g *OllamaGuard) Converge() (managed, restarted bool, err error) {
 // sudo commands that apply them; nothing is written and nothing restarts.
 func (g *OllamaGuard) reportSystemDrift() error {
 	plist := g.plist()
+	g.recordWanted()
 	want := map[string]string{}
 	if g.plistValue(ollamaNoCloud) != "1" {
 		want[ollamaNoCloud] = "1"
@@ -389,12 +395,43 @@ func (g *OllamaGuard) reportSystemDrift() error {
 	for _, k := range keys {
 		cmds = append(cmds, fmt.Sprintf("sudo %s -replace EnvironmentVariables.%s -string '%s' %s", plutilBin, k, want[k], plist))
 	}
-	cmds = append(cmds, "sudo launchctl bootout system/"+g.label(), "sudo launchctl bootstrap system "+plist)
+	// A job that is not loaded is not an error: bootout says "No such process".
+	cmds = append(cmds, "sudo launchctl bootout system/"+g.label()+" 2>/dev/null || true", "sudo launchctl bootstrap system "+plist)
 	reason := fmt.Sprintf("the native Ollama is a boot service (%s, root's), which this agent cannot edit, and it lacks %s: "+
 		"on the Mac run `%s`, or run `noo enroll --resume`", plist, strings.Join(keys, ", "), strings.Join(cmds, "; "))
 	refusals.Record("ollama_env", "ollama", reason)
 	slog.Warn("ollama: the boot-service plist lacks noomesh's environment; the agent cannot write it", "plist", plist, "keys", keys)
 	return nil
+}
+
+// OllamaWantedEnvFile is the file (under ~/noomesh) the guard writes the
+// tuning a boot-service plist must carry to. `noo enroll --resume` reads it
+// (noo-cli/src/commands/enroll.rs OLLAMA_WANTED_ENV_FILE) and writes the same
+// values with sudo, so the remedy it is named in is true.
+const OllamaWantedEnvFile = "ollama-env.json"
+
+// recordWanted writes the tuning keys with their values as a JSON object to
+// WantedFile, only when the content changed. Best effort: a failure is
+// logged and the sudo commands in the refusal still name every value.
+func (g *OllamaGuard) recordWanted() {
+	if g.WantedFile == "" {
+		return
+	}
+	b, err := json.Marshal(g.tuning())
+	if err != nil {
+		return
+	}
+	b = append(b, '\n')
+	if cur, err := os.ReadFile(g.WantedFile); err == nil && string(cur) == string(b) {
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(g.WantedFile), 0o750); err != nil {
+		slog.Warn("ollama: could not record the wanted env", "file", g.WantedFile, "err", err)
+		return
+	}
+	if err := os.WriteFile(g.WantedFile, b, 0o640); err != nil {
+		slog.Warn("ollama: could not record the wanted env", "file", g.WantedFile, "err", err)
+	}
 }
 
 func (g *OllamaGuard) restart() error {

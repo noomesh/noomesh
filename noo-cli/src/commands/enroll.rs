@@ -1727,6 +1727,40 @@ fn darwin_arm(noo_url: &str, node: &str, birth_dir: &std::path::Path, data_root:
 /// releases `homebrew.mxcl.ollama` (host6, 2026-10-05, had only the first).
 pub(crate) const OLLAMA_PLIST_LABELS: [&str; 2] = ["sh.brew.ollama", "homebrew.mxcl.ollama"];
 
+/// The placement tuning keys the node agent's `ollama_env` check requires in a
+/// boot-service plist (node-agent-go `OllamaTuningKeys`, same order; a Python
+/// guard keeps the two lists equal).
+pub(crate) const OLLAMA_TUNING_KEYS: [&str; 6] = [
+    "OLLAMA_NUM_PARALLEL",
+    "OLLAMA_MAX_LOADED_MODELS",
+    "OLLAMA_KEEP_ALIVE",
+    "OLLAMA_CONTEXT_LENGTH",
+    "OLLAMA_FLASH_ATTENTION",
+    "OLLAMA_KV_CACHE_TYPE",
+];
+
+/// The file under `~/noomesh` where the agent records the tuning values it
+/// wants in the boot-service plist (node-agent-go `OllamaWantedEnvFile`). The
+/// values come from the node's placements, which enroll cannot know, so enroll
+/// reads what the agent asked for rather than inventing defaults.
+pub(crate) const OLLAMA_WANTED_ENV_FILE: &str = "ollama-env.json";
+
+/// The tuning pairs in the agent's wanted-env file (a JSON object of strings),
+/// in `OLLAMA_TUNING_KEYS` order. Anything else is dropped: an unknown key, a
+/// non-string or empty value, or one with a control character.
+pub(crate) fn ollama_wanted_env(json: &str) -> Vec<(String, String)> {
+    let Ok(serde_json::Value::Object(m)) = serde_json::from_str::<serde_json::Value>(json) else {
+        return Vec::new();
+    };
+    OLLAMA_TUNING_KEYS
+        .iter()
+        .filter_map(|k| {
+            let v = m.get(*k)?.as_str()?.trim();
+            (!v.is_empty() && v.len() <= 128 && !v.chars().any(char::is_control)).then(|| (k.to_string(), v.to_string()))
+        })
+        .collect()
+}
+
 /// Single-quote a value for `sh`.
 pub(crate) fn sh_quote(v: &str) -> String {
     format!("'{}'", v.replace('\'', "'\\''"))
@@ -1802,12 +1836,14 @@ pub(crate) struct OllamaBootStep {
 /// from the formula and drops the edits (`brew services start` of a loaded
 /// service is a no-op, so a re-run of this plan is safe). `UserName` is set
 /// with plutil too, for a boot service an older run registered without it.
+/// `tuning` is the placement env the agent asked for (`ollama_wanted_env`),
+/// written with the rest so the agent's `ollama_env` check passes at once.
 ///
 /// A per-user LaunchAgent of the same service is unloaded and removed FIRST:
 /// two jobs would fight over 127.0.0.1:11434, and the agent's OllamaGuard
 /// would read the wrong plist. Both domains are tried (gui/<uid> at the
 /// screen, user/<uid> over SSH); a job that is not loaded is not an error.
-pub(crate) fn darwin_ollama_boot_plan(home: &str, user: &str, uid: &str, store: &str) -> Vec<OllamaBootStep> {
+pub(crate) fn darwin_ollama_boot_plan(home: &str, user: &str, uid: &str, store: &str, tuning: &[(String, String)]) -> Vec<OllamaBootStep> {
     let b = crate::vendor::BREW_ENV;
     let agents = format!("{}/Library/LaunchAgents", home.trim_end_matches('/'));
     let mut unload = String::new();
@@ -1831,6 +1867,9 @@ pub(crate) fn darwin_ollama_boot_plan(home: &str, user: &str, uid: &str, store: 
     env.push_str(&set("EnvironmentVariables.HOME", home.trim_end_matches('/')));
     env.push_str(&set("EnvironmentVariables.OLLAMA_MODELS", store));
     env.push_str(&set("EnvironmentVariables.OLLAMA_NO_CLOUD", "1"));
+    for (k, v) in tuning {
+        env.push_str(&set(&format!("EnvironmentVariables.{k}"), v));
+    }
     env.push_str("true");
     let restart = format!(
         "{find}sudo launchctl bootout \"system/$L\" >/dev/null 2>&1; \
@@ -1888,7 +1927,10 @@ fn darwin_ollama_boot_service(home: &str, user: &str, data_root: Option<&str>) {
         )));
     }
     let uid = run(Command::new("id").arg("-u")).1;
-    for step in darwin_ollama_boot_plan(home, user, uid.trim(), &store) {
+    let tuning = std::fs::read_to_string(format!("{}/noomesh/{OLLAMA_WANTED_ENV_FILE}", home.trim_end_matches('/')))
+        .map(|j| ollama_wanted_env(&j))
+        .unwrap_or_default();
+    for step in darwin_ollama_boot_plan(home, user, uid.trim(), &store, &tuning) {
         ui::step(step.what);
         let (code, why) = if step.what == "install ollama if absent" || step.what == "register ollama as a boot service" {
             (run_visible(Command::new("sh").args(["-c", &step.sh])), String::new())
@@ -2114,7 +2156,7 @@ mod tests {
     // node user. The plan is pure: the commands, in order.
     #[test]
     fn the_mac_ollama_plan_installs_unloads_registers_and_pins_the_store() {
-        let plan = super::darwin_ollama_boot_plan("/Users/nodeuser", "nodeuser", "501", "/Users/nodeuser/.ollama/models");
+        let plan = super::darwin_ollama_boot_plan("/Users/nodeuser", "nodeuser", "501", "/Users/nodeuser/.ollama/models", &[]);
         let whats: Vec<&str> = plan.iter().map(|s| s.what).collect();
         assert_eq!(
             whats,
@@ -2157,6 +2199,35 @@ mod tests {
         assert!(sh(5).contains("sudo launchctl bootout \"system/$L\"") && sh(5).contains("sudo launchctl bootstrap system \"$P\""), "{}", sh(5));
         // Never `brew services restart`: it regenerates the plist and drops the edits.
         assert!(plan.iter().all(|s| !s.sh.contains("brew services restart")), "{plan:?}");
+    }
+
+    // The agent records the env it requires of a boot-service plist; enroll
+    // writes exactly those values with the rest, in the agent's key order.
+    #[test]
+    fn the_mac_ollama_plan_writes_the_tuning_the_agent_asked_for() {
+        let json = r#"{"OLLAMA_NUM_PARALLEL":"2","OLLAMA_HOST":"0.0.0.0","OLLAMA_KEEP_ALIVE":"-1","OLLAMA_CONTEXT_LENGTH":"8192","OLLAMA_KV_CACHE_TYPE":"","OLLAMA_MAX_LOADED_MODELS":3}"#;
+        let t = super::ollama_wanted_env(json);
+        assert_eq!(
+            t,
+            [("OLLAMA_NUM_PARALLEL", "2"), ("OLLAMA_KEEP_ALIVE", "-1"), ("OLLAMA_CONTEXT_LENGTH", "8192")]
+                .map(|(k, v)| (k.to_string(), v.to_string())),
+            "unknown keys, empty and non-string values are dropped"
+        );
+        assert!(super::ollama_wanted_env("not json").is_empty() && super::ollama_wanted_env("[]").is_empty());
+        assert!(super::ollama_wanted_env(r#"{"OLLAMA_KEEP_ALIVE":"a\nb"}"#).is_empty(), "control characters");
+        let plan = super::darwin_ollama_boot_plan("/Users/nodeuser", "nodeuser", "501", "/Users/nodeuser/.ollama/models", &t);
+        let env = &plan[4].sh;
+        for want in [
+            "sudo /usr/bin/plutil -replace EnvironmentVariables.OLLAMA_NUM_PARALLEL -string '2' \"$P\"",
+            "sudo /usr/bin/plutil -replace EnvironmentVariables.OLLAMA_KEEP_ALIVE -string '-1' \"$P\"",
+            "sudo /usr/bin/plutil -replace EnvironmentVariables.OLLAMA_CONTEXT_LENGTH -string '8192' \"$P\"",
+        ] {
+            assert!(env.contains(want), "missing {want}: {env}");
+        }
+        assert!(!env.contains("OLLAMA_HOST"), "{env}");
+        // Idempotent: plutil -replace sets the same value again, and the job is re-bootstrapped.
+        let again = super::darwin_ollama_boot_plan("/Users/nodeuser", "nodeuser", "501", "/Users/nodeuser/.ollama/models", &t);
+        assert_eq!(plan, again);
     }
 
     // The store stays where Ollama keeps it today; a data root's store takes

@@ -33,6 +33,12 @@ login) until someone runs `noo enroll --resume` on it once: an upgrade or
 applier never runs Homebrew as root. Until then the `native ollama` row
 warns "not a boot service yet".
 
+`noo enroll --resume` also writes into the boot service's plist the Ollama
+settings the node agent asks for (context length, keep-alive, parallelism and
+the like, which come from the node's placements). The agent records them in
+`~/noomesh/ollama-env.json`; run `noo enroll --resume` again after a placement
+change that alters them, or apply the `sudo plutil` commands the agent prints.
+
 The tier is derived from the facts a node reports; see
 [../cli/fleet.md](../cli/fleet.md) for the rule and the override.
 
