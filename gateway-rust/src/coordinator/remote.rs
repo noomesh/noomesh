@@ -242,6 +242,20 @@ impl HarnessRuntime for RemoteRuntime {
         crate::harness::profile::chat_context_for(&pinned.model)
     }
 
+    /// The engine window for the pinned vLLM / llama.cpp model: what the
+    /// controller works out for its own in-process chats
+    /// (`chat_context::window_for`), carried to the node by the agent's
+    /// `/harness/placement` `chat_windows`. `None` (the loop keeps its global
+    /// window, as before) for any other backend, any endpoint but the
+    /// pinned one, or when the agent sent no window for the model.
+    async fn chat_window(&self, backend: &ResolvedBackend) -> Option<u64> {
+        if !crate::chat_context::reads_window(&backend.backend_type) {
+            return None;
+        }
+        let pinned = self.pinned.as_ref().filter(|p| p.url == backend.url)?;
+        crate::harness::profile::chat_window_for(&pinned.model)
+    }
+
     async fn route_facts(&self, url: &str, _backend: &str) -> Option<(String, Option<super::classes::Slots>)> {
         // The placed endpoint is this node's; the slots come live from its
         // agent (`: queued ahead=N` and the occupancy headers), not from here.
@@ -996,6 +1010,72 @@ mod tests {
         let body = bodies.lock().unwrap().first().cloned().expect("the model was called");
         assert_eq!(body["options"]["num_ctx"], serde_json::json!(32768), "{body}");
         assert_eq!(body["options"]["num_predict"], serde_json::json!(crate::chat_context::reserve_for(32768)), "the reply reserve of the decided window: {body}");
+    }
+
+    /// i1411: a node harness fits a turn to the engine's own window for a
+    /// llama.cpp or vLLM placement (`/harness/placement` `chat_windows`), as
+    /// the gateway does for its in-process chats. A 4096 llama.cpp placement
+    /// gives a 3072-token prompt budget, not the global 12288; a missing
+    /// value (an older agent) or an unusable one keeps the global window; an
+    /// Ollama takes its decided context as before. One test, because the
+    /// tables are process-wide.
+    #[tokio::test]
+    async fn a_node_harness_fits_a_turn_to_the_engines_window() {
+        use super::super::agent_loop::window_max_input;
+        let rt = |pinned: &ResolvedBackend| RemoteRuntime {
+            gateway: "http://127.0.0.1:1".into(),
+            token: "t".into(),
+            client: reqwest::Client::new(),
+            metrics: Arc::new(crate::metrics::MetricsState::new()),
+            max_context_tokens: None,
+            max_session_messages: 1,
+            skills: crate::prompt_skills::SkillRegistry::default(),
+            runbooks: Vec::new(),
+            pinned: Some(pinned.clone()),
+        };
+        let llama = ResolvedBackend { url: "http://noo-llamacpp:8085".into(), model: "win-llama-3b".into(), backend_type: "llamacpp".into(), api_format: "llamacpp".into() };
+        let vllm = ResolvedBackend { url: "http://noo-vllm:8000".into(), model: "win-vllm-7b".into(), backend_type: "vllm".into(), api_format: "openai".into() };
+        let ollama = ResolvedBackend { url: "http://127.0.0.1:11434".into(), model: "win-ollama:1b".into(), backend_type: "ollama".into(), api_format: "ollama".into() };
+        let (global_len, reserve) = (16384u32, 4096u32);
+        let global_input = 12_288usize;
+
+        // An older agent: no `chat_windows`. Today's behaviour exactly.
+        crate::harness::profile::set_chat_windows(crate::harness::profile::chat_windows_of(&serde_json::json!({"placed": true})));
+        assert_eq!(rt(&llama).chat_window(&llama).await, None);
+        assert_eq!(window_max_input(&rt(&llama), &llama, global_len, reserve).await, global_input, "no value: the global window");
+
+        // The agent's table, with a zero and an absurd entry beside the two real ones.
+        let placement = serde_json::json!({"placed": true,
+            "chat_windows": {"win-llama-3b": 4096, "win-vllm-7b": 8192, "win-zero": 0, "win-absurd": 99_999_999_999u64}});
+        crate::harness::profile::set_chat_windows(crate::harness::profile::chat_windows_of(&placement));
+
+        assert_eq!(rt(&llama).chat_window(&llama).await, Some(4096));
+        assert_eq!(window_max_input(&rt(&llama), &llama, global_len, reserve).await, 3072, "4096 less its 1024 reserve, not the global 12288");
+        assert_eq!(rt(&vllm).chat_window(&vllm).await, Some(8192));
+        assert_eq!(window_max_input(&rt(&vllm), &vllm, global_len, reserve).await, 6144, "a vLLM placement likewise");
+
+        // Ollama: its window is its decided context (`chat_num_ctx`, pinned by
+        // the test above); the engine table is never consulted for it, even
+        // when it names the model.
+        let named = ResolvedBackend { model: "win-llama-3b".into(), ..ollama.clone() };
+        assert_eq!(rt(&named).chat_window(&named).await, None, "an Ollama has no engine window");
+
+        // Only the pinned endpoint is this node's.
+        let elsewhere = ResolvedBackend { url: "http://elsewhere:8085".into(), ..llama.clone() };
+        assert_eq!(rt(&llama).chat_window(&elsewhere).await, None);
+
+        // Zero, absurd, and absent entries are the global window.
+        for model in ["win-zero", "win-absurd", "win-not-in-table"] {
+            let b = ResolvedBackend { model: model.into(), ..llama.clone() };
+            assert_eq!(rt(&b).chat_window(&b).await, None, "{model}");
+            assert_eq!(window_max_input(&rt(&b), &b, global_len, reserve).await, global_input, "{model}");
+        }
+
+        // A table with no entry for the pinned model, and a cleared table.
+        crate::harness::profile::set_chat_windows(crate::harness::profile::chat_windows_of(&serde_json::json!({"chat_windows": {"other-model": 4096}})));
+        assert_eq!(rt(&llama).chat_window(&llama).await, None);
+        crate::harness::profile::set_chat_windows(None);
+        assert_eq!(rt(&vllm).chat_window(&vllm).await, None);
     }
 
     /// i411, P3: a body with nothing readable in it is the backend's error,

@@ -501,6 +501,17 @@ translator stamps it on an Ollama-bound body a CLI sent without one. It is
 absent when nothing is decided or the agent is older; the loop then keeps
 the global `VLLM_MAX_MODEL_LEN` window.
 
+`chat_windows` is the same for a vLLM or llama.cpp chat model: the engine's
+own window per model as placed (`VLLM_MAX_MODEL_LEN`, or llama.cpp's `N_CTX`
+shared by its parallel slots, else the node's profile context, capped by the
+model's own ceiling), as the controller reads it for the chats it runs
+itself (desired-config `chat_windows`). The agent stamps nothing with it. The
+harness fits its loop's turns to the pinned model's entry, so a 4096-token
+llama.cpp placement gets a prompt budget inside 4096 rather than the global
+window. It is absent when no window is readable or the agent is older; zero
+or implausibly large values are ignored; the loop then keeps the global
+`VLLM_MAX_MODEL_LEN` window.
+
 `noo-gateway harness probe --kind <kind>` runs steps 1, 3, 4 and 5 once,
 with no door key and no MCP wiring. That means no `{mcp_config}`
 arguments and no `[mcp_servers]` table. The probe uses either the node's

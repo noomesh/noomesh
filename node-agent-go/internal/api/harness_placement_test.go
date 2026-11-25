@@ -77,6 +77,14 @@ func TestHarnessPlacementRouteAnswersPlacedAndUnplaced(t *testing.T) {
 	if body := strings.ReplaceAll(rec.Body.String(), " ", ""); strings.TrimSpace(body) != `{"kind":"native","env":{},"desired_state":"running","placed":true,"chat_contexts":{"gemma4:e2b":32768}}` {
 		t.Fatalf("chat_contexts body: %s", body)
 	}
+	// The engine windows ride along too (i1411); an older answer has none.
+	windows := placementServer(t, func() HarnessPlacement {
+		return HarnessPlacement{Kind: "native", DesiredState: "running", Placed: true, ChatWindows: map[string]int{"Llama-3.2-3B-Instruct-Q4_K_M.gguf": 4096}}
+	})
+	rec = getPlacement(windows, own, "127.0.0.1:5000", "")
+	if body := strings.ReplaceAll(rec.Body.String(), " ", ""); strings.TrimSpace(body) != `{"kind":"native","env":{},"desired_state":"running","placed":true,"chat_windows":{"Llama-3.2-3B-Instruct-Q4_K_M.gguf":4096}}` {
+		t.Fatalf("chat_windows body: %s", body)
+	}
 	unplaced := placementServer(t, func() HarnessPlacement { return HarnessPlacement{} })
 	rec = getPlacement(unplaced, own, "127.0.0.1:5000", "")
 	if rec.Code != 404 || strings.ReplaceAll(rec.Body.String(), " ", "") != `{"placed":false}` {

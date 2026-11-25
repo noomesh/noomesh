@@ -305,6 +305,7 @@ pub async fn run() -> Result<()> {
     let placement = read_placement(&model_url, &client).await;
     let profile = profile_of(&placement);
     install_chat_contexts(&placement, "start");
+    install_chat_windows(&placement, "start");
     match &profile {
         Some(p) => tracing::info!(
             tier = ?p.tier, first_byte_secs = ?p.first_byte_secs, stream_idle_secs = ?p.stream_idle_secs,
@@ -394,6 +395,7 @@ pub async fn run() -> Result<()> {
                 tick.tick().await;
                 let placement = read_placement(&model_url, &client).await;
                 install_chat_contexts(&placement, "re-read");
+                install_chat_windows(&placement, "re-read");
                 let (mode, source) =
                     thinking_after_read(std::env::var(coordinator::thinking::THINKING_ENV).ok(), &placement);
                 if source == "unreachable" {
@@ -833,6 +835,20 @@ fn install_chat_contexts(placement: &Result<Option<serde_json::Value>>, when: &s
     let shown = table.as_ref().map(|t| format!("{t:?}")).unwrap_or_else(|| "none".into());
     if crate::harness::profile::set_chat_contexts(table) {
         tracing::info!("harness: decided chat contexts={shown} ({when})");
+    }
+}
+
+/// The agent's engine windows (`chat_windows`, vLLM and llama.cpp chat
+/// models) from a placement read, installed for the loop
+/// ([`crate::harness::profile::chat_window_for`]). Held like
+/// [`install_chat_contexts`]: unreachable leaves the table, a read without
+/// the key (an older agent) clears it.
+fn install_chat_windows(placement: &Result<Option<serde_json::Value>>, when: &str) {
+    let Ok(read) = placement else { return };
+    let table = read.as_ref().and_then(crate::harness::profile::chat_windows_of);
+    let shown = table.as_ref().map(|t| format!("{t:?}")).unwrap_or_else(|| "none".into());
+    if crate::harness::profile::set_chat_windows(table) {
+        tracing::info!("harness: engine chat windows={shown} ({when})");
     }
 }
 

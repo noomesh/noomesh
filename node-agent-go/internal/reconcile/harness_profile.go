@@ -275,6 +275,43 @@ func (r *Reconciler) ChatContexts() map[string]int {
 	return out
 }
 
+// recordChatWindows installs desired-config's `chat_windows` (i1411): the
+// controller's engine window per vLLM / llama.cpp chat model. An absent key
+// (an older gateway, nothing readable) clears the table. A blank name and a
+// non-positive value are dropped. Names are kept as placed (trimmed): the
+// harness looks the model up by the name its placement carries.
+func (r *Reconciler) recordChatWindows(in map[string]int) {
+	var out map[string]int
+	for m, n := range in {
+		if k := strings.TrimSpace(m); k != "" && n > 0 {
+			if out == nil {
+				out = map[string]int{}
+			}
+			out[k] = n
+		}
+	}
+	r.harnessMu.Lock()
+	defer r.harnessMu.Unlock()
+	r.chatWindows = out
+}
+
+// ChatWindows is a copy of the engine-window table (desired-config
+// `chat_windows`), nil when none is known. GET /harness/placement carries it
+// so the node's harness fits a turn to the engine's real window, as the
+// controller does for its own chats (i1411).
+func (r *Reconciler) ChatWindows() map[string]int {
+	r.harnessMu.RLock()
+	defer r.harnessMu.RUnlock()
+	if len(r.chatWindows) == 0 {
+		return nil
+	}
+	out := make(map[string]int, len(r.chatWindows))
+	for k, v := range r.chatWindows {
+		out[k] = v
+	}
+	return out
+}
+
 // ChatContextWindow is the context window, in tokens, that the node's chat
 // backend runs with as far as the agent sets it, for GET /harness/placement
 // (`model_context`): the harness tells a foreign CLI its model's real window

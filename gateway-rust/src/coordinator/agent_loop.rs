@@ -1330,6 +1330,13 @@ async fn backend_context<R: HarnessRuntime>(rt: &R, backend: &ResolvedBackend) -
     }
 }
 
+/// The prompt budget a turn on `backend` is fitted to, as the turn set-up
+/// computes it. A test seam for the runtimes' window tests.
+#[cfg(test)]
+pub(super) async fn window_max_input<R: HarnessRuntime>(rt: &R, backend: &ResolvedBackend, global_len: u32, global_reserve: u32) -> usize {
+    turn_window(rt.max_context_tokens(), backend_context(rt, backend).await, global_len, global_reserve).max_input
+}
+
 /// The prompt tier a window affords (`coordinator::context::PromptTier`).
 type WindowTier = super::context::PromptTier;
 

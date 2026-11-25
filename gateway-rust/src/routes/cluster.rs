@@ -4748,6 +4748,12 @@ async fn desired_config_get(
     if let Some(map) = chat_contexts {
         body["chat_contexts"] = map;
     }
+    // i1411, for the node agent: {"<model>": engine window tokens} for the
+    // node's vLLM and llama.cpp chat placements, which its harness fits a
+    // turn to (an agent that predates it ignores the key). Omitted when none.
+    if let Some(map) = chat_windows_map(&placement_json, &record, profile_context) {
+        body["chat_windows"] = map;
+    }
     if let Some(nw) = node_workloads {
         body["node_workloads"] = Value::Array(nw);
     }
@@ -4836,6 +4842,27 @@ pub(crate) fn chat_contexts_map(rows: &[Value]) -> Option<Value> {
         .filter_map(|r| Some((r["model"].as_str()?.to_string(), Value::from(r["decided"].as_u64()?))))
         .collect();
     (!map.is_empty()).then_some(Value::Object(map))
+}
+
+/// desired-config's `chat_windows` (i1411): `{"<model>": engine window in
+/// tokens}` for each RUNNING vLLM / llama.cpp chat placement with a model,
+/// worked out by `harness_fit::chat_window` exactly as the gateway's own
+/// in-process chats read it (`chat_context::window_for`): the engine's key,
+/// else the profile's context, capped by the model's ceiling. The node's
+/// harness fits its turns to it. A model placed twice keeps the smaller
+/// window. `None` when there are none, so the key is omitted.
+pub(crate) fn chat_windows_map(placements: &[Value], record: &Value, profile_context: u64) -> Option<Value> {
+    let mut windows: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+    for p in placements {
+        let backend = p["backend"].as_str().unwrap_or("");
+        if !crate::chat_context::reads_window(backend) || p["role"].as_str() != Some("chat") || p["desired_state"].as_str() != Some("running") {
+            continue;
+        }
+        let Some(model) = p["model"].as_str().map(str::trim).filter(|m| !m.is_empty()) else { continue };
+        let Some(w) = crate::harness_fit::chat_window(backend, &p["env"], Some(model), record, profile_context) else { continue };
+        windows.entry(model.to_string()).and_modify(|t| *t = (*t).min(w.tokens)).or_insert(w.tokens);
+    }
+    (!windows.is_empty()).then(|| json!(windows))
 }
 
 /// Per node, the live tasks it holds (i227 fix 4): `running` (running or
@@ -10987,7 +11014,7 @@ mod heartbeat_gzip_tests {
 
 #[cfg(test)]
 mod chat_context_detail_tests {
-    use super::{chat_context_rows, chat_contexts_map};
+    use super::{chat_context_rows, chat_contexts_map, chat_windows_map};
     use serde_json::json;
 
     /// fa's one-box node: 16 GB, gemma4:e2b running at Ollama's 4,096 default.
@@ -11031,6 +11058,34 @@ mod chat_context_detail_tests {
         assert!(chat_contexts_map(&chat_context_rows(&placements[2..5], &record(), 16384, (false, None))).is_none(), "nothing decided: the key is omitted");
     }
 
+    /// i1411: a running vLLM or llama.cpp chat placement ships its engine
+    /// window (the key, the slots, the model's ceiling), the gateway's own
+    /// reading; an Ollama, an embed row, a stopped row and an engine with no
+    /// readable window ship none; with none, the key is omitted.
+    #[test]
+    fn chat_windows_carry_the_engine_window_of_llamacpp_and_vllm_chats() {
+        let placements = vec![
+            json!({"backend": "llamacpp", "role": "chat", "model": "Llama-3.2-3B-Instruct-Q4_K_M.gguf", "env": {"N_CTX": "4096"}, "desired_state": "running"}),
+            json!({"backend": "vllm", "role": "chat", "model": "org/windowed", "env": {"VLLM_MAX_MODEL_LEN": 8192}, "desired_state": "running"}),
+            json!({"backend": "llamacpp", "role": "chat", "model": "slots.gguf", "env": {"N_CTX": 8192, "N_PARALLEL": 2}, "desired_state": "running"}),
+            json!({"backend": "ollama", "role": "chat", "model": "gemma4:e2b", "env": {"OLLAMA_CONTEXT_LENGTH": "32768"}, "desired_state": "running"}),
+            json!({"backend": "llamacpp", "role": "embed", "model": "embedder.gguf", "env": {"N_CTX": 512}, "desired_state": "running"}),
+            json!({"backend": "llamacpp", "role": "chat", "model": "old.gguf", "env": {"N_CTX": 2048}, "desired_state": "stopped"}),
+            json!({"backend": "llamacpp", "role": "chat", "model": "nothing.gguf", "env": {}, "desired_state": "running"}),
+        ];
+        let map = chat_windows_map(&placements, &record(), 0).expect("some windows");
+        assert_eq!(
+            map,
+            json!({"Llama-3.2-3B-Instruct-Q4_K_M.gguf": 4096, "org/windowed": 8192, "slots.gguf": 4096}),
+            "N_CTX not the global window; slots divide it; Ollama, embed, stopped and unreadable rows ship none"
+        );
+        // With the profile's context, an engine that sets none gets it (as chat_window does at the gateway).
+        let with_profile = chat_windows_map(&placements[6..], &record(), 16384).expect("the profile declares it");
+        assert_eq!(with_profile, json!({"nothing.gguf": 16384}));
+        assert!(chat_windows_map(&placements[3..6], &record(), 16384).is_none(), "nothing to ship: the key is omitted");
+        assert!(chat_windows_map(&[], &record(), 16384).is_none());
+    }
+
     /// desired-config sends both: the detail for `noo cluster show` and the
     /// map for the agent, the map only when something is decided.
     #[test]
@@ -11040,6 +11095,8 @@ mod chat_context_detail_tests {
         assert!(body.contains("chat_context_rows(&placement_json, &record, profile_context, stack)"), "computed from the placements served");
         assert!(body.contains("\"chat_context_detail\": chat_context_detail,"));
         assert!(body.contains("if let Some(map) = chat_contexts \u{7b}\n        body[\"chat_contexts\"] = map;"), "only Some sets the key");
+        assert!(body.contains("chat_windows_map(&placement_json, &record, profile_context)"), "the engine windows come from the same placements and profile context");
+        assert!(body.contains("body[\"chat_windows\"] = map;"), "only Some sets the key");
     }
 }
 

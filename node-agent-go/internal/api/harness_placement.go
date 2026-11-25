@@ -39,6 +39,11 @@ type HarnessPlacement struct {
 	// stamps it as options.num_ctx on that model's calls; the harness fits
 	// its turns to the same number (i802).
 	ChatContexts map[string]int `json:"chat_contexts,omitempty"`
+	// ChatWindows is the controller's engine window per vLLM and llama.cpp
+	// chat model on this node (desired-config `chat_windows`, keyed by the
+	// model as placed), omitted when none is known. The agent stamps nothing
+	// with it; the harness fits its turns to it (i1411).
+	ChatWindows map[string]int `json:"chat_windows,omitempty"`
 	// Unknown: the agent has not applied a desired-config yet, so it cannot
 	// say whether a harness is placed. The route answers 503 with
 	// Retry-After, and the harness waits instead of falling back to its
