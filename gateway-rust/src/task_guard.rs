@@ -1191,6 +1191,7 @@ mod tests {
         let allowed_fns = [
             ("heartbeat_actions.rs", "run_llm_action_inner"),   // under run_llm_action's ceiling
             ("heartbeat_actions.rs", "research_corrective_retry"), // only called from run_llm_action_inner
+            ("heartbeat_actions.rs", "non_answer_retry"),       // only called from run_llm_action_inner
             ("heartbeat_actions.rs", "action_self_benchmark"),  // ceiling_for_run in run_rust_native_task
             ("research_pipeline.rs", "run_research_pipeline"),  // called from run_llm_action_inner
             ("research_pipeline.rs", "run_section"),            // called from run_research_pipeline

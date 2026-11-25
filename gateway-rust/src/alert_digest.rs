@@ -11,8 +11,9 @@
 //! This module reads what the operator was actually told (the `events.ops.>`
 //! alert stream, which the EVENTS stream keeps for 24 h), the conditions
 //! still open, and the nodes in maintenance, and prepends them to the
-//! prompt with an explicit rule: the summary reports them, and never says
-//! all is well while the record lists any. When the stream cannot be read,
+//! prompt (AFTER the task, as material that goes into the summary) with an
+//! explicit rule: the summary reports them, and never says all is well while
+//! the record lists any. When the stream cannot be read,
 //! the record says so rather than staying silent (an unread record is not a
 //! clean one).
 //!
@@ -67,9 +68,11 @@ pub fn render_record(
     now: i64,
 ) -> String {
     let mut out = String::from(
-        "## Operator alert record (authoritative; read this before you write anything)\n\
-         This is what the operator was actually told in the last 24 hours, the conditions still \
-         open, and the nodes known to be down for maintenance.\n\n",
+        "## Operator alert record (input for the task above)\n\
+         This record is part of your input. Put every alert, open condition and maintenance node \
+         it lists INTO your answer, in its own section. It never replaces the task above. It is \
+         what the operator was actually told in the last 24 hours, the conditions still open, and \
+         the nodes known to be down for maintenance.\n\n",
     );
     match events {
         None => out.push_str(
@@ -142,8 +145,8 @@ pub fn render_record(
     out.push_str(
         "\nRules: report every failure, open condition and maintenance node above. Never write \
          that there were no errors, nothing to report, or that everything is healthy while this \
-         record lists any alert or open condition. If the record lists none, say only that no \
-         alerts were sent in the window.\n\n---\n\n",
+         record lists any alert or open condition. If the record lists none, state in one line of \
+         your answer that no alerts were sent in the window.\n",
     );
     out
 }
@@ -196,7 +199,12 @@ pub fn wants_alert_record(action: &str, config: &Value) -> bool {
     }
 }
 
-/// Prepend the alert record to a summary prompt (no-op for other actions).
+/// Put the task first and the alert record after it (no-op for other actions).
+pub fn compose_prompt(task: &str, record: &str) -> String {
+    format!("{task}\n\n{record}")
+}
+
+/// Append the alert record to a summary prompt (no-op for other actions).
 pub async fn enrich_prompt(prompt: String, state: &AppState, action: &str, config: &Value) -> String {
     if !wants_alert_record(action, config) {
         return prompt;
@@ -206,7 +214,7 @@ pub async fn enrich_prompt(prompt: String, state: &AppState, action: &str, confi
     let open = crate::operator_alert::open_conditions(state).await;
     let maintenance = crate::maintenance::active(&state.js, now).await;
     let record = render_record(events.as_deref(), &open, &maintenance, now);
-    format!("{record}{prompt}")
+    compose_prompt(&prompt, &record)
 }
 
 #[cfg(test)]
@@ -236,6 +244,22 @@ mod tests {
         assert!(out.contains("Never write"), "the rule that forbids an all-clear is part of the input");
         // Evidence stays out: only the channel headline is carried.
         assert!(!out.contains("10.0.0.9"), "{out}");
+    }
+
+    #[test]
+    fn the_task_comes_first_and_the_record_is_material_for_it() {
+        let record = render_record(Some(&[]), &[], &[], 0);
+        let task = "Generate a daily briefing summarizing: cluster node health.";
+        let out = compose_prompt(task, &record);
+        assert!(out.starts_with(task), "the task is the first thing the model reads: {out}");
+        let t = out.find(task).unwrap();
+        let r = out.find("## Operator alert record").unwrap();
+        assert!(t < r, "task before record");
+        assert!(out.contains("Put every alert, open condition and maintenance node it lists INTO your answer"), "{out}");
+        assert!(out.contains("It never replaces the task above"), "{out}");
+        assert!(out.contains("state in one line of your answer that no alerts were sent"), "{out}");
+        assert!(!out.contains("say only"), "the record must not compete with the task: {out}");
+        assert!(!out.contains("authoritative") && !out.contains("before you write anything"), "{out}");
     }
 
     #[test]

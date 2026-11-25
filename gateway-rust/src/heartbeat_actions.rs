@@ -594,7 +594,24 @@ pub(crate) fn load_skill_body(name: &str) -> Option<String> {
 /// skill's body is loaded from `prompts/skills/` and prepended to the
 /// action's own prompt. This lets tasks opt into shared quality rules
 /// without baking them into each per-action template.
+/// Said to every unattended LLM action: a scheduled run has no one to ask.
+/// A model that offers "Shall I proceed?" or declines to start has produced
+/// nothing; the run is then judged by [`detect_non_answer`].
+pub const UNATTENDED_NOTE: &str = "This runs unattended: no one can answer a question. Do the \
+     task with what you have and the tools offered; never ask to proceed.";
+
+/// The task, then (for an LLM action) the unattended note. The alert record
+/// of a summary is appended after both (`alert_digest::enrich_prompt`).
 pub fn build_action_prompt(action: &str, task_name: &str, config: &Value) -> String {
+    let prompt = build_action_prompt_base(action, task_name, config);
+    if matches!(action_path(action), ActionPath::RustLlm) {
+        format!("{prompt}\n\n{UNATTENDED_NOTE}")
+    } else {
+        prompt
+    }
+}
+
+fn build_action_prompt_base(action: &str, task_name: &str, config: &Value) -> String {
     let action_prompt = build_action_prompt_inner(action, task_name, config);
 
     // Opt-in skill prepend. Two fields supported:
@@ -1971,7 +1988,7 @@ async fn run_llm_action_inner(
             .map_err(|e| anyhow::anyhow!("research ran without sources: {e}"))?;
     }
     let text = sanitize_result_text(&cr.response);
-    Ok(research_corrective_retry(
+    let text = research_corrective_retry(
         state,
         action,
         prompt,
@@ -1980,7 +1997,174 @@ async fn run_llm_action_inner(
         config,
         text,
     )
-    .await)
+    .await;
+    // A refusal or a question is not a result: one corrective retry, then a
+    // failed run (nothing delivered; the loop alerts through operator_alert).
+    gate_unattended_answer(action, text, |hit| {
+        non_answer_retry(state, prompt, conversation_id, max_iterations, config, hit)
+    })
+    .await
+}
+
+/// Why an unattended run's text is not an answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NonAnswer {
+    /// It opens by declining the task.
+    Declined,
+    /// It ends by asking leave to go on (nobody can reply).
+    AskedToProceed,
+}
+
+impl NonAnswer {
+    /// The run's error text.
+    pub fn reason(self) -> &'static str {
+        match self {
+            NonAnswer::Declined => "unattended_non_answer: declined",
+            NonAnswer::AskedToProceed => "unattended_non_answer: asked_to_proceed",
+        }
+    }
+}
+
+/// A non-answer is short: a long text is a real report with a stray phrase.
+const NON_ANSWER_MAX_CHARS: usize = 2500;
+const DECLINE_OPENERS: &[&str] = &[
+    "i cannot", "i can not", "i can't", "i'm unable", "i am unable", "i'm not able", "i am not able",
+    "i won't", "i will not", "i'm sorry, but i", "sorry, but i", "i apologize, but i",
+];
+/// The opener must be about the task ("I cannot fulfill the request"), not a
+/// finding ("I cannot reach node_a").
+const DECLINE_OBJECTS: &[&str] = &[
+    "fulfill", "comply", "complete", "generate", "provide", "produce", "create", "write", "proceed",
+    "do that", "do this", "help with", "assist", "perform", "the request", "this request", "the task",
+    "as instructed",
+];
+const LEAVE_PHRASES: &[&str] = &[
+    "shall i", "should i", "would you like", "do you want me", "want me to", "like me to", "may i",
+    "can i proceed", "ready to proceed",
+];
+
+fn first_sentence(s: &str) -> String {
+    let end = s
+        .char_indices()
+        .find(|&(i, c)| {
+            c == '\n' || (matches!(c, '.' | '!' | '?') && s[i + 1..].starts_with(char::is_whitespace))
+        })
+        .map(|(i, _)| i)
+        .unwrap_or(s.len());
+    s[..end].chars().take(300).collect()
+}
+
+/// Is `text` a refusal or a request for leave rather than the task's result?
+/// Pure. Conservative: only the START (declines, about the task) and the END
+/// (a final line that asks leave and ends in `?`) count, and only for a short
+/// text. A question mid-text, "node_a cannot reach node_b", an empty text
+/// (the usability gate's) and a long report are not hits.
+pub fn detect_non_answer(text: &str) -> Option<NonAnswer> {
+    let t = text.trim();
+    if t.is_empty() || t.chars().count() > NON_ANSWER_MAX_CHARS {
+        return None;
+    }
+    let norm = t.replace('\u{2019}', "'").to_lowercase();
+    let head = norm.trim_start_matches(|c: char| !c.is_alphanumeric());
+    if DECLINE_OPENERS.iter().any(|o| head.starts_with(o)) {
+        let first = first_sentence(head);
+        if DECLINE_OBJECTS.iter().any(|o| first.contains(o)) {
+            return Some(NonAnswer::Declined);
+        }
+    }
+    let last = norm.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("");
+    let last = last.trim().trim_end_matches(|c: char| matches!(c, '*' | '_' | '"' | '\'' | ')' | ' '));
+    if let Some(body) = last.strip_suffix('?') {
+        let sentence = match body.rfind(|c: char| matches!(c, '.' | '!' | ':')) {
+            Some(i) => &body[i + 1..],
+            None => body,
+        };
+        if LEAVE_PHRASES.iter().any(|p| sentence.contains(p)) {
+            return Some(NonAnswer::AskedToProceed);
+        }
+    }
+    None
+}
+
+fn non_answer_correction(hit: NonAnswer) -> &'static str {
+    match hit {
+        NonAnswer::Declined => {
+            "⚠️ RETRY: your previous answer declined to do the task. This run is unattended and \
+             nobody can reply. Do the task now with the information in this prompt and the tools \
+             offered; if some data is unavailable, say which and report the rest. Do not decline \
+             and do not ask a question."
+        }
+        NonAnswer::AskedToProceed => {
+            "⚠️ RETRY: your previous answer ended by asking whether to proceed. This run is \
+             unattended and nobody can reply. Do the task now with the information in this prompt \
+             and the tools offered, and write the finished result. Do not ask a question."
+        }
+    }
+}
+
+/// Run `first` through the non-answer detector. A hit gets ONE corrective
+/// retry (`retry` returns the second text, or None if it could not run); a
+/// second hit, or no second text, is an `Err` carrying the reason, so the
+/// run is recorded failed, nothing is delivered and the loop alerts.
+pub async fn gate_unattended_answer<F, Fut>(action: &str, first: String, retry: F) -> anyhow::Result<String>
+where
+    F: FnOnce(NonAnswer) -> Fut,
+    Fut: std::future::Future<Output = Option<String>>,
+{
+    let Some(hit) = detect_non_answer(&first) else {
+        return Ok(first);
+    };
+    tracing::warn!(action, reason = hit.reason(), "heartbeat_non_answer_retrying");
+    if let Some(second) = retry(hit).await {
+        match detect_non_answer(&second) {
+            None => return Ok(second),
+            Some(again) => anyhow::bail!("{}", again.reason()),
+        }
+    }
+    anyhow::bail!("{}", hit.reason())
+}
+
+/// The corrective retry for a non-answer, in its own conversation.
+async fn non_answer_retry(
+    state: &std::sync::Arc<crate::state::AppState>,
+    base_prompt: &str,
+    conversation_id: &str,
+    max_iterations: u32,
+    config: &Value,
+    hit: NonAnswer,
+) -> Option<String> {
+    let retry_prompt = format!("{base_prompt}\n\n{}", non_answer_correction(hit));
+    let model = task_model(config);
+    match crate::bus_principal::with_principal(
+        crate::bus_principal::unattended_principal(crate::heartbeat_actions::HEARTBEAT_CONVERSATION_OWNER),
+        crate::coordinator::run_with_thinking(
+            state,
+            &retry_prompt,
+            &format!("{conversation_id}-nonanswer"),
+            "heartbeat",
+            max_iterations,
+            model.as_deref(),
+            Some(HEARTBEAT_CONVERSATION_OWNER),
+            false,
+        ),
+    )
+    .await
+    {
+        Ok(cr) => {
+            crate::usage::record(
+                state.db.clone(),
+                cr.node.clone(),
+                cr.backend.clone(),
+                cr.model.clone(),
+                "heartbeat",
+                crate::usage::UsageActor::consumer("heartbeat"),
+                cr.usage.prompt_tokens,
+                cr.usage.completion_tokens,
+            );
+            Some(sanitize_result_text(&cr.response))
+        }
+        Err(_) => None,
+    }
 }
 
 /// Single corrective retry for a research action whose first output failed
@@ -6197,5 +6381,127 @@ mod self_check_delivery_tests {
         let now = crate::test_src::own_code(include_str!("routes/intelligence.rs"));
         let body = crate::test_src::fn_body(&now, "async fn execute_manual_run(");
         assert!(body.contains("heartbeat_actions::channel_report(&status, &action, &result_text, &error_text)"), "run now");
+    }
+}
+
+#[cfg(test)]
+mod non_answer_tests {
+    use super::*;
+    use serde_json::json;
+    use std::cell::Cell;
+
+    /// The record's text (i1395), with its elided middle.
+    const REFUSAL: &str = "I cannot fulfill the request to generate the daily briefing as instructed \
+        because the operator alert record provided contains active alerts and conditions, and your \
+        specific instructions for the alert record require me to report every failure and open \
+        condition listed in that record. I would first need the node and knowledge base data. \
+        Shall I proceed with gathering that data now?";
+
+    const BRIEFING: &str = "## Daily briefing\n\n### Alerts\n- node_a cannot be reached (open for 2h).\n\
+        Why did the backup fail? Its last run timed out.\n\n### Cluster\nnode_a is offline; ctrl is healthy.\n\
+        Knowledge base: 12 documents. Cache: 41% used.\n\nNo pending jobs.";
+
+    #[test]
+    fn the_records_refusal_is_a_decline() {
+        assert_eq!(detect_non_answer(REFUSAL), Some(NonAnswer::Declined));
+        assert_eq!(NonAnswer::Declined.reason(), "unattended_non_answer: declined");
+        assert_eq!(detect_non_answer("**I can\u{2019}t complete this task.**"), Some(NonAnswer::Declined));
+    }
+
+    #[test]
+    fn a_real_briefing_is_not_a_hit() {
+        assert_eq!(detect_non_answer(BRIEFING), None);
+        assert_eq!(detect_non_answer(""), None, "empty is the usability gate's");
+    }
+
+    #[test]
+    fn a_question_mid_text_or_a_node_that_cannot_reach_is_not_a_hit() {
+        let mid = "## Briefing\nShall I worry about node_a? It has been offline for 2h.\nAll else is healthy.";
+        assert_eq!(detect_non_answer(mid), None);
+        assert_eq!(detect_non_answer("node_a cannot reach node_b over the mesh.\nCache 41%."), None);
+        assert_eq!(detect_non_answer("I cannot reach node_a; it is offline.\nCache 41%."), None, "a finding, not a refusal");
+        let long_tail = format!("{}\nShall I proceed?", "Section.\n".repeat(400));
+        assert_eq!(detect_non_answer(&long_tail), None, "a long report is not judged by a closing phrase");
+    }
+
+    #[test]
+    fn a_trailing_ask_for_leave_is_a_hit() {
+        let t = "## Briefing\nnode_a is offline.\n\nShall I proceed?";
+        assert_eq!(detect_non_answer(t), Some(NonAnswer::AskedToProceed));
+        assert_eq!(NonAnswer::AskedToProceed.reason(), "unattended_non_answer: asked_to_proceed");
+        assert_eq!(detect_non_answer("Done so far. **Would you like me to continue?**"), Some(NonAnswer::AskedToProceed));
+        assert_eq!(detect_non_answer("Cache is 41%. What else matters?"), None, "a question that does not ask leave");
+    }
+
+    #[test]
+    fn the_unattended_note_follows_the_task_for_llm_actions_only() {
+        let p = build_action_prompt("daily_briefing", "Daily", &json!({}));
+        assert!(p.starts_with("Generate a daily briefing"), "{p}");
+        assert!(p.ends_with(UNATTENDED_NOTE), "{p}");
+        assert!(UNATTENDED_NOTE.contains("no one can answer a question") && UNATTENDED_NOTE.contains("never ask to proceed"));
+        let c = build_action_prompt("custom_prompt", "t", &json!({"prompt": "Do the thing"}));
+        assert!(c.contains("Do the thing") && c.ends_with(UNATTENDED_NOTE), "{c}");
+        assert!(!matches!(action_path("database_backup"), ActionPath::RustLlm));
+        assert!(!build_action_prompt("database_backup", "t", &json!({})).contains(UNATTENDED_NOTE));
+    }
+
+    #[tokio::test]
+    async fn a_good_first_text_is_returned_without_a_retry() {
+        let calls = Cell::new(0);
+        let out = gate_unattended_answer("daily_briefing", BRIEFING.to_string(), |_| {
+            calls.set(calls.get() + 1);
+            async { Some("second".to_string()) }
+        })
+        .await
+        .unwrap();
+        assert_eq!(out, BRIEFING);
+        assert_eq!(calls.get(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_retry_that_succeeds_delivers_the_second_text_only() {
+        let seen = Cell::new(None);
+        let out = gate_unattended_answer("daily_briefing", REFUSAL.to_string(), |hit| {
+            seen.set(Some(hit));
+            async { Some(BRIEFING.to_string()) }
+        })
+        .await
+        .unwrap();
+        assert_eq!(out, BRIEFING);
+        assert!(!out.contains("Shall I proceed"));
+        assert_eq!(seen.get(), Some(NonAnswer::Declined), "the retry is told what went wrong");
+        assert!(non_answer_correction(NonAnswer::Declined).contains("declined"));
+        assert!(non_answer_correction(NonAnswer::AskedToProceed).contains("asking whether to proceed"));
+    }
+
+    #[tokio::test]
+    async fn a_second_non_answer_is_a_failed_run_with_the_reason_delivering_nothing() {
+        let calls = Cell::new(0);
+        let err = gate_unattended_answer("daily_briefing", REFUSAL.to_string(), |_| {
+            calls.set(calls.get() + 1);
+            async { Some("Done.\nShall I proceed?".to_string()) }
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(calls.get(), 1, "one retry, not a loop");
+        assert_eq!(err.to_string(), "unattended_non_answer: asked_to_proceed");
+        // The loop records the Err as an error run: nothing is delivered ...
+        let reason = err.to_string();
+        assert_eq!(channel_report("error", "daily_briefing", "", &reason), None);
+        assert_eq!(task_failed_detail(&reason), "unattended_non_answer: asked_to_proceed");
+        // ... and the failed run is alerted once per task through operator_alert.
+        let src = include_str!("heartbeat_loop.rs");
+        let loop_body = &src[src.find("pub async fn execute_task(").unwrap()..];
+        assert!(loop_body.contains("Err(e) => {") && loop_body.contains("(\"error\".to_string(), String::new(), e.to_string())"));
+        let alert = &loop_body[loop_body.find("if status == \"error\" {").unwrap()..];
+        assert!(alert.contains("\"heartbeat.task_failed\"") && alert.contains("task_id,") && alert.contains("3600"), "{alert}");
+    }
+
+    #[tokio::test]
+    async fn a_retry_that_cannot_run_fails_with_the_first_reason() {
+        let err = gate_unattended_answer("daily_briefing", REFUSAL.to_string(), |_| async { None })
+            .await
+            .unwrap_err();
+        assert_eq!(err.to_string(), "unattended_non_answer: declined");
     }
 }

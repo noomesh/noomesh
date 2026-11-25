@@ -191,6 +191,15 @@ written by an agent or the MCP door, is filed as a proposal instead:
 `heartbeat proposals [<id>]` lists them and `approve` / `reject` decide them
 at a terminal (people only). `remove` asks for confirmation.
 
+A scheduled LLM action runs unattended, so its prompt says that nobody can
+answer a question. If its answer declines the task or ends by asking leave
+("Shall I proceed?"), the gateway retries once with a corrective line. A
+second such answer is recorded as an `error` run with the reason
+`unattended_non_answer: declined` or `unattended_non_answer: asked_to_proceed`,
+is not delivered to any channel, and raises the usual failed-task operator
+alert (at most one per hour per task). A summary's operator alert record now
+follows the task in the prompt and is written into the summary.
+
 ### Find errors across the stack
 
 ```sh
