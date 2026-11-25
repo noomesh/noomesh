@@ -78,6 +78,28 @@ func (f *bootFixture) hang(t *testing.T, key string, count int) {
 	}
 }
 
+// fail makes a fake call exit 1 at once: key "<kind>.<id>", count 0 = every
+// call, n = only the first n calls.
+func (f *bootFixture) fail(t *testing.T, key string, count int) {
+	t.Helper()
+	body := ""
+	if count > 0 {
+		body = fmt.Sprint(count)
+	}
+	if err := os.WriteFile(filepath.Join(f.dir, "failn."+key), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// unbound makes the container's mounts not include the secret directory, so
+// the script has to read its labels (the meta inspect).
+func (f *bootFixture) unbound(t *testing.T, id string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(f.dir, "unbound."+id), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // down makes the Running check say false until a start of id is answered.
 func (f *bootFixture) down(t *testing.T, id string) {
 	t.Helper()
@@ -107,6 +129,11 @@ for a in "$@"; do id="$a"; done
 [ "$sub" = ps ] && id=ps
 kind="$sub"
 case "$*" in *Mounts*) kind=mounts ;; *State.Running*) kind=running ;; esac
+if [ -e "$d/failn.$kind.$id" ]; then
+  n="$(cat "$d/failn.$kind.$id")"
+  c=$(( $(cat "$d/fcnt.$kind.$id" 2>/dev/null || echo 0) + 1 )); echo $c > "$d/fcnt.$kind.$id"
+  if [ -z "$n" ] || [ "$c" -le "$n" ]; then echo "Cannot connect to the Docker daemon" >&2; exit 1; fi
+fi
 if [ -e "$d/hang.$kind.$id" ]; then
   n="$(cat "$d/hang.$kind.$id")"
   if [ -z "$n" ]; then exec sleep 120; fi
@@ -118,7 +145,7 @@ case "$sub" in
   start) rm -f "$d/down.$id" ;;
   inspect)
     case "$*" in
-      *Mounts*) echo "$(cat "$d/rundir")/x" ;;
+      *Mounts*) if [ -e "$d/unbound.$id" ]; then echo /other/x; else echo "$(cat "$d/rundir")/x"; fi ;;
       *State.Running*) if [ -e "$d/down.$id" ]; then echo false; else echo true; fi ;;
     esac ;;
 esac
@@ -162,11 +189,11 @@ func newBootFixture(t *testing.T) *bootFixture {
 		f.logs = append(f.logs, strings.TrimSpace(fmt.Sprintf(format, a...)))
 		f.mu.Unlock()
 	}}
-	ol, ot, ow, oi, os_, on, oo := bootListBound, bootListTries, bootListWait, bootInspectBound, bootStartBound, bootNetnsBound, bootOverall
+	ol, ot, ow, oi, os_, on, oo := bootListBound, bootListWindow, bootListWait, bootInspectBound, bootStartBound, bootNetnsBound, bootOverall
 	t.Cleanup(func() {
-		bootListBound, bootListTries, bootListWait, bootInspectBound, bootStartBound, bootNetnsBound, bootOverall = ol, ot, ow, oi, os_, on, oo
+		bootListBound, bootListWindow, bootListWait, bootInspectBound, bootStartBound, bootNetnsBound, bootOverall = ol, ot, ow, oi, os_, on, oo
 	})
-	bootListBound, bootListTries, bootListWait = 2*time.Second, 3, 1*time.Second
+	bootListBound, bootListWindow, bootListWait = 2*time.Second, 20*time.Second, 1*time.Second
 	bootInspectBound, bootStartBound, bootNetnsBound, bootOverall = 2*time.Second, 3*time.Second, 2*time.Second, 60*time.Second
 	return f
 }
@@ -321,7 +348,7 @@ func TestBootRestoreBoundedListThatAnswersOnTheThirdTryStartsTheContainers(t *te
 			t.Errorf("container %s was not started", id)
 		}
 	}
-	if !strings.Contains(f.logText(), "boot-restore: done") || !strings.Contains(f.logText(), "(try 2 of 3); retrying") {
+	if !strings.Contains(f.logText(), "boot-restore: done") || !strings.Contains(f.logText(), "try 2, ") {
 		t.Fatalf("log: %s", f.logText())
 	}
 	assertLockFree(t)
@@ -333,6 +360,7 @@ func TestBootRestoreBoundedListThatAnswersOnTheThirdTryStartsTheContainers(t *te
 func TestBootRestoreBoundedListThatNeverAnswersIsAWarnNotDone(t *testing.T) {
 	f := newBootFixture(t)
 	f.hang(t, "ps.ps", 0)
+	bootListWindow = 5 * time.Second
 	f.run(t)
 	logs := f.logText()
 	if !strings.Contains(logs, "BOOT-RESTORE WARN") || !strings.Contains(logs, "did not answer the container list") || !strings.Contains(logs, "NO container was started") {
@@ -350,19 +378,19 @@ func TestBootRestoreBoundedListThatNeverAnswersIsAWarnNotDone(t *testing.T) {
 			ps++
 		}
 	}
-	if ps != 3 {
-		t.Errorf("docker ps ran %d times, want the 3 tries", ps)
+	if ps < 2 || ps > 4 {
+		t.Errorf("docker ps ran %d times, want a few tries within the window", ps)
 	}
 	assertLockFree(t)
 }
 
-// The overall deadline stops a run that the per-call bounds did not (the list
-// bound is longer than the overall one): the shell is killed, the lock
+// The overall deadline stops a run that the per-call bounds did not (no usable
+// timeout(1) here, so the calls are unbounded): the shell is killed, the lock
 // released, and the log says so (no retry, no silent success).
 func TestBootRestoreBoundedOverallDeadlineKillsTheRunAndReleasesTheLock(t *testing.T) {
 	f := newBootFixture(t)
+	f.fakeTimeout(t, "exit 125\n") // no per-call bound: only the backstop can end the run
 	f.hang(t, "ps.ps", 0)
-	bootListBound = 100 * time.Second
 	bootOverall = 4 * time.Second
 	f.run(t)
 	logs := f.logText()
@@ -433,4 +461,113 @@ func TestBootRestoreBoundedUnusableTimeoutFallsBackToUnboundedAndSaysSo(t *testi
 		t.Fatalf("log: %s", logs)
 	}
 	assertLockFree(t)
+}
+
+// A list that FAILS at once (dockerd not listening yet) is "Docker did not
+// answer yet", not an empty list: it is retried, and once it answers the
+// containers are started.
+func TestBootRestoreBoundedListThatFailsFastIsRetriedThenStarts(t *testing.T) {
+	f := newBootFixture(t)
+	f.fail(t, "ps.ps", 2)
+	f.run(t)
+	logs := f.logText()
+	if !strings.Contains(logs, "(exit 1, try 2") || !strings.Contains(logs, "started 3 container(s)") || !strings.Contains(logs, "boot-restore: done") {
+		t.Fatalf("log: %s", logs)
+	}
+	for _, id := range []string{"aaa", "bbb", "ccc"} {
+		if f.startsOf(t, id) != 1 {
+			t.Errorf("container %s was not started", id)
+		}
+	}
+	assertLockFree(t)
+}
+
+// A list that always fails fast is a WARN naming it, never "started 0" done.
+func TestBootRestoreBoundedListThatAlwaysFailsFastIsAWarnNotDone(t *testing.T) {
+	f := newBootFixture(t)
+	f.fail(t, "ps.ps", 0)
+	bootListWindow = 4 * time.Second
+	f.run(t)
+	logs := f.logText()
+	if !strings.Contains(logs, "BOOT-RESTORE WARN") || !strings.Contains(logs, "did not answer the container list (exit 1") || !strings.Contains(logs, "NO container was started") {
+		t.Errorf("log: %s", logs)
+	}
+	if strings.Contains(logs, "boot-restore: done") || strings.Contains(logs, "started 0") {
+		t.Errorf("a failing list was reported as done:\n%s", logs)
+	}
+	assertLockFree(t)
+}
+
+// The budget bounds every call, not only the entry to each container: a start
+// reached near the budget is clamped, and the script ends ITSELF with its
+// summary naming what was not handled (exit 4), not by the Go deadline.
+func TestBootRestoreBoundedBudgetClampsALateStartAndTheScriptSummarisesItself(t *testing.T) {
+	f := newBootFixture(t)
+	f.hang(t, "start.aaa", 0)
+	f.down(t, "aaa")
+	bootStartBound = 100 * time.Second // far past the budget of 12 s
+	bootOverall = 24 * time.Second     // script budget: 12 s
+	f.run(t)
+	logs := f.logText()
+	if strings.Contains(logs, "did not finish within") {
+		t.Fatalf("the Go deadline fired instead of the script's own summary:\n%s", logs)
+	}
+	if !strings.Contains(logs, "BOOT-RESTORE WARN") || !strings.Contains(logs, "not handled (left alone): aaa, bbb and the rest (out of time)") {
+		t.Fatalf("the summary does not name what was left:\n%s", logs)
+	}
+	if f.startsOf(t, "bbb") != 0 || f.startsOf(t, "ccc") != 0 {
+		t.Errorf("containers past the budget were started")
+	}
+	assertLockFree(t)
+}
+
+// A docker start that FAILS at once is a failed start (as before): not
+// counted, not "did not answer"; the container is reported as still down.
+func TestBootRestoreBoundedQuickFailingStartIsAFailedStartNotNoAnswer(t *testing.T) {
+	f := newBootFixture(t)
+	f.fail(t, "start.bbb", 0)
+	f.down(t, "bbb")
+	f.run(t)
+	logs := f.logText()
+	if strings.Contains(logs, "did not answer for container bbb") || !strings.Contains(logs, "started 2; still down: bbb") {
+		t.Fatalf("log: %s", logs)
+	}
+	if f.startsOf(t, "bbb") != 1 {
+		t.Errorf("a failed start was retried")
+	}
+	assertLockFree(t)
+}
+
+// The labels inspect (reached for a container whose mounts do not bind the
+// secret directory) is bounded too: skipped, named, nothing else done to it.
+func TestBootRestoreBoundedHungLabelsInspectSkipsTheContainer(t *testing.T) {
+	f := newBootFixture(t)
+	f.unbound(t, "bbb")
+	f.hang(t, "inspect.bbb", 0)
+	f.run(t)
+	logs := f.logText()
+	if !strings.Contains(logs, "Docker did not answer for container bbb within") || !strings.Contains(logs, "(docker inspect); it was left alone") {
+		t.Fatalf("log: %s", logs)
+	}
+	if f.callsEnding(t, "bbb") != 2 || f.startsOf(t, "bbb") != 0 || f.startsOf(t, "ccc") != 1 {
+		t.Errorf("calls naming bbb: %d, starts of bbb: %d:\n%s", f.callsEnding(t, "bbb"), f.startsOf(t, "bbb"), strings.Join(f.argv(t), "\n"))
+	}
+	assertLockFree(t)
+}
+
+// The production numbers are pinned: changing one is a decision, not a drift.
+func TestBootRestoreBoundedProductionBoundsArePinned(t *testing.T) {
+	if bootListBound != 20*time.Second || bootListWindow != 10*time.Minute || bootListWait != 15*time.Second ||
+		bootInspectBound != 15*time.Second || bootStartBound != 180*time.Second || bootNetnsBound != 150*time.Second ||
+		bootOverall != 25*time.Minute {
+		t.Fatalf("bounds changed: list %s window %s wait %s inspect %s start %s netns %s overall %s",
+			bootListBound, bootListWindow, bootListWait, bootInspectBound, bootStartBound, bootNetnsBound, bootOverall)
+	}
+	if got := scriptBudget(bootOverall); got != 1440 {
+		t.Fatalf("script budget = %ds, want 1440", got)
+	}
+	// After the longest list wait the container pass still has its full time.
+	if pass := scriptBudget(bootOverall) - secs(bootListWindow); pass < 840 {
+		t.Fatalf("the container pass has only %ds after the list window", pass)
+	}
 }
