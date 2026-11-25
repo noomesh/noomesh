@@ -71,3 +71,14 @@ def test_the_refusal_still_offers_resume_only_while_it_applies_the_recorded_env(
     assert "or run `noo enroll --resume`" in drift
     assert "g.recordWanted()" in drift
     assert "bootout system/" in drift and "2>/dev/null || true" in drift
+
+
+def test_the_wanted_file_shape_is_the_same_on_both_sides():
+    # Go writes {"known":true,"env":{...}}; Rust reads only that shape.
+    assert 'json:"known"' in GO and 'json:"env"' in GO
+    reader = rs.fn_body(RS, "fn ollama_wanted_env")
+    assert '"known"' in reader and '"env"' in reader
+    # the agent writes only once its desired state is known
+    rec = GO.split("func (g *OllamaGuard) recordWanted", 1)[1].split("\nfunc ", 1)[0]
+    assert "g.TuningKnown == nil || !g.TuningKnown()" in rec
+    assert re.search(r"TuningKnown:\s+OllamaTuningKnown,", GO), "NewOllamaGuard must wire TuningKnown"

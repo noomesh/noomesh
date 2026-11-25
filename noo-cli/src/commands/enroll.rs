@@ -1789,13 +1789,20 @@ pub(crate) fn ollama_tuning_value_ok(key: &str, v: &str) -> bool {
     }
 }
 
-/// Reads the agent's wanted-env file (a JSON object of strings). None when it
-/// is not an object: then nothing is changed. Otherwise the file is
-/// authoritative for the closed key list (see `darwin_ollama_boot_plan`).
+/// Reads the agent's wanted-env file: `{"known":true,"env":{<key>:<string>}}`.
+/// None when it is not that (not JSON, no `known: true`, no `env` object; an
+/// older flat file, or one from an agent that had not read its desired state):
+/// then nothing is written and nothing removed. Otherwise the file is
+/// authoritative for the closed key list (see `darwin_ollama_boot_plan`); an
+/// empty `env` means none is wanted.
 pub(crate) fn ollama_wanted_env(json: &str) -> Option<OllamaWanted> {
-    let serde_json::Value::Object(m) = serde_json::from_str::<serde_json::Value>(json).ok()? else {
+    let serde_json::Value::Object(root) = serde_json::from_str::<serde_json::Value>(json).ok()? else {
         return None;
     };
+    if root.get("known").and_then(serde_json::Value::as_bool) != Some(true) {
+        return None;
+    }
+    let m = root.get("env")?.as_object()?;
     let mut w = OllamaWanted::default();
     for k in OLLAMA_TUNING_KEYS {
         let Some(raw) = m.get(k) else { continue };
@@ -2272,7 +2279,7 @@ mod tests {
     // removes the closed-list keys the file no longer carries.
     #[test]
     fn the_mac_ollama_plan_writes_the_tuning_the_agent_asked_for() {
-        let json = r#"{"OLLAMA_NUM_PARALLEL":"2","OLLAMA_HOST":"0.0.0.0","OLLAMA_KEEP_ALIVE":"-1","OLLAMA_CONTEXT_LENGTH":"8192","OLLAMA_KV_CACHE_TYPE":"","OLLAMA_MAX_LOADED_MODELS":3}"#;
+        let json = r#"{"known":true,"env":{"OLLAMA_NUM_PARALLEL":"2","OLLAMA_HOST":"0.0.0.0","OLLAMA_KEEP_ALIVE":"-1","OLLAMA_CONTEXT_LENGTH":"8192","OLLAMA_KV_CACHE_TYPE":"","OLLAMA_MAX_LOADED_MODELS":3}}"#;
         let w = super::ollama_wanted_env(json).expect("an object");
         assert_eq!(
             w.set,
@@ -2282,7 +2289,19 @@ mod tests {
         );
         assert_eq!(w.rejected, ["OLLAMA_MAX_LOADED_MODELS".to_string(), "OLLAMA_KV_CACHE_TYPE".to_string()]);
         assert!(super::ollama_wanted_env("not json").is_none() && super::ollama_wanted_env("[]").is_none());
-        let ctl = super::ollama_wanted_env(r#"{"OLLAMA_KEEP_ALIVE":"a\nb"}"#).expect("an object");
+        // Unknown is not empty: an older flat file, `known: false` or no `env` change nothing.
+        for unknown in [r#"{"OLLAMA_KEEP_ALIVE":"-1"}"#, r#"{"known":false,"env":{}}"#, r#"{"known":true}"#, r#"{"env":{}}"#] {
+            assert!(super::ollama_wanted_env(unknown).is_none(), "{unknown}");
+        }
+        // Known-empty: nothing wanted, so every closed-list key is removed.
+        let empty = super::ollama_wanted_env(r#"{"known":true,"env":{}}"#).expect("known empty");
+        assert!(empty.set.is_empty() && empty.rejected.is_empty());
+        let plan0 = super::darwin_ollama_boot_plan("/Users/nodeuser", "nodeuser", "501", "/Users/nodeuser/.ollama/models", Some(&empty));
+        let env0 = &plan0.iter().find(|s| s.what.starts_with("run it as the node user")).expect("the env step").sh;
+        for k in super::OLLAMA_TUNING_KEYS {
+            assert!(env0.contains(&format!("plutil -remove EnvironmentVariables.{k} ")), "{k}: {env0}");
+        }
+        let ctl = super::ollama_wanted_env(r#"{"known":true,"env":{"OLLAMA_KEEP_ALIVE":"a\nb"}}"#).expect("an object");
         assert!(ctl.set.is_empty(), "control characters");
         let plan = super::darwin_ollama_boot_plan("/Users/nodeuser", "nodeuser", "501", "/Users/nodeuser/.ollama/models", Some(&w));
         let env = &plan.iter().find(|s| s.what.starts_with("run it as the node user")).expect("the env step").sh;
@@ -2319,7 +2338,7 @@ mod tests {
         ] {
             assert!(super::ollama_tuning_value_ok(k, ok), "{k}={ok}");
             assert!(!super::ollama_tuning_value_ok(k, bad), "{k}={bad}");
-            let j = format!(r#"{{"{k}":"{bad}"}}"#);
+            let j = format!(r#"{{"known":true,"env":{{"{k}":"{bad}"}}}}"#);
             let w = super::ollama_wanted_env(&j).expect("an object");
             assert!(w.set.is_empty() && w.rejected == [k.to_string()], "{k}: {w:?}");
         }
@@ -2329,7 +2348,7 @@ mod tests {
         for bad in ["m", "5x", "1h30", "-2", "1d"] {
             assert!(!super::ollama_tuning_value_ok("OLLAMA_KEEP_ALIVE", bad), "{bad}");
         }
-        let long = format!(r#"{{"OLLAMA_CONTEXT_LENGTH":"{}"}}"#, "1".repeat(129));
+        let long = format!(r#"{{"known":true,"env":{{"OLLAMA_CONTEXT_LENGTH":"{}"}}}}"#, "1".repeat(129));
         let w = super::ollama_wanted_env(&long).expect("an object");
         assert!(w.set.is_empty() && w.rejected == ["OLLAMA_CONTEXT_LENGTH".to_string()], "{w:?}");
     }
