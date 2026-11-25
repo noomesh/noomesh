@@ -8,7 +8,7 @@ service, project, status), the one id Docker does not answer for ("hung"), the
 services whose compose call would touch it ("touch_hang": the held service and
 the services linked to it), the rendered compose config and service list.
 Every call is appended to $FAKE_LOG as one line. A call that names the hung
-container, or a compose call that would touch it, sleeps 25 s (the real one
+container, or a compose call that would touch it, sleeps 60 s (the real one
 never returns); a `docker ps` hangs when $FAKE_PS_HANGS is set. Nothing real
 is touched.
 """
@@ -34,7 +34,7 @@ def save():
 
 
 def hang():
-    time.sleep(25)
+    time.sleep(60)
     sys.exit(0)
 
 
@@ -51,6 +51,8 @@ def is_hung(c):
 
 def fmt(c, f):
     health = "healthy" if c["status"] == "running" else c["status"]
+    if os.environ.get("FAKE_UNHEALTHY") == c["service"]:
+        health = "unhealthy"
     pairs = [
         ('{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}', health),
         ('{{.State.Status}}', c["status"]), ('{{.State.ExitCode}}', "0"),

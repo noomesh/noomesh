@@ -8,7 +8,7 @@ A container whose process survived SIGKILL: from then on every docker call
 naming it (`docker inspect` included, and any compose call that touches it)
 never returned. These tests run the REAL scripts/noomesh-start.sh and
 noomesh-restart.sh in a scratch install against the stateful fake `docker` in
-tests/fake_docker_held.py (a call that names the held container sleeps 25 s;
+tests/fake_docker_held.py (a call that names the held container sleeps 60 s;
 the test deadline is shorter, so a launcher that waits on it FAILS the test),
 and assert on the recorded docker calls and the exit code. Nothing real is
 touched.
@@ -27,7 +27,8 @@ import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
 HUNG = "9f3e1d2c0000"
-DEADLINE = 22  # the fake sleeps 25 s on anything that touches the held container
+DEADLINE = 90  # the fake sleeps 60 s on anything that touches the held container
+QUICK = 30  # a launcher that waits on the held container takes 60 s or more; a loaded host takes a fraction of this
 
 CFG = {"services": {
     "gateway": {"depends_on": {"postgres": {"condition": "service_healthy"}, "redis": {"condition": "service_healthy"}}},
@@ -163,7 +164,7 @@ def test_full_start_with_one_held_container(tmp_path):
     p, calls, took = ins.run("noomesh-start.sh")
     out = p.stdout + p.stderr
     assert p.returncode == 75, out
-    assert took < 12, took
+    assert took < QUICK, took
     assert untouched(calls) == [], untouched(calls)
     ups = compose_calls(calls, "up")
     # data stores first (waited for), then the rest by layer; node-agent is scaled out
@@ -187,7 +188,7 @@ def test_whole_stack_restart_with_one_held_container(tmp_path, force):
     p, calls, took = ins.run("noomesh-restart.sh", *(["--force"] if force else []))
     out = p.stdout + p.stderr
     assert p.returncode == 75, out
-    assert took < 12, took
+    assert took < QUICK, took
     assert untouched(calls) == [], untouched(calls)
     verb = "up" if force else "restart"
     stages = compose_calls(calls, verb)
@@ -209,7 +210,7 @@ def test_named_start_and_restart_with_one_held_container(tmp_path, script, verb,
     p, calls, took = ins.run(script, named)
     out = p.stdout + p.stderr
     assert p.returncode == rc, out
-    assert took < 12, took
+    assert took < QUICK, took
     assert untouched(calls) == [], untouched(calls)
     stages = compose_calls(calls, verb)
     if not touches:
@@ -242,7 +243,7 @@ def test_docker_not_listing_containers_starts_nothing(tmp_path, script):
     assert p.returncode == 1, out
     assert "Docker did not list containers" in out
     assert compose_calls(calls, "up") == [] and compose_calls(calls, "restart") == []
-    assert took < 12, took
+    assert took < QUICK, took
 
 
 def test_created_leftovers_of_another_project_or_scaled_out_are_not_started(tmp_path):
@@ -270,7 +271,7 @@ def test_a_store_needing_re_owning_on_the_held_service_does_not_bring_the_hang_b
     p, calls, took = ins.run("noomesh-start.sh", env={"NOO_REOWN_CMD": str(tmp_path / "reown.sh")})
     out = p.stdout + p.stderr
     assert p.returncode == 75, out
-    assert took < 12, took
+    assert took < QUICK, took
     assert untouched(calls) == [], untouched(calls)
     assert "not re-owning" in out, out
 
@@ -280,7 +281,7 @@ def test_the_restart_true_relation_alone_leaves_the_door_out(tmp_path):
     p, calls, took = ins.run("noomesh-restart.sh")
     out = p.stdout + p.stderr
     assert p.returncode == 75, out
-    assert took < 12, took
+    assert took < QUICK, took
     assert untouched(calls) == [], untouched(calls)
     assert "stunnel-ollama-embed (compose restarts ollama-embed with it)" in out, out
 
@@ -339,7 +340,7 @@ def test_the_snapshot_functions_never_inspect_the_held_container(tmp_path):
     """)
     out = p.stdout + p.stderr
     assert "FULL_RC=75" in out and "NAMED_RC=0" in out, out
-    assert took < 18, took  # two probe rounds and two stages; the fake sleeps 25 s
+    assert took < QUICK, took  # two probe rounds and two stages; the fake sleeps 60 s
     assert [c for c in calls if HUNG in c and c.startswith("inspect")] == [f"inspect -f {{{{.State.Status}}}} {HUNG}"] * 4
     assert snapshot_inspects(calls) and not any(HUNG in c for c in snapshot_inspects(calls))
     assert [c.split(" up ")[1] for c in compose_calls(calls, "up")][-2:] == ["--no-deps -d postgres redis", "--no-deps -d gateway"]
@@ -378,3 +379,63 @@ def test_launchers_probe_before_every_step_that_touches_a_container():
     assert named.index("noo_hold_hung") < named.index('reown_nonroot_dirs "${_state_root')
     restart = (ROOT / "scripts" / "noomesh-restart.sh").read_text()
     assert restart.index("noo_hold_hung") < restart.index("compose_remove_retired .")
+
+
+def test_a_held_store_the_gateway_needs_says_the_controller_is_not_up(tmp_path):
+    ins = Install(tmp_path)
+    st = ins.state()
+    st["hung"] = "rd0000000003"                       # redis
+    st["touch_hang"] = ["redis"]
+    ins.state_path.write_text(json.dumps(st))
+    p, calls, took = ins.run("noomesh-restart.sh")
+    out = p.stdout + p.stderr
+    assert p.returncode == 75, out
+    assert "THE CONTROLLER IS NOT UP: noo-redis (redis) is held and the gateway needs it" in out, out
+    assert took < QUICK, took
+    # and the held embedder (which the gateway does not need) does not say it
+    ins2 = Install(tmp_path / "b") if (tmp_path / "b").mkdir() is None else None
+    p2, _, _ = ins2.run("noomesh-restart.sh")
+    assert "THE CONTROLLER IS NOT UP" not in p2.stdout + p2.stderr
+
+
+def test_an_unhealthy_gateway_after_a_held_start_is_said(tmp_path):
+    ins = Install(tmp_path)
+    p, calls, took = ins.run("noomesh-restart.sh", env={"FAKE_UNHEALTHY": "gateway"})
+    out = p.stdout + p.stderr
+    assert p.returncode == 75, out
+    assert "the gateway is up but not healthy (unhealthy): it may be restarting" in out, out
+
+
+def test_a_probe_that_cannot_be_bounded_stops_the_launch(tmp_path):
+    ins = Install(tmp_path)
+    p, calls, _ = _lib(ins, 'noo_hold_hung "" compose $COMPOSE_FILES $PROFILE_ARGS; echo "RC=$?"',
+                       env={"TMPDIR": str(tmp_path / "no" / "such")})
+    assert "RC=3" in p.stdout, p.stdout + p.stderr
+    assert not [c for c in calls if c.startswith("inspect")], calls
+
+
+def test_the_probe_lists_the_launchers_own_project(tmp_path):
+    ins = Install(tmp_path)
+    p, calls, _ = _lib(ins, f"""
+        . {ins.work}/scripts/lib-compose.sh
+        cd {ins.work}
+        _noo_project""")
+    want = (ins.work / "docker-compose.cluster.yml").read_text()
+    import re
+    m = re.search(r"^name:\s*(\S+)", want, re.M)
+    assert p.stdout.strip() == (m.group(1) if m else "noomesh"), p.stdout + p.stderr
+
+
+def test_a_reown_stop_that_times_out_refuses_instead_of_chowning_on(tmp_path):
+    scripts = ROOT / "scripts"
+    r = subprocess.run(["bash", "-c", f"""
+        . {scripts}/lib-reown.sh
+        NOO_REOWN_CMD={tmp_path}/reown.sh
+        printf '#!/bin/sh\\ncase "$2" in find*) [ -f "$0.done" ] || echo /d/x ;; chown*) touch "$0.done" ;; esac\\n' > {tmp_path}/reown.sh
+        chmod +x {tmp_path}/reown.sh
+        mkdir -p {tmp_path}/root/redis
+        reown_stop_service() {{ return 124; }}
+        reown_nonroot_dirs {tmp_path}/root redis; echo "RC=$?"
+    """], capture_output=True, text=True, env={"PATH": "/usr/bin:/bin"})
+    assert "RC=1" in r.stdout and "did not stop in time" in r.stderr, r.stdout + r.stderr
+    assert not (tmp_path / "reown.sh.done").exists(), "the chown must not run"

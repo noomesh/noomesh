@@ -4335,6 +4335,28 @@ fn container_created(name: &str) -> Option<String> {
     if s.is_empty() { None } else { Some(s) }
 }
 
+/// The stamp a lookup records when Docker did not answer for the container in
+/// time (a process that survived SIGKILL: the call never returns). Not a real
+/// stamp: [`recreate_verdicts`] reads it as "unknown", never as "absent".
+pub(crate) const STAMP_NO_ANSWER: &str = "\u{1}docker-did-not-answer";
+
+/// Like [`container_created`], but a timeout (or a Docker that cannot be run)
+/// is [`STAMP_NO_ANSWER`], not `None`: "no such container" and "Docker did not
+/// answer" must not read the same, or a consumer whose container is held
+/// would be reported as not part of this install.
+fn container_stamp(name: &str) -> Option<String> {
+    match crate::bounded::docker(&["inspect", "-f", "{{.Created}}", name], std::time::Duration::from_secs(10)) {
+        crate::bounded::Bounded::Answered(out) => {
+            if !out.status.success() {
+                return None;
+            }
+            let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if s.is_empty() { None } else { Some(s) }
+        }
+        _ => Some(STAMP_NO_ANSWER.to_string()),
+    }
+}
+
 /// What happened to one consumer across a recreate, judged by its `Created`
 /// stamp before and after — never by the launcher's exit status.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4352,6 +4374,10 @@ pub(crate) enum RecreateVerdict {
     /// Present before, gone after. The recreate removed it and did not bring
     /// it back — a failure, and a louder one than Unchanged.
     Vanished,
+    /// Docker did not answer for its container before or after (held: a
+    /// process that survived SIGKILL). It cannot have been recreated and may
+    /// still hold the OLD value: a failure, never "not part of this install".
+    Held,
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -4362,7 +4388,7 @@ pub(crate) enum RecreateVerdict {
 /// the evidence a recreate actually happened (#258), and the provision verb
 /// needs the same evidence a rotation does.
 pub(crate) fn container_created_pub(name: &str) -> Option<String> {
-    container_created(name)
+    container_stamp(name)
 }
 
 /// Write one provisioned value into the store, atomically.
@@ -4854,7 +4880,9 @@ pub(crate) fn recreate_verdicts(
         .map(|c| {
             let b = before.get(c).cloned().flatten();
             let a = after.get(c).cloned().flatten();
+            let unknown = |x: &Option<String>| x.as_deref() == Some(STAMP_NO_ANSWER);
             let v = match (b, a) {
+                (b, a) if unknown(&b) || unknown(&a) => RecreateVerdict::Held,
                 (None, None) => RecreateVerdict::NotRunning,
                 (Some(_), None) => RecreateVerdict::Vanished,
                 (None, Some(_)) => RecreateVerdict::Recreated,
@@ -5582,7 +5610,7 @@ pub fn secrets_rotate(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         // "recreated with the new values". So the verdict is taken from each
         // consumer's `Created` stamp, before and after, not from the script.
         let before: BTreeMap<String, Option<String>> =
-            consumers.iter().map(|c| (c.clone(), container_created(c))).collect();
+            consumers.iter().map(|c| (c.clone(), container_stamp(c))).collect();
         // Same binary as this process — see mesh.rs::run_script for why.
         let cli_bin = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_default();
         let st = Command::new("bash")
@@ -5605,11 +5633,16 @@ pub fn secrets_rotate(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             return Ok(1);
         }
         let after: BTreeMap<String, Option<String>> =
-            consumers.iter().map(|c| (c.clone(), container_created(c))).collect();
+            consumers.iter().map(|c| (c.clone(), container_stamp(c))).collect();
         let verdicts = recreate_verdicts(&consumers, &before, &after);
         let stale: Vec<&str> = verdicts
             .iter()
-            .filter(|(_, v)| matches!(v, RecreateVerdict::Unchanged | RecreateVerdict::Vanished))
+            .filter(|(_, v)| matches!(v, RecreateVerdict::Unchanged | RecreateVerdict::Vanished | RecreateVerdict::Held))
+            .map(|(c, _)| c.as_str())
+            .collect();
+        let held: Vec<&str> = verdicts
+            .iter()
+            .filter(|(_, v)| *v == RecreateVerdict::Held)
             .map(|(c, _)| c.as_str())
             .collect();
         let off: Vec<&str> = verdicts
@@ -5622,6 +5655,7 @@ pub fn secrets_rotate(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                 "restart": "ran",
                 "recreated": verdicts.iter().filter(|(_, v)| *v == RecreateVerdict::Recreated).map(|(c, _)| c).collect::<Vec<_>>(),
                 "not_recreated": stale,
+                "held": held,
                 "not_running": off,
             }));
             return Ok(if stale.is_empty() { 0 } else { 1 });
@@ -5632,6 +5666,7 @@ pub fn secrets_rotate(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                 RecreateVerdict::NotRunning => ui::status_line(Glyph::Bullet, &format!("{c}  {}", ui::muted("not running here (add-on off) — nothing to recreate"))),
                 RecreateVerdict::Unchanged => ui::status_line(Glyph::Err, &format!("{c}  NOT recreated — same container as before; it still holds the OLD value")),
                 RecreateVerdict::Vanished => ui::status_line(Glyph::Err, &format!("{c}  gone — it was running before the recreate and is not now")),
+                RecreateVerdict::Held => ui::status_line(Glyph::Err, &format!("{c}  NOT recreated: its container is held (Docker does not answer for it); it still holds the OLD value until this host is rebooted")),
             };
             println!("{line}");
         }
@@ -6410,6 +6445,29 @@ mod tests {
         // and a consumer the maps do not even mention reads the same way
         let v = recreate_verdicts(&consumers, &stamps(&[]), &stamps(&[]));
         assert_eq!(v[0].1, RecreateVerdict::NotRunning);
+    }
+
+    /// Exit 75 with a consumer whose container Docker did not answer for,
+    /// before and after: it was NOT recreated and must not read as "not part
+    /// of this install". A container that is genuinely absent stays as it was.
+    #[test]
+    fn a_consumer_docker_did_not_answer_for_is_held_not_absent() {
+        use super::STAMP_NO_ANSWER;
+        let consumers = vec!["noo-trellion".to_string(), "noo-trellion-intel".to_string()];
+        let no_answer = Some(STAMP_NO_ANSWER);
+        let v = recreate_verdicts(
+            &consumers,
+            &stamps(&[("noo-trellion", no_answer), ("noo-trellion-intel", None)]),
+            &stamps(&[("noo-trellion", no_answer), ("noo-trellion-intel", None)]),
+        );
+        assert_eq!(v[0].1, RecreateVerdict::Held);
+        assert_eq!(v[1].1, RecreateVerdict::NotRunning, "genuinely absent: today's 'nothing to recreate'");
+        // one side only is enough: it cannot be proven recreated
+        let v = recreate_verdicts(&consumers[..1], &stamps(&[("noo-trellion", Some("t1"))]), &stamps(&[("noo-trellion", no_answer)]));
+        assert_eq!(v[0].1, RecreateVerdict::Held);
+        // exit-0 paths unchanged: a stamp that moved is still Recreated
+        let v = recreate_verdicts(&consumers[..1], &stamps(&[("noo-trellion", Some("t1"))]), &stamps(&[("noo-trellion", Some("t2"))]));
+        assert_eq!(v[0].1, RecreateVerdict::Recreated);
     }
 
     #[test]

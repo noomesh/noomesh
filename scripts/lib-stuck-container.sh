@@ -222,7 +222,16 @@ elif mode == "layers":
 }
 
 # _noo_project — the compose project this launch belongs to.
-_noo_project() { printf '%s' "${COMPOSE_PROJECT_NAME:-noomesh}"; }
+# The launcher's own answer (lib-compose.sh: COMPOSE_PROJECT_NAME, else the
+# cluster file's name:, else noomesh), so a renamed project is probed, not a
+# different one.
+_noo_project() {
+    if declare -F _compose_project_name >/dev/null; then
+        _compose_project_name .
+    else
+        printf '%s' "${COMPOSE_PROJECT_NAME:-noomesh}"
+    fi
+}
 
 # noo_name_is_held <container name or id> — true for a held container.
 noo_name_is_held() {
@@ -243,7 +252,7 @@ noo_name_is_held() {
 # when the listing itself got no answer or failed: nothing was probed, and the
 # caller must not run compose.
 _noo_hung_services() {
-    local rows id name svc rc d n=0 running=0 i proj
+    local rows id name svc rc d n=0 running=0 i proj r
     proj="$(_noo_project)"
     rows="$(_noo_bounded "$NOO_DOCKER_PROBE_SECS" docker ps -a --filter "label=com.docker.compose.project=$proj" \
         --format '{{.ID}} {{.Names}} {{.Label "com.docker.compose.service"}}')"
@@ -261,11 +270,19 @@ _noo_hung_services() {
         [ -n "$id" ] && [ -n "$svc" ] || continue
         n=$((n + 1))
         (
+            # One result file per container: "ok", "held <svc> <id> <name>" or
+            # "err" (the call could not be bounded). A subshell that dies leaves
+            # no file, and that reads as "could not probe", never as "answered".
             _noo_bounded "$NOO_DOCKER_PROBE_SECS" docker inspect -f '{{.State.Status}}' "$id" >/dev/null 2>&1
-            [ "$?" -eq 124 ] || exit 0
+            r=$?
+            if [ "$r" -eq 125 ]; then echo err > "$d/$n"; exit 0; fi
+            if [ "$r" -ne 124 ]; then echo ok > "$d/$n"; exit 0; fi
             # Slow is not stuck: one more try, with the longer bound.
             _noo_bounded "$NOO_DOCKER_REPROBE_SECS" docker inspect -f '{{.State.Status}}' "$id" >/dev/null 2>&1
-            [ "$?" -eq 124 ] && printf '%s %s %s\n' "$svc" "$id" "$name" > "$d/$n"
+            r=$?
+            if [ "$r" -eq 124 ]; then printf 'held %s %s %s\n' "$svc" "$id" "$name" > "$d/$n"
+            elif [ "$r" -eq 125 ]; then echo err > "$d/$n"
+            else echo ok > "$d/$n"; fi
             exit 0
         ) </dev/null &
         running=$((running + 1))
@@ -276,7 +293,15 @@ EOF_ROWS
     wait
     i=1
     while [ "$i" -le "$n" ]; do
-        [ -f "$d/$i" ] && cat "$d/$i"
+        r="$(cat "$d/$i" 2>/dev/null)"
+        case "$r" in
+            ok) ;;
+            held\ *) printf '%s\n' "${r#held }" ;;
+            *)
+                rm -rf "$d"
+                ui_failed "Could not probe every container of project $proj (a probe did not report back): nothing was started or restarted; try again." >&2
+                return 3 ;;
+        esac
         i=$((i + 1))
     done
     rm -rf "$d"
@@ -286,12 +311,13 @@ EOF_ROWS
 # _noo_report_hung <service> <container id> <container name> — the one plain
 # statement per held container, worded as what is known, and the report line.
 _noo_report_hung() {
-    local what
+    local what c
     what="$(_noo_service_role "$1")"
-    case "$1" in
-        gateway|postgres)
-            ui_failed "THE CONTROLLER IS NOT UP: $3 ($1) is held, and $what." ;;
-    esac
+    # The gateway itself, or anything it depends_on (read from the rendered
+    # config, never a list): the controller is not working.
+    if [ "$1" = gateway ] || { c="$(_noo_rel closure gateway 2>/dev/null)" && case " $c " in *" $1 "*) true ;; *) false ;; esac; }; then
+        ui_failed "THE CONTROLLER IS NOT UP: $3 ($1) is held and the gateway needs it; the gateway may be crash-looping or restarting without it."
+    fi
     ui_failed "Docker did not answer for $3 ($1) in ${NOO_DOCKER_PROBE_SECS}s, and not again in ${NOO_DOCKER_REPROBE_SECS}s. If it still does not answer, its process most likely did not exit and Docker cannot remove it; only a reboot of this host removes it. Starting the rest of the stack without it; $what until then."
     if [ -n "${NOO_STUCK_REPORT:-}" ]; then
         printf '%s\n%s\n' "$1" "$2" >> "$NOO_STUCK_REPORT" 2>/dev/null || true
@@ -305,13 +331,15 @@ _noo_report_hung() {
 # NOO_EXCLUDED_SERVICES and NOO_PROBE_DONE. Returns 3 when Docker does not
 # list containers at all (the caller stops), else 0.
 noo_hold_hung() {
-    local svc id name held="" rows rc svcname why
+    local svc id name held="" rows rc svcname why c
     shift
     NOO_ISOLATED_SERVICES=""; NOO_HELD_IDS=""; NOO_HELD_NAMES=""
     NOO_EXCLUDED_SERVICES=""; NOO_PROBE_DONE=1; _NOO_CFG_JSON=""
     rows="$(_noo_hung_services "$@")"
     rc=$?
     [ "$rc" -eq 0 ] || return "$rc"
+    [ -n "$rows" ] || return 0
+    _NOO_CFG_JSON="$(_noo_bounded 30 docker "$@" config --format json 2>/dev/null)" || _NOO_CFG_JSON=""
     while read -r svc id name; do
         [ -n "$svc" ] || continue
         _noo_report_hung "$svc" "$id" "$name"
@@ -322,8 +350,6 @@ noo_hold_hung() {
 $rows
 EOF_HUNG
     NOO_ISOLATED_SERVICES="$held"
-    [ -n "$held" ] || return 0
-    _NOO_CFG_JSON="$(_noo_bounded 30 docker "$@" config --format json 2>/dev/null)" || _NOO_CFG_JSON=""
     # shellcheck disable=SC2046
     rows="$(_noo_rel excluded $held)" || rows=""
     if [ -z "$_NOO_CFG_JSON" ] || ! command -v python3 >/dev/null 2>&1; then
@@ -472,6 +498,19 @@ _noo_scaled_out() {
     done
 }
 
+# _noo_say_gateway <compose args...> — after a held-path start: when the
+# gateway is not healthy, say it (up but possibly restarting).
+_noo_say_gateway() {
+    local id st
+    id="$(_noo_bounded "$NOO_DOCKER_PROBE_SECS" docker "$@" ps -aq gateway 2>/dev/null | head -1)"
+    [ -n "$id" ] || return 0
+    st="$(_noo_bounded "$NOO_DOCKER_PROBE_SECS" docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$id" 2>/dev/null)"
+    case "$st" in healthy|running) ;; *)
+        ui_warned "the gateway is up but not healthy (${st:-unknown}): it may be restarting${NOO_ISOLATED_SERVICES:+ while $NOO_ISOLATED_SERVICES stays held}" ;;
+    esac
+    return 0
+}
+
 # _noo_staged_up <docker compose args before up> -- <up flags> -- <service>... —
 # the services (and, for a named start, everything they depend on that is not
 # held or left out) are brought up in explicit stages, each its own
@@ -526,6 +565,7 @@ $layers
 EOF_LAYERS
     fi
     _noo_sweep_created "${sel[@]}"
+    _noo_say_gateway "${base[@]}"
     failed="$(_noo_not_up "${base[@]}" -- "${sel[@]}" | tr '\n' ' ')"
     if [ -n "${failed// /}" ]; then
         ui_failed "did not come up: ${failed% }"
@@ -580,6 +620,8 @@ noo_staged_restart() {
 $layers
 EOF_LAYERS
     fi
+    # shellcheck disable=SC2086
+    _noo_say_gateway compose $COMPOSE_FILES $PROFILE_ARGS
     # shellcheck disable=SC2086
     failed="$(_noo_not_up compose $COMPOSE_FILES $PROFILE_ARGS -- "${sel[@]}" | tr '\n' ' ')"
     if [ -n "${failed// /}" ]; then

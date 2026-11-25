@@ -2690,15 +2690,25 @@ pub fn security_service_key_provision(g: &Globals, args: &[String]) -> Result<i3
     let verdicts = crate::commands::secrets::recreate_verdicts(&t.containers, &before, &after);
     let stale: Vec<&str> = verdicts.iter()
         .filter(|(_, v)| matches!(v, crate::commands::secrets::RecreateVerdict::Unchanged
-                                    | crate::commands::secrets::RecreateVerdict::Vanished))
+                                    | crate::commands::secrets::RecreateVerdict::Vanished
+                                    | crate::commands::secrets::RecreateVerdict::Held))
         .map(|(c, _)| c.as_str())
         .collect();
     if !stale.is_empty() {
+        let held: Vec<&str> = verdicts.iter()
+            .filter(|(_, v)| *v == crate::commands::secrets::RecreateVerdict::Held)
+            .map(|(c, _)| c.as_str())
+            .collect();
+        let held_note = if held.is_empty() {
+            String::new()
+        } else {
+            format!(" (held, Docker does not answer for the container, so it still holds the OLD value until this host is rebooted: {})", held.join(", "))
+        };
         return finish(
             g,
             &t,
             crate::commands::secrets::ProvisionOutcome::StoredNotRecreated,
-            &format!("these consumers did not come back on the new value: {}", stale.join(", ")),
+            &format!("these consumers did not come back on the new value: {}{held_note}", stale.join(", ")),
         );
     }
 
