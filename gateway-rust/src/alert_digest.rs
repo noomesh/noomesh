@@ -264,9 +264,8 @@ mod tests {
 
     #[test]
     fn enrich_prompt_puts_the_task_first() {
-        let src = include_str!("alert_digest.rs");
-        let f = &src[src.find("pub async fn enrich_prompt(").unwrap()..];
-        let f = &f[..f.find("\n}\n").unwrap()];
+        let code = crate::test_src::own_code(include_str!("alert_digest.rs"));
+        let f = crate::test_src::fn_body(&code, "pub async fn enrich_prompt(");
         assert!(f.contains("compose_prompt(&prompt, &record)"), "{f}");
         assert!(!f.contains("format!(\"{record}"), "the record must not lead the prompt: {f}");
     }

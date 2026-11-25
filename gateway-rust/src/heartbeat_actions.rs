@@ -6556,9 +6556,8 @@ mod non_answer_tests {
         let cp = build_action_prompt("custom_prompt", "t", &json!({"prompt": "Do the thing"}));
         assert!(!cp.contains(UNATTENDED_NOTE), "{cp}");
         // the gate is skipped for them: run_llm_action_inner returns the text untouched
-        let src = include_str!("heartbeat_actions.rs");
-        let inner = &src[src.find("async fn run_llm_action_inner(").unwrap()..];
-        let inner = &inner[..inner.find("\n}\n").unwrap()];
+        let code = crate::test_src::own_code(include_str!("heartbeat_actions.rs"));
+        let inner = crate::test_src::fn_body(&code, "async fn run_llm_action_inner(");
         assert!(inner.contains("if !is_summary_action(action) {\n        return Ok(text);\n    }"), "{inner}");
         assert!(inner.contains("gate_unattended_answer(action, text,"), "the gate must be called");
         assert!(inner.contains("non_answer_retry(state, prompt, conversation_id"), "retry uses the same enriched prompt");
@@ -6571,9 +6570,9 @@ mod non_answer_tests {
         let base = "TASK\n\nnote\n\n## Operator alert record";
         let p = non_answer_retry_prompt(base, NonAnswer::Declined);
         assert!(p.starts_with(base) && p.ends_with(non_answer_correction(NonAnswer::Declined)), "{p}");
-        let src = include_str!("heartbeat_actions.rs");
-        let f = &src[src.find("async fn non_answer_retry(").unwrap()..];
-        assert!(f[..f.find("\n}\n").unwrap()].contains("non_answer_retry_prompt(base_prompt, hit)"));
+        let code = crate::test_src::own_code(include_str!("heartbeat_actions.rs"));
+        let f = crate::test_src::fn_body(&code, "async fn non_answer_retry(");
+        assert!(f.contains("non_answer_retry_prompt(base_prompt, hit)"), "{f}");
     }
 
     #[test]
