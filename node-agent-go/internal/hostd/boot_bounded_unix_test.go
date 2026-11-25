@@ -20,6 +20,10 @@ import (
 // A real bash runs the real boot-restore script against a FAKE docker that
 // answers from files; PATH is the fake plus symlinks to the few tools the
 // script needs, so the machine's own docker is unreachable from the run.
+// Time limits are generous (the fake sleeps 120 s when it hangs, the tests
+// allow 45 s) so a loaded host does not flip them and an unbounded call does.
+const testTimeLimit = 45 * time.Second
+
 type bootFixture struct {
 	e      *Engine
 	dir    string // fake docker dir
@@ -40,10 +44,57 @@ func (f *bootFixture) argv(t *testing.T) []string {
 	return strings.Split(strings.TrimRight(string(b), "\n"), "\n")
 }
 
-// behave: a docker subcommand+container pair that sleeps instead of answering.
-func (f *bootFixture) hang(t *testing.T, key string) {
+// callsEnding counts recorded docker calls whose last argument is id.
+func (f *bootFixture) callsEnding(t *testing.T, id string) int {
+	n := 0
+	for _, l := range f.argv(t) {
+		if strings.HasSuffix(l, " "+id) {
+			n++
+		}
+	}
+	return n
+}
+
+func (f *bootFixture) startsOf(t *testing.T, id string) int {
+	n := 0
+	for _, l := range f.argv(t) {
+		if l == "docker start "+id {
+			n++
+		}
+	}
+	return n
+}
+
+// hang makes a fake call sleep: key "<kind>.<id>" (kinds ps, mounts, running,
+// start); count 0 = every call, n = only the first n calls.
+func (f *bootFixture) hang(t *testing.T, key string, count int) {
 	t.Helper()
-	if err := os.WriteFile(filepath.Join(f.dir, "hang."+key), nil, 0o644); err != nil {
+	body := ""
+	if count > 0 {
+		body = fmt.Sprint(count)
+	}
+	if err := os.WriteFile(filepath.Join(f.dir, "hang."+key), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// down makes the Running check say false until a start of id is answered.
+func (f *bootFixture) down(t *testing.T, id string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(f.dir, "down."+id), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// fakeTimeout installs a `timeout` ahead of the real one on PATH.
+func (f *bootFixture) fakeTimeout(t *testing.T, body string) {
+	t.Helper()
+	real, err := exec.LookPath("timeout")
+	if err != nil {
+		t.Skip("no timeout(1) on this host")
+	}
+	script := "#!/bin/bash\nREAL=" + real + "\n" + body
+	if err := os.WriteFile(filepath.Join(f.dir, "timeout"), []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -56,14 +107,19 @@ for a in "$@"; do id="$a"; done
 [ "$sub" = ps ] && id=ps
 kind="$sub"
 case "$*" in *Mounts*) kind=mounts ;; *State.Running*) kind=running ;; esac
-[ -e "$d/hang.$kind.$id" ] && exec sleep 60
+if [ -e "$d/hang.$kind.$id" ]; then
+  n="$(cat "$d/hang.$kind.$id")"
+  if [ -z "$n" ]; then exec sleep 120; fi
+  c=$(( $(cat "$d/cnt.$kind.$id" 2>/dev/null || echo 0) + 1 )); echo $c > "$d/cnt.$kind.$id"
+  [ "$c" -le "$n" ] && exec sleep 120
+fi
 case "$sub" in
   ps) printf 'aaa\nbbb\nccc\n' ;;
-  start) ;;
+  start) rm -f "$d/down.$id" ;;
   inspect)
     case "$*" in
       *Mounts*) echo "$(cat "$d/rundir")/x" ;;
-      *State.Running*) echo true ;;
+      *State.Running*) if [ -e "$d/down.$id" ]; then echo false; else echo true; fi ;;
     esac ;;
 esac
 exit 0
@@ -87,7 +143,7 @@ func newBootFixture(t *testing.T) *bootFixture {
 	must(os.WriteFile(filepath.Join(root, "docker-compose.cluster.yml"), []byte("services: {}\n"), 0o644))
 	must(os.WriteFile(filepath.Join(fake, "docker"), []byte(fakeDocker), 0o755))
 	must(os.WriteFile(filepath.Join(fake, "rundir"), []byte(rundir), 0o644))
-	for _, tool := range []string{"bash", "timeout", "sleep", "grep", "cut", "sed", "awk", "sort", "tr", "head", "ls", "dirname", "cat", "mkdir", "touch", "printf", "echo"} {
+	for _, tool := range []string{"bash", "timeout", "sleep", "grep", "cut", "sed", "awk", "sort", "tr", "head", "ls", "dirname", "cat", "mkdir", "touch", "printf", "echo", "true", "rm"} {
 		if p, err := exec.LookPath(tool); err == nil {
 			must(os.Symlink(p, filepath.Join(tools, tool)))
 		}
@@ -106,12 +162,12 @@ func newBootFixture(t *testing.T) *bootFixture {
 		f.logs = append(f.logs, strings.TrimSpace(fmt.Sprintf(format, a...)))
 		f.mu.Unlock()
 	}}
-	// short bounds for the test; restored after
-	ol, oi, os_, on, oo := bootListBound, bootInspectBound, bootStartBound, bootNetnsBound, bootOverall
+	ol, ot, ow, oi, os_, on, oo := bootListBound, bootListTries, bootListWait, bootInspectBound, bootStartBound, bootNetnsBound, bootOverall
 	t.Cleanup(func() {
-		bootListBound, bootInspectBound, bootStartBound, bootNetnsBound, bootOverall = ol, oi, os_, on, oo
+		bootListBound, bootListTries, bootListWait, bootInspectBound, bootStartBound, bootNetnsBound, bootOverall = ol, ot, ow, oi, os_, on, oo
 	})
-	bootListBound, bootInspectBound, bootStartBound, bootNetnsBound, bootOverall = 2*time.Second, 1*time.Second, 5*time.Second, 1*time.Second, 20*time.Second
+	bootListBound, bootListTries, bootListWait = 2*time.Second, 3, 1*time.Second
+	bootInspectBound, bootStartBound, bootNetnsBound, bootOverall = 2*time.Second, 3*time.Second, 2*time.Second, 60*time.Second
 	return f
 }
 
@@ -127,23 +183,39 @@ func assertLockFree(t *testing.T) {
 	}()
 	select {
 	case <-done:
-	case <-time.After(3 * time.Second):
+	case <-time.After(5 * time.Second):
 		t.Fatal("the compose lock is still held after boot-restore returned")
 	}
+}
+
+func (f *bootFixture) run(t *testing.T) time.Duration {
+	t.Helper()
+	t0 := time.Now()
+	f.e.BootRestore(context.Background())
+	el := time.Since(t0)
+	if el > testTimeLimit {
+		t.Fatalf("boot-restore took %s (limit %s)", el, testTimeLimit)
+	}
+	return el
+}
+
+func normalArgv() []string {
+	want := []string{"docker ps -aq --filter status=created --filter status=exited"}
+	for _, id := range []string{"aaa", "bbb", "ccc"} {
+		want = append(want,
+			"docker inspect -f {{range .Mounts}}{{println .Source}}{{end}} "+id,
+			"docker start "+id,
+			"docker inspect -f {{.State.Running}} "+id)
+	}
+	return want
 }
 
 // Docker answers normally: the same calls in the same order as before the
 // bounds, with the same argv (timeout execs docker unchanged).
 func TestBootRestoreBoundedNormalPathRecordsTheSameDockerCalls(t *testing.T) {
 	f := newBootFixture(t)
-	f.e.BootRestore(context.Background())
-	mounts := "docker inspect -f {{range .Mounts}}{{println .Source}}{{end}} "
-	var want = []string{"docker ps -aq --filter status=created --filter status=exited"}
-	for _, id := range []string{"aaa", "bbb", "ccc"} {
-		want = append(want, "docker "+strings.TrimPrefix(mounts, "docker ")+id, "docker start "+id, "docker inspect -f {{.State.Running}} "+id)
-	}
-	got := f.argv(t)
-	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+	f.run(t)
+	if got, want := strings.Join(f.argv(t), "\n"), strings.Join(normalArgv(), "\n"); got != want {
 		t.Fatalf("docker calls changed:\n got %q\nwant %q", got, want)
 	}
 	if !strings.Contains(f.logText(), "boot-restore: done") || strings.Contains(f.logText(), "did not answer") {
@@ -152,34 +224,43 @@ func TestBootRestoreBoundedNormalPathRecordsTheSameDockerCalls(t *testing.T) {
 	assertLockFree(t)
 }
 
-// One container Docker never answers for (the mounts inspect, the start, or
-// the running check) is skipped and named; the rest are still handled;
-// boot-restore returns within the bounds.
+// One container Docker never answers for is skipped and named, the rest are
+// handled, and NOTHING more is done to the skipped one (the exact number of
+// docker calls naming it is pinned, so a removed `continue` shows).
 func TestBootRestoreBoundedSkipsAContainerDockerDoesNotAnswerFor(t *testing.T) {
-	for _, tc := range []struct{ key, call string }{
-		{"mounts.bbb", "docker inspect"},
-		{"start.bbb", "docker start"},
-		{"running.bbb", "docker inspect"},
+	for _, tc := range []struct {
+		name, key, call string
+		down            bool
+		calls, starts   int
+		started         string
+	}{
+		{"mounts inspect", "mounts.bbb", "docker inspect", false, 1, 0, "started 2"},
+		{"start (and not running)", "start.bbb", "docker start", true, 5, 2, "started 2"},
+		{"running check", "running.bbb", "docker inspect", false, 3, 1, "started 3"},
 	} {
-		t.Run(tc.key, func(t *testing.T) {
+		t.Run(tc.name, func(t *testing.T) {
 			f := newBootFixture(t)
-			f.hang(t, tc.key)
-			t0 := time.Now()
-			f.e.BootRestore(context.Background())
-			if el := time.Since(t0); el > 8*time.Second {
-				t.Fatalf("boot-restore took %s with one wedged container", el)
+			f.hang(t, tc.key, 0)
+			if tc.down {
+				f.down(t, "bbb")
 			}
-			argv := strings.Join(f.argv(t), "\n")
+			f.run(t)
 			for _, id := range []string{"aaa", "ccc"} {
-				if !strings.Contains(argv, "docker start "+id) || !strings.Contains(argv, "docker inspect -f {{.State.Running}} "+id) {
-					t.Errorf("container %s was not fully handled:\n%s", id, argv)
+				if f.startsOf(t, id) != 1 || f.callsEnding(t, id) != 3 {
+					t.Errorf("container %s was not handled exactly once:\n%s", id, strings.Join(f.argv(t), "\n"))
 				}
+			}
+			if got := f.startsOf(t, "bbb"); got != tc.starts {
+				t.Errorf("docker start bbb ran %d times, want %d", got, tc.starts)
+			}
+			if got := f.callsEnding(t, "bbb"); got != tc.calls {
+				t.Errorf("docker calls naming bbb: %d, want %d:\n%s", got, tc.calls, strings.Join(f.argv(t), "\n"))
 			}
 			logs := f.logText()
 			if !strings.Contains(logs, "Docker did not answer for container bbb within") || !strings.Contains(logs, "("+tc.call+"); it was left alone") {
 				t.Errorf("the skipped container is not named:\n%s", logs)
 			}
-			if !strings.Contains(logs, "started 2; Docker did not answer for: bbb (left alone)") && !strings.Contains(logs, "started 3; Docker did not answer for: bbb (left alone)") || strings.Contains(logs, "boot-restore: done") {
+			if !strings.Contains(logs, tc.started+"; not handled (left alone): bbb") || strings.Contains(logs, "boot-restore: done") {
 				t.Errorf("a skipped container must not be reported as a plain success:\n%s", logs)
 			}
 			assertLockFree(t)
@@ -187,69 +268,169 @@ func TestBootRestoreBoundedSkipsAContainerDockerDoesNotAnswerFor(t *testing.T) {
 	}
 }
 
-// A hung `docker ps` fails the attempt within the list bound, says so, and
-// releases the lock; nothing is started.
-func TestBootRestoreBoundedHungListFailsTheAttemptAndReleasesTheLock(t *testing.T) {
+// A start that only TIMES OUT but leaves the container running is a slow
+// start: counted as started, noted, never called "left alone".
+func TestBootRestoreBoundedSlowStartThatIsRunningCountsAsStarted(t *testing.T) {
 	f := newBootFixture(t)
-	f.hang(t, "ps.ps")
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	inner := f.e.Logf
-	f.e.Logf = func(format string, a ...any) {
-		inner(format, a...)
-		if strings.Contains(fmt.Sprintf(format, a...), "attempt 1 failed") {
-			cancel() // stop the retry loop's sleep
-		}
-	}
-	t0 := time.Now()
-	f.e.BootRestore(ctx)
-	if el := time.Since(t0); el > 8*time.Second {
-		t.Fatalf("took %s with a hung docker ps (list bound 2s)", el)
-	}
+	f.hang(t, "start.bbb", 0) // bbb is not marked down: its Running check says true
+	f.run(t)
 	logs := f.logText()
-	if !strings.Contains(logs, "attempt 1 failed (exit 1)") || !strings.Contains(logs, "did not answer the container list within 2s") {
-		t.Errorf("the failure is not stated:\n%s", logs)
+	if !strings.Contains(logs, "container bbb was slow to start") || strings.Contains(logs, "left alone") || !strings.Contains(logs, "boot-restore: done") {
+		t.Fatalf("log: %s", logs)
 	}
-	if strings.Contains(strings.Join(f.argv(t), "\n"), "docker start") {
-		t.Errorf("something was started")
+	if !strings.Contains(logs, "started 3 container(s)") {
+		t.Fatalf("the slow container is not counted: %s", logs)
+	}
+	if f.startsOf(t, "bbb") != 1 {
+		t.Errorf("a running container was started again")
 	}
 	assertLockFree(t)
 }
 
-// The overall deadline stops a run that the per-call bounds did not (here the
-// list bound is longer than the overall one): the shell is killed,
-// the lock released, and the log says so (no retry, no silent success).
+// A start that times out on a container that is NOT running gets one more
+// bounded start; if that answers, it is started.
+func TestBootRestoreBoundedSlowStartThatIsNotRunningIsStartedOnceMore(t *testing.T) {
+	f := newBootFixture(t)
+	f.hang(t, "start.bbb", 1) // the first start hangs, the second answers
+	f.down(t, "bbb")
+	f.run(t)
+	logs := f.logText()
+	if f.startsOf(t, "bbb") != 2 || strings.Contains(logs, "left alone") || !strings.Contains(logs, "started 3 container(s)") || !strings.Contains(logs, "boot-restore: done") {
+		t.Fatalf("starts of bbb: %d; log: %s", f.startsOf(t, "bbb"), logs)
+	}
+	assertLockFree(t)
+}
+
+// A list Docker does not answer is retried; one that answers on the third try
+// starts the containers and reports done.
+func TestBootRestoreBoundedListThatAnswersOnTheThirdTryStartsTheContainers(t *testing.T) {
+	f := newBootFixture(t)
+	f.hang(t, "ps.ps", 2)
+	f.run(t)
+	ps := 0
+	for _, l := range f.argv(t) {
+		if strings.HasPrefix(l, "docker ps ") {
+			ps++
+		}
+	}
+	if ps != 3 {
+		t.Fatalf("docker ps ran %d times, want 3", ps)
+	}
+	for _, id := range []string{"aaa", "bbb", "ccc"} {
+		if f.startsOf(t, id) != 1 {
+			t.Errorf("container %s was not started", id)
+		}
+	}
+	if !strings.Contains(f.logText(), "boot-restore: done") || !strings.Contains(f.logText(), "(try 2 of 3); retrying") {
+		t.Fatalf("log: %s", f.logText())
+	}
+	assertLockFree(t)
+}
+
+// A list that never answers is a WARN, never "done": the secret files are
+// already written, so a second pass would only say "nothing to do". Nothing is
+// started, the caller does not retry, the lock is free.
+func TestBootRestoreBoundedListThatNeverAnswersIsAWarnNotDone(t *testing.T) {
+	f := newBootFixture(t)
+	f.hang(t, "ps.ps", 0)
+	f.run(t)
+	logs := f.logText()
+	if !strings.Contains(logs, "BOOT-RESTORE WARN") || !strings.Contains(logs, "did not answer the container list") || !strings.Contains(logs, "NO container was started") {
+		t.Errorf("the failure is not stated:\n%s", logs)
+	}
+	if strings.Contains(logs, "boot-restore: done") || strings.Contains(logs, "attempt 2") {
+		t.Errorf("a list that never answered was reported as done or retried:\n%s", logs)
+	}
+	ps := 0
+	for _, l := range f.argv(t) {
+		if strings.Contains(l, " start ") {
+			t.Errorf("something was started: %s", l)
+		}
+		if strings.HasPrefix(l, "docker ps ") {
+			ps++
+		}
+	}
+	if ps != 3 {
+		t.Errorf("docker ps ran %d times, want the 3 tries", ps)
+	}
+	assertLockFree(t)
+}
+
+// The overall deadline stops a run that the per-call bounds did not (the list
+// bound is longer than the overall one): the shell is killed, the lock
+// released, and the log says so (no retry, no silent success).
 func TestBootRestoreBoundedOverallDeadlineKillsTheRunAndReleasesTheLock(t *testing.T) {
 	f := newBootFixture(t)
-	f.hang(t, "ps.ps")
-	bootListBound = 30 * time.Second
-	bootOverall = 2 * time.Second
-	t0 := time.Now()
-	f.e.BootRestore(context.Background())
-	if el := time.Since(t0); el > 8*time.Second {
-		t.Fatalf("took %s with an overall deadline of 2s", el)
-	}
+	f.hang(t, "ps.ps", 0)
+	bootListBound = 100 * time.Second
+	bootOverall = 4 * time.Second
+	f.run(t)
 	logs := f.logText()
-	if !strings.Contains(logs, "BOOT-RESTORE WARN: the run did not finish within 2s and was stopped") || strings.Contains(logs, "boot-restore: done") {
+	if !strings.Contains(logs, "BOOT-RESTORE WARN: the run did not finish within 4s and was stopped") || strings.Contains(logs, "boot-restore: done") {
 		t.Errorf("log: %s", logs)
 	}
 	assertLockFree(t)
 }
 
-// The namespace-restore script runs under the same lock; a hang there is cut
-// at its bound and the pass still reports.
+// The namespace-restore pass runs under the same lock; a hang there is cut at
+// its own bound and the pass still reports.
 func TestBootRestoreBoundedHungNamespaceRestoreIsCutOff(t *testing.T) {
 	f := newBootFixture(t)
-	if err := os.WriteFile(filepath.Join(f.e.Root, "scripts", "noo-netns-restore.sh"), []byte("exec sleep 60\n"), 0o755); err != nil {
+	if err := os.WriteFile(filepath.Join(f.e.Root, "scripts", "noo-netns-restore.sh"), []byte("exec sleep 120\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	t0 := time.Now()
-	f.e.BootRestore(context.Background())
-	if el := time.Since(t0); el > 8*time.Second {
-		t.Fatalf("took %s with a hung namespace restore (bound 1s)", el)
-	}
+	f.run(t)
 	if !strings.Contains(f.logText(), "the namespace restore reported a problem") {
 		t.Errorf("log: %s", f.logText())
+	}
+	assertLockFree(t)
+}
+
+// The pass's bound is capped by what is left of the script budget, so it ends
+// before the overall deadline and no orphan can outlive the lock: here the
+// pass's own bound is 100 s but the overall deadline is 24 s.
+func TestBootRestoreBoundedNamespaceRestoreEndsBeforeTheOverallDeadline(t *testing.T) {
+	f := newBootFixture(t)
+	if err := os.WriteFile(filepath.Join(f.e.Root, "scripts", "noo-netns-restore.sh"), []byte("exec sleep 120\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	bootNetnsBound = 100 * time.Second
+	bootOverall = 24 * time.Second
+	f.run(t)
+	logs := f.logText()
+	if strings.Contains(logs, "did not finish within") || !strings.Contains(logs, "the namespace restore reported a problem") {
+		t.Errorf("the pass outlived the script budget:\n%s", logs)
+	}
+	assertLockFree(t)
+}
+
+// A timeout(1) without --foreground and -k (BusyBox) still bounds each call.
+func TestBootRestoreBoundedBusyBoxTimeoutStillBoundsTheCalls(t *testing.T) {
+	f := newBootFixture(t)
+	f.fakeTimeout(t, `case "$1" in --foreground|-k|-*) exit 125 ;; esac
+exec "$REAL" "$@"
+`)
+	f.hang(t, "mounts.bbb", 0)
+	f.run(t)
+	logs := f.logText()
+	if !strings.Contains(logs, "Docker did not answer for container bbb") || strings.Contains(logs, "not usable") || f.startsOf(t, "bbb") != 0 || f.startsOf(t, "ccc") != 1 {
+		t.Fatalf("log: %s", logs)
+	}
+	assertLockFree(t)
+}
+
+// A timeout(1) that works in no form: the calls run unbounded, said once, and
+// the run is NOT "started 0" success: it behaves exactly as before.
+func TestBootRestoreBoundedUnusableTimeoutFallsBackToUnboundedAndSaysSo(t *testing.T) {
+	f := newBootFixture(t)
+	f.fakeTimeout(t, "exit 125\n")
+	f.run(t)
+	if got, want := strings.Join(f.argv(t), "\n"), strings.Join(normalArgv(), "\n"); got != want {
+		t.Fatalf("docker calls changed:\n got %q\nwant %q", got, want)
+	}
+	logs := f.logText()
+	if strings.Count(logs, "timeout(1) is not usable here") != 1 || !strings.Contains(logs, "started 3 container(s)") || !strings.Contains(logs, "boot-restore: done") {
+		t.Fatalf("log: %s", logs)
 	}
 	assertLockFree(t)
 }
