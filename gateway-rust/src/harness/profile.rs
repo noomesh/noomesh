@@ -264,6 +264,17 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// The shipped harness is pinned to the model `auto`: the agent states
+    /// its context under `auto:latest` (Ollama) and its window under `auto`,
+    /// and the pin finds both as it looks them up.
+    #[test]
+    fn the_auto_pin_finds_what_the_agent_states_for_it() {
+        let placement = json!({"chat_contexts": {"auto:latest": 8192, "gemma4:e2b": 32768}, "chat_windows": {"auto": 4096}});
+        let c = chat_contexts_of(&placement).unwrap();
+        assert_eq!(c.get(&context_key("auto").unwrap()), Some(&8192));
+        assert_eq!(chat_windows_of(&placement).unwrap().get("auto"), Some(&4096));
+    }
+
     /// The engine windows, read off the placement: zero, negative,
     /// non-numbers, blank names and absurd values dropped; no key or an
     /// empty table is "none" (an older agent). The model name is as placed.

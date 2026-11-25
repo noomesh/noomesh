@@ -505,12 +505,24 @@ the global `VLLM_MAX_MODEL_LEN` window.
 own window per model as placed (`VLLM_MAX_MODEL_LEN`, or llama.cpp's `N_CTX`
 shared by its parallel slots, else the node's profile context, capped by the
 model's own ceiling), as the controller reads it for the chats it runs
-itself (desired-config `chat_windows`). The agent stamps nothing with it. The
-harness fits its loop's turns to the pinned model's entry, so a 4096-token
-llama.cpp placement gets a prompt budget inside 4096 rather than the global
-window. It is absent when no window is readable or the agent is older; zero
-or implausibly large values are ignored; the loop then keeps the global
-`VLLM_MAX_MODEL_LEN` window.
+itself (desired-config `chat_windows`; a model placed twice keeps the smaller
+window). The agent stamps nothing with it. It is the controller's desired
+state, not a live reading of the engine: it changes when the placement does
+and reaches the harness on its one-minute re-read. Keys are exact model
+names as placed, and the value is never larger than the gateway's own fit
+for that model.
+
+The shipped harness is pinned to the model `auto` (the node's inference
+proxy substitutes the model of the backend it picks). So the agent also
+states, under `auto` in `chat_windows` and under `auto:latest` in
+`chat_contexts`, the SMALLEST window across the node's running chat
+placements (an engine window or an Ollama decided context); the proxy picks
+one backend per request and the harness cannot see which, so the smallest
+cannot overflow. The harness looks its window up by its pin as given, so a
+4096-token llama.cpp placement gets a prompt budget inside 4096 rather than
+the global window. Both are absent when nothing is known or the agent is
+older; zero or implausibly large values are ignored; the loop then keeps
+the global `VLLM_MAX_MODEL_LEN` window.
 
 `noo-gateway harness probe --kind <kind>` runs steps 1, 3, 4 and 5 once,
 with no door key and no MCP wiring. That means no `{mcp_config}`
