@@ -6,6 +6,8 @@ package backendrt
 import (
 	"errors"
 	"github.com/noomesh/noomesh/node-agent-go/internal/refusals"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -390,5 +392,40 @@ func TestConvergeRewritesAChangedProfileContextAndRestartsOnce(t *testing.T) {
 	if _, restarted, _ := g.Converge(); !restarted ||
 		!f.had(plutilBin+" -replace EnvironmentVariables.OLLAMA_CONTEXT_LENGTH -string 8192 "+plist) {
 		t.Errorf("a changed default must converge: restarted=%v %v", restarted, f.cmds)
+	}
+}
+
+// A boot-service plist the agent cannot edit: the refusal names every sudo
+// command (a bootout of a job that is not loaded is tolerated), and the wanted
+// tuning is recorded for `noo enroll --resume`, which writes the same values.
+func TestSystemPlistDriftRecordsTheWantedEnvForEnrollResume(t *testing.T) {
+	refusals.Reset()
+	t.Cleanup(refusals.Reset)
+	f := &fakeMac{env: map[string]string{"OLLAMA_NO_CLOUD": "1"}, procEnv: procWith}
+	sys := OllamaSystemPlistPath(newBrew)
+	g := &OllamaGuard{Home: "/Users/m", UID: 501, Run: f.run, Exists: func(p string) bool { return p == sys }}
+	g.WantedFile = filepath.Join(t.TempDir(), "noomesh", OllamaWantedEnvFile)
+	g.Tuning = func() map[string]string {
+		return map[string]string{"OLLAMA_CONTEXT_LENGTH": "8192", "OLLAMA_KEEP_ALIVE": "-1", "OLLAMA_HOST": "0.0.0.0"}
+	}
+	if managed, restarted, err := g.Converge(); err != nil || !managed || restarted {
+		t.Fatalf("managed=%v restarted=%v err=%v", managed, restarted, err)
+	}
+	b, err := os.ReadFile(g.WantedFile)
+	if err != nil || string(b) != "{\"OLLAMA_CONTEXT_LENGTH\":\"8192\",\"OLLAMA_KEEP_ALIVE\":\"-1\"}\n" {
+		t.Fatalf("wanted file = %q, %v", b, err)
+	}
+	rs := refusals.List()
+	if len(rs) != 1 || rs[0].Scope != "ollama_env" {
+		t.Fatalf("refusals = %+v", rs)
+	}
+	for _, want := range []string{
+		"sudo " + plutilBin + " -replace EnvironmentVariables.OLLAMA_CONTEXT_LENGTH -string '8192' " + sys,
+		"sudo launchctl bootout system/" + newBrew + " 2>/dev/null || true",
+		"or run `noo enroll --resume`",
+	} {
+		if !strings.Contains(rs[0].Reason, want) {
+			t.Errorf("reason lacks %q: %s", want, rs[0].Reason)
+		}
 	}
 }
