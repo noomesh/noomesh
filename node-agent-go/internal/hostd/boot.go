@@ -60,7 +60,7 @@ import (
 // everything on it) staying down while the disk is absent.
 
 const bootRestoreScript = `_noo_lib=%s
-_noo_t_list=%d _noo_t_inspect=%d _noo_t_start=%d _noo_t_netns=%d _noo_t_tries=%d _noo_t_listwait=%d _noo_budget=%d
+_noo_t_list=%d _noo_t_inspect=%d _noo_t_start=%d _noo_t_netns=%d _noo_t_listwindow=%d _noo_t_listwait=%d _noo_budget=%d
 . "$_noo_lib" 2>/dev/null || { echo "boot-restore: cannot source lib-secrets.sh" >&2; exit 2; }
 if . "$(dirname "$_noo_lib")/lib-data-root-mount.sh" 2>/dev/null; then
   data_root_mount_boot_guard || { echo "boot-restore: the data-root guard refused (the data root is not on its recorded filesystem, or it cannot be checked) — stateful containers stopped, nothing started (reason above, and in .noo-data-root-refused)" >&2; exit 3; }
@@ -123,7 +123,16 @@ _noo_bound() {
     *) "$@" ;;
   esac
 }
-_noo_dk() { _noo_s2="$1"; shift; _noo_bound "$_noo_s2" docker "$@"; }
+# Every call is also clamped to what is left of the script budget (at least
+# 1 s), so a container reached late cannot run the script past its budget: the
+# script always ends itself, with its summary, before the Go deadline.
+_noo_dk() {
+  _noo_s2="$1"; shift
+  _noo_rem=$((_noo_budget - SECONDS))
+  [ "$_noo_rem" -lt "$_noo_s2" ] && _noo_s2="$_noo_rem"
+  [ "$_noo_s2" -lt 1 ] && _noo_s2=1
+  _noo_bound "$_noo_s2" docker "$@"
+}
 _noo_skip() {
   echo "boot-restore: Docker did not answer for container $1 within ${2}s ($3); it was left alone" >&2
   skipped="${skipped:+$skipped, }$1"
@@ -145,19 +154,22 @@ _noo_start() {
   if ! _noo_wedged "$_noo_rr" && [ "$_noo_rs" = true ]; then echo "boot-restore: container $1 was slow to start (over ${_noo_t_start}s) and is running" >&2; return 0; fi
   return 9
 }
-# The list. dockerd may still be starting after a power cut, so a list that
-# does not answer is retried (bounded each time). Giving up is NOT a success and
-# is not retried by the caller (the secret files are written by now, so a second
-# pass would say "nothing to do"): it exits 4, the WARN path.
+# The list. dockerd may still be starting after a power cut (it then refuses
+# the connection at once), so ANY failure of the list, a timeout or a fast
+# error, means "Docker did not answer yet" and is retried, bounded each time,
+# for the list window. Only a zero status with an empty answer means "no
+# containers". Giving up is NOT a success and is not retried by the caller (the
+# secret files are written by now, so a second pass would say "nothing to
+# do"): it exits 4, the WARN path.
 _noo_try=1
 while :; do
   ids="$(_noo_dk "$_noo_t_list" ps -aq --filter status=created --filter status=exited)"; rc=$?
-  _noo_wedged "$rc" || break
-  if [ "$_noo_try" -ge "$_noo_t_tries" ] || [ "$SECONDS" -ge "$_noo_budget" ]; then
-    echo "boot-restore: Docker did not answer the container list (${_noo_t_list}s, $_noo_try tries); the secret files are written but NO container was started" >&2
+  [ "$rc" = 0 ] && break
+  if [ "$SECONDS" -ge "$_noo_t_listwindow" ] || [ "$SECONDS" -ge "$_noo_budget" ]; then
+    echo "boot-restore: Docker did not answer the container list (exit $rc, $_noo_try tries over ${SECONDS}s); the secret files are written but NO container was started" >&2
     exit 4
   fi
-  echo "boot-restore: Docker did not answer the container list within ${_noo_t_list}s (try $_noo_try of $_noo_t_tries); retrying" >&2
+  echo "boot-restore: Docker did not answer the container list (exit $rc, try $_noo_try, ${SECONDS}s of ${_noo_t_listwindow}s); retrying" >&2
   sleep "$_noo_t_listwait"; _noo_try=$((_noo_try+1))
 done
 for id in $ids; do
@@ -222,13 +234,14 @@ fi
 // a test can shrink them; nothing reads them from the environment.
 var (
 	// bootListBound: one `docker ps` (the container list). Docker answers it in
-	// milliseconds when healthy; a miss is retried (below), never taken as done.
+	// milliseconds when healthy.
 	bootListBound = 20 * time.Second
-	// bootListTries x (bootListBound + bootListWait): dockerd may still be
-	// starting after a power cut, so the list is retried for about four minutes
-	// before the run gives up (exit 4, a WARN, not a success).
-	bootListTries = 8
-	bootListWait  = 10 * time.Second
+	// bootListWindow / bootListWait: dockerd may need minutes after a power cut
+	// (and BootRestore runs once, with no timer), so a list that fails or does
+	// not answer is retried every bootListWait for about ten minutes before the
+	// run gives up (exit 4, a WARN, not a success).
+	bootListWindow = 10 * time.Minute
+	bootListWait   = 15 * time.Second
 	// bootInspectBound: one `docker inspect`, per container. A miss skips that
 	// container (named in the log) and the rest are still handled.
 	bootInspectBound = 15 * time.Second
@@ -241,17 +254,21 @@ var (
 	// script budget, so it always ends before bootOverall.
 	bootNetnsBound = 150 * time.Second
 	// bootOverall: the Go-side backstop for the whole run, held under the
-	// compose lock. The script keeps its own budget (scriptBudget: 30 s less)
-	// and stops starting new work, and bounds the namespace pass, inside it, so
-	// nothing it started outlives this. On expiry the shell is killed (not a
+	// compose lock: the 10 min list window plus 15 min for the container pass
+	// (the pass has its full time after a long wait) = 25 min. The script
+	// keeps its own budget (scriptBudget: 60 s less), clamps every call to what
+	// is left of it and stops starting containers near it, so it ends itself,
+	// with its summary, before this fires. On expiry the shell is killed (not a
 	// process group; each child carries its own bound) and the lock released.
-	bootOverall = 15 * time.Minute
+	bootOverall = 25 * time.Minute
 )
 
 // scriptBudget is the part of the overall deadline the script may spend:
-// 30 s less (at least half), so the last bounded call and its kill grace fit.
+// 60 s less (at least half). Every call is clamped to the budget that is left
+// (at least 1 s), so after the budget only the few 1 s calls of the container
+// in hand and the summary remain, which fit in the 60 s.
 func scriptBudget(overall time.Duration) int {
-	b := overall - 30*time.Second
+	b := overall - 60*time.Second
 	if b < overall/2 {
 		b = overall / 2
 	}
@@ -276,7 +293,7 @@ func (e *Engine) BootRestore(ctx context.Context) {
 	// it did, so it must reach the log too (i301 a).
 	script := "exec 1>&2\n" + fmt.Sprintf(bootRestoreScript, shellQuote(filepath.Join(e.Root, "scripts", "lib-secrets.sh")),
 		secs(bootListBound), secs(bootInspectBound), secs(bootStartBound), secs(bootNetnsBound),
-		bootListTries, secs(bootListWait), scriptBudget(bootOverall))
+		secs(bootListWindow), secs(bootListWait), scriptBudget(bootOverall))
 	for attempt := 1; attempt <= 12; attempt++ {
 		unlock, err := acquireComposeLock(ctx)
 		if err != nil {
