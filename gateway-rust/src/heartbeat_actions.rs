@@ -2121,9 +2121,9 @@ fn opens_with_decline(text: &str) -> bool {
 fn trailing_ask_start(text: &str) -> Option<usize> {
     let start = text.rfind('\n').map(|i| i + 1).unwrap_or(0);
     let line = text[start..].replace('\u{2019}', "'").to_lowercase();
-    let line = line.trim().trim_end_matches(|c: char| matches!(c, '*' | '_' | '"' | '\'' | ')' | ' '));
+    let line = line.trim().trim_end_matches(['*', '_', '"', '\'', ')', ' ']);
     let body = line.strip_suffix('?')?;
-    let sentence = match body.rfind(|c: char| matches!(c, '.' | '!' | ':')) {
+    let sentence = match body.rfind(['.', '!', ':']) {
         Some(i) => &body[i + 1..],
         None => body,
     };
@@ -6563,7 +6563,7 @@ mod non_answer_tests {
         assert!(inner.contains("gate_unattended_answer(action, text,"), "the gate must be called");
         assert!(inner.contains("non_answer_retry(state, prompt, conversation_id"), "retry uses the same enriched prompt");
         // and a question reply from channel_message passes the detector's scope: it is never gated
-        assert_eq!(detect_non_answer(&cfg["prompt"].as_str().unwrap().to_string()), Some(NonAnswer::AskedToProceed), "the detector alone would flag it: the scope is what protects it");
+        assert_eq!(detect_non_answer(cfg["prompt"].as_str().unwrap()), Some(NonAnswer::AskedToProceed), "the detector alone would flag it: the scope is what protects it");
     }
 
     #[test]
