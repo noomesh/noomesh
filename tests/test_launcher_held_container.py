@@ -439,3 +439,64 @@ def test_a_reown_stop_that_times_out_refuses_instead_of_chowning_on(tmp_path):
     """], capture_output=True, text=True, env={"PATH": "/usr/bin:/bin"})
     assert "RC=1" in r.stdout and "did not stop in time" in r.stderr, r.stdout + r.stderr
     assert not (tmp_path / "reown.sh.done").exists(), "the chown must not run"
+
+
+def test_the_sweep_never_starts_a_held_or_linked_container_even_if_asked_to(tmp_path):
+    """The sweep's own guards, not only the list it is given: a Created container of the HELD
+    service and one of a LINKED (left-out) service are named to it and still get no `start`."""
+    ins = Install(tmp_path)
+    st = ins.state()
+    for c in st["containers"]:
+        if c["name"] in ("noo-ollama-embed", "noo-stunnel-ollama-embed", "noo-loki"):
+            c["status"] = "created"
+    ins.state_path.write_text(json.dumps(st))
+    p, calls, took = _lib(ins, """
+        noo_hold_hung "" compose $COMPOSE_FILES $PROFILE_ARGS
+        _noo_sweep_created ollama-embed stunnel-ollama-embed loki
+        echo DONE
+    """)
+    assert "DONE" in p.stdout, p.stdout + p.stderr
+    started = [c for c in calls if c.startswith("start ")]
+    assert started == ["start noo-loki"], started
+    assert took < QUICK, took
+
+
+def test_a_probe_that_leaves_no_result_stops_the_launch_before_compose(tmp_path):
+    for script in ("noomesh-start.sh", "noomesh-restart.sh"):
+        sub = tmp_path / script
+        sub.mkdir()
+        ins = Install(sub)
+        p, calls, took = ins.run(script, env={"FAKE_INSPECT_KILLS_PROBE": "rd0000000003"})
+        out = p.stdout + p.stderr
+        assert p.returncode == 1, out
+        assert "Could not probe every container" in out and "nothing was started or restarted" in out, out
+        assert compose_calls(calls, "up") == [] and compose_calls(calls, "restart") == [], calls
+
+
+def test_a_probe_that_could_not_be_bounded_is_not_read_as_answered(tmp_path):
+    ins = Install(tmp_path)
+    p, calls, _ = _lib(ins, """
+        eval "$(declare -f _noo_bounded | sed '1s/_noo_bounded/_noo_bounded_orig/')"
+        _noo_bounded() {
+            case "$*" in *"inspect -f {{.State.Status}} pg0000000002"*) return 125 ;; esac
+            _noo_bounded_orig "$@"
+        }
+        noo_hold_hung "" compose $COMPOSE_FILES $PROFILE_ARGS; echo "RC=$?"
+    """)
+    assert "RC=3" in p.stdout, p.stdout + p.stderr
+    assert "Could not probe every container" in p.stderr + p.stdout
+
+
+def test_an_optional_dependency_does_not_make_the_controller_not_up(tmp_path):
+    cfg = json.loads(json.dumps(CFG))
+    cfg["services"]["gateway"]["depends_on"]["redis"]["required"] = False
+    ins = Install(tmp_path, cfg=cfg)
+    st = ins.state()
+    st["hung"] = "rd0000000003"
+    st["touch_hang"] = ["redis"]
+    ins.state_path.write_text(json.dumps(st))
+    p, calls, took = ins.run("noomesh-restart.sh")
+    out = p.stdout + p.stderr
+    assert p.returncode == 75, out
+    assert "THE CONTROLLER IS NOT UP" not in out, out
+    assert "noo-redis (redis)" in out
