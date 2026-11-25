@@ -434,13 +434,15 @@ func TestAQuickReplaceOfTheLastRoleNeverStops(t *testing.T) {
 	}
 }
 
-// newestPerBackend keeps each backend's latest unplace; a time that does not
-// parse never replaces one that does.
+// newestPerBackend keeps each backend's latest unplace, whatever order they
+// come in; an older one after it never replaces it, nor does a time that does
+// not parse.
 func TestTheNewestTombstoneOfABackendIsTheOneActedOn(t *testing.T) {
 	got := newestPerBackend([]unplacedTombstone{
 		{Backend: "ollama", Role: "embed", UnplacedAt: embedUnplacedAt},
 		{Backend: "reranker", Role: "rerank", UnplacedAt: unplacedAt},
 		{Backend: "ollama", Role: "chat", UnplacedAt: unplacedAt},
+		{Backend: "ollama", Role: "old", UnplacedAt: "2026-11-23T08:00:00.000Z"},
 		{Backend: "ollama", Role: "x", UnplacedAt: "not a time"},
 	})
 	if len(got) != 2 || got[0].Backend != "ollama" || got[0].UnplacedAt != unplacedAt || got[1].Backend != "reranker" {
