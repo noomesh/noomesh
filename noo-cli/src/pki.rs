@@ -2106,7 +2106,11 @@ impl ClusterCa {
     // ── Inventory ───────────────────────────────────────────────────
 
     /// Every *.crt under the PKI dir, sorted by path (ca.py `sorted(rglob)`
-    /// parity). Unparseable files are skipped silently, like Python.
+    /// parity), except under its dot-directories (rotation backups, forgotten
+    /// nodes' leftovers: see `collect_crts`). Every caller (`pki status`,
+    /// verify's `cert expiry`, `expiring_certs`, the CA rotation's leaf walks)
+    /// wants the live tree only, so the one listing is the filtered one.
+    /// Unparseable files are skipped silently, like Python.
     pub fn list_certs(&self) -> Vec<CertInfo> {
         let mut paths: Vec<PathBuf> = Vec::new();
         collect_crts(&self.dir, &mut paths);
@@ -2341,6 +2345,15 @@ fn collect_crts(dir: &Path, out: &mut Vec<PathBuf>) {
     for entry in rd.flatten() {
         let p = entry.path();
         if p.is_dir() {
+            // A dot-directory of the PKI dir is never live material:
+            // `.rotate-backup-*` / `.rotate-backup-ca-*` hold the copies a
+            // rotation took before it re-issued, `.forgotten-*` a removed
+            // node's leftovers. Listing them put every backed-up leaf in
+            // `pki status`, in verify's `cert expiry` row and in the next
+            // `rotate-all`'s scan, which would re-issue the backup's copies.
+            if entry.file_name().to_string_lossy().starts_with('.') {
+                continue;
+            }
             collect_crts(&p, out);
         } else if p.extension().is_some_and(|e| e == "crt") {
             out.push(p);
@@ -3630,6 +3643,35 @@ mod public_view_tests {
         let listed: Vec<String> = ca.list_certs().into_iter().map(|c| c.name).collect();
         assert!(listed.iter().all(|n| !n.starts_with("public")), "copies counted twice: {listed:?}");
         assert_eq!(listed.len(), 5, "ca, gateway, node, node door, loki: {listed:?}");
+    }
+
+    /// A rotation backup (`.rotate-backup-*`, `.rotate-backup-ca-*`) and a
+    /// forgotten node's leftovers (`.forgotten-*`) sit inside the PKI dir.
+    /// Neither is a certificate the cluster serves: listing them made `pki
+    /// status` and verify count 15 more "expiring" certificates and let a
+    /// second `rotate-all` pick them up.
+    #[test]
+    fn the_listing_skips_dot_directories_of_the_pki_dir() {
+        let ca = ClusterCa::new(scratch());
+        ca.generate_ca("t", 3650).unwrap();
+        let (loki_crt, _) = ca.issue_service_cert("loki", &[], &[], 1).unwrap();
+        let live: Vec<String> = ca.list_certs().into_iter().map(|c| c.name).collect();
+        for dir in [
+            ".rotate-backup-1/gateway/gateway.crt",
+            ".rotate-backup-ca-2/services/loki/service.crt",
+            ".forgotten-host9-3/nodes/host9/node.crt",
+        ] {
+            let dst = ca.dir.join(dir);
+            std::fs::create_dir_all(dst.parent().unwrap()).unwrap();
+            std::fs::copy(&loki_crt, &dst).unwrap();
+        }
+        let after: Vec<String> = ca.list_certs().into_iter().map(|c| c.name).collect();
+        assert_eq!(after, live, "backup and forgotten copies are not listed");
+        assert!(after.iter().all(|n| !n.starts_with('.')), "{after:?}");
+        assert!(
+            ca.expiring_certs(100_000).iter().all(|c| !c.name.starts_with('.')),
+            "rotate-all's scan must not reach a backup"
+        );
     }
 
     /// PLANT TARGET: rotation (`rotate-all`, `rotate`, the heartbeat's
