@@ -19,6 +19,7 @@ from tests import _rust_src as rs
 
 ROOT = Path(__file__).resolve().parents[1]
 GO = (ROOT / "node-agent-go/internal/backendrt/ollama_telemetry.go").read_text()
+RS_RAW = (ROOT / "noo-cli/src/commands/enroll.rs").read_text()
 RS = rs.own_code((ROOT / "noo-cli/src/commands/enroll.rs").read_text())
 
 
@@ -82,3 +83,24 @@ def test_the_wanted_file_shape_is_the_same_on_both_sides():
     rec = GO.split("func (g *OllamaGuard) recordWanted", 1)[1].split("\nfunc ", 1)[0]
     assert "g.TuningKnown == nil || !g.TuningKnown()" in rec
     assert re.search(r"TuningKnown:\s+OllamaTuningKnown,", GO), "NewOllamaGuard must wire TuningKnown"
+
+
+def test_every_value_the_agent_emits_is_in_the_list_the_rust_validator_is_tested_with():
+    # Rust's validator test runs AGENT_EMITTED through it; this keeps that list
+    # equal to what the Go side can format for each key.
+    m = re.search(r"const AGENT_EMITTED: \[\(&str, &str\); \d+\] = \[(.*?)\];", RS_RAW, re.S)
+    assert m, "this guard is stale: AGENT_EMITTED is gone"
+    listed = set(re.findall(r'\("([A-Z_]+)", "([^"]*)"\)', m.group(1)))
+    emitted: set[tuple[str, str]] = set()
+    for f in ("reconcile/multirole.go", "reconcile/harness_profile.go"):
+        src = (ROOT / "node-agent-go/internal" / f).read_text()
+        emitted |= set(re.findall(r'env\["(OLLAMA_[A-Z_]+)"\] = "([^"]*)"', src))
+    assert emitted, "this guard is stale: the agent's literal env values moved"
+    assert emitted <= listed, f"the agent emits {emitted - listed} that the validator is not tested with"
+    # decimal integers: the counts are formatted with strconv.Itoa on the Go side
+    multi = (ROOT / "node-agent-go/internal/reconcile/multirole.go").read_text()
+    assert 'env["OLLAMA_MAX_LOADED_MODELS"] = strconv.Itoa(' in multi
+    prof = (ROOT / "node-agent-go/internal/reconcile/harness_profile.go").read_text()
+    assert "strconv.Itoa(prof.Context)" in prof
+    for k in ("OLLAMA_MAX_LOADED_MODELS", "OLLAMA_CONTEXT_LENGTH"):
+        assert any(key == k and v.isdigit() for key, v in listed)

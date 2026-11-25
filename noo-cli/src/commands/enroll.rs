@@ -1757,34 +1757,44 @@ pub(crate) struct OllamaWanted {
 /// Whether `v` has the shape Ollama accepts for `key`. The file is writable by
 /// the node's user and enroll writes it into a root LaunchDaemon plist, so
 /// nothing outside these shapes is written: a count is digits; keep-alive is
-/// `-1`, seconds, or a Go duration (`5m`, `1h30m`); flash attention is a
-/// boolean; the KV cache type is one Ollama lists.
+/// what Ollama parses (a signed integer of seconds, or a Go duration such as
+/// `5m`, `-5m`, `1.5h`, `1h30m`); flash attention is a Go `ParseBool` form; a
+/// KV cache type is a short lowercase name, so a type newer than this CLI is
+/// not refused.
 pub(crate) fn ollama_tuning_value_ok(key: &str, v: &str) -> bool {
     let digits = |s: &str| !s.is_empty() && s.len() <= 9 && s.bytes().all(|b| b.is_ascii_digit());
     match key {
         "OLLAMA_NUM_PARALLEL" | "OLLAMA_MAX_LOADED_MODELS" | "OLLAMA_CONTEXT_LENGTH" => digits(v),
         "OLLAMA_KEEP_ALIVE" => {
-            if v == "-1" || digits(v) {
+            let body = v.strip_prefix(['-', '+']).unwrap_or(v);
+            if digits(body) {
                 return true;
             }
-            // one or more <digits><unit> groups, unit in ms|s|m|h
-            let mut rest = v;
+            // Go's time.ParseDuration: one or more <number><unit>, number
+            // digits with an optional fraction, unit ns|us|µs|μs|ms|s|m|h.
+            let mut rest = body;
             let mut groups = 0;
             while !rest.is_empty() {
-                let n = rest.bytes().take_while(u8::is_ascii_digit).count();
-                if n == 0 || n > 9 {
+                let int = rest.bytes().take_while(u8::is_ascii_digit).count();
+                rest = &rest[int..];
+                let mut frac = 0;
+                if let Some(r) = rest.strip_prefix('.') {
+                    frac = r.bytes().take_while(u8::is_ascii_digit).count();
+                    rest = &r[frac..];
+                }
+                if int + frac == 0 || int > 9 || frac > 9 {
                     return false;
                 }
-                rest = &rest[n..];
-                let unit = ["ms", "s", "m", "h"].into_iter().find(|u| rest.starts_with(u));
-                let Some(u) = unit else { return false };
+                let Some(u) = ["ns", "us", "\u{b5}s", "\u{3bc}s", "ms", "s", "m", "h"].into_iter().find(|u| rest.starts_with(u)) else {
+                    return false;
+                };
                 rest = &rest[u.len()..];
                 groups += 1;
             }
             groups > 0
         }
-        "OLLAMA_FLASH_ATTENTION" => matches!(v, "0" | "1" | "true" | "false"),
-        "OLLAMA_KV_CACHE_TYPE" => matches!(v, "f16" | "q8_0" | "q4_0"),
+        "OLLAMA_FLASH_ATTENTION" => matches!(v, "1" | "t" | "T" | "TRUE" | "true" | "True" | "0" | "f" | "F" | "FALSE" | "false" | "False"),
+        "OLLAMA_KV_CACHE_TYPE" => (1..=16).contains(&v.len()) && v.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_'),
         _ => false,
     }
 }
@@ -2324,6 +2334,25 @@ mod tests {
         assert_eq!(plan, again);
     }
 
+    // Every value shape the node agent itself emits for a tuning key (read
+    // from its source by tests/test_mac_ollama_env_parity.py): the literal
+    // `-1`, and decimal integers from strconv.Itoa. All must pass.
+    const AGENT_EMITTED: [(&str, &str); 6] = [
+        ("OLLAMA_KEEP_ALIVE", "-1"),
+        ("OLLAMA_MAX_LOADED_MODELS", "3"),
+        ("OLLAMA_CONTEXT_LENGTH", "32768"),
+        ("OLLAMA_NUM_PARALLEL", "2"),
+        ("OLLAMA_FLASH_ATTENTION", "1"),
+        ("OLLAMA_KV_CACHE_TYPE", "q8_0"),
+    ];
+
+    #[test]
+    fn the_mac_ollama_validator_accepts_what_the_agent_emits() {
+        for (k, v) in AGENT_EMITTED {
+            assert!(super::ollama_tuning_value_ok(k, v), "{k}={v}");
+        }
+    }
+
     // Per key: a value of the right shape passes, one other shape is refused,
     // and a value over 128 bytes never reaches the plist.
     #[test]
@@ -2342,11 +2371,25 @@ mod tests {
             let w = super::ollama_wanted_env(&j).expect("an object");
             assert!(w.set.is_empty() && w.rejected == [k.to_string()], "{k}: {w:?}");
         }
-        for ok in ["5m", "24h", "1h30m", "300", "90s"] {
-            assert!(super::ollama_tuning_value_ok("OLLAMA_KEEP_ALIVE", ok), "{ok}");
+        // The unusual forms Ollama accepts, one list per key.
+        for (k, ok) in [
+            ("OLLAMA_KEEP_ALIVE", ["5m", "24h", "1h30m", "300", "90s"].as_slice()),
+            ("OLLAMA_KEEP_ALIVE", ["-5m", "1.5h", ".5s", "+2m", "-1", "100ms", "2us"].as_slice()),
+            ("OLLAMA_FLASH_ATTENTION", ["1", "t", "T", "TRUE", "true", "True", "0", "f", "F", "FALSE", "false", "False"].as_slice()),
+            ("OLLAMA_KV_CACHE_TYPE", ["f16", "q8_0", "q4_0", "q5_1", "bf16", "tq1"].as_slice()),
+        ] {
+            for v in ok {
+                assert!(super::ollama_tuning_value_ok(k, v), "{k}={v}");
+            }
         }
-        for bad in ["m", "5x", "1h30", "-2", "1d"] {
-            assert!(!super::ollama_tuning_value_ok("OLLAMA_KEEP_ALIVE", bad), "{bad}");
+        for (k, bad) in [
+            ("OLLAMA_KEEP_ALIVE", ["m", "5x", "1h30", "1d", ".", "--1", "5 m", "1e3s"].as_slice()),
+            ("OLLAMA_FLASH_ATTENTION", ["yes", "on", "tRUE", "2", ""].as_slice()),
+            ("OLLAMA_KV_CACHE_TYPE", ["Q8", "a-b", "x y", "", "seventeen_chars_xx"].as_slice()),
+        ] {
+            for v in bad {
+                assert!(!super::ollama_tuning_value_ok(k, v), "{k}={v}");
+            }
         }
         let long = format!(r#"{{"known":true,"env":{{"OLLAMA_CONTEXT_LENGTH":"{}"}}}}"#, "1".repeat(129));
         let w = super::ollama_wanted_env(&long).expect("an object");
