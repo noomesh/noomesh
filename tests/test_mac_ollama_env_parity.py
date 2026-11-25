@@ -47,15 +47,27 @@ def test_both_sides_name_the_same_wanted_env_file():
     assert go and rust and go.group(1) == rust.group(1)
 
 
+def test_both_sides_use_the_same_path_for_the_wanted_env_file():
+    go = re.search(r'WantedFile:\s*filepath\.Join\(home, "([^"]+)", OllamaWantedEnvFile\)', GO)
+    assert go, "this guard is stale: NewOllamaGuard no longer sets WantedFile from home"
+    caller = rs.fn_body(RS, "fn darwin_ollama_boot_service")
+    rust = re.search(r'"\{\}/([^/{}"]+)/\{OLLAMA_WANTED_ENV_FILE\}"', caller)
+    assert rust, "this guard is stale: enroll no longer reads {home}/<dir>/<file>"
+    assert go.group(1) == rust.group(1)
+    assert "home.trim_end_matches('/')" in caller
+
+
 def test_enroll_writes_the_tuning_it_reads_into_the_boot_plist():
     plan = rs.fn_body(RS, "fn darwin_ollama_boot_plan")
-    assert "for (k, v) in tuning" in plan and "EnvironmentVariables.{k}" in plan
+    assert "for (k, v) in &w.set" in plan and "EnvironmentVariables.{k}" in plan
+    assert "plutil -remove EnvironmentVariables.{k}" in plan and "for k in OLLAMA_TUNING_KEYS" in plan
+    assert "fn ollama_tuning_value_ok" in RS
     caller = rs.fn_body(RS, "fn darwin_ollama_boot_service")
     assert "OLLAMA_WANTED_ENV_FILE" in caller and "ollama_wanted_env" in caller
 
 
 def test_the_refusal_still_offers_resume_only_while_it_applies_the_recorded_env():
     drift = GO.split("func (g *OllamaGuard) reportSystemDrift", 1)[1].split("\nfunc ", 1)[0]
-    if "noo enroll --resume" in drift:
-        assert "g.recordWanted()" in drift
+    assert "or run `noo enroll --resume`" in drift
+    assert "g.recordWanted()" in drift
     assert "bootout system/" in drift and "2>/dev/null || true" in drift
