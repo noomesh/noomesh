@@ -188,12 +188,15 @@ pub fn parse_owner(text: &str) -> Result<(u32, String), String> {
     }
 }
 
-// ── Which declared containers are down, and which are held ────────
+// ── Which of an add-on's containers are down, and which are held ──
 
-/// An add-on's declared containers (`x-noo-addon: containers`) as they are
-/// now: `down` are expected to run and do not; `held` the launcher never
-/// starts (a GPU, the Docker socket or privileged mode, `resources::holds`),
-/// with why. A held container is neither expected to run nor started.
+/// An add-on's containers as they are now: `down` are expected to run and do
+/// not; `unhealthy` run but report an unhealthy healthcheck (`starting` is
+/// not unhealthy); `held` the launcher never starts (a GPU, the Docker
+/// socket or privileged mode, `resources::holds`), with why. A held
+/// container is neither expected to run nor started. "Expected" is every
+/// name in `x-noo-addon: containers` plus every compose service of the
+/// overlay that has no `profiles:` key (a profiled service is optional).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Containers {
     pub down: Vec<String>,
@@ -202,21 +205,137 @@ pub struct Containers {
     /// containers to check: verify WARNs, after-boot skips it with one log
     /// line. Never a FAIL: the operator cannot fix a third-party overlay.
     pub undeclared: bool,
+    /// Running with `State.Health.Status == unhealthy`. Reported by verify;
+    /// never a reason for after-boot to start the add-on.
+    pub unhealthy: Vec<String>,
 }
 
-/// Split `declared` against what is `running` and what the launcher holds
-/// (`held`: container name and why). Pure; [`down_containers_at`] reads the
-/// three from the machine.
-pub fn split_containers(declared: &[String], running: &[String], held: &[(String, String)]) -> Containers {
-    let mut c = Containers::default();
-    for d in declared {
-        if let Some((_, why)) = held.iter().find(|(h, _)| h == d) {
-            c.held.push((d.clone(), why.clone()));
-        } else if !running.contains(d) {
-            c.down.push(d.clone());
+/// One container (any state) as `docker inspect` reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Seen {
+    pub name: String,
+    /// Its `com.docker.compose.service` label; empty when it has none.
+    pub service: String,
+    /// `.State.Status`: running, exited, restarting, created, dead, ...
+    pub state: String,
+    pub exit_code: i32,
+    /// `.State.Health.Status`; empty when the container has no healthcheck.
+    pub health: String,
+}
+
+/// The format [`parse_states`] reads. Separate from the pin logic's
+/// `INSPECT_FORMAT`, which must not change.
+pub const STATE_FORMAT: &str = "{{.Name}}\t{{index .Config.Labels \"com.docker.compose.service\"}}\t{{.State.Status}}\t{{.State.ExitCode}}\t{{if .State.Health}}{{.State.Health.Status}}{{end}}";
+
+/// Parse [`STATE_FORMAT`] output. Any other line is an error, never skipped.
+pub fn parse_states(out: &str) -> Result<Vec<Seen>, String> {
+    out.lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| {
+            let f: Vec<&str> = l.split('\t').collect();
+            let [n, svc, state, code, health] = f.as_slice() else {
+                return Err(format!("unexpected docker inspect line {l:?}"));
+            };
+            let exit_code = code.trim().parse::<i32>().map_err(|_| format!("unexpected docker inspect line {l:?}"))?;
+            if n.is_empty() || state.is_empty() {
+                return Err(format!("unexpected docker inspect line {l:?}"));
+            }
+            Ok(Seen {
+                name: n.trim_start_matches('/').to_string(),
+                service: svc.trim().to_string(),
+                state: state.trim().to_string(),
+                exit_code,
+                health: health.trim().to_string(),
+            })
+        })
+        .collect()
+}
+
+/// One container the add-on is expected to run.
+struct Want {
+    /// What the row names: the container name when the overlay sets one.
+    label: String,
+    /// Match a container by this name when set, else by `service`.
+    cname: Option<String>,
+    service: Option<String>,
+    /// Meant to run once and exit 0 (see [`judge_containers`]).
+    oneshot: bool,
+}
+
+fn yaml_restart_is_no(def: &serde_yaml::Value) -> bool {
+    match def.get("restart") {
+        Some(serde_yaml::Value::String(s)) => s == "no",
+        Some(serde_yaml::Value::Bool(b)) => !b,
+        _ => false,
+    }
+}
+
+/// Judge an add-on's containers against what docker `seen` (every state).
+/// Pure; [`down_containers_at`] reads the inputs from the machine.
+///
+/// Expected = `decl` (the overlay's `x-noo-addon: containers`) UNION every
+/// compose service without a `profiles:` key. A service resolves to its
+/// container by `container_name` when the overlay sets one, else by the
+/// `com.docker.compose.service` label. A one-shot (a service on the declared
+/// list `oneshots`, or one whose overlay says `restart: "no"`) is excused
+/// when no container of it exists or every one exited 0; anything else not
+/// running is `down`. A running container whose health is `unhealthy` is
+/// listed in `unhealthy`. `held` names are neither.
+pub fn judge_containers(
+    decl: &[String],
+    overlay: &str,
+    seen: &[Seen],
+    held: &[(String, String)],
+    oneshots: &[String],
+) -> Result<Containers, String> {
+    let doc: serde_yaml::Value = serde_yaml::from_str(overlay).map_err(|e| format!("the overlay is not valid YAML ({e})"))?;
+    let mut wants: Vec<Want> = Vec::new();
+    if let Some(services) = doc.get("services").and_then(|s| s.as_mapping()) {
+        for (k, def) in services {
+            let Some(svc) = k.as_str() else { continue };
+            let cname = def.get("container_name").and_then(|c| c.as_str()).map(str::to_string);
+            let label = cname.clone().unwrap_or_else(|| svc.to_string());
+            let listed = decl.iter().any(|d| d == &label || d == svc);
+            if def.get("profiles").is_some() && !listed {
+                continue;
+            }
+            let oneshot = yaml_restart_is_no(def) || crate::oneshots::is_oneshot_in(svc, oneshots) || crate::oneshots::is_oneshot_in(&label, oneshots);
+            wants.push(Want { label, cname, service: Some(svc.to_string()), oneshot });
         }
     }
-    c
+    for d in decl {
+        if !wants.iter().any(|w| &w.label == d || w.service.as_deref() == Some(d.as_str())) {
+            wants.push(Want { label: d.clone(), cname: Some(d.clone()), service: None, oneshot: crate::oneshots::is_oneshot_in(d, oneshots) });
+        }
+    }
+    let mut c = Containers::default();
+    for w in &wants {
+        if let Some((_, why)) = held.iter().find(|(h, _)| h == &w.label) {
+            c.held.push((w.label.clone(), why.clone()));
+            continue;
+        }
+        let mine: Vec<&Seen> = seen
+            .iter()
+            .filter(|s| match (&w.cname, &w.service) {
+                (Some(n), _) => &s.name == n,
+                (None, Some(svc)) => &s.service == svc,
+                (None, None) => false,
+            })
+            .collect();
+        let running: Vec<&&Seen> = mine.iter().filter(|s| s.state == "running").collect();
+        if !running.is_empty() {
+            if running.iter().any(|s| s.health == "unhealthy") {
+                c.unhealthy.push(w.label.clone());
+            }
+            continue;
+        }
+        let finished = mine.iter().all(|s| s.state == "exited" && s.exit_code == 0);
+        if w.oneshot && finished {
+            continue;
+        }
+        c.down.push(w.label.clone());
+    }
+    Ok(c)
 }
 
 /// The containers the launcher holds for this overlay, by container name:
@@ -671,19 +790,52 @@ impl Run for Live<'_> {
     }
 }
 
-/// The add-on's declared containers (`x-noo-addon: containers`) on the
-/// install at `root`: which are down, and which the launcher holds.
+/// The add-on's containers on the install at `root` (the names in
+/// `x-noo-addon: containers` and every non-profiled compose service): which
+/// are down, which are unhealthy, and which the launcher holds.
 pub(crate) fn down_containers_at(root: &Path, addon: &str) -> Result<Containers, String> {
-    use crate::addons::resolve::Docker as _;
     let overlay = crate::addons::pins::addon_dir(root, addon).join("docker-compose.yml");
     let text = std::fs::read_to_string(&overlay).map_err(|e| format!("{}: {e}", overlay.display()))?;
     let Some(decl) = crate::addon_decl_parse::parse_decl(&format!("{addon}'s overlay"), &text, Some(addon))? else {
         return Ok(Containers { undeclared: true, ..Default::default() });
     };
-    let mut docker = crate::addons::resolve::LiveDocker::new(root);
-    let running: Vec<String> = docker.running().map_err(|e| format!("could not list running containers: {e}"))?.into_iter().map(|c| c.name).collect();
+    let seen = read_states().map_err(|e| format!("could not list containers: {e}"))?;
     let held = held_containers(&text, crate::addons::resolve::third_party(addon))?;
-    Ok(split_containers(&decl.containers, &running, &held))
+    judge_containers(&decl.containers, &text, &seen, &held, crate::oneshots::declared())
+}
+
+/// Every container docker has, in any state: `docker ps -aq`, then one
+/// inspect of [`STATE_FORMAT`]. A container removed between the two fails the
+/// inspect; read once more before calling it an error.
+fn read_states() -> Result<Vec<Seen>, String> {
+    let mut last = String::new();
+    for _ in 0..2 {
+        let ps = std::process::Command::new("docker")
+            .args(["ps", "-aq", "--no-trunc"])
+            .output()
+            .map_err(|e| format!("docker ps: {e}"))?;
+        if !ps.status.success() {
+            return Err(format!("docker ps: {}", String::from_utf8_lossy(&ps.stderr).trim()));
+        }
+        let ids: Vec<String> = String::from_utf8_lossy(&ps.stdout).split_whitespace().map(String::from).collect();
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let out = std::process::Command::new("docker")
+            .args(["inspect", "--type", "container", "--format", STATE_FORMAT])
+            .args(&ids)
+            .output()
+            .map_err(|e| format!("docker inspect: {e}"))?;
+        if out.status.success() {
+            let found = parse_states(&String::from_utf8_lossy(&out.stdout)).map_err(|e| format!("docker inspect: {e}"))?;
+            if found.len() != ids.len() {
+                return Err(format!("docker inspect: {} of {} containers read", found.len(), ids.len()));
+            }
+            return Ok(found);
+        }
+        last = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    }
+    Err(format!("docker inspect: {last}"))
 }
 
 /// A random (version 4) UUID from 16 bytes of the kernel's randomness.
@@ -859,7 +1011,7 @@ mod tests {
             } else {
                 self.down.get(addon).cloned().unwrap_or_default()
             };
-            Ok(Containers { down, held, undeclared: self.undeclared.iter().any(|u| u == addon) })
+            Ok(Containers { down, held, undeclared: self.undeclared.iter().any(|u| u == addon), ..Default::default() })
         }
         fn guard_refusal(&mut self, addon: &str) -> Option<String> {
             self.guard.get(addon).cloned()
@@ -1190,19 +1342,77 @@ mod tests {
         );
     }
 
+    fn seen(name: &str, service: &str, state: &str, exit_code: i32, health: &str) -> Seen {
+        Seen { name: name.into(), service: service.into(), state: state.into(), exit_code, health: health.into() }
+    }
+
+    const TWO_SERVICES: &str = "services:\n  web:\n    container_name: noo-rhaddon\n    image: x\n  worker:\n    container_name: noo-rhaddon-worker\n    image: x\n  gpu:\n    container_name: noo-rhaddon-gpu\n    image: x\n";
+
     /// A held container (the launcher's hold) is neither expected to run nor
-    /// started; another declared container that is down still is. Not
+    /// started; another expected container that is down still is. Not
     /// subtracting holds turns a held GPU worker into a FAIL every boot.
     #[test]
     fn a_held_container_is_not_down_and_another_down_one_still_is() {
         let declared = vec!["noo-rhaddon".to_string(), "noo-rhaddon-gpu".to_string()];
+        let overlay = "services:\n  web:\n    container_name: noo-rhaddon\n  gpu:\n    container_name: noo-rhaddon-gpu\n";
         let held = vec![("noo-rhaddon-gpu".to_string(), "asks for a GPU".to_string())];
-        let c = split_containers(&declared, &["noo-rhaddon".to_string()], &held);
-        assert_eq!(c, Containers { down: vec![], held: held.clone(), undeclared: false }, "held only: nothing is down");
-        let c = split_containers(&declared, &[], &held);
+        let up = [seen("noo-rhaddon", "web", "running", 0, "")];
+        let c = judge_containers(&declared, overlay, &up, &held, &[]).unwrap();
+        assert_eq!(c, Containers { held: held.clone(), ..Default::default() }, "held only: nothing is down");
+        let c = judge_containers(&declared, overlay, &[], &held, &[]).unwrap();
         assert_eq!(c.down, vec!["noo-rhaddon".to_string()], "only the container that should run is down");
         assert_eq!(c.held, held);
-        assert_eq!(split_containers(&declared, &[], &[]).down, declared, "without a hold both are down");
+        assert_eq!(judge_containers(&declared, overlay, &[], &[], &[]).unwrap().down, declared, "without a hold both are down");
+    }
+
+    /// A compose service that `x-noo-addon: containers` does not list is
+    /// still expected: Exited (127) next to a running sibling is down, and
+    /// an unhealthy running container is named, not passed.
+    #[test]
+    fn a_service_outside_the_declared_list_is_expected_and_health_is_read() {
+        let decl = vec!["noo-rhaddon".to_string()];
+        let s = [seen("noo-rhaddon", "web", "running", 0, "unhealthy"), seen("noo-rhaddon-worker", "worker", "exited", 127, "")];
+        let c = judge_containers(&decl, TWO_SERVICES, &s, &[], &[]).unwrap();
+        assert_eq!(c.down, vec!["noo-rhaddon-worker".to_string(), "noo-rhaddon-gpu".to_string()], "{c:?}");
+        assert_eq!(c.unhealthy, vec!["noo-rhaddon".to_string()], "{c:?}");
+        // `starting` is not unhealthy; with every service up nothing is named.
+        let s = [
+            seen("noo-rhaddon", "web", "running", 0, "starting"),
+            seen("noo-rhaddon-worker", "worker", "running", 0, "healthy"),
+            seen("noo-rhaddon-gpu", "gpu", "running", 0, ""),
+        ];
+        let c = judge_containers(&decl, TWO_SERVICES, &s, &[], &[]).unwrap();
+        assert_eq!(c, Containers::default(), "{c:?}");
+    }
+
+    /// A service without `container_name` resolves by its compose label; a
+    /// profiled service is optional; a one-shot that finished (exit 0) or
+    /// never ran is not down, one that failed is.
+    #[test]
+    fn services_resolve_by_label_profiles_are_optional_and_one_shots_may_exit() {
+        let decl = vec!["noo-rhaddon".to_string()];
+        let overlay = "services:\n  web:\n    container_name: noo-rhaddon\n  api:\n    image: x\n  extra:\n    image: x\n    profiles: [debug]\n  routes:\n    image: x\n    restart: \"no\"\n  prep:\n    image: x\n";
+        let base = [seen("noo-rhaddon", "web", "running", 0, ""), seen("acme-api-1", "api", "running", 0, "")];
+        let c = judge_containers(&decl, overlay, &base, &[], &["prep".to_string()]).unwrap();
+        assert_eq!(c, Containers::default(), "profiled absent, one-shots never created: ok: {c:?}");
+        let mut done = base.to_vec();
+        done.push(seen("acme-routes-1", "routes", "exited", 0, ""));
+        done.push(seen("acme-prep-1", "prep", "exited", 0, ""));
+        assert_eq!(judge_containers(&decl, overlay, &done, &[], &["prep".to_string()]).unwrap(), Containers::default());
+        let mut bad = base.to_vec();
+        bad.push(seen("acme-routes-1", "routes", "exited", 1, ""));
+        assert_eq!(judge_containers(&decl, overlay, &bad, &[], &[]).unwrap().down, vec!["routes".to_string(), "prep".to_string()]);
+        // Without the declared list, `prep` (no `restart: "no"`) is expected.
+        assert_eq!(judge_containers(&decl, overlay, &done, &[], &[]).unwrap().down, vec!["prep".to_string()]);
+    }
+
+    #[test]
+    fn state_lines_parse_with_and_without_a_healthcheck() {
+        let out = "/noo-a\tweb\trunning\t0\thealthy\n/noo-b\t\texited\t127\t\n";
+        let v = parse_states(out).unwrap();
+        assert_eq!(v[0], seen("noo-a", "web", "running", 0, "healthy"));
+        assert_eq!(v[1], seen("noo-b", "", "exited", 127, ""));
+        assert!(parse_states("garbage").is_err());
     }
 
     /// The hold is the launcher's (`resources::holds`), for a third-party

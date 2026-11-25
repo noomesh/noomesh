@@ -8432,11 +8432,13 @@ pub(crate) fn tailnet_merge_missing(j: &Value) -> Option<Vec<String>> {
     Some(out)
 }
 
-/// The `add-on containers` row for one enabled add-on (i509): its declared
-/// containers (`x-noo-addon: containers`) that are not running, or why they
-/// could not be read. Down is a FAIL naming `noo stack restart <addon>`: after
-/// a reboot, nothing else says that an add-on did not come back. A container
-/// the launcher HOLDS (`addon_after_boot::split_containers`, the launcher's
+/// The `add-on containers` row for one enabled add-on (i509): the containers
+/// it declares (`x-noo-addon: containers`) or its compose file starts (every
+/// service without `profiles:`) that are not running or are unhealthy, or
+/// why they could not be read. Not running is a FAIL naming `noo stack start`,
+/// unhealthy a FAIL naming `noo stack restart <addon>`: after a reboot,
+/// nothing else says that an add-on did not come back. A container the
+/// launcher HOLDS (`addon_after_boot::judge_containers`, the launcher's
 /// own rule) is not expected to run: a note on an OK row, never a FAIL. An
 /// add-on whose overlay declares no containers (no `x-noo-addon` block) is a
 /// WARN: a row red forever for what the operator cannot fix trains people to
@@ -8446,15 +8448,29 @@ pub(crate) fn addon_containers_row(addon: &str, state: Result<crate::commands::a
     let restart = format!("noo stack restart {addon}");
     match state {
         Ok(c) if c.undeclared => warn(ROW, format!("{addon}: declares no containers, so they aren't checked"), None),
-        Ok(c) if c.down.is_empty() => {
+        Ok(c) if c.down.is_empty() && c.unhealthy.is_empty() => {
             let held: Vec<String> = c.held.iter().map(|(h, why)| format!("held: {h} ({why})")).collect();
             if held.is_empty() {
-                ok(ROW, format!("{addon}: every declared container is running"))
+                ok(ROW, format!("{addon}: every container the add-on declares or its compose file starts is running"))
             } else {
                 ok(ROW, format!("{addon}: every container that should run is running; {}", held.join("; ")))
             }
         }
-        Ok(c) => fail(ROW, format!("{addon}: not running: {}", c.down.join(", ")), restart),
+        Ok(c) => {
+            let mut why: Vec<String> = Vec::new();
+            let mut remedy: Vec<String> = Vec::new();
+            if !c.down.is_empty() {
+                why.push(format!("not running: {}", c.down.join(", ")));
+                remedy.push("noo stack start".to_string());
+            }
+            if !c.unhealthy.is_empty() {
+                why.push(format!("unhealthy: {}", c.unhealthy.join(", ")));
+                remedy.push(restart.clone());
+            }
+            let first = c.down.first().or(c.unhealthy.first()).map(String::as_str).unwrap_or("<service>");
+            remedy.push(format!("noo stack logs {first}"));
+            fail(ROW, format!("{addon}: {}", why.join("; ")), remedy.join("; "))
+        }
         Err(e) => fail(ROW, format!("{addon}: whether its containers run could not be read ({e})"), restart),
     }
 }
@@ -11134,30 +11150,60 @@ mod tests {
     /// i509 step 5: an enabled add-on that is down FAILS, naming it and the
     /// restart; one that runs passes; an unreadable state is not a pass.
     #[test]
-    fn an_enabled_add_on_whose_containers_are_down_fails_and_names_the_restart() {
-        use crate::commands::addon_after_boot::split_containers;
-        let declared = vec!["noo-rhaddon".to_string(), "noo-rhaddon-worker".to_string(), "noo-rhaddon-gpu".to_string()];
-        let all: Vec<String> = declared[..2].to_vec();
+    fn an_enabled_add_on_whose_containers_are_down_fails_and_names_the_start() {
+        use crate::commands::addon_after_boot::Containers;
         let gpu = vec![("noo-rhaddon-gpu".to_string(), "asks for a GPU".to_string())];
-        let up = super::addon_containers_row("rhaddon", Ok(split_containers(&declared[..2], &all, &[])));
+        let up = super::addon_containers_row("rhaddon", Ok(Containers::default()));
         assert_eq!((up.name, up.verdict), ("add-on containers", super::Verdict::Ok), "{up:?}");
-        assert!(up.detail.starts_with("rhaddon: "), "{up:?}");
-        let down = super::addon_containers_row("rhaddon", Ok(split_containers(&declared[..2], &[], &[])));
+        assert!(up.detail.starts_with("rhaddon: ") && up.detail.contains("declares or its compose file starts is running"), "{up:?}");
+        let down = super::addon_containers_row("rhaddon", Ok(Containers { down: vec!["noo-rhaddon".into(), "noo-rhaddon-worker".into()], ..Default::default() }));
         assert_eq!(down.verdict, super::Verdict::Fail, "{down:?}");
-        assert!(down.detail.contains("rhaddon") && down.detail.contains("noo-rhaddon, noo-rhaddon-worker"), "{down:?}");
-        assert_eq!(down.remedy.as_deref(), Some("noo stack restart rhaddon"));
+        assert!(down.detail.contains("rhaddon") && down.detail.contains("not running: noo-rhaddon, noo-rhaddon-worker"), "{down:?}");
+        let remedy = down.remedy.as_deref().unwrap();
+        assert!(remedy.contains("noo stack start") && remedy.contains("noo stack logs noo-rhaddon"), "{down:?}");
         let unknown = super::addon_containers_row("rhaddon", Err("docker is not answering".into()));
         assert_eq!(unknown.verdict, super::Verdict::Fail, "an unreadable state is never a pass: {unknown:?}");
         assert!(unknown.detail.contains("docker is not answering"), "{unknown:?}");
         assert_eq!(unknown.remedy.as_deref(), Some("noo stack restart rhaddon"));
         // A held container is a note, not a FAIL (the launcher never starts it).
-        let held = super::addon_containers_row("rhaddon", Ok(split_containers(&declared, &all, &gpu)));
+        let held = super::addon_containers_row("rhaddon", Ok(Containers { held: gpu.clone(), ..Default::default() }));
         assert_eq!(held.verdict, super::Verdict::Ok, "a held container is not a FAIL: {held:?}");
         assert!(held.detail.contains("held: noo-rhaddon-gpu (asks for a GPU)"), "{held:?}");
         // Held plus another one down: a FAIL that names only the down one.
-        let both = super::addon_containers_row("rhaddon", Ok(split_containers(&declared, &["noo-rhaddon".to_string()], &gpu)));
+        let both = super::addon_containers_row("rhaddon", Ok(Containers { down: vec!["noo-rhaddon-worker".into()], held: gpu, ..Default::default() }));
         assert_eq!(both.verdict, super::Verdict::Fail, "{both:?}");
         assert!(both.detail.contains("not running: noo-rhaddon-worker") && !both.detail.contains("noo-rhaddon-gpu"), "{both:?}");
+    }
+
+    /// 0.6.30 live fleet: after a reboot one service of an add-on was Exited
+    /// (127) and another Up (unhealthy), and the row said every declared
+    /// container ran. The expected set is the declared names plus every
+    /// non-profiled compose service, and health is read.
+    #[test]
+    fn an_exited_service_outside_the_declared_list_and_an_unhealthy_one_fail() {
+        use crate::commands::addon_after_boot::{judge_containers, Seen};
+        let overlay = "services:\n  web:\n    container_name: noo-rhaddon\n    image: x\n  worker:\n    container_name: noo-rhaddon-worker\n    image: x\n  debug:\n    container_name: noo-rhaddon-debug\n    image: x\n    profiles: [debug]\n  routes:\n    image: x\n    restart: \"no\"\n";
+        let decl = vec!["noo-rhaddon".to_string()];
+        let seen = |n: &str, svc: &str, st: &str, code: i32, h: &str| Seen { name: n.into(), service: svc.into(), state: st.into(), exit_code: code, health: h.into() };
+        let judge = |s: &[Seen]| super::addon_containers_row("rhaddon", judge_containers(&decl, overlay, s, &[], &[]));
+        // Healthy; the profiled service is absent and the finished one-shot exited 0.
+        let ok = judge(&[
+            seen("noo-rhaddon", "web", "running", 0, "healthy"),
+            seen("noo-rhaddon-worker", "worker", "running", 0, "starting"),
+            seen("acme-routes-1", "routes", "exited", 0, ""),
+        ]);
+        assert_eq!(ok.verdict, super::Verdict::Ok, "a profiled service, a completed one-shot and `starting` are fine: {ok:?}");
+        // The undeclared service exited 127: FAIL naming it.
+        let down = judge(&[seen("noo-rhaddon", "web", "running", 0, "healthy"), seen("noo-rhaddon-worker", "worker", "exited", 127, "")]);
+        assert_eq!(down.verdict, super::Verdict::Fail, "{down:?}");
+        assert!(down.detail.contains("not running: noo-rhaddon-worker"), "{down:?}");
+        assert!(down.remedy.as_deref().unwrap().contains("noo stack start"), "{down:?}");
+        // Up but unhealthy: FAIL naming it and the restart.
+        let sick = judge(&[seen("noo-rhaddon", "web", "running", 0, "unhealthy"), seen("noo-rhaddon-worker", "worker", "running", 0, "")]);
+        assert_eq!(sick.verdict, super::Verdict::Fail, "{sick:?}");
+        assert!(sick.detail.contains("unhealthy: noo-rhaddon") && !sick.detail.contains("not running"), "{sick:?}");
+        let remedy = sick.remedy.as_deref().unwrap();
+        assert!(remedy.contains("noo stack restart rhaddon") && remedy.contains("noo stack logs noo-rhaddon"), "{sick:?}");
     }
 
     /// The `model classes` row: declared candidates must be
