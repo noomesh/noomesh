@@ -8656,6 +8656,11 @@ pub(crate) fn addon_containers_row(addon: &str, state: Result<crate::commands::a
     const ROW: &str = "add-on containers";
     let restart = format!("noo stack restart {addon}");
     match state {
+        Ok(c) if c.docker_timeout.is_some() => warn(
+            ROW,
+            format!("{addon}: Docker did not answer for {addon} ({}); its containers were not checked", c.docker_timeout.as_deref().unwrap_or("timed out")),
+            Some("noo doctor".to_string()),
+        ),
         Ok(c) if c.undeclared => warn(ROW, format!("{addon}: declares no containers, so they aren't checked"), None),
         Ok(c) if c.down.is_empty() && c.unhealthy.is_empty() => {
             let held: Vec<String> = c.held.iter().map(|(h, why)| format!("held: {h} ({why})")).collect();
@@ -8670,6 +8675,12 @@ pub(crate) fn addon_containers_row(addon: &str, state: Result<crate::commands::a
             let mut remedy: Vec<String> = Vec::new();
             if !c.down.is_empty() {
                 why.push(format!("not running: {}", c.down.join(", ")));
+                if !c.exited_clean.is_empty() {
+                    why.push(format!(
+                        "{} exited 0: if it is meant to finish, declare it a one-shot (`restart: \"no\"` in the overlay)",
+                        c.exited_clean.join(", ")
+                    ));
+                }
                 remedy.push("noo stack start".to_string());
             }
             if !c.unhealthy.is_empty() {
@@ -11373,6 +11384,11 @@ mod tests {
         assert!(down.detail.contains("rhaddon") && down.detail.contains("not running: noo-rhaddon, noo-rhaddon-worker"), "{down:?}");
         let remedy = down.remedy.as_deref().unwrap();
         assert!(remedy.contains("noo stack start") && remedy.contains("noo stack logs noo-rhaddon"), "{down:?}");
+        let hung = super::addon_containers_row("rhaddon", Ok(Containers { docker_timeout: Some("docker ps after 20s".into()), ..Default::default() }));
+        assert_eq!(hung.verdict, super::Verdict::Warn, "a hang is never a pass and never a hang: {hung:?}");
+        assert!(hung.detail.contains("Docker did not answer for rhaddon"), "{hung:?}");
+        let quiet = super::addon_containers_row("rhaddon", Ok(Containers { down: vec!["quiet".into()], exited_clean: vec!["quiet".into()], ..Default::default() }));
+        assert!(quiet.detail.contains("quiet exited 0") && quiet.detail.contains("one-shot"), "{quiet:?}");
         let unknown = super::addon_containers_row("rhaddon", Err("docker is not answering".into()));
         assert_eq!(unknown.verdict, super::Verdict::Fail, "an unreadable state is never a pass: {unknown:?}");
         assert!(unknown.detail.contains("docker is not answering"), "{unknown:?}");
@@ -11396,8 +11412,8 @@ mod tests {
         use crate::commands::addon_after_boot::{judge_containers, Seen};
         let overlay = "services:\n  web:\n    container_name: noo-rhaddon\n    image: x\n  worker:\n    container_name: noo-rhaddon-worker\n    image: x\n  debug:\n    container_name: noo-rhaddon-debug\n    image: x\n    profiles: [debug]\n  routes:\n    image: x\n    restart: \"no\"\n";
         let decl = vec!["noo-rhaddon".to_string()];
-        let seen = |n: &str, svc: &str, st: &str, code: i32, h: &str| Seen { name: n.into(), service: svc.into(), state: st.into(), exit_code: code, health: h.into() };
-        let judge = |s: &[Seen]| super::addon_containers_row("rhaddon", judge_containers(&decl, overlay, s, &[], &[]));
+        let seen = |n: &str, svc: &str, st: &str, code: i32, h: &str| Seen { name: n.into(), project: "p".into(), service: svc.into(), state: st.into(), exit_code: code, health: h.into() };
+        let judge = |s: &[Seen]| super::addon_containers_row("rhaddon", judge_containers(&decl, overlay, "p", s, &[], &[]));
         // Healthy; the profiled service is absent and the finished one-shot exited 0.
         let ok = judge(&[
             seen("noo-rhaddon", "web", "running", 0, "healthy"),

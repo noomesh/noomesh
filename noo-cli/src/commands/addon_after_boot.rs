@@ -208,12 +208,25 @@ pub struct Containers {
     /// Running with `State.Health.Status == unhealthy`. Reported by verify;
     /// never a reason for after-boot to start the add-on.
     pub unhealthy: Vec<String>,
+    /// The part of `down` that exited 0 (maybe a one-shot nobody declared):
+    /// verify names the fix.
+    pub exited_clean: Vec<String>,
+    /// Only the names in `x-noo-addon: containers` that are not running: what
+    /// after-boot acts on, exactly as before the widened check. Never grows
+    /// with compose services, so the boot-time restart cannot loop on a
+    /// service that exits on purpose.
+    pub boot_down: Vec<String>,
+    /// docker did not answer in time (what was being read); a row that never
+    /// hangs and never passes on this.
+    pub docker_timeout: Option<String>,
 }
 
 /// One container (any state) as `docker inspect` reports it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Seen {
     pub name: String,
+    /// Its `com.docker.compose.project` label.
+    pub project: String,
     /// Its `com.docker.compose.service` label; empty when it has none.
     pub service: String,
     /// `.State.Status`: running, exited, restarting, created, dead, ...
@@ -225,7 +238,7 @@ pub struct Seen {
 
 /// The format [`parse_states`] reads. Separate from the pin logic's
 /// `INSPECT_FORMAT`, which must not change.
-pub const STATE_FORMAT: &str = "{{.Name}}\t{{index .Config.Labels \"com.docker.compose.service\"}}\t{{.State.Status}}\t{{.State.ExitCode}}\t{{if .State.Health}}{{.State.Health.Status}}{{end}}";
+pub const STATE_FORMAT: &str = "{{.Name}}\t{{index .Config.Labels \"com.docker.compose.project\"}}\t{{index .Config.Labels \"com.docker.compose.service\"}}\t{{.State.Status}}\t{{.State.ExitCode}}\t{{if .State.Health}}{{.State.Health.Status}}{{end}}";
 
 /// Parse [`STATE_FORMAT`] output. Any other line is an error, never skipped.
 pub fn parse_states(out: &str) -> Result<Vec<Seen>, String> {
@@ -233,7 +246,7 @@ pub fn parse_states(out: &str) -> Result<Vec<Seen>, String> {
         .filter(|l| !l.trim().is_empty())
         .map(|l| {
             let f: Vec<&str> = l.split('\t').collect();
-            let [n, svc, state, code, health] = f.as_slice() else {
+            let [n, project, svc, state, code, health] = f.as_slice() else {
                 return Err(format!("unexpected docker inspect line {l:?}"));
             };
             let exit_code = code.trim().parse::<i32>().map_err(|_| format!("unexpected docker inspect line {l:?}"))?;
@@ -242,6 +255,7 @@ pub fn parse_states(out: &str) -> Result<Vec<Seen>, String> {
             }
             Ok(Seen {
                 name: n.trim_start_matches('/').to_string(),
+                project: project.trim().to_string(),
                 service: svc.trim().to_string(),
                 state: state.trim().to_string(),
                 exit_code,
@@ -260,6 +274,13 @@ struct Want {
     service: Option<String>,
     /// Meant to run once and exit 0 (see [`judge_containers`]).
     oneshot: bool,
+    /// Named in `x-noo-addon: containers` (what after-boot acts on).
+    declared: bool,
+}
+
+fn replicas_zero(def: &serde_yaml::Value) -> bool {
+    def.get("deploy").and_then(|d| d.get("replicas")).and_then(serde_yaml::Value::as_u64) == Some(0)
+        || def.get("scale").and_then(serde_yaml::Value::as_u64) == Some(0)
 }
 
 fn yaml_restart_is_no(def: &serde_yaml::Value) -> bool {
@@ -271,7 +292,9 @@ fn yaml_restart_is_no(def: &serde_yaml::Value) -> bool {
 }
 
 /// Judge an add-on's containers against what docker `seen` (every state).
-/// Pure; [`down_containers_at`] reads the inputs from the machine.
+/// Pure; [`down_containers_at`] reads the inputs from the machine. Only
+/// containers of compose project `project` count: another project's service
+/// of the same name neither makes this one look up nor makes it fail.
 ///
 /// Expected = `decl` (the overlay's `x-noo-addon: containers`) UNION every
 /// compose service without a `profiles:` key. A service resolves to its
@@ -280,10 +303,15 @@ fn yaml_restart_is_no(def: &serde_yaml::Value) -> bool {
 /// list `oneshots`, or one whose overlay says `restart: "no"`) is excused
 /// when no container of it exists or every one exited 0; anything else not
 /// running is `down`. A running container whose health is `unhealthy` is
-/// listed in `unhealthy`. `held` names are neither.
+/// listed in `unhealthy`. `held` names are neither. A service with
+/// `deploy.replicas: 0` or `scale: 0` has no container by design and is not
+/// expected. Profiles the operator enables through `COMPOSE_PROFILES` are
+/// not read here: a profiled service is expected only when it is named in
+/// `x-noo-addon: containers`.
 pub fn judge_containers(
     decl: &[String],
     overlay: &str,
+    project: &str,
     seen: &[Seen],
     held: &[(String, String)],
     oneshots: &[String],
@@ -296,16 +324,19 @@ pub fn judge_containers(
             let cname = def.get("container_name").and_then(|c| c.as_str()).map(str::to_string);
             let label = cname.clone().unwrap_or_else(|| svc.to_string());
             let listed = decl.iter().any(|d| d == &label || d == svc);
+            if replicas_zero(def) {
+                continue;
+            }
             if def.get("profiles").is_some() && !listed {
                 continue;
             }
             let oneshot = yaml_restart_is_no(def) || crate::oneshots::is_oneshot_in(svc, oneshots) || crate::oneshots::is_oneshot_in(&label, oneshots);
-            wants.push(Want { label, cname, service: Some(svc.to_string()), oneshot });
+            wants.push(Want { label, cname, service: Some(svc.to_string()), oneshot, declared: listed });
         }
     }
     for d in decl {
         if !wants.iter().any(|w| &w.label == d || w.service.as_deref() == Some(d.as_str())) {
-            wants.push(Want { label: d.clone(), cname: Some(d.clone()), service: None, oneshot: crate::oneshots::is_oneshot_in(d, oneshots) });
+            wants.push(Want { label: d.clone(), cname: Some(d.clone()), service: None, oneshot: crate::oneshots::is_oneshot_in(d, oneshots), declared: true });
         }
     }
     let mut c = Containers::default();
@@ -316,6 +347,7 @@ pub fn judge_containers(
         }
         let mine: Vec<&Seen> = seen
             .iter()
+            .filter(|s| s.project == project)
             .filter(|s| match (&w.cname, &w.service) {
                 (Some(n), _) => &s.name == n,
                 (None, Some(svc)) => &s.service == svc,
@@ -323,6 +355,9 @@ pub fn judge_containers(
             })
             .collect();
         let running: Vec<&&Seen> = mine.iter().filter(|s| s.state == "running").collect();
+        if running.is_empty() && w.declared {
+            c.boot_down.push(w.label.clone());
+        }
         if !running.is_empty() {
             if running.iter().any(|s| s.health == "unhealthy") {
                 c.unhealthy.push(w.label.clone());
@@ -332,6 +367,9 @@ pub fn judge_containers(
         let finished = mine.iter().all(|s| s.state == "exited" && s.exit_code == 0);
         if w.oneshot && finished {
             continue;
+        }
+        if !mine.is_empty() && mine.iter().all(|s| s.state == "exited" && s.exit_code == 0) {
+            c.exited_clean.push(w.label.clone());
         }
         c.down.push(w.label.clone());
     }
@@ -757,7 +795,7 @@ impl Run for Live<'_> {
     }
 
     fn containers(&mut self, addon: &str) -> Result<Containers, String> {
-        down_containers_at(&self.root, addon)
+        down_containers_at(&self.root, addon).and_then(boot_view)
     }
 
     fn guard_refusal(&mut self, addon: &str) -> Option<String> {
@@ -791,51 +829,89 @@ impl Run for Live<'_> {
 }
 
 /// The add-on's containers on the install at `root` (the names in
-/// `x-noo-addon: containers` and every non-profiled compose service): which
-/// are down, which are unhealthy, and which the launcher holds.
+/// `x-noo-addon: containers` and every non-profiled compose service of the
+/// install's compose project): which are down, which are unhealthy, and which
+/// the launcher holds. `boot_down` is the declared-names-only part after-boot
+/// acts on.
 pub(crate) fn down_containers_at(root: &Path, addon: &str) -> Result<Containers, String> {
     let overlay = crate::addons::pins::addon_dir(root, addon).join("docker-compose.yml");
     let text = std::fs::read_to_string(&overlay).map_err(|e| format!("{}: {e}", overlay.display()))?;
     let Some(decl) = crate::addon_decl_parse::parse_decl(&format!("{addon}'s overlay"), &text, Some(addon))? else {
         return Ok(Containers { undeclared: true, ..Default::default() });
     };
-    let seen = read_states().map_err(|e| format!("could not list containers: {e}"))?;
+    // The stack runs every add-on overlay in the install's own compose project.
+    let project = crate::envfile::compose_project();
     let held = held_containers(&text, crate::addons::resolve::third_party(addon))?;
-    judge_containers(&decl.containers, &text, &seen, &held, crate::oneshots::declared())
+    let seen = match read_states_via(&project, &mut |args| crate::bounded::docker(args, DOCKER_LIMIT)) {
+        Ok(seen) => seen,
+        Err(StatesError::TimedOut(what)) => return Ok(Containers { docker_timeout: Some(what), ..Default::default() }),
+        Err(StatesError::Failed(e)) => return Err(format!("could not list containers: {e}")),
+    };
+    judge_containers(&decl.containers, &text, &project, &seen, &held, crate::oneshots::declared())
 }
 
-/// Every container docker has, in any state: `docker ps -aq`, then one
-/// inspect of [`STATE_FORMAT`]. A container removed between the two fails the
-/// inspect; read once more before calling it an error.
-fn read_states() -> Result<Vec<Seen>, String> {
+/// What after-boot sees: only the names `x-noo-addon: containers` declares,
+/// as before the row looked at compose services. A docker that did not
+/// answer is an error here (never "already running").
+pub(crate) fn boot_view(c: Containers) -> Result<Containers, String> {
+    if let Some(what) = &c.docker_timeout {
+        return Err(format!("docker did not answer for {what}"));
+    }
+    Ok(Containers { down: c.boot_down.clone(), unhealthy: Vec::new(), exited_clean: Vec::new(), ..c })
+}
+
+/// The bound on each docker call the container check makes.
+const DOCKER_LIMIT: Duration = Duration::from_secs(20);
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum StatesError {
+    /// The docker call that did not answer in time.
+    TimedOut(String),
+    Failed(String),
+}
+
+/// This project's containers in any state: `docker ps -aq` filtered on the
+/// compose project label, then one inspect of [`STATE_FORMAT`] of just those.
+/// A container removed between the two fails the inspect; read once more
+/// before calling it an error. `docker` runs one bounded call (the real one
+/// is `bounded::docker`; a test injects its own).
+pub(crate) fn read_states_via(
+    project: &str,
+    docker: &mut dyn FnMut(&[&str]) -> crate::bounded::Bounded,
+) -> Result<Vec<Seen>, StatesError> {
+    use crate::bounded::Bounded;
     let mut last = String::new();
     for _ in 0..2 {
-        let ps = std::process::Command::new("docker")
-            .args(["ps", "-aq", "--no-trunc"])
-            .output()
-            .map_err(|e| format!("docker ps: {e}"))?;
+        let filter = format!("label=com.docker.compose.project={project}");
+        let ps = match docker(&["ps", "-aq", "--no-trunc", "--filter", &filter]) {
+            Bounded::Answered(o) => o,
+            Bounded::TimedOut { secs } => return Err(StatesError::TimedOut(format!("docker ps after {secs}s"))),
+            Bounded::SpawnFailed(e) => return Err(StatesError::Failed(format!("docker ps: {e}"))),
+        };
         if !ps.status.success() {
-            return Err(format!("docker ps: {}", String::from_utf8_lossy(&ps.stderr).trim()));
+            return Err(StatesError::Failed(format!("docker ps: {}", String::from_utf8_lossy(&ps.stderr).trim())));
         }
         let ids: Vec<String> = String::from_utf8_lossy(&ps.stdout).split_whitespace().map(String::from).collect();
         if ids.is_empty() {
             return Ok(Vec::new());
         }
-        let out = std::process::Command::new("docker")
-            .args(["inspect", "--type", "container", "--format", STATE_FORMAT])
-            .args(&ids)
-            .output()
-            .map_err(|e| format!("docker inspect: {e}"))?;
+        let mut args: Vec<&str> = vec!["inspect", "--type", "container", "--format", STATE_FORMAT];
+        args.extend(ids.iter().map(String::as_str));
+        let out = match docker(&args) {
+            Bounded::Answered(o) => o,
+            Bounded::TimedOut { secs } => return Err(StatesError::TimedOut(format!("docker inspect after {secs}s"))),
+            Bounded::SpawnFailed(e) => return Err(StatesError::Failed(format!("docker inspect: {e}"))),
+        };
         if out.status.success() {
-            let found = parse_states(&String::from_utf8_lossy(&out.stdout)).map_err(|e| format!("docker inspect: {e}"))?;
+            let found = parse_states(&String::from_utf8_lossy(&out.stdout)).map_err(|e| StatesError::Failed(format!("docker inspect: {e}")))?;
             if found.len() != ids.len() {
-                return Err(format!("docker inspect: {} of {} containers read", found.len(), ids.len()));
+                return Err(StatesError::Failed(format!("docker inspect: {} of {} containers read", found.len(), ids.len())));
             }
             return Ok(found);
         }
         last = String::from_utf8_lossy(&out.stderr).trim().to_string();
     }
-    Err(format!("docker inspect: {last}"))
+    Err(StatesError::Failed(format!("docker inspect: {last}")))
 }
 
 /// A random (version 4) UUID from 16 bytes of the kernel's randomness.
@@ -874,7 +950,7 @@ pub fn report_restarted(g: &Globals, named: &[String]) {
     let Ok(enabled) = crate::addons::licensed_on(&root) else { return };
     let enabled: Vec<String> = enabled.into_iter().map(str::to_string).collect();
     for a in restarted_addons(named, &enabled) {
-        if !matches!(down_containers_at(&root, &a), Ok(c) if c.down.is_empty() && !c.undeclared) {
+        if !matches!(down_containers_at(&root, &a).and_then(boot_view), Ok(c) if c.down.is_empty() && !c.undeclared) {
             continue;
         }
         let sent = fresh_uuid().and_then(|id| {
@@ -1343,7 +1419,7 @@ mod tests {
     }
 
     fn seen(name: &str, service: &str, state: &str, exit_code: i32, health: &str) -> Seen {
-        Seen { name: name.into(), service: service.into(), state: state.into(), exit_code, health: health.into() }
+        Seen { name: name.into(), project: "p".into(), service: service.into(), state: state.into(), exit_code, health: health.into() }
     }
 
     const TWO_SERVICES: &str = "services:\n  web:\n    container_name: noo-rhaddon\n    image: x\n  worker:\n    container_name: noo-rhaddon-worker\n    image: x\n  gpu:\n    container_name: noo-rhaddon-gpu\n    image: x\n";
@@ -1357,12 +1433,12 @@ mod tests {
         let overlay = "services:\n  web:\n    container_name: noo-rhaddon\n  gpu:\n    container_name: noo-rhaddon-gpu\n";
         let held = vec![("noo-rhaddon-gpu".to_string(), "asks for a GPU".to_string())];
         let up = [seen("noo-rhaddon", "web", "running", 0, "")];
-        let c = judge_containers(&declared, overlay, &up, &held, &[]).unwrap();
+        let c = judge_containers(&declared, overlay, "p", &up, &held, &[]).unwrap();
         assert_eq!(c, Containers { held: held.clone(), ..Default::default() }, "held only: nothing is down");
-        let c = judge_containers(&declared, overlay, &[], &held, &[]).unwrap();
+        let c = judge_containers(&declared, overlay, "p", &[], &held, &[]).unwrap();
         assert_eq!(c.down, vec!["noo-rhaddon".to_string()], "only the container that should run is down");
         assert_eq!(c.held, held);
-        assert_eq!(judge_containers(&declared, overlay, &[], &[], &[]).unwrap().down, declared, "without a hold both are down");
+        assert_eq!(judge_containers(&declared, overlay, "p", &[], &[], &[]).unwrap().down, declared, "without a hold both are down");
     }
 
     /// A compose service that `x-noo-addon: containers` does not list is
@@ -1372,7 +1448,7 @@ mod tests {
     fn a_service_outside_the_declared_list_is_expected_and_health_is_read() {
         let decl = vec!["noo-rhaddon".to_string()];
         let s = [seen("noo-rhaddon", "web", "running", 0, "unhealthy"), seen("noo-rhaddon-worker", "worker", "exited", 127, "")];
-        let c = judge_containers(&decl, TWO_SERVICES, &s, &[], &[]).unwrap();
+        let c = judge_containers(&decl, TWO_SERVICES, "p", &s, &[], &[]).unwrap();
         assert_eq!(c.down, vec!["noo-rhaddon-worker".to_string(), "noo-rhaddon-gpu".to_string()], "{c:?}");
         assert_eq!(c.unhealthy, vec!["noo-rhaddon".to_string()], "{c:?}");
         // `starting` is not unhealthy; with every service up nothing is named.
@@ -1381,7 +1457,7 @@ mod tests {
             seen("noo-rhaddon-worker", "worker", "running", 0, "healthy"),
             seen("noo-rhaddon-gpu", "gpu", "running", 0, ""),
         ];
-        let c = judge_containers(&decl, TWO_SERVICES, &s, &[], &[]).unwrap();
+        let c = judge_containers(&decl, TWO_SERVICES, "p", &s, &[], &[]).unwrap();
         assert_eq!(c, Containers::default(), "{c:?}");
     }
 
@@ -1393,22 +1469,85 @@ mod tests {
         let decl = vec!["noo-rhaddon".to_string()];
         let overlay = "services:\n  web:\n    container_name: noo-rhaddon\n  api:\n    image: x\n  extra:\n    image: x\n    profiles: [debug]\n  routes:\n    image: x\n    restart: \"no\"\n  prep:\n    image: x\n";
         let base = [seen("noo-rhaddon", "web", "running", 0, ""), seen("acme-api-1", "api", "running", 0, "")];
-        let c = judge_containers(&decl, overlay, &base, &[], &["prep".to_string()]).unwrap();
+        let c = judge_containers(&decl, overlay, "p", &base, &[], &["prep".to_string()]).unwrap();
         assert_eq!(c, Containers::default(), "profiled absent, one-shots never created: ok: {c:?}");
         let mut done = base.to_vec();
         done.push(seen("acme-routes-1", "routes", "exited", 0, ""));
         done.push(seen("acme-prep-1", "prep", "exited", 0, ""));
-        assert_eq!(judge_containers(&decl, overlay, &done, &[], &["prep".to_string()]).unwrap(), Containers::default());
+        assert_eq!(judge_containers(&decl, overlay, "p", &done, &[], &["prep".to_string()]).unwrap(), Containers::default());
         let mut bad = base.to_vec();
         bad.push(seen("acme-routes-1", "routes", "exited", 1, ""));
-        assert_eq!(judge_containers(&decl, overlay, &bad, &[], &[]).unwrap().down, vec!["routes".to_string(), "prep".to_string()]);
+        assert_eq!(judge_containers(&decl, overlay, "p", &bad, &[], &[]).unwrap().down, vec!["routes".to_string(), "prep".to_string()]);
         // Without the declared list, `prep` (no `restart: "no"`) is expected.
-        assert_eq!(judge_containers(&decl, overlay, &done, &[], &[]).unwrap().down, vec!["prep".to_string()]);
+        assert_eq!(judge_containers(&decl, overlay, "p", &done, &[], &[]).unwrap().down, vec!["prep".to_string()]);
+    }
+
+    /// Another compose project's service of the same name is invisible, both
+    /// ways: its running `db` does not make this project's dead `db` look up,
+    /// and its failed one-shot does not fail this project.
+    #[test]
+    fn another_projects_service_of_the_same_name_does_not_count() {
+        let decl = vec!["noo-rhaddon".to_string()];
+        let overlay = "services:\n  web:\n    container_name: noo-rhaddon\n  db:\n    image: x\n  job:\n    image: x\n    restart: \"no\"\n";
+        let other = |svc: &str, state: &str, code: i32| Seen { name: format!("other-{svc}-1"), project: "other".into(), service: svc.into(), state: state.into(), exit_code: code, health: String::new() };
+        let web = seen("noo-rhaddon", "web", "running", 0, "");
+        // Ours is dead, theirs runs: still down.
+        let mut s = vec![web.clone(), seen("p-db-1", "db", "exited", 1, ""), other("db", "running", 0)];
+        assert_eq!(judge_containers(&decl, overlay, "p", &s, &[], &[]).unwrap().down, vec!["db".to_string()]);
+        // Ours runs, theirs failed (and their one-shot failed): nothing is down.
+        s = vec![web, seen("p-db-1", "db", "running", 0, ""), other("db", "exited", 1), other("job", "exited", 1)];
+        assert_eq!(judge_containers(&decl, overlay, "p", &s, &[], &[]).unwrap(), Containers::default());
+    }
+
+    /// `deploy.replicas: 0` / `scale: 0` are not expected; a service that
+    /// exited 0 without being a declared one-shot is down for verify (named
+    /// in `exited_clean`) but never in `boot_down`, so after-boot cannot loop.
+    #[test]
+    fn replicas_zero_is_not_expected_and_after_boot_acts_only_on_the_declared_names() {
+        let decl = vec!["noo-rhaddon".to_string()];
+        let overlay = "services:\n  web:\n    container_name: noo-rhaddon\n  off:\n    image: x\n    deploy:\n      replicas: 0\n  off2:\n    image: x\n    scale: 0\n  quiet:\n    image: x\n";
+        let s = [seen("noo-rhaddon", "web", "running", 0, ""), seen("p-quiet-1", "quiet", "exited", 0, "")];
+        let c = judge_containers(&decl, overlay, "p", &s, &[], &[]).unwrap();
+        assert_eq!(c.down, vec!["quiet".to_string()], "{c:?}");
+        assert_eq!(c.exited_clean, vec!["quiet".to_string()], "{c:?}");
+        assert!(c.boot_down.is_empty(), "after-boot must not act on it: {c:?}");
+        let v = boot_view(c).unwrap();
+        assert!(v.down.is_empty() && v.unhealthy.is_empty(), "{v:?}");
+        // A declared container that is down is what after-boot starts.
+        let c = judge_containers(&decl, overlay, "p", &[], &[], &[]).unwrap();
+        assert_eq!(boot_view(c).unwrap().down, vec!["noo-rhaddon".to_string()]);
+    }
+
+    fn answered(stdout: &str) -> crate::bounded::Bounded {
+        use std::os::unix::process::ExitStatusExt as _;
+        crate::bounded::Bounded::Answered(std::process::Output { status: std::process::ExitStatus::from_raw(0), stdout: stdout.as_bytes().to_vec(), stderr: Vec::new() })
+    }
+
+    /// The listing is filtered on this project and only its ids are
+    /// inspected; a docker that hangs is a timeout, never an empty answer.
+    #[test]
+    fn docker_is_asked_about_this_project_only_and_a_hang_is_not_a_pass() {
+        let mut calls: Vec<Vec<String>> = Vec::new();
+        let r = read_states_via("proj", &mut |args| {
+            calls.push(args.iter().map(|a| a.to_string()).collect());
+            if args[0] == "ps" { answered("abc\n") } else { answered("/noo-a\tproj\tweb\trunning\t0\t\n") }
+        });
+        assert_eq!(r.unwrap().len(), 1);
+        assert!(calls[0].contains(&"label=com.docker.compose.project=proj".to_string()), "{calls:?}");
+        assert_eq!(calls[1].last().map(String::as_str), Some("abc"), "{calls:?}");
+        for hang_on in ["ps", "inspect"] {
+            let r = read_states_via("proj", &mut |args| {
+                if args[0] == hang_on { crate::bounded::Bounded::TimedOut { secs: 20 } } else { answered("abc\n") }
+            });
+            assert!(matches!(r, Err(StatesError::TimedOut(ref w)) if w.contains(hang_on)), "{r:?}");
+        }
+        let hung = Containers { docker_timeout: Some("docker ps after 20s".into()), ..Default::default() };
+        assert!(boot_view(hung).is_err(), "after-boot never reads a hang as already running");
     }
 
     #[test]
     fn state_lines_parse_with_and_without_a_healthcheck() {
-        let out = "/noo-a\tweb\trunning\t0\thealthy\n/noo-b\t\texited\t127\t\n";
+        let out = "/noo-a\tp\tweb\trunning\t0\thealthy\n/noo-b\tp\t\texited\t127\t\n";
         let v = parse_states(out).unwrap();
         assert_eq!(v[0], seen("noo-a", "web", "running", 0, "healthy"));
         assert_eq!(v[1], seen("noo-b", "", "exited", 127, ""));
