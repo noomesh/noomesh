@@ -319,7 +319,7 @@ mod tests {
     fn the_last_role_s_unplace_is_what_ships_the_backend() {
         let embed = tomb("ollama", "embed", NOW - 1500);
         let chat_placed = vec![json!({"backend": "ollama", "role": "chat", "desired_state": "running"})];
-        assert!(ship(&[embed.clone()], &chat_placed, NOW).0.is_empty());
+        assert!(ship(std::slice::from_ref(&embed), &chat_placed, NOW).0.is_empty());
         let chat = tomb("ollama", "chat", NOW - 2);
         let (u, _) = ship(&[embed, chat], &[], NOW);
         assert_eq!(u.len(), 2);
