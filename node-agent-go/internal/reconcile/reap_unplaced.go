@@ -65,7 +65,10 @@ func (r *Reconciler) forgetUnplaced() {
 // observeUnplaced records this read's tombstones and returns the ones that
 // may be acted on: in this good read AND the previous one, never on the
 // first good pass since the agent started. A read that is not good (no
-// node, the controller away) forgets everything.
+// node, the controller away) forgets everything. A tombstone whose backend
+// a placement still names (in any role) is not recorded: one role's unplace
+// while another role keeps the backend placed is no reap authority, so the
+// two reads start counting only once the backend's last placement has gone.
 func (r *Reconciler) observeUnplaced(d *desiredConfig) []unplacedTombstone {
 	away, _ := ctrlreach.Down()
 	if d == nil || d.Node == nil || away {
@@ -76,7 +79,7 @@ func (r *Reconciler) observeUnplaced(d *desiredConfig) []unplacedTombstone {
 	cur := map[unplacedTombstone]bool{}
 	var confirmed []unplacedTombstone
 	for _, u := range d.Unplaced {
-		if u.Backend == "" || u.UnplacedAt == "" {
+		if u.Backend == "" || u.UnplacedAt == "" || wantedBackend(d.Placements, u.Backend) {
 			continue
 		}
 		cur[u] = true
@@ -177,7 +180,7 @@ func planReap(in reapInput) ([]reapAction, []backendreap.Orphan) {
 	}
 	var acts []reapAction
 	done := map[string]bool{}
-	for _, u := range in.confirmed {
+	for _, u := range newestPerBackend(in.confirmed) {
 		if done[u.Backend] || wantedBackend(d.Placements, u.Backend) {
 			continue
 		}
@@ -197,6 +200,29 @@ func planReap(in reapInput) ([]reapAction, []backendreap.Orphan) {
 		}
 	}
 	return acts, orphans
+}
+
+// newestPerBackend keeps, for each backend, the confirmed tombstone with the
+// latest unplaced_at (the backend's last unplace: the time the stop, its
+// report and its acknowledgement name), in first-seen order. A time that does
+// not parse never replaces one that does.
+func newestPerBackend(ts []unplacedTombstone) []unplacedTombstone {
+	idx := map[string]int{}
+	var out []unplacedTombstone
+	for _, u := range ts {
+		i, seen := idx[u.Backend]
+		if !seen {
+			idx[u.Backend] = len(out)
+			out = append(out, u)
+			continue
+		}
+		cur, errCur := time.Parse(time.RFC3339Nano, out[i].UnplacedAt)
+		at, err := time.Parse(time.RFC3339Nano, u.UnplacedAt)
+		if err == nil && (errCur != nil || at.After(cur)) {
+			out[i] = u
+		}
+	}
+	return out
 }
 
 // reapUnplacedBackends is the reconcile phase: report the orphans, and stop
