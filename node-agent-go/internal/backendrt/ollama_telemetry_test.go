@@ -405,6 +405,7 @@ func TestSystemPlistDriftRecordsTheWantedEnvForEnrollResume(t *testing.T) {
 	sys := OllamaSystemPlistPath(newBrew)
 	g := &OllamaGuard{Home: "/Users/m", UID: 501, Run: f.run, Exists: func(p string) bool { return p == sys }}
 	g.WantedFile = filepath.Join(t.TempDir(), "noomesh", OllamaWantedEnvFile)
+	g.TuningKnown = func() bool { return true }
 	g.Tuning = func() map[string]string {
 		return map[string]string{"OLLAMA_CONTEXT_LENGTH": "8192", "OLLAMA_KEEP_ALIVE": "-1", "OLLAMA_HOST": "0.0.0.0"}
 	}
@@ -412,7 +413,7 @@ func TestSystemPlistDriftRecordsTheWantedEnvForEnrollResume(t *testing.T) {
 		t.Fatalf("managed=%v restarted=%v err=%v", managed, restarted, err)
 	}
 	b, err := os.ReadFile(g.WantedFile)
-	if err != nil || string(b) != "{\"OLLAMA_CONTEXT_LENGTH\":\"8192\",\"OLLAMA_KEEP_ALIVE\":\"-1\"}\n" {
+	if err != nil || string(b) != "{\"known\":true,\"env\":{\"OLLAMA_CONTEXT_LENGTH\":\"8192\",\"OLLAMA_KEEP_ALIVE\":\"-1\"}}\n" {
 		t.Fatalf("wanted file = %q, %v", b, err)
 	}
 	rs := refusals.List()
@@ -451,6 +452,7 @@ func TestWantedEnvFileTracksTheSetWithoutDriftAndLeavesNoTempFile(t *testing.T) 
 	g := &OllamaGuard{Home: "/Users/m", UID: 501, Run: f.run, Exists: func(p string) bool { return p == sys }}
 	dir := filepath.Join(t.TempDir(), "noomesh")
 	g.WantedFile = filepath.Join(dir, OllamaWantedEnvFile)
+	g.TuningKnown = func() bool { return true }
 	set := map[string]string{"OLLAMA_KEEP_ALIVE": "-1"}
 	g.Tuning = func() map[string]string { return set }
 	read := func() string {
@@ -461,12 +463,12 @@ func TestWantedEnvFileTracksTheSetWithoutDriftAndLeavesNoTempFile(t *testing.T) 
 		return string(b)
 	}
 	g.Converge() // the plist already matches: no drift
-	if got := read(); got != "{\"OLLAMA_KEEP_ALIVE\":\"-1\"}\n" {
+	if got := read(); got != "{\"known\":true,\"env\":{\"OLLAMA_KEEP_ALIVE\":\"-1\"}}\n" {
 		t.Fatalf("file = %q", got)
 	}
 	set = map[string]string{} // the key left the placements; still no drift
 	g.Converge()
-	if got := read(); got != "{}\n" {
+	if got := read(); got != "{\"known\":true,\"env\":{}}\n" {
 		t.Fatalf("file = %q", got)
 	}
 	if st, _ := os.Stat(g.WantedFile); st.Mode().Perm() != 0o640 {
@@ -474,5 +476,48 @@ func TestWantedEnvFileTracksTheSetWithoutDriftAndLeavesNoTempFile(t *testing.T) 
 	}
 	if ents, _ := os.ReadDir(dir); len(ents) != 1 {
 		t.Errorf("temp file left behind: %v", ents)
+	}
+}
+
+// Before the reconciler has read the desired state the tuning is unknown, not
+// empty: nothing is written and an older file survives. After it, an empty
+// set is written as known-empty.
+func TestWantedEnvFileIsLeftAloneUntilTheDesiredStateIsKnown(t *testing.T) {
+	refusals.Reset()
+	t.Cleanup(refusals.Reset)
+	sys := OllamaSystemPlistPath(newBrew)
+	f := &fakeMac{env: map[string]string{"OLLAMA_NO_CLOUD": "1"}, procEnv: procWith}
+	g := &OllamaGuard{Home: "/Users/m", UID: 501, Run: f.run, Exists: func(p string) bool { return p == sys }}
+	g.WantedFile = filepath.Join(t.TempDir(), OllamaWantedEnvFile)
+	old := "{\"known\":true,\"env\":{\"OLLAMA_KEEP_ALIVE\":\"-1\"}}\n"
+	if err := os.WriteFile(g.WantedFile, []byte(old), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	known := false
+	g.TuningKnown = func() bool { return known }
+	g.Tuning = func() map[string]string { return map[string]string{} }
+	g.Converge()
+	if b, _ := os.ReadFile(g.WantedFile); string(b) != old {
+		t.Fatalf("an unknown set rewrote the file: %q", b)
+	}
+	known = true
+	g.Converge()
+	if b, _ := os.ReadFile(g.WantedFile); string(b) != "{\"known\":true,\"env\":{}}\n" {
+		t.Fatalf("file = %q", b)
+	}
+}
+
+// The process-wide signal is false until SetOllamaTuning runs, even with nil.
+func TestOllamaTuningKnownFollowsSetOllamaTuning(t *testing.T) {
+	tuningMu.Lock()
+	tuningKnown = false
+	tuningMu.Unlock()
+	t.Cleanup(func() { SetOllamaTuning(nil) })
+	if OllamaTuningKnown() {
+		t.Fatal("known before any desired state")
+	}
+	SetOllamaTuning(nil)
+	if !OllamaTuningKnown() {
+		t.Fatal("SetOllamaTuning(nil) is a known-empty set")
 	}
 }

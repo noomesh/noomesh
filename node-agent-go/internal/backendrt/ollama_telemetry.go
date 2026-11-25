@@ -120,6 +120,10 @@ type OllamaGuard struct {
 	// OllamaTuningKeys are honoured. A native ollama is not a container, so
 	// placement env cannot reach it any other way than this plist.
 	Tuning func() map[string]string
+	// TuningKnown reports whether the reconciler has published tuning from the
+	// node's desired state in this run (SetOllamaTuning, even to nil). Until it
+	// has, the tuning is unknown, not empty, and WantedFile is left alone.
+	TuningKnown func() bool
 	// WantedFile is where the guard records the tuning a boot-service plist
 	// must carry ("" = nowhere), for `noo enroll --resume` to apply with sudo.
 	WantedFile string
@@ -418,10 +422,16 @@ const OllamaWantedEnvFile = "ollama-env.json"
 // from the plist). Best effort: a failure is
 // logged and the sudo commands in the refusal still name every value.
 func (g *OllamaGuard) recordWanted() {
-	if g.WantedFile == "" {
+	if g.WantedFile == "" || g.TuningKnown == nil || !g.TuningKnown() {
 		return
 	}
-	b, err := json.Marshal(g.tuning())
+	// "known": the set is read from the node's desired state, so an empty
+	// "env" means "none wanted" (enroll removes the keys); a file without it
+	// means nothing to enroll.
+	b, err := json.Marshal(struct {
+		Known bool              `json:"known"`
+		Env   map[string]string `json:"env"`
+	}{true, g.tuning()})
 	if err != nil {
 		return
 	}
@@ -559,6 +569,8 @@ func (g *OllamaGuard) noteNoPlist() {
 var (
 	tuningMu   sync.Mutex
 	tuningHeld map[string]string
+	// tuningKnown: SetOllamaTuning ran in this process (desired state read).
+	tuningKnown bool
 )
 
 // SetOllamaTuning publishes the merged ollama placement env (the
@@ -566,6 +578,7 @@ var (
 func SetOllamaTuning(env map[string]string) {
 	tuningMu.Lock()
 	defer tuningMu.Unlock()
+	tuningKnown = true
 	tuningHeld = nil
 	if len(env) > 0 {
 		tuningHeld = make(map[string]string, len(env))
@@ -573,6 +586,14 @@ func SetOllamaTuning(env map[string]string) {
 			tuningHeld[k] = v
 		}
 	}
+}
+
+// OllamaTuningKnown reports whether SetOllamaTuning has run in this process:
+// the node's desired state was read, so an empty tuning means none is wanted.
+func OllamaTuningKnown() bool {
+	tuningMu.Lock()
+	defer tuningMu.Unlock()
+	return tuningKnown
 }
 
 // OllamaTuning returns a copy of the published env.
