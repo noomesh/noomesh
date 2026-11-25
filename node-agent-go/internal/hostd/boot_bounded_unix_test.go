@@ -515,6 +515,9 @@ func TestBootRestoreBoundedBudgetClampsALateStartAndTheScriptSummarisesItself(t 
 	if !strings.Contains(logs, "BOOT-RESTORE WARN") || !strings.Contains(logs, "not handled (left alone): aaa, bbb and the rest (out of time)") {
 		t.Fatalf("the summary does not name what was left:\n%s", logs)
 	}
+	if !strings.Contains(logs, "container aaa was not handled: the run was out of time") || strings.Contains(logs, "Docker did not answer for container aaa") {
+		t.Fatalf("a call cut short by the budget must read as out of time, not as Docker not answering:\n%s", logs)
+	}
 	if f.startsOf(t, "bbb") != 0 || f.startsOf(t, "ccc") != 0 {
 		t.Errorf("containers past the budget were started")
 	}
