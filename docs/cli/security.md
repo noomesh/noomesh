@@ -223,20 +223,42 @@ CA**: it scans, confirms, backs up to `pki/.rotate-backup-<ts>`,
 re-issues every leaf expiring within `--warn-days`, delivers node certs
 on the pull rail (no fallback — a node with no birth cert on record must
 be re-enrolled first), restarts the consumers with the
-gateway last, and health-probes: Docker must report every restarted
-container running and healthy, and the gateway's `/health` must answer at
-the address the gateway is bound to (`NOO_BIND_ADDR`, else `NOO_BIND_MODE`:
-the tailnet address on a tailnet controller, localhost only when the bind
-is local or `all`), with the certificate verified. When a container is not
-running or unhealthy, or `/health` answers with a failure, `rotate-all`
-restores the backup and restarts again (exit 1). When Docker says the
-containers are fine but the probe cannot tell (no address to probe, no
-trust anchor, or nothing answering at an address taken from the configured
-gateway URL), it does **not** revert: the new certificates stay, the
-command exits 1 with `rotation_unconfirmed`, and it prints the URL probed,
-the error, `noo cluster verify --wait` to confirm, and the exact copy-back
-from the backup if you want it. Certificate scans (`status`, `rotate-all`,
-`cluster verify`) skip the dot-directories of the PKI dir
+gateway last, and waits for them (up to 150 s). **Docker's own health
+decides whether a rotation is reverted; the CLI's HTTP probe of `/health`
+can confirm a rotation but never condemns one on a failure of its own side.**
+
+- **Healthy** (done): every restarted container is running and, for those
+  with a healthcheck, Docker reports `healthy` (not merely "not
+  unhealthy": a container still `starting` is not healthy yet), or
+  `/health` answered 200 with no container not running or `unhealthy`.
+- **Reverted** (the backup is restored, the consumers restart again,
+  `pki/public/` is re-synced to the restored certificates, exit 1): at the
+  deadline a restarted container is not running, Docker reports one
+  `unhealthy`, or `/health` was reached over a verified TLS connection to
+  this machine and answered a non-200 status. If the revert's own gate
+  fails the same way the message says "REVERT DID NOT RECOVER"; if it
+  cannot tell, it says the revert could not be verified.
+- **Kept, not confirmed** (`rotation_unconfirmed`, exit 1, nothing
+  restarted again) for everything else at the deadline: a container still
+  `starting`; no address to probe; no trust anchor; nothing answering
+  `/health`; and every failure on the CLI's side, such as a certificate
+  name mismatch (the gateway certificate does not name the address the
+  gateway is now bound to) or an unknown issuer (a stale `$NOO_TLS_CA`).
+  The new certificates stay, and so do node certificates already
+  delivered (same CA). The message says what Docker reported (`running;
+  health: healthy|starting|none`), the URL probed and the error, to run
+  `noo cluster verify --wait`, and the copy-back from the backup
+  (`cp -a`, `noo security pki fix-modes` to re-sync `pki/public/`,
+  `docker restart`).
+
+`/health` is probed at the address the gateway is bound to: `NOO_BIND_ADDR`,
+else `NOO_BIND_MODE` (read from the environment, then `.env`, as the
+launcher reads them): the tailnet address on a tailnet controller,
+`127.0.0.1` for `local` or `all`. With no bind known, the configured
+gateway URL is tried, and its answer counts only when its host is this
+machine. `pki rotate-ca` runs the same wait but only warns
+(`rotated_with_warnings`); it never reverts. Certificate scans (`status`,
+`rotate-all`, `cluster verify`) skip the dot-directories of the PKI dir
 (`.rotate-backup-*`, `.forgotten-*`). A node that did not take its cert makes the
 exit code 1 too; `--no-deliver`/`--no-reload` skip those steps and say
 so. Nothing expiring prints `no certificates expiring within N days`.
