@@ -14,7 +14,6 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
-	"regexp"
 	"runtime"
 	"strings"
 	"sync"
@@ -834,56 +833,40 @@ func (c *Client) RunningBackends(ctx context.Context) (map[string]string, error)
 	return backends, nil
 }
 
-// backendKeyFromName maps a running container name to its backend key,
-// using the same substring heuristics as RunningBackends. Returns "" for
-// containers that aren't a recognized PAI backend. Shared so RunningBackends
-// and BackendLabels agree on which container is which backend.
-// renameOrphan matches docker's deferred-removal name: a 12-hex prefix and
-// an underscore before the original name (`a1b2c3d4e5f6_noo-llamacpp`).
-// the design named the class; scripts/noo-host-watcher.sh reaps them.
-var renameOrphan = regexp.MustCompile(`^[0-9a-f]{12}_`)
+// secondaryVLLMContainer is the second vLLM the compose stack runs
+// (container_name `${NOO_CONTAINER_PREFIX:-noo}-vllm-secondary`). It has no
+// backendSpecs entry (the agent never creates it), so it is named here, the
+// one name backendSpecs cannot supply.
+const (
+	secondaryVLLMKey       = "vllm-secondary"
+	secondaryVLLMContainer = "noo-vllm-secondary"
+)
 
-func backendKeyFromName(name string) string {
-	// A rename-orphan is a container the agent no longer manages, left
-	// behind by a deferred removal. It still CONTAINS the backend's name,
-	// so a substring match counted it as the live backend — and since the
-	// caller builds a map, whichever came last in the listing won. The
-	// symptom is the reconciler seeing a stale model forever: it recreates
-	// the backend every tick, logs "backend started", then reads the ORPHAN
-	// back and decides it still does not match. Observed on host9
-	// 2026-09-04, where a placement change never took effect while every
-	// tick reported success.
-	if renameOrphan.MatchString(name) {
-		return ""
-	}
-	// A stunnel sidecar carries the backend's name (noo-stunnel-llamacpp,
-	// noo-stunnel-ollama) and none of its env: counted as the backend it
-	// fronts, it set the model to "" and — the map keeping whichever came
-	// last — could make a running llama.cpp vanish from RunningBackends.
-	if strings.Contains(name, "stunnel") {
-		return ""
-	}
-	switch {
-	case strings.Contains(name, "vllm"):
-		if strings.Contains(name, "vllm-secondary") {
-			return "vllm-secondary"
+// backendNames maps every container name the agent owns as a backend to its
+// key. It is derived from backendSpecs (the one definition of the agent's
+// backend containers) plus the compose-only secondary vLLM, so a backend added
+// to backendSpecs is recognised without touching a second list.
+var backendNames = sync.OnceValue(func() map[string]string {
+	m := map[string]string{secondaryVLLMContainer: secondaryVLLMKey}
+	for key, spec := range backendSpecs {
+		if spec.ContainerName != "" {
+			m[spec.ContainerName] = key
 		}
-		return "vllm"
-	case strings.Contains(name, "llamacpp"):
-		return "llamacpp"
-	case strings.Contains(name, "airllm"):
-		return "airllm"
-	case strings.Contains(name, "ollama") && !strings.Contains(name, "embed"):
-		return "ollama"
-	case strings.Contains(name, "reranker"):
-		// noo-reranker does not match "llamacpp" regardless of which
-		// engine is inside. Leaving it unmapped made RunningBackends()
-		// blind to a healthy reranker: the reconciler recreated it every
-		// tick (was_running=false) and the heartbeat reported it missing,
-		// firing node_placement_drift forever.
-		return "reranker"
 	}
-	return ""
+	return m
+})
+
+// backendKeyFromName maps a running container name to its backend key by
+// EXACT name: only a container named as one of the agent's own backends
+// (backendNames) is a backend. Everything else returns "": another project's
+// container, an add-on's, a stunnel sidecar, a rename-orphan
+// (`a1b2c3d4e5f6_noo-llamacpp`) and a look-alike that merely contains a
+// backend's name (`my-ollama-ui`, `x-noo-vllm-1`). The key is used by the
+// readers that report backends and by the heals that act on a listed
+// container ID, so a loose match would let the agent report or restart a
+// container it does not own.
+func backendKeyFromName(name string) string {
+	return backendNames()[name]
 }
 
 // BackendLabels returns backend_key -> value of the given container label

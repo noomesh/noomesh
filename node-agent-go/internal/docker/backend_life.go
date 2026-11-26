@@ -149,10 +149,17 @@ func imageFacts(img string) (string, bool) {
 // stunnelBackendKey is the backend a stunnel sidecar fronts ("noo-stunnel-
 // ollama" -> "ollama"), "" when name is no sidecar or fronts none.
 func stunnelBackendKey(name string) string {
-	if !strings.Contains(name, "stunnel") {
+	if !strings.HasPrefix(name, StunnelContainerPrefix) {
 		return ""
 	}
-	return backendKeyFromName(strings.Replace(name, "stunnel", "", 1))
+	svc := strings.TrimPrefix(name, StunnelContainerPrefix)
+	if b := sidecarBackend(name); b != "" {
+		return b
+	}
+	if svc == secondaryVLLMKey {
+		return secondaryVLLMKey
+	}
+	return ""
 }
 
 // markOrphans flags every report entry whose backend key an adopted lane
