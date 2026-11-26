@@ -737,7 +737,7 @@ pub(crate) fn reconcile_refusals_check(id: &str, n: &Value) -> Option<Check> {
             reason.to_string()
         };
         let remedy = if scope == OLLAMA_ENV_SCOPE {
-            format!("on {id}: noo enroll --resume")
+            format!("on {id}: noo enroll --resume   # asks for the Mac's admin password")
         } else {
             format!("noo cluster show {id}   # the reason names its own fix")
         };
@@ -754,17 +754,23 @@ pub(crate) fn reconcile_refusals_check(id: &str, n: &Value) -> Option<Check> {
 /// boot service lacking the settings noomesh wants.
 const OLLAMA_ENV_SCOPE: &str = "ollama_env";
 
+/// The most missing settings the `ollama_env` detail names; the agent's key
+/// set is closed and small (six), so this is every one of them.
+const OLLAMA_ENV_KEYS_SHOWN: usize = 8;
+
 /// The detail an `ollama_env` refusal shows: what is wrong in plain words,
 /// short enough to print whole. The agent's reason names the missing keys
-/// after "lacks " and ends that list at the first colon; the fix is the row's
-/// remedy, so the reason's command text is never printed (or cut off) here.
+/// after " lacks " and ends that list at the first colon (the same in the old
+/// and the new wording); the fix is the row's remedy, so the reason's command
+/// text is never printed (or cut off) here. More keys than shown: "N settings".
 fn ollama_env_detail(reason: &str) -> String {
-    let keys = reason.split_once(" lacks ")
+    let keys: Option<Vec<&str>> = reason.split_once(" lacks ")
         .and_then(|(_, rest)| rest.split_once(':'))
-        .map(|(k, _)| k.trim())
-        .filter(|k| !k.is_empty() && k.chars().count() <= REFUSAL_REASON_MAX_CHARS - 70);
+        .map(|(k, _)| k.split(',').map(str::trim).filter(|k| !k.is_empty()).collect::<Vec<_>>())
+        .filter(|k| !k.is_empty() && k.iter().all(|k| k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')));
     match keys {
-        Some(k) => format!("settings missing on the node's native Ollama ({k}); the node cannot write them itself"),
+        Some(k) if k.len() <= OLLAMA_ENV_KEYS_SHOWN => format!("settings missing on the node's native Ollama ({}); the node cannot write them itself", k.join(", ")),
+        Some(k) => format!("{} settings missing on the node's native Ollama (starting {}); the node cannot write them itself", k.len(), k[..3].join(", ")),
         None => "settings missing on the node's native Ollama; the node cannot write them itself".to_string(),
     }
 }
@@ -20730,7 +20736,7 @@ mod bundle_fetch_and_refusal_rows_tests {
         let c = reconcile_refusals_check("node-a", &refusing(json!([{"scope": "ollama_env", "target": "ollama", "reason": reason}]))).unwrap();
         assert_eq!(c.verdict, Verdict::Warn);
         assert_eq!(c.detail, "node-a: ollama_env=ollama: settings missing on the node's native Ollama (OLLAMA_KEEP_ALIVE, OLLAMA_CONTEXT_LENGTH); the node cannot write them itself");
-        assert_eq!(c.remedy.as_deref(), Some("on node-a: noo enroll --resume"));
+        assert_eq!(c.remedy.as_deref(), Some("on node-a: noo enroll --resume   # asks for the Mac's admin password"));
         // An older agent's reason (no keys list) still reads whole.
         let old = reconcile_refusals_check("node-a", &refusing(json!([{"scope": "ollama_env", "target": "ollama", "reason": "x".repeat(400)}]))).unwrap();
         assert!(old.detail.contains("settings missing on the node's native Ollama;") && !old.detail.contains("xxx"), "{}", old.detail);
@@ -20739,7 +20745,29 @@ mod bundle_fetch_and_refusal_rows_tests {
             {"scope": "ollama_env", "target": "ollama", "reason": reason},
             {"scope": "models_dir", "target": "/m", "reason": "not writable"},
         ]))).unwrap();
-        assert_eq!(mixed.remedy.as_deref(), Some("on node-a: noo enroll --resume; noo cluster show node-a   # the reason names its own fix"));
+        assert_eq!(mixed.remedy.as_deref(), Some("on node-a: noo enroll --resume   # asks for the Mac's admin password; noo cluster show node-a   # the reason names its own fix"));
+    }
+
+    #[test]
+    fn an_ollama_env_detail_names_all_six_keys_in_either_wording_and_falls_back_on_garbage() {
+        let six = "OLLAMA_NO_CLOUD, OLLAMA_CONTEXT_LENGTH, OLLAMA_KEEP_ALIVE, OLLAMA_HOST, OLLAMA_MODELS, OLLAMA_FLASH_ATTENTION";
+        let want = format!("node-a: ollama_env=ollama: settings missing on the node's native Ollama ({six}); the node cannot write them itself");
+        // The new wording and the OLD one (an agent not yet rolled) carry the same list.
+        let new = format!("the native Ollama is a boot service (/p/x.plist, root's), which this agent cannot edit, and it lacks {six}: run `noo enroll --resume` on this Mac to apply them; or by hand on the Mac run `sudo x`");
+        let old = format!("the native Ollama is a boot service (/p/x.plist, root's), which this agent cannot edit, and it lacks {six}: on the Mac run `sudo x`, or run `noo enroll --resume`");
+        for reason in [new, old] {
+            let c = reconcile_refusals_check("node-a", &refusing(json!([{"scope": "ollama_env", "target": "ollama", "reason": reason}]))).unwrap();
+            assert_eq!(c.detail, want);
+        }
+        // Garbled: no list, or a "list" that is not setting names.
+        for garbled in ["lacks", "and it lacks : run", "it lacks some words here: run", "and it lacks \u{0}\u{1}: x"] {
+            let c = reconcile_refusals_check("node-a", &refusing(json!([{"scope": "ollama_env", "target": "ollama", "reason": garbled}]))).unwrap();
+            assert_eq!(c.detail, "node-a: ollama_env=ollama: settings missing on the node's native Ollama; the node cannot write them itself", "{garbled}");
+        }
+        // More than the closed set: counted, not cut mid-name.
+        let many = (0..12).map(|i| format!("OLLAMA_K{i}")).collect::<Vec<_>>().join(", ");
+        let c = reconcile_refusals_check("node-a", &refusing(json!([{"scope": "ollama_env", "target": "ollama", "reason": format!("and it lacks {many}: x")}]))).unwrap();
+        assert!(c.detail.contains("12 settings missing") && c.detail.contains("OLLAMA_K0, OLLAMA_K1, OLLAMA_K2)"), "{}", c.detail);
     }
 
     #[test]
