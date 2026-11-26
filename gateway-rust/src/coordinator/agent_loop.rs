@@ -5039,12 +5039,12 @@ mod frame_budget_tests {
     }
 
     fn kb() -> String {
-        let paras: Vec<String> = (1..=4).map(|i| format!("Chunk {i}. {}", "Leave is accrued monthly. ".repeat(12))).collect();
+        let paras: Vec<String> = (1..=4).map(|i| format!("Chunk {i}. {}", "Leave is accrued monthly. ".repeat(12).trim_end())).collect();
         format!("{}\nSources:\n  - Page A\n  - Page B\n  - Page C", paras.join("\n\n"))
     }
 
     fn memory() -> String {
-        (0..40).map(|i| format!("MEMORYLINE {i} an earlier message about leave")).collect::<Vec<_>>().join("\n")
+        (0..45).map(|i| format!("MEMORYLINE {i} an earlier message about leave")).collect::<Vec<_>>().join("\n")
     }
 
     fn video() -> String {
@@ -5095,7 +5095,7 @@ mod frame_budget_tests {
     fn the_last_layer_is_cut_whole_paragraphs_and_loses_its_citations() {
         let long = format!(
             "{}\nSources:\n  - Page A\n  - Page B",
-            (1..=8).map(|i| format!("Chunk {i}. {}", "Leave is accrued monthly. ".repeat(12))).collect::<Vec<_>>().join("\n\n")
+            (1..=8).map(|i| format!("Chunk {i}. {}", "Leave is accrued monthly. ".repeat(12).trim_end())).collect::<Vec<_>>().join("\n\n")
         );
         let l = vec![(KB_FRAME_LABEL, Some(long.as_str()))];
         let (frame, fit) = super::super::context::fit_data_frame(&l, 900);
@@ -5107,9 +5107,26 @@ mod frame_budget_tests {
         assert!(frame.contains("Chunk 1.") && !frame.contains("Chunk 8."));
         assert!(frame.contains("the rest was left out"));
         let body = frame.split(&format!("[{KB_FRAME_LABEL}]\n")).nth(1).unwrap().split("\n[...").next().unwrap();
+        assert_eq!(body, body.trim_end(), "no stray whitespace before the note");
         for p in body.split("\n\n") {
             assert!(p.starts_with("Chunk ") && p.ends_with("monthly."), "a whole paragraph, never mid-sentence: {p:?}");
         }
+    }
+
+    /// With no paragraph or line break to cut at, the cut lands at the end of
+    /// a sentence: no partial word, no trailing space.
+    #[test]
+    fn a_single_paragraph_is_cut_at_a_sentence_end() {
+        let one = format!("Chunk 1. {}", "Leave is accrued monthly. ".repeat(60));
+        let l = vec![(KB_FRAME_LABEL, Some(one.as_str()))];
+        let (frame, fit) = super::super::context::fit_data_frame(&l, 700);
+        let frame = frame.expect("a useful body remains");
+        assert_eq!(fit.trimmed, vec![KB_FRAME_LABEL.to_string()]);
+        assert!(fit.after <= 700, "{fit:?}");
+        let body = frame.split(&format!("[{KB_FRAME_LABEL}]\n")).nth(1).unwrap().split("\n[...").next().unwrap();
+        assert!(body.starts_with("Chunk 1. Leave") && body.ends_with("accrued monthly."), "{body:?}");
+        assert_eq!(body, body.trim_end());
+        assert!(body.len() < one.len());
     }
 
     /// 16,384-token window: nothing is trimmed and the frame is what
@@ -5133,7 +5150,9 @@ mod frame_budget_tests {
     /// is intact, and a turn whose instructions and question fit is not refused.
     #[test]
     fn a_window_with_no_room_drops_the_frame_and_does_not_refuse() {
-        let fit_budget = 1200;
+        // Estimator: system 1000 chars = 404, question 14, no tools -> room 1100-404-14-64 = 618,
+        // ceiling 40% = 440; the header and markers alone cost 322 and the floor is 322 + 150 = 472.
+        let fit_budget = 1100;
         let mut messages = vec![json!({"role": "system", "content": "s".repeat(1000)}), json!({"role": "user", "content": QUESTION})];
         let (kb, mem, vid) = (kb(), memory(), video());
         let l = layers(&kb, &mem, &vid);
