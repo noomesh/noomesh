@@ -1870,6 +1870,32 @@ agent_protect_apply() {
     applied="$applied agent-protect=$_ap_cnt"
 }
 
+# agent_protect_rereport ENV — REPORT ONLY, for a bundle that carries no
+# agent-env (a certificate or single-kind push). The applied line of such a
+# bundle replaces the node's one status row, so without this the hold the node
+# has reads as unknown to `noo cluster verify`. Render what the INSTALLED env
+# calls for, with the same renderer as agent_protect_apply, and say
+# `agent-protect=unchanged:N` ONLY when the installed drop-in is exactly that
+# (bytes, mode 644, owner). Anything else (no systemd, env or drop-in missing
+# or unreadable, a bad value, any difference) says NOTHING: never a claim of
+# a hold that is not proved. It writes no file, installs nothing, never
+# reloads systemd and never asks for a restart.
+agent_protect_rereport() {
+    [ -d "${AP_SYSTEMD_DIR:-/run/systemd/system}" ] || return 0
+    [ -f "$1" ] && [ -r "$1" ] || return 0
+    [ -f "$AGENT_DROPIN" ] && [ -r "$AGENT_DROPIN" ] || return 0
+    ap_collect "$1" || return 0
+    if [ -n "$AP_STAT_OWNER" ]; then
+        [ "$(stat -c '%a %U:%G' "$AGENT_DROPIN" 2>/dev/null)" = "644 $AP_STAT_OWNER" ] || return 0
+    fi
+    _ar_want="$(ap_render; printf x)" || return 0
+    _ar_have="$(cat -- "$AGENT_DROPIN"; printf x)" || return 0
+    [ "$_ar_want" = "$_ar_have" ] || return 0
+    _ar_cnt="$(printf '%s\n' "$AP_PATHS" | grep -c .)" || return 0
+    [ "$_ar_cnt" -ge 1 ] || return 0
+    applied="$applied agent-protect=unchanged:$_ar_cnt"
+}
+
 # agent_protect_remove — teardown: the drop-in, and its directory if empty.
 agent_protect_remove() {
     rm -f -- "${AGENT_DROPIN:?}"
@@ -2934,6 +2960,11 @@ if [ -f "$WORK/files/agent-env" ]; then
     # The agent's filesystem hold, from the same staged env (agent_protect).
     # A change sets need_restart: the one agent restart at the end.
     agent_protect_apply "$WORK/files/agent-env"
+else
+    # No agent-env in this bundle: re-state the hold the node already has, from
+    # the installed env and drop-in, so this apply's report still carries it.
+    # Report only; nothing is written (agent_protect_rereport).
+    agent_protect_rereport /etc/noo-node-agent.env
 fi
 
 # nats-creds — the node's OWN NATS credential. Applied AFTER
