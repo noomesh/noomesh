@@ -109,6 +109,21 @@ nothing breaks. If the disk is already missing on that first launch and the
 mountpoint is an empty directory on the root disk, that is indistinguishable
 from a fresh install: record it from a healthy boot, not a degraded one.
 
+### A record with no data root
+
+The record (`.noo-data-root-id`) names the data root and the filesystem under
+it. Trailing slashes are ignored everywhere: `/var/lib/noo`, `/var/lib/noo/` and
+`/var/lib/noo//` are one root, and the launcher never writes a record for an
+empty root or `/` (it says so and writes nothing).
+
+- A record that names a filesystem but has no `data_root` is compared by
+  filesystem alone. If the data root is on that recorded filesystem the launch
+  proceeds and the data root is written back into the record; any other
+  filesystem is refused exactly as before.
+- A record with neither a `data_root` nor a filesystem identity is damaged. The
+  refusal says so (not "the data disk is not mounted") and names the repair:
+  check `findmnt -T <data root>`, then `NOO_DATA_ROOT_RERECORD=1 noo stack start`.
+
 ### Nodes: the agent's own check (0.6.30)
 
 Each Linux node agent checks its own data roots (`NOO_DATA_ROOT`, plus
