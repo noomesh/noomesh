@@ -26,11 +26,14 @@ import (
 // system/net.noomesh.fetch` (at most every fetchCheckEvery, and after each
 // fetch kick), and
 //   - not loaded, plist present  → bootstrap the existing plist, kickstart;
-//   - loaded, not running, spawn refused → bootout, wait out teardown,
-//     bootstrap the existing plist, kickstart;
+//   - loaded, not running, spawn refused, and still so on two more prints a few
+//     seconds apart → bootout, wait out teardown, bootstrap the existing
+//     plist, kickstart;
 //   - anything else → nothing. A running job is never touched (that would abort
 //     an apply). No plist or binary is ever written; no other job is touched.
-// Re-arms are rate limited and give up loudly (until this daemon restarts)
+// After a fetch kick the check runs only when the kick itself failed: a
+// kick that worked leaves launchd mid-spawn, with the previous run's exit
+// status still on display. Re-arms are rate limited and give up loudly (until this daemon restarts)
 // after fetchGiveUpAfter consecutive failures. Linux has a systemd timer that
 // re-fires by itself, so nothing here runs there.
 
@@ -45,7 +48,12 @@ const (
 var (
 	fetchRearmGOOS      = runtime.GOOS
 	fetchLaunchctlLimit = 20 * time.Second
-	fetchPlistExists    = func(p string) bool { _, err := os.Stat(p); return err == nil }
+	// The gap between the confirming prints before a bootout; a package var so
+	// tests need not sleep.
+	fetchConfirmGap   = 5 * time.Second
+	fetchConfirmSleep = func() { time.Sleep(fetchConfirmGap) }
+	fetchKickGOOS     = runtime.GOOS
+	fetchPlistExists  = func(p string) bool { _, err := os.Stat(p); return err == nil }
 )
 
 // FetchJob states in the fact.
@@ -75,33 +83,43 @@ const (
 )
 
 var (
-	fetchStateRe    = regexp.MustCompile(`(?m)^\s*(?:job )?state = (.+?)\s*$`)
-	fetchLastExitRe = regexp.MustCompile(`(?m)^\s*last exit (?:code|status) = (\d+)`)
+	fetchStateRe  = regexp.MustCompile(`(?m)^\s*state = (.+?)\s*$`)
+	fetchPIDRe    = regexp.MustCompile(`(?m)^\s*pid = \d+`)
+	fetchStatusRe = regexp.MustCompile(`(?m)^\s*(last exit (?:code|status)|reason) = (.*?)\s*$`)
+	fetchExit78Re = regexp.MustCompile(`^78\b`)
 )
 
 // parseFetchJob classifies `launchctl print system/<label>` (exit status and
-// stdout). Pure and defensive: anything it does not recognise is Unknown, and
-// Unknown means leave the job alone. A non-zero print (113, "could not find
-// service") is NotLoaded; 127 (no launchctl) is not.
+// stdout). Pure and strict: only the specific "not found" signal (exit 113 or
+// launchd's own words) is NotLoaded; only `state = running` is Running; only
+// the exact idle states ("not running", "waiting") with no `pid = ` line are
+// Idle or SpawnRefused; everything else (another state such as "spawn
+// scheduled", a pid with an idle state, a failing print, no state line,
+// garbage) is Unknown, and Unknown means leave the job alone. Refused is read
+// only from the job's own `last exit code|status =` and `reason =` lines:
+// exit 78, or "LWCR" / "spawn failed".
 func parseFetchJob(rc int, out string) fetchJobStatus {
 	if rc != 0 {
-		if rc == 127 {
-			return fetchJobUnknown
+		if rc == 113 || strings.Contains(strings.ToLower(out), "could not find service") {
+			return fetchJobNotLoaded
 		}
-		return fetchJobNotLoaded
+		return fetchJobUnknown
 	}
 	m := fetchStateRe.FindStringSubmatch(out)
 	if m == nil {
 		return fetchJobUnknown
 	}
-	if strings.HasPrefix(m[1], "running") {
+	if m[1] == "running" {
 		return fetchJobRunning
 	}
-	if lc := strings.ToLower(out); strings.Contains(lc, "lwcr") || strings.Contains(lc, "spawn failed") {
-		return fetchJobSpawnRefused
+	if (m[1] != "not running" && m[1] != "waiting") || fetchPIDRe.MatchString(out) {
+		return fetchJobUnknown
 	}
-	if e := fetchLastExitRe.FindStringSubmatch(out); e != nil && e[1] == fmt.Sprint(fetchSpawnRefused) {
-		return fetchJobSpawnRefused
+	for _, l := range fetchStatusRe.FindAllStringSubmatch(out, -1) {
+		v := strings.ToLower(l[2])
+		if fetchExit78Re.MatchString(v) || strings.Contains(v, "lwcr") || strings.Contains(v, "spawn failed") {
+			return fetchJobSpawnRefused
+		}
 	}
 	return fetchJobIdle
 }
@@ -196,6 +214,16 @@ func (e *Engine) fetchJobCheck(ctx context.Context, force bool) {
 			e.logf("WARN fetch job: %s refuses to spawn and its plist %s does not exist; not touching it", target, plist)
 			f.setFact(now, FetchJobPlistMissing, plist+" is missing")
 			return
+		}
+		// Never bootout on one sighting: a job mid-spawn can show the previous
+		// run's exit status. It must stay idle-and-refused on two more prints.
+		for i := 0; i < 2; i++ {
+			fetchConfirmSleep()
+			rc2, out2 := r.Capture(ctx, "/", "launchctl", "print", target)
+			if r.timedOut || parseFetchJob(rc2, out2) != fetchJobSpawnRefused {
+				e.logf("fetch job: %s looked spawn-refused but the job changed on print %d; leaving it alone this round", target, i+2)
+				return
+			}
 		}
 		e.fetchRearmJob(ctx, r, f, now, plist, target, "loaded, not running, spawn refused", true)
 	default:
