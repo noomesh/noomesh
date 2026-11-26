@@ -268,17 +268,30 @@ machine. `pki rotate-ca` runs the same wait but only warns
 `rotate-all`, `cluster verify`) skip the dot-directories of the PKI dir
 (`.rotate-backup-*`, `.forgotten-*`). A node that did not take its cert makes the
 exit code 1 too; `--no-deliver`/`--no-reload` skip those steps and say
-so. `--no-reload` computes the same restart list the reload path uses
-(the running containers that present a rotated certificate, plus running
-replicas, gateway last) and prints the exact follow-up for just those:
-`noo stack restart <service>...` for the named services (one command, the
-gateway on its own command last) and `docker restart <container>` for a
-container with no service name (a replica), then says nothing else needs
-restarting. With no running consumer it says no restart is needed. `--json`
-adds `would_restart` (the ordered container names) on that path, and
-`restarted` on the reload path. Nothing expiring prints `no certificates expiring within N days`.
+so. Nothing expiring prints `no certificates expiring within N days`.
 Leaf rotation also runs unattended from the `cert_auto_rotate` autonomy
 location when enabled.
+
+`--no-reload` does not restart anything; it prints what to run **on
+this machine**, from the same list the reload path restarts (the running
+containers that present a rotated certificate, plus running replicas),
+gateway last: `sudo systemctl restart noo-node-agent` (plain `systemctl`
+as root) when this machine's node certificate rotated and the agent is a
+host unit; one `noo stack restart <service>...` for the named services
+and the gateway on its own command last (`noo --instance <name> stack
+restart ...` for a named instance); `docker restart <container>` for a
+container with no service name (a replica). It then says nothing else on
+this machine needs restarting, or, when nothing needs restarting, that no
+restart is needed. When Docker does not answer, it says so and prints every
+consumer of a rotated certificate, running or not, and never says no
+restart is needed. The agent's copy under `/etc/noo/pki` is synced only by
+the reload path. Certificates rotated for other machines are not restarted
+from here: they are delivered over the pull rail in the delivery step
+(skipped, and said so, with `--no-deliver`). `--json` adds
+`would_restart` (the ordered container names) and `docker_answered` on
+that path. On the reload path Docker must answer before anything restarts
+(otherwise the command stops, rotated and unrestarted, and prints the
+follow-up), and `--json` adds `restarted`.
 
 ### Rotate the CA and re-key the fleet
 

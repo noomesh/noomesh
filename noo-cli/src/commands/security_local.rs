@@ -1426,10 +1426,14 @@ pub(crate) fn replica_consumers(name: &str, running: &[String]) -> Vec<String> {
 /// gateway last. `rotated` is `(pki-relative name, role)`. Both `rotate-all`
 /// paths use it: the reload path restarts exactly this list, and `--no-reload`
 /// prints the follow-up for exactly this list.
+///
+/// `running` is `None` when Docker could not be asked: the list is then every
+/// consumer of a rotated certificate, running or not (replicas cannot be
+/// known), so a follow-up built from it can only over-name, never omit.
 pub(crate) fn restart_list(
     rotated: &[(&str, &str)],
     local_hostname: &str,
-    running: &[String],
+    running: Option<&[String]>,
     remap: impl Fn(&str) -> String,
 ) -> Vec<String> {
     let mut to_restart: Vec<String> = Vec::new();
@@ -1439,11 +1443,11 @@ pub(crate) fn restart_list(
             // here so the running-set match, the restarts and the health
             // probe all see this instance's real container names.
             let c = remap(&c);
-            if running.contains(&c) && !to_restart.contains(&c) {
+            if running.is_none_or(|r| r.contains(&c)) && !to_restart.contains(&c) {
                 to_restart.push(c);
             }
         }
-        for c in replica_consumers(name, running) {
+        for c in replica_consumers(name, running.unwrap_or_default()) {
             if !to_restart.contains(&c) {
                 to_restart.push(c);
             }
@@ -1454,8 +1458,24 @@ pub(crate) fn restart_list(
     to_restart
 }
 
-const NO_RESTART_NEEDED: &str = "no running service uses a rotated certificate: no restart is needed";
-const NOTHING_ELSE_TO_RESTART: &str = "nothing else needs restarting";
+/// Run `restart` on each container of `list`, in order: the reload and the
+/// revert loops both go through here, so what restarts is exactly the list.
+fn restart_each(list: &[String], mut restart: impl FnMut(&str)) {
+    for c in list {
+        restart(c);
+    }
+}
+
+fn docker_restart(container: &str) {
+    let _ = Command::new("docker").args(["restart", container]).output();
+}
+
+const NO_RESTART_NEEDED: &str = "on this machine no running service uses a rotated certificate: no restart is needed";
+const NO_CONSUMERS: &str = "on this machine no service consumes a rotated certificate";
+const NOTHING_ELSE_TO_RESTART: &str = "on this machine nothing else needs restarting";
+const DOCKER_DID_NOT_ANSWER: &str = "Docker did not answer, so which containers are running is unknown: these are EVERY consumer of a rotated certificate, running or not";
+const AGENT_COPY_NOTE: &str = "the agent's copy of its certificate under /etc/noo/pki is synced only by the reload path; --no-reload did not sync it";
+const OTHER_NODES_NOTE: &str = "certificates rotated for other machines are not restarted from here: they were delivered over the pull rail above (--no-deliver skips that, and says so above)";
 
 /// The compose service a container is, when `noo stack restart <service>`
 /// can name it: containers are `<prefix>-<service>` (`noo-gateway` is
@@ -1473,37 +1493,81 @@ fn stack_service_of(container: &str, prefix: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-/// What `rotate-all --no-reload` tells the operator to run for `restart`
-/// (from [`restart_list`], gateway last): one `noo stack restart <services>`
-/// for the named services, `docker restart <container>` for each container
-/// with no service name, and the gateway on its own command at the end.
-/// Empty when nothing needs restarting.
-fn no_reload_commands(restart: &[String], prefix: &str) -> Vec<String> {
+/// What `rotate-all --no-reload` tells the operator, as data.
+struct NoReloadInputs<'a> {
+    /// From [`restart_list`], gateway last.
+    restart: &'a [String],
+    /// Whether Docker answered when the list was made.
+    docker_answered: bool,
+    /// The instance's container prefix (`noo`, or `noo-<name>`).
+    prefix: &'a str,
+    /// The named instance (`--instance`), empty for the default one.
+    instance: &'a str,
+    /// This machine's node certificate rotated and `noo-node-agent` is a
+    /// host unit: the reload path restarts it with systemctl.
+    local_agent_unit: bool,
+    /// The reload path runs systemctl directly as root, `sudo -n` otherwise.
+    am_root: bool,
+    /// A node certificate for another machine was rotated.
+    other_nodes_rotated: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct NoReloadReport {
+    warning: Option<String>,
+    /// Commands to run on this machine, in order, gateway last.
+    commands: Vec<String>,
+    /// Muted closing lines.
+    notes: Vec<String>,
+}
+
+fn no_reload_report(p: &NoReloadInputs) -> NoReloadReport {
+    let noo = if p.instance.is_empty() { "noo".to_string() } else { format!("noo --instance {}", shquote(p.instance)) };
     let mut services: Vec<String> = Vec::new();
     let mut docker: Vec<String> = Vec::new();
     let mut gateway: Option<String> = None;
-    for c in restart {
-        match stack_service_of(c, prefix) {
+    for c in p.restart {
+        match stack_service_of(c, p.prefix) {
             Some(svc) if c.ends_with("-gateway") => gateway = Some(svc),
             Some(svc) => services.push(svc),
-            None => docker.push(format!("docker restart {c}")),
+            None => docker.push(format!("docker restart {}", shquote(c))),
         }
     }
-    let mut out: Vec<String> = Vec::new();
+    let mut commands: Vec<String> = Vec::new();
+    if p.local_agent_unit {
+        // What the reload path runs: systemctl as root, `sudo -n systemctl` otherwise.
+        commands.push(if p.am_root { "systemctl restart noo-node-agent".into() } else { "sudo systemctl restart noo-node-agent".into() });
+    }
     if !services.is_empty() {
-        out.push(format!("noo stack restart {}", services.join(" ")));
+        commands.push(format!("{noo} stack restart {}", services.join(" ")));
     }
-    out.extend(docker);
+    commands.extend(docker);
     if let Some(g) = gateway {
-        out.push(format!("noo stack restart {g}"));
+        commands.push(format!("{noo} stack restart {g}"));
     }
-    out
+    let mut notes: Vec<String> = Vec::new();
+    if !commands.is_empty() {
+        notes.push(NOTHING_ELSE_TO_RESTART.to_string());
+    } else if p.docker_answered {
+        notes.push(NO_RESTART_NEEDED.to_string());
+    } else {
+        notes.push(NO_CONSUMERS.to_string());
+    }
+    if p.local_agent_unit {
+        notes.push(AGENT_COPY_NOTE.to_string());
+    }
+    if p.other_nodes_rotated {
+        notes.push(OTHER_NODES_NOTE.to_string());
+    }
+    NoReloadReport { warning: (!p.docker_answered).then(|| DOCKER_DID_NOT_ANSWER.to_string()), commands, notes }
 }
 
 /// `--no-reload` JSON: `would_restart` names, in order, the containers the
-/// reload path would have restarted.
-fn with_would_restart(mut summary: serde_json::Value, restart: &[String]) -> serde_json::Value {
+/// reload path would have restarted (every consumer when Docker did not
+/// answer), and `docker_answered` says which.
+fn with_would_restart(mut summary: serde_json::Value, restart: &[String], docker_answered: bool) -> serde_json::Value {
     summary["would_restart"] = serde_json::json!(restart);
+    summary["docker_answered"] = serde_json::json!(docker_answered);
     summary
 }
 
@@ -1520,17 +1584,20 @@ fn local_hostname() -> String {
         .unwrap_or_default()
 }
 
-fn running_containers() -> Vec<String> {
-    let out = Command::new("docker")
-        .args(["ps", "--format", "{{.Names}}"])
-        .output();
-    match out {
-        Ok(o) => String::from_utf8_lossy(&o.stdout)
-            .split_whitespace()
-            .map(str::to_string)
-            .collect(),
-        Err(_) => Vec::new(),
+/// The running container names, or `None` when Docker could not be asked
+/// (not runnable, a failed `docker ps`, or no answer in time): an empty list
+/// and "could not ask" must never read the same.
+fn docker_running_names() -> Option<Vec<String>> {
+    match crate::bounded::docker(&["ps", "--format", "{{.Names}}"], Duration::from_secs(15)) {
+        crate::bounded::Bounded::Answered(o) if o.status.success() => {
+            Some(String::from_utf8_lossy(&o.stdout).split_whitespace().map(str::to_string).collect())
+        }
+        _ => None,
     }
+}
+
+fn running_containers() -> Vec<String> {
+    docker_running_names().unwrap_or_default()
 }
 
 /// What the gateway's `/health` probe found.
@@ -5137,27 +5204,66 @@ pub fn pki_rotate_all(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
 
     // The containers this rotation needs restarted: computed once, used by
     // the reload path to restart them and by --no-reload to name them.
-    let running = running_containers();
+    let running = docker_running_names();
     let rotated_certs: Vec<(&str, &str)> = rotated.iter().map(|r| (r.name.as_str(), r.role)).collect();
-    let to_restart = restart_list(&rotated_certs, &hostname, &running, crate::envfile::instanced);
+    let to_restart = restart_list(&rotated_certs, &hostname, running.as_deref(), crate::envfile::instanced);
+    let docker_answered = running.is_some();
+    let local_node_rotated = rotated.iter().any(|r| {
+        r.role == "node"
+            && cert_node_name(&r.name).is_some_and(|n| n.eq_ignore_ascii_case(&hostname))
+    });
+    let local_agent_unit = local_node_rotated && systemd_unit_known("noo-node-agent");
+    let report = no_reload_report(&NoReloadInputs {
+        restart: &to_restart,
+        docker_answered,
+        prefix: &crate::envfile::container_prefix(),
+        instance: &crate::envfile::instance(),
+        local_agent_unit,
+        am_root: unsafe { libc::geteuid() } == 0,
+        other_nodes_rotated: remote_rotated,
+    });
 
     if !reload {
         if g.json {
-            println!("{}", with_would_restart(json_summary(&[], None, false), &to_restart));
+            println!("{}", with_would_restart(json_summary(&[], None, false), &to_restart, docker_answered));
             return Ok(exit_for_deliveries(0));
         } else {
-            let commands = no_reload_commands(&to_restart, &crate::envfile::container_prefix());
-            if commands.is_empty() {
-                println!("{}", ui::muted(NO_RESTART_NEEDED));
-            } else {
-                ui::close_warned("the rotated certificates take effect only once the services that use them restart");
-                let entries: Vec<(&str, &str)> = commands.iter().map(|c| (c.as_str(), "restarts only what the rotation touched, gateway last")).collect();
-                ui::guide(&entries);
-                println!("{}", ui::muted(NOTHING_ELSE_TO_RESTART));
+            if let Some(w) = &report.warning {
+                ui::warned(w);
+            }
+            if !report.commands.is_empty() {
+                ui::close_warned("the rotated certificates take effect only once these restart on this machine, in this order:");
+                for c in &report.commands {
+                    println!("  {c}");
+                }
+            }
+            for n in &report.notes {
+                println!("{}", ui::muted(n));
             }
             println!("{}", ui::note(&format!("backup kept at {}", backup_dir.display())));
         }
         return Ok(exit_for_deliveries(0));
+    }
+
+    // Docker must answer before anything restarts: an unknown running set is
+    // not an empty one (that read as "no running consumers", a silent no-op
+    // over a rotation whose consumers still hold the old certificates).
+    if !docker_answered {
+        if g.json {
+            println!("{}", with_restarted(json_summary(&[], None, false), &[]));
+        }
+        fail(
+            g.json,
+            ExitCode::Generic,
+            "docker_did_not_answer",
+            &format!(
+                "The certificates were rotated, but Docker did not answer, so no consumer was restarted and \
+                 none can be judged. Once Docker answers, run on this machine: {} (backup at {})",
+                report.commands.join("; "),
+                backup_dir.display()
+            ),
+            None,
+        );
     }
 
     // ── Reload consumers: services first, gateway last ──
@@ -5168,10 +5274,6 @@ pub fn pki_rotate_all(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         println!("{}", ui::phase("reload"));
     }
     let mut reloaded_units: Vec<String> = Vec::new();
-    let local_node_rotated = rotated.iter().any(|r| {
-        r.role == "node"
-            && cert_node_name(&r.name).is_some_and(|n| n.eq_ignore_ascii_case(&hostname))
-    });
     if local_node_rotated && systemd_unit_known("noo-node-agent") {
         let _ = sync_self_agent_trust_plane(&ca, &hostname, g.json);
         if systemd_restart_unit("noo-node-agent") {
@@ -5196,9 +5298,7 @@ pub fn pki_rotate_all(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     if !g.json {
         ui::step(&format!("reloading consumers: {}", to_restart.join(", ")));
     }
-    for c in &to_restart {
-        let _ = Command::new("docker").args(["restart", c]).output();
-    }
+    restart_each(&to_restart, docker_restart);
 
     let gate = probe_health_gate(&to_restart, 150);
     let action = gate_action(&gate);
@@ -5285,9 +5385,7 @@ pub fn pki_rotate_all(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             ui::warned(&format!("pki/public/ was not re-synced to the restored certificates: {e}"));
         }
     }
-    for c in &to_restart {
-        let _ = Command::new("docker").args(["restart", c]).output();
-    }
+    restart_each(&to_restart, docker_restart);
     let gate2 = probe_health_gate(&to_restart, 150);
     if g.json {
         // The same summary object as the other paths; a re-sync error is in
@@ -5299,7 +5397,7 @@ pub fn pki_rotate_all(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             GateOutcome::Unhealthy(_) => Some(false),
             GateOutcome::Blind(_) => None,
         };
-        let mut summary = json_summary(&all_reloaded, healthy2, true);
+        let mut summary = with_restarted(json_summary(&all_reloaded, healthy2, true), &to_restart);
         summary["public_view_errors"] = serde_json::json!(view.errors);
         println!("{summary}");
     }
@@ -7035,12 +7133,33 @@ none /mnt/c/deeper tmpfs rw 0 0
         v.iter().map(|s| (*s).to_string()).collect()
     }
 
+    fn inputs<'a>(restart: &'a [String], prefix: &'a str, instance: &'a str) -> NoReloadInputs<'a> {
+        NoReloadInputs {
+            restart,
+            docker_answered: true,
+            prefix,
+            instance,
+            local_agent_unit: false,
+            am_root: false,
+            other_nodes_rotated: false,
+        }
+    }
+
+    /// Every printed `noo ... stack restart` line names at least one service.
+    fn assert_no_bare_stack_restart(lines: &[String]) {
+        for l in lines.iter().filter(|l| l.contains("stack restart")) {
+            let after = l.split("stack restart").nth(1).unwrap_or("").trim();
+            assert!(!after.is_empty(), "a whole-stack restart was printed: {l}");
+            assert!(!after.starts_with('-'), "a flag, not a service: {l}");
+        }
+    }
+
     #[test]
     fn restart_list_puts_the_gateway_last_and_drops_what_is_not_running() {
         // gateway rotated first, then nats; stunnel-nats is not running.
         let rotated = [("gateway/gateway.crt", "gateway"), ("services/nats/service.crt", "service")];
         let running = names(&["noo-gateway", "noo-nats", "noo-loki"]);
-        let got = restart_list(&rotated, "host1", &running, str::to_string);
+        let got = restart_list(&rotated, "host1", Some(&running), str::to_string);
         assert_eq!(got, names(&["noo-nats", "noo-gateway"]));
     }
 
@@ -7052,7 +7171,7 @@ none /mnt/c/deeper tmpfs rw 0 0
             ("gateway/gateway.crt", "gateway"),
         ];
         let running = names(&["noo-sandbox", "noo-stunnel-sandbox", "noomesh-sandbox-extra-1", "noo-gateway"]);
-        let got = restart_list(&rotated, "host1", &running, str::to_string);
+        let got = restart_list(&rotated, "host1", Some(&running), str::to_string);
         assert_eq!(got, names(&["noo-sandbox", "noo-stunnel-sandbox", "noomesh-sandbox-extra-1", "noo-gateway"]));
     }
 
@@ -7061,59 +7180,131 @@ none /mnt/c/deeper tmpfs rw 0 0
         let rotated = [("gateway/gateway.crt", "gateway")];
         let remap = |c: &str| c.replacen("noo-", "noo-galaxy-", 1);
         let running = names(&["noo-galaxy-gateway"]);
-        assert_eq!(restart_list(&rotated, "host1", &running, remap), names(&["noo-galaxy-gateway"]));
-        assert!(restart_list(&rotated, "host1", &names(&["noo-nats"]), str::to_string).is_empty());
-        assert!(restart_list(&[("ca.crt", "ca")], "host1", &names(&["noo-gateway"]), str::to_string).is_empty());
+        assert_eq!(restart_list(&rotated, "host1", Some(&running), remap), names(&["noo-galaxy-gateway"]));
+        assert!(restart_list(&rotated, "host1", Some(&names(&["noo-nats"])), str::to_string).is_empty());
+        assert!(restart_list(&[("ca.crt", "ca")], "host1", Some(&names(&["noo-gateway"])), str::to_string).is_empty());
+    }
+
+    /// Docker not answering is not "nothing is running": every consumer is
+    /// named, running or not, gateway last.
+    #[test]
+    fn restart_list_without_an_answer_names_every_consumer() {
+        let rotated = [("gateway/gateway.crt", "gateway"), ("services/nats/service.crt", "service")];
+        let got = restart_list(&rotated, "host1", None, str::to_string);
+        assert_eq!(got, names(&["noo-nats", "noo-stunnel-nats", "noo-gateway"]));
+        // An answered empty list is a different thing: nothing to restart.
+        assert!(restart_list(&rotated, "host1", Some(&[]), str::to_string).is_empty());
     }
 
     #[test]
     fn no_reload_names_exactly_the_services_gateway_last() {
         let restart = names(&["noo-stunnel-nats", "noo-nats", "noo-gateway"]);
-        let cmds = no_reload_commands(&restart, "noo");
-        assert_eq!(cmds, names(&["noo stack restart stunnel-nats nats", "noo stack restart gateway"]));
-        // Never the bare whole-stack command.
-        for c in &cmds {
-            assert!(c.len() > "noo stack restart ".len(), "{c}");
-            assert!(c.starts_with("noo stack restart ") && !c.trim_end().ends_with("restart"), "{c}");
-        }
+        let r = no_reload_report(&inputs(&restart, "noo", ""));
+        assert_eq!(r.commands, names(&["noo stack restart stunnel-nats nats", "noo stack restart gateway"]));
+        assert_eq!(r.notes, names(&[NOTHING_ELSE_TO_RESTART]));
+        assert_eq!(r.warning, None);
+        assert_no_bare_stack_restart(&r.commands);
     }
 
     #[test]
     fn no_reload_maps_instance_names_and_falls_back_to_docker_for_replicas() {
         let restart = names(&["noo-galaxy-sandbox", "noomesh-sandbox-extra-1", "noo-galaxy-gateway"]);
-        let cmds = no_reload_commands(&restart, "noo-galaxy");
+        let r = no_reload_report(&inputs(&restart, "noo-galaxy", "galaxy"));
         assert_eq!(
-            cmds,
+            r.commands,
             names(&[
-                "noo stack restart sandbox",
+                "noo --instance galaxy stack restart sandbox",
                 "docker restart noomesh-sandbox-extra-1",
-                "noo stack restart gateway",
+                "noo --instance galaxy stack restart gateway",
             ])
         );
+        assert_no_bare_stack_restart(&r.commands);
         // A container outside the prefix has no service name either.
-        assert_eq!(no_reload_commands(&names(&["other-thing"]), "noo"), names(&["docker restart other-thing"]));
+        let other = names(&["other-thing"]);
+        assert_eq!(no_reload_report(&inputs(&other, "noo", "")).commands, names(&["docker restart other-thing"]));
     }
 
     #[test]
-    fn no_reload_with_nothing_to_restart_prints_no_command() {
-        assert!(no_reload_commands(&[], "noo").is_empty());
-        assert!(NO_RESTART_NEEDED.contains("no restart is needed"));
-        assert!(!NO_RESTART_NEEDED.contains("noo stack restart"));
-        assert_eq!(NOTHING_ELSE_TO_RESTART, "nothing else needs restarting");
+    fn no_reload_with_nothing_to_restart_says_so_and_prints_no_command() {
+        let r = no_reload_report(&inputs(&[], "noo", ""));
+        assert!(r.commands.is_empty());
+        assert_eq!(r.notes, names(&[NO_RESTART_NEEDED]));
+        assert!(NO_RESTART_NEEDED.contains("no restart is needed") && NO_RESTART_NEEDED.contains("on this machine"));
+    }
+
+    /// Docker did not answer: a warning, the full follow-up, never the
+    /// "no restart is needed" line (even when the list is empty).
+    #[test]
+    fn no_reload_when_docker_did_not_answer_never_says_no_restart_is_needed() {
+        let restart = names(&["noo-nats", "noo-stunnel-nats", "noo-gateway"]);
+        let mut p = inputs(&restart, "noo", "");
+        p.docker_answered = false;
+        let r = no_reload_report(&p);
+        assert_eq!(r.warning.as_deref(), Some(DOCKER_DID_NOT_ANSWER));
+        assert_eq!(r.commands, names(&["noo stack restart nats stunnel-nats", "noo stack restart gateway"]));
+        assert!(r.notes.iter().all(|n| n != NO_RESTART_NEEDED));
+        let empty = no_reload_report(&NoReloadInputs { restart: &[], docker_answered: false, ..p });
+        assert!(empty.warning.is_some());
+        assert!(empty.notes.iter().all(|n| !n.contains("no restart is needed")), "{:?}", empty.notes);
+        assert_eq!(empty.notes, names(&[NO_CONSUMERS]));
+    }
+
+    /// The controller's own agent as a HOST unit is part of the follow-up,
+    /// first (the reload path restarts it first), as the command the reload
+    /// path runs; an empty container list no longer reads "no restart".
+    #[test]
+    fn no_reload_includes_the_local_agent_unit_and_scopes_to_this_machine() {
+        let mut p = inputs(&[], "noo", "");
+        p.local_agent_unit = true;
+        let r = no_reload_report(&p);
+        assert_eq!(r.commands, names(&["sudo systemctl restart noo-node-agent"]));
+        assert!(r.notes.iter().all(|n| n != NO_RESTART_NEEDED));
+        assert!(r.notes.contains(&AGENT_COPY_NOTE.to_string()));
+        p.am_root = true;
+        assert_eq!(no_reload_report(&p).commands, names(&["systemctl restart noo-node-agent"]));
+        let restart = names(&["noo-nats", "noo-gateway"]);
+        let mut q = inputs(&restart, "noo", "");
+        q.local_agent_unit = true;
+        let r = no_reload_report(&q);
+        assert_eq!(r.commands.first().map(String::as_str), Some("sudo systemctl restart noo-node-agent"));
+        assert_eq!(r.commands.last().map(String::as_str), Some("noo stack restart gateway"));
+        assert!(r.notes.iter().all(|n| n.starts_with("on this machine") || n.starts_with("the agent")));
+    }
+
+    #[test]
+    fn no_reload_says_how_other_machines_certificates_take_effect() {
+        let mut p = inputs(&[], "noo", "");
+        assert!(no_reload_report(&p).notes.iter().all(|n| n != OTHER_NODES_NOTE));
+        p.other_nodes_rotated = true;
+        let r = no_reload_report(&p);
+        assert!(r.notes.contains(&OTHER_NODES_NOTE.to_string()));
+        assert!(OTHER_NODES_NOTE.contains("pull rail") && OTHER_NODES_NOTE.contains("--no-deliver"));
     }
 
     #[test]
     fn rotate_all_json_names_what_would_restart_and_what_restarted() {
         let base = serde_json::json!({ "reloaded": [], "healthy": null });
         let list = names(&["noo-nats", "noo-gateway"]);
-        let would = with_would_restart(base.clone(), &list);
+        let would = with_would_restart(base.clone(), &list, true);
         assert_eq!(would["would_restart"], serde_json::json!(["noo-nats", "noo-gateway"]));
+        assert_eq!(would["docker_answered"], serde_json::json!(true));
         assert!(would.get("restarted").is_none());
         assert_eq!(would["healthy"], serde_json::Value::Null); // existing fields kept
+        assert_eq!(with_would_restart(base.clone(), &list, false)["docker_answered"], serde_json::json!(false));
         let did = with_restarted(base, &list);
         assert_eq!(did["restarted"], serde_json::json!(["noo-nats", "noo-gateway"]));
         assert!(did.get("would_restart").is_none());
-        assert_eq!(with_would_restart(serde_json::json!({}), &[])["would_restart"], serde_json::json!([]));
+        assert_eq!(with_would_restart(serde_json::json!({}), &[], true)["would_restart"], serde_json::json!([]));
+    }
+
+    /// The loops restart exactly the list, in order: no filtering between.
+    #[test]
+    fn restart_each_visits_exactly_the_list_in_order() {
+        let list = names(&["noo-nats", "noo-stunnel-nats", "noo-gateway"]);
+        let mut seen: Vec<String> = Vec::new();
+        restart_each(&list, |c| seen.push(c.to_string()));
+        assert_eq!(seen, list);
+        restart_each(&[], |c| panic!("restarted {c} from an empty list"));
     }
 
     #[test]
@@ -7123,9 +7314,21 @@ none /mnt/c/deeper tmpfs rw 0 0
         let list_at = body.find("restart_list(").unwrap();
         let branch_at = body.find("if !reload {").expect("no --no-reload branch");
         assert!(list_at < branch_at, "the list is computed before the --no-reload branch");
-        assert!(body.contains("no_reload_commands("), "the no-reload branch names the services");
+        assert!(body.contains("no_reload_report("), "the no-reload branch names the services");
         assert!(body.contains("with_would_restart("));
         assert!(!body.contains("\"noo stack restart\""), "the bare whole-stack restart is gone");
+        // Both restart loops (reload, revert) walk to_restart itself, and
+        // nothing narrows it after it is made.
+        assert_eq!(body.matches("restart_each(&to_restart,").count(), 2);
+        for narrowing in ["to_restart.retain", "to_restart.truncate", "to_restart.pop", "to_restart.remove", "to_restart.clear"] {
+            assert!(!body.contains(narrowing), "{narrowing}");
+        }
+        // Docker must answer before the first restart (the unit or a container).
+        let ask = body.find("if !docker_answered").expect("no could-not-ask refusal");
+        assert!(ask < body.find("systemd_restart_unit(").unwrap());
+        assert!(ask < body.find("restart_each(").unwrap());
+        // The revert summary names what was restarted too.
+        assert_eq!(body.matches("with_restarted(").count(), 5, "empty-list, accept, blind, revert, could-not-ask");
     }
 
     // ── trust-ca command construction ───────────────────────────────────
