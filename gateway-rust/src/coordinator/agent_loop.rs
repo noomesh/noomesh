@@ -5310,7 +5310,8 @@ mod frame_budget_tests {
         // No history: 3,000 - 1,500 - 404 - 14 - 64 = 1,018, under the 40% cap of 1,200.
         assert_eq!(frame_budget(&bare, 3000, 1500), 1018);
         // Small history is reserved in full: 808 < 25% of 6,000 = 1,500.
-        assert_eq!(frame_budget(&with_history, 6000, 0), (6000 - 404 - 14 - 808 - 64).min(2400));
+        // room = 6,000 - 404 - 14 - 808 - 64 = 4,710, held to 40% = 2,400.
+        assert_eq!(frame_budget(&with_history, 6000, 0), 2400);
         // Just under the bound the 40% cap applies (3,276); at it, it does not.
         assert_eq!(frame_budget(&bare, 8191, 0), 3276);
         assert_eq!(frame_budget(&bare, 8192, 0), 8192 - 404 - 14 - 64);
