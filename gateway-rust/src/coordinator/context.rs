@@ -593,7 +593,7 @@ pub(super) fn fit_data_frame<'a>(layers: &[(&'a str, Option<&str>)], budget_toke
     let before = frame_tokens(&full);
     let mut parts: Vec<Part<'a>> = layers
         .iter()
-        .filter_map(|(l, t)| t.map(str::trim).filter(|t| !t.is_empty()).map(|t| Part::parse(*l, t)))
+        .filter_map(|&(l, t)| t.map(str::trim).filter(|t| !t.is_empty()).map(|t| Part::parse(l, t)))
         .collect();
     let labels = |parts: &[Part]| parts.iter().map(|p| p.label.to_string()).collect::<Vec<_>>();
     let all = labels(&parts);
