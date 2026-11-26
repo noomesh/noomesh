@@ -4327,11 +4327,14 @@ pub(crate) fn put_bytes(g: &Globals, path: &str, body: &[u8]) -> Result<serde_js
     let base = crate::envfile::gateway_url(&g.gateway_override);
     let url = format!("{base}{path}");
     let agent = crate::http::agent(g, &base, 120);
+    ensure_login_before_upload(g, body.len());
     let mut req = agent.put(&url).header("content-type", "application/octet-stream");
     if let Some(b) = crate::auth::bearer(g) {
         req = req.header("Authorization", &b);
     }
-    let mut resp = req.send(body).map_err(|e| format!("PUT {path}: {e}"))?;
+    let mut resp = req
+        .send(body)
+        .map_err(|e| oversize_hint("PUT", path, body.len(), &e.to_string()))?;
     let status = resp.status().as_u16();
     let text = resp.body_mut().read_to_string().unwrap_or_default();
     if !(200..=299).contains(&status) {
@@ -4346,13 +4349,14 @@ pub(crate) fn post_bytes(g: &Globals, path: &str, body: &[u8]) -> Result<(), Str
     // 60 s plus a second per MB: a bundle carrying a staged vendor CLI
     // (i83 E1e) is a few hundred MB, which a flat 60 s cut off below ~5 MB/s.
     let agent = crate::http::agent(g, &base, 60 + (body.len() / 1_000_000) as u64);
+    ensure_login_before_upload(g, body.len());
     let mut req = agent.post(&url).header("content-type", "application/octet-stream");
     if let Some(b) = crate::auth::bearer(g) {
         req = req.header("Authorization", &b);
     }
     let resp = req
         .send(body)
-        .map_err(|e| oversize_hint(path, body.len(), &e.to_string()))?;
+        .map_err(|e| oversize_hint("POST", path, body.len(), &e.to_string()))?;
     let status = resp.status().as_u16();
     if status == 413 {
         return Err(format!(
@@ -4366,26 +4370,61 @@ pub(crate) fn post_bytes(g: &Globals, path: &str, body: &[u8]) -> Result<(), Str
     Ok(())
 }
 
+/// A body over this many bytes is "large": the gateway answers a refusal
+/// (the size cap, or a login it does not accept) and closes before reading
+/// the rest, so the client sees a cut connection, not the status.
+const LARGE_UPLOAD_BYTES: usize = 2 * 1024 * 1024;
+
+/// Whether a login check must run before this upload starts: a large body
+/// (a refusal on authentication would look like a cut connection) or no
+/// credential held at all.
+fn needs_login_preflight(len: usize, has_bearer: bool) -> bool {
+    len > LARGE_UPLOAD_BYTES || !has_bearer
+}
+
+/// One small authenticated request before a large upload, through the CLI's
+/// normal request path: a 401 there refreshes the stored login once, retries,
+/// and otherwise stops with the standard "sign in again" message and exit
+/// status (`http::auth_failed`). It returns only when the login is accepted,
+/// so an expired or revoked login is found BEFORE any body is written.
+fn ensure_login_before_upload(g: &Globals, len: usize) {
+    if needs_login_preflight(len, crate::auth::bearer(g).is_some()) {
+        crate::http::get_json(g, LOGIN_CHECK_PATH, true, 15);
+    }
+}
+
+/// The identity read `noo auth status` makes: tiny, and answered only to an
+/// accepted login.
+const LOGIN_CHECK_PATH: &str = "/auth/me";
+
 /// A transport error part-way through a large upload, said in terms of the
-/// thing that actually went wrong.
+/// causes that can actually produce it.
 ///
-/// A server that refuses an over-cap body answers 413 and closes BEFORE
-/// reading the rest, so the client never sees the status — it sees the write
-/// fail. Twice now that has reached an operator as `io: Broken pipe (os error
-/// 32)`, which names the syscall and nothing else: 2026-09-03 on a ~9 MB CLI
-/// asset against a 2 MB cap, and 2026-09-19 on an 82 MB bundle against 64 MB,
-/// where it stopped the whole fleet upgrade on four nodes.
-fn oversize_hint(path: &str, len: usize, err: &str) -> String {
+/// A server that refuses a body answers and closes BEFORE reading the rest,
+/// so the client never sees the status — it sees the write fail. Two refusals
+/// look identical from here: a body over the gateway's cap (413), and a login
+/// the gateway does not accept (401). Twice a cut reached an operator as
+/// `io: Broken pipe (os error 32)`, which names the syscall and nothing else:
+/// 2026-09-03 on a ~9 MB CLI asset against a 2 MB cap, and 2026-09-19 on an
+/// 82 MB bundle against 64 MB, where it stopped the whole fleet upgrade on
+/// four nodes. The hint therefore names both, and how to tell them apart.
+fn oversize_hint(verb: &str, path: &str, len: usize, err: &str) -> String {
     let disconnected = ["broken pipe", "connection reset", "os error 32", "connection aborted"]
         .iter()
         .any(|needle| err.to_ascii_lowercase().contains(needle));
-    if disconnected && len > 2 * 1024 * 1024 {
+    if disconnected && len > LARGE_UPLOAD_BYTES {
         return format!(
-            "POST {path}: the gateway closed the connection while receiving {} ({err}).              A body over the gateway's cap is refused this way — the 413 never reaches us              because it stops reading first. Upgrade the stack so the gateway takes it,              or check `noo stack logs gateway` for the refusal.",
+            "{verb} {path}: the gateway closed the connection while receiving {} ({err}). \
+             Two refusals look like this, because the gateway stops reading as soon as it \
+             refuses: the body is over the gateway's cap (upgrade the stack so the gateway \
+             takes it), or the login was refused (authentication). To tell them apart, run \
+             `noo auth status`: if it says you are not signed in, run `noo auth login` and \
+             retry; if it shows a valid login, the cap is the cause, and \
+             `noo stack logs gateway` shows the refusal.",
             human_bytes(len)
         );
     }
-    format!("POST {path}: {err}")
+    format!("{verb} {path}: {err}")
 }
 
 /// Overwrite the staged credential file, then remove the workdir — the same
@@ -5648,6 +5687,58 @@ pub(crate) const HARNESS_TLS_KEY: &str = "/run/credentials/noo-harness.service/n
 
 #[cfg(test)]
 mod tests {
+    /// i1397: which uploads check the login first.
+    #[test]
+    fn a_login_check_runs_before_a_large_body_or_with_no_credential() {
+        let small = 1024 * 1024;
+        let large = 3 * 1024 * 1024;
+        assert!(!super::needs_login_preflight(small, true), "a small body with a credential needs no check");
+        assert!(super::needs_login_preflight(large, true), "a large body is checked first");
+        assert!(super::needs_login_preflight(small, false), "no credential is checked first");
+        assert!(super::needs_login_preflight(large, false));
+        // The boundary is the hint's own: exactly the limit is not large.
+        assert!(!super::needs_login_preflight(super::LARGE_UPLOAD_BYTES, true));
+        assert!(super::needs_login_preflight(super::LARGE_UPLOAD_BYTES + 1, true));
+    }
+
+    /// i1397: a cut connection on a large upload names both refusals and how to
+    /// tell them apart; never the size cap alone.
+    #[test]
+    fn a_cut_upload_names_the_size_cap_and_an_authentication_refusal() {
+        let big = 82_000_000;
+        let h = super::oversize_hint("POST", "/api/cluster/provision-bundle/n1", big, "io: Broken pipe (os error 32)");
+        assert!(h.contains("cap"), "{h}");
+        assert!(h.contains("authentication"), "{h}");
+        assert!(h.contains("noo auth status") && h.contains("noo auth login"), "{h}");
+        assert!(h.contains("82.0 MB"), "{h}");
+        // PUT uploads say PUT.
+        let p = super::oversize_hint("PUT", "/api/cluster/cli-asset/x", big, "connection reset by peer");
+        assert!(p.starts_with("PUT /api/cluster/cli-asset/x:"), "{p}");
+        // Not a disconnect, or not large: the error passes through unexplained.
+        assert_eq!(super::oversize_hint("POST", "/p", big, "timed out"), "POST /p: timed out");
+        assert_eq!(
+            super::oversize_hint("POST", "/p", 1000, "Broken pipe"),
+            "POST /p: Broken pipe"
+        );
+    }
+
+    /// i1397: the login check runs before the body is written, in both upload
+    /// functions. The check exits with the standard login message when the
+    /// login is refused, so reaching `.send(` means it passed.
+    #[test]
+    fn both_uploads_check_the_login_before_sending_the_body() {
+        let own = crate::test_src::own_code(include_str!("provision.rs"));
+        for f in ["pub(crate) fn post_bytes(", "pub(crate) fn put_bytes("] {
+            let body = crate::test_src::fn_body(&own, f);
+            let check = body.find("ensure_login_before_upload(").unwrap_or_else(|| panic!("{f} never checks the login"));
+            let send = body.find(".send(body)").unwrap_or_else(|| panic!("{f} no longer sends"));
+            assert!(check < send, "{f} sends before it checks the login");
+        }
+        let pre = crate::test_src::fn_body(&own, "fn ensure_login_before_upload(");
+        assert!(pre.contains("needs_login_preflight("), "the check ignores the decision");
+        assert!(pre.contains("crate::http::get_json(g, LOGIN_CHECK_PATH, true"), "the check is not an authenticated request through the CLI's own path");
+    }
+
     /// i689(b): the agent comes from the signed lock's node-agent DIGEST.
     #[test]
     fn the_agent_image_is_taken_by_the_signed_lock_digest() {

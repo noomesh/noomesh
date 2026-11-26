@@ -106,6 +106,7 @@ def test_a_mid_upload_disconnect_is_explained_not_just_reported() -> None:
     hint = src.split("fn oversize_hint(", 1)[1].split("\nfn ", 1)[0]
     for needle in ("broken pipe", "connection reset"):
         assert needle in hint, f"{needle} must be recognised as a possible refusal"
-    assert "cap" in hint.lower(), "the hint must name the body cap as the likely cause"
+    assert "cap" in hint.lower(), "the hint must name the body cap as a possible cause"
+    assert "authentication" in hint, "the hint must name a refused login as the other possible cause (i1397)"
     # And a real 413, when the client does see it, says so plainly.
     assert "413" in src and "too large" in src
