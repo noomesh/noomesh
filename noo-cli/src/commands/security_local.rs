@@ -1420,6 +1420,99 @@ pub(crate) fn replica_consumers(name: &str, running: &[String]) -> Vec<String> {
         .collect()
 }
 
+/// The containers a set of rotated certificates needs restarted, in restart
+/// order: running consumers (`cert_consumers`, remapped to this instance by
+/// `remap`) plus running replicas (`replica_consumers`), each once, the
+/// gateway last. `rotated` is `(pki-relative name, role)`. Both `rotate-all`
+/// paths use it: the reload path restarts exactly this list, and `--no-reload`
+/// prints the follow-up for exactly this list.
+pub(crate) fn restart_list(
+    rotated: &[(&str, &str)],
+    local_hostname: &str,
+    running: &[String],
+    remap: impl Fn(&str) -> String,
+) -> Vec<String> {
+    let mut to_restart: Vec<String> = Vec::new();
+    for (name, role) in rotated {
+        for c in cert_consumers(name, role, local_hostname) {
+            // cert_consumers speaks default-instance names; remap ONCE
+            // here so the running-set match, the restarts and the health
+            // probe all see this instance's real container names.
+            let c = remap(&c);
+            if running.contains(&c) && !to_restart.contains(&c) {
+                to_restart.push(c);
+            }
+        }
+        for c in replica_consumers(name, running) {
+            if !to_restart.contains(&c) {
+                to_restart.push(c);
+            }
+        }
+    }
+    // Suffix compare: instance prefixes vary (noo-gateway / noo-galaxy-gateway).
+    to_restart.sort_by_key(|c| c.ends_with("-gateway")); // stable: gateway last
+    to_restart
+}
+
+const NO_RESTART_NEEDED: &str = "no running service uses a rotated certificate: no restart is needed";
+const NOTHING_ELSE_TO_RESTART: &str = "nothing else needs restarting";
+
+/// The compose service a container is, when `noo stack restart <service>`
+/// can name it: containers are `<prefix>-<service>` (`noo-gateway` is
+/// `gateway`, `noo-stunnel-nats` is `stunnel-nats`). A replica
+/// (`<project>-sandbox-extra-1`) has no container_name and no service of its
+/// own to name, so it has none.
+fn stack_service_of(container: &str, prefix: &str) -> Option<String> {
+    if container.contains("-extra-") {
+        return None;
+    }
+    container
+        .strip_prefix(prefix)
+        .and_then(|rest| rest.strip_prefix('-'))
+        .filter(|svc| !svc.is_empty())
+        .map(str::to_string)
+}
+
+/// What `rotate-all --no-reload` tells the operator to run for `restart`
+/// (from [`restart_list`], gateway last): one `noo stack restart <services>`
+/// for the named services, `docker restart <container>` for each container
+/// with no service name, and the gateway on its own command at the end.
+/// Empty when nothing needs restarting.
+fn no_reload_commands(restart: &[String], prefix: &str) -> Vec<String> {
+    let mut services: Vec<String> = Vec::new();
+    let mut docker: Vec<String> = Vec::new();
+    let mut gateway: Option<String> = None;
+    for c in restart {
+        match stack_service_of(c, prefix) {
+            Some(svc) if c.ends_with("-gateway") => gateway = Some(svc),
+            Some(svc) => services.push(svc),
+            None => docker.push(format!("docker restart {c}")),
+        }
+    }
+    let mut out: Vec<String> = Vec::new();
+    if !services.is_empty() {
+        out.push(format!("noo stack restart {}", services.join(" ")));
+    }
+    out.extend(docker);
+    if let Some(g) = gateway {
+        out.push(format!("noo stack restart {g}"));
+    }
+    out
+}
+
+/// `--no-reload` JSON: `would_restart` names, in order, the containers the
+/// reload path would have restarted.
+fn with_would_restart(mut summary: serde_json::Value, restart: &[String]) -> serde_json::Value {
+    summary["would_restart"] = serde_json::json!(restart);
+    summary
+}
+
+/// Reload-path JSON: `restarted` names the containers that were restarted.
+fn with_restarted(mut summary: serde_json::Value, restart: &[String]) -> serde_json::Value {
+    summary["restarted"] = serde_json::json!(restart);
+    summary
+}
+
 fn local_hostname() -> String {
     std::fs::read_to_string("/proc/sys/kernel/hostname")
         .map(|s| s.trim().to_string())
@@ -4955,7 +5048,6 @@ pub fn pki_rotate_all(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     }
 
     let rotated: Vec<&RotateResult> = results.iter().filter(|r| r.status == "rotated").collect();
-    let gateway_rotated = rotated.iter().any(|r| r.role == "gateway");
 
     // ── fu72 #2: DELIVER re-issued remote node certs ──
     // The old command stopped here: a remote node's cert was re-issued on
@@ -5043,14 +5135,25 @@ pub fn pki_rotate_all(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         return Ok(exit_for_deliveries(0));
     }
 
+    // The containers this rotation needs restarted: computed once, used by
+    // the reload path to restart them and by --no-reload to name them.
+    let running = running_containers();
+    let rotated_certs: Vec<(&str, &str)> = rotated.iter().map(|r| (r.name.as_str(), r.role)).collect();
+    let to_restart = restart_list(&rotated_certs, &hostname, &running, crate::envfile::instanced);
+
     if !reload {
         if g.json {
-            println!("{}", json_summary(&[], None, false));
+            println!("{}", with_would_restart(json_summary(&[], None, false), &to_restart));
             return Ok(exit_for_deliveries(0));
         } else {
-            if gateway_rotated {
-                ui::close_warned("the gateway certificate was rotated: restart the gateway for the new cert to take effect");
-                ui::guide(&[("noo stack restart", "picks up the rotated gateway certificate")]);
+            let commands = no_reload_commands(&to_restart, &crate::envfile::container_prefix());
+            if commands.is_empty() {
+                println!("{}", ui::muted(NO_RESTART_NEEDED));
+            } else {
+                ui::close_warned("the rotated certificates take effect only once the services that use them restart");
+                let entries: Vec<(&str, &str)> = commands.iter().map(|c| (c.as_str(), "restarts only what the rotation touched, gateway last")).collect();
+                ui::guide(&entries);
+                println!("{}", ui::muted(NOTHING_ELSE_TO_RESTART));
             }
             println!("{}", ui::note(&format!("backup kept at {}", backup_dir.display())));
         }
@@ -5081,30 +5184,9 @@ pub fn pki_rotate_all(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             ui::guide(&[("systemctl status noo-node-agent", "shows why the agent did not come back")]);
         }
     }
-    let running = running_containers();
-    let mut to_restart: Vec<String> = Vec::new();
-    for r in &rotated {
-        for c in cert_consumers(&r.name, r.role, &hostname) {
-            // cert_consumers speaks default-instance names; remap ONCE
-            // here so the running-set match, the restarts and the health
-            // probe all see this instance's real container names.
-            let c = crate::envfile::instanced(&c);
-            if running.contains(&c) && !to_restart.contains(&c) {
-                to_restart.push(c);
-            }
-        }
-        for c in replica_consumers(&r.name, &running) {
-            if !to_restart.contains(&c) {
-                to_restart.push(c);
-            }
-        }
-    }
-    // Suffix compare: instance prefixes vary (noo-gateway / noo-galaxy-gateway).
-    to_restart.sort_by_key(|c| c.ends_with("-gateway")); // stable: gateway last
-
     if to_restart.is_empty() {
         if g.json {
-            println!("{}", json_summary(&reloaded_units, None, false));
+            println!("{}", with_restarted(json_summary(&reloaded_units, None, false), &to_restart));
         } else if reloaded_units.is_empty() {
             println!("{}", ui::muted("no running consumers to reload"));
         }
@@ -5124,7 +5206,7 @@ pub fn pki_rotate_all(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         let mut all_reloaded = reloaded_units.clone();
         all_reloaded.extend(to_restart.iter().cloned());
         if g.json {
-            println!("{}", json_summary(&all_reloaded, Some(true), false));
+            println!("{}", with_restarted(json_summary(&all_reloaded, Some(true), false), &to_restart));
         } else {
             ui::close_done(&format!("rotation applied: {detail}"));
             if undelivered > 0 {
@@ -5152,7 +5234,7 @@ pub fn pki_rotate_all(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         if g.json {
             let mut all_reloaded = reloaded_units.clone();
             all_reloaded.extend(to_restart.iter().cloned());
-            println!("{}", json_summary(&all_reloaded, None, false));
+            println!("{}", with_restarted(json_summary(&all_reloaded, None, false), &to_restart));
         }
         fail(
             g.json,
@@ -6947,6 +7029,103 @@ none /mnt/c/deeper tmpfs rw 0 0
         v.sort_by_key(|c| c == "noo-gateway");
         assert_eq!(v.last().map(String::as_str), Some("noo-gateway"));
         assert_eq!(&v[..2], &["noo-nats".to_string(), "noo-stunnel-nats".to_string()]);
+    }
+
+    fn names(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn restart_list_puts_the_gateway_last_and_drops_what_is_not_running() {
+        // gateway rotated first, then nats; stunnel-nats is not running.
+        let rotated = [("gateway/gateway.crt", "gateway"), ("services/nats/service.crt", "service")];
+        let running = names(&["noo-gateway", "noo-nats", "noo-loki"]);
+        let got = restart_list(&rotated, "host1", &running, str::to_string);
+        assert_eq!(got, names(&["noo-nats", "noo-gateway"]));
+    }
+
+    #[test]
+    fn restart_list_includes_replicas_and_removes_duplicates() {
+        let rotated = [
+            ("services/sandbox/service.crt", "service"),
+            ("services/sandbox/service.crt", "service"),
+            ("gateway/gateway.crt", "gateway"),
+        ];
+        let running = names(&["noo-sandbox", "noo-stunnel-sandbox", "noomesh-sandbox-extra-1", "noo-gateway"]);
+        let got = restart_list(&rotated, "host1", &running, str::to_string);
+        assert_eq!(got, names(&["noo-sandbox", "noo-stunnel-sandbox", "noomesh-sandbox-extra-1", "noo-gateway"]));
+    }
+
+    #[test]
+    fn restart_list_remaps_to_the_instance_and_is_empty_when_nothing_runs() {
+        let rotated = [("gateway/gateway.crt", "gateway")];
+        let remap = |c: &str| c.replacen("noo-", "noo-galaxy-", 1);
+        let running = names(&["noo-galaxy-gateway"]);
+        assert_eq!(restart_list(&rotated, "host1", &running, remap), names(&["noo-galaxy-gateway"]));
+        assert!(restart_list(&rotated, "host1", &names(&["noo-nats"]), str::to_string).is_empty());
+        assert!(restart_list(&[("ca.crt", "ca")], "host1", &names(&["noo-gateway"]), str::to_string).is_empty());
+    }
+
+    #[test]
+    fn no_reload_names_exactly_the_services_gateway_last() {
+        let restart = names(&["noo-stunnel-nats", "noo-nats", "noo-gateway"]);
+        let cmds = no_reload_commands(&restart, "noo");
+        assert_eq!(cmds, names(&["noo stack restart stunnel-nats nats", "noo stack restart gateway"]));
+        // Never the bare whole-stack command.
+        for c in &cmds {
+            assert!(c.len() > "noo stack restart ".len(), "{c}");
+            assert!(c.starts_with("noo stack restart ") && !c.trim_end().ends_with("restart"), "{c}");
+        }
+    }
+
+    #[test]
+    fn no_reload_maps_instance_names_and_falls_back_to_docker_for_replicas() {
+        let restart = names(&["noo-galaxy-sandbox", "noomesh-sandbox-extra-1", "noo-galaxy-gateway"]);
+        let cmds = no_reload_commands(&restart, "noo-galaxy");
+        assert_eq!(
+            cmds,
+            names(&[
+                "noo stack restart sandbox",
+                "docker restart noomesh-sandbox-extra-1",
+                "noo stack restart gateway",
+            ])
+        );
+        // A container outside the prefix has no service name either.
+        assert_eq!(no_reload_commands(&names(&["other-thing"]), "noo"), names(&["docker restart other-thing"]));
+    }
+
+    #[test]
+    fn no_reload_with_nothing_to_restart_prints_no_command() {
+        assert!(no_reload_commands(&[], "noo").is_empty());
+        assert!(NO_RESTART_NEEDED.contains("no restart is needed"));
+        assert!(!NO_RESTART_NEEDED.contains("noo stack restart"));
+        assert_eq!(NOTHING_ELSE_TO_RESTART, "nothing else needs restarting");
+    }
+
+    #[test]
+    fn rotate_all_json_names_what_would_restart_and_what_restarted() {
+        let base = serde_json::json!({ "reloaded": [], "healthy": null });
+        let list = names(&["noo-nats", "noo-gateway"]);
+        let would = with_would_restart(base.clone(), &list);
+        assert_eq!(would["would_restart"], serde_json::json!(["noo-nats", "noo-gateway"]));
+        assert!(would.get("restarted").is_none());
+        assert_eq!(would["healthy"], serde_json::Value::Null); // existing fields kept
+        let did = with_restarted(base, &list);
+        assert_eq!(did["restarted"], serde_json::json!(["noo-nats", "noo-gateway"]));
+        assert!(did.get("would_restart").is_none());
+        assert_eq!(with_would_restart(serde_json::json!({}), &[])["would_restart"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn rotate_all_computes_the_list_once_and_never_says_bare_stack_restart() {
+        let body = crate::test_src::fn_body(include_str!("security_local.rs"), "pub fn pki_rotate_all(");
+        assert_eq!(body.matches("restart_list(").count(), 1, "one list for both paths");
+        let list_at = body.find("restart_list(").unwrap();
+        let branch_at = body.find("if !reload {").expect("no --no-reload branch");
+        assert!(list_at < branch_at, "the list is computed before the --no-reload branch");
+        assert!(body.contains("no_reload_commands("), "the no-reload branch names the services");
+        assert!(body.contains("with_would_restart("));
+        assert!(!body.contains("\"noo stack restart\""), "the bare whole-stack restart is gone");
     }
 
     // ── trust-ca command construction ───────────────────────────────────

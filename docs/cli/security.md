@@ -268,7 +268,15 @@ machine. `pki rotate-ca` runs the same wait but only warns
 `rotate-all`, `cluster verify`) skip the dot-directories of the PKI dir
 (`.rotate-backup-*`, `.forgotten-*`). A node that did not take its cert makes the
 exit code 1 too; `--no-deliver`/`--no-reload` skip those steps and say
-so. Nothing expiring prints `no certificates expiring within N days`.
+so. `--no-reload` computes the same restart list the reload path uses
+(the running containers that present a rotated certificate, plus running
+replicas, gateway last) and prints the exact follow-up for just those:
+`noo stack restart <service>...` for the named services (one command, the
+gateway on its own command last) and `docker restart <container>` for a
+container with no service name (a replica), then says nothing else needs
+restarting. With no running consumer it says no restart is needed. `--json`
+adds `would_restart` (the ordered container names) on that path, and
+`restarted` on the reload path. Nothing expiring prints `no certificates expiring within N days`.
 Leaf rotation also runs unattended from the `cert_auto_rotate` autonomy
 location when enabled.
 
