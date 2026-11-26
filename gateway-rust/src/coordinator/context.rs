@@ -325,26 +325,36 @@ pub(super) fn attach_data_frame(messages: &mut [Value], frame: &str) -> bool {
 // ── Budget ──────────────────────────────────────────────────────
 //
 // The frame is attached after the turn was fitted to its window, so on its
-// own it can push a small window over. [`frame_budget`] says how much of the
-// input budget the frame may take and [`fit_data_frame`] makes the frame fit
-// it: whole layers first (lowest priority first), then the one layer left is
-// cut at a paragraph or sentence boundary. On a window the frame already fits
-// the frame is returned byte for byte as [`build_data_frame`] made it.
+// own it can push a small window over. [`frame_budget`] says how many tokens
+// the frame may take and [`fit_data_frame`] makes the frame fit them: items
+// are dropped from the tail of the lowest-priority layer first (a layer with
+// no items left goes whole), then the one item left is cut at a boundary. A
+// frame that already fits is returned byte for byte as [`build_data_frame`]
+// made it.
 
-/// The most of the turn's input budget the frame may take, in percent.
+/// On a window whose fit budget is under this many tokens the frame may take
+/// at most [`FRAME_MAX_PERCENT`] of it. 8,192 is the bound under which the
+/// loop already takes the compact prompt tier (`COMPACT_TIER_BELOW`): there
+/// the question, the tool results of later steps and the answer share a
+/// small space. At or above it the frame takes whatever room is left, so a
+/// large window is never trimmed while the frame fits.
+pub(super) const FRAME_SMALL_WINDOW_BELOW: usize = 8192;
+/// The most of a small window's fit budget the frame may take, in percent.
 pub(super) const FRAME_MAX_PERCENT: usize = 40;
-/// How much of the input budget earlier turns keep before the frame is
+/// How much of the fit budget earlier turns keep before the frame is
 /// sized, in percent (or what history there is, if less).
 pub(super) const FRAME_HISTORY_RESERVE_PERCENT: usize = 25;
 /// Tokens kept back for what is added to the messages after the frame (the
 /// clock line, the knowledge-base note on the persona).
-const FRAME_SLACK_TOKENS: usize = 64;
+pub(super) const FRAME_SLACK_TOKENS: usize = 64;
 /// The least body (beyond the fixed header and markers) worth sending.
 const FRAME_MIN_BODY_TOKENS: usize = 150;
-/// Ends a layer that was cut.
+/// Ends a layer that lost items or was cut.
 const FRAME_TRIM_NOTE: &str = "\n[... the rest was left out to fit the model's context window]";
 /// Where a knowledge-base layer's citations start.
 const SOURCES_MARK: &str = "\nSources:";
+/// The label the loops give the long-conversation continuity layer.
+pub(super) const CONTINUITY_FRAME_LABEL: &str = "Earlier in this conversation (outline, summary, recall)";
 
 /// The loop's token estimate (~2.5 chars/token) of `frame` as attached,
 /// with the line that introduces the user's text.
@@ -359,9 +369,10 @@ fn frame_overhead_tokens() -> usize {
 
 /// The tokens the frame may take on this turn: what is left of
 /// `fit_budget` after the tool schemas, the system messages, the latest user
-/// message and the recent history kept back, never more than
-/// [`FRAME_MAX_PERCENT`] of the budget. `messages` is the turn before the
-/// frame is attached.
+/// message, the recent history kept back ([`FRAME_HISTORY_RESERVE_PERCENT`])
+/// and [`FRAME_SLACK_TOKENS`]. On a window under
+/// [`FRAME_SMALL_WINDOW_BELOW`] never more than [`FRAME_MAX_PERCENT`] of the
+/// budget. `messages` is the turn before the frame is attached.
 pub(super) fn frame_budget(messages: &[Value], fit_budget: usize, tool_tokens: usize) -> usize {
     let role = |m: &Value, r: &str| m.get("role").and_then(|x| x.as_str()) == Some(r);
     let system: Vec<Value> = messages.iter().filter(|m| role(m, "system")).cloned().collect();
@@ -374,7 +385,11 @@ pub(super) fn frame_budget(messages: &[Value], fit_budget: usize, tool_tokens: u
     let history = super::estimate_tokens(messages).saturating_sub(system + question);
     let reserve = history.min(fit_budget * FRAME_HISTORY_RESERVE_PERCENT / 100);
     let room = fit_budget.saturating_sub(tool_tokens + system + question + reserve + FRAME_SLACK_TOKENS);
-    room.min(fit_budget * FRAME_MAX_PERCENT / 100)
+    if fit_budget < FRAME_SMALL_WINDOW_BELOW {
+        room.min(fit_budget * FRAME_MAX_PERCENT / 100)
+    } else {
+        room
+    }
 }
 
 /// What [`fit_data_frame`] did, for the request's log line.
@@ -388,8 +403,10 @@ pub(super) struct FrameFit {
     pub budget: usize,
     /// Layers left out whole, lowest priority first.
     pub dropped: Vec<String>,
-    /// Layers cut short.
+    /// Layers that lost items or were cut short.
     pub trimmed: Vec<String>,
+    /// Items dropped from the tail of layers that stayed.
+    pub items_dropped: usize,
     /// Layers in the frame as sent.
     pub kept: Vec<String>,
     /// Why anything was left out ("" when nothing was).
@@ -418,35 +435,44 @@ impl FrameFit {
     }
 }
 
-/// Lower is dropped first: the fungible domain facts go before identity and
-/// continuity (the same order the layers are assembled in).
+/// The knowledge-base text, but only if this turn's frame still carries the
+/// knowledge base: what the persona's "already shown" note may rest on.
+pub(super) fn rag_if_kept<'a>(fit: &FrameFit, rag_layer: Option<&'a str>) -> Option<&'a str> {
+    rag_layer.filter(|_| fit.has(KB_FRAME_LABEL))
+}
+
+/// Lower is dropped first: what the model needs least on a small window goes
+/// before what it needs most. The knowledge base is the most query-relevant
+/// layer and goes last; the user's own facts and the conversation so far
+/// come just before it.
 fn keep_rank(label: &str) -> u8 {
     if label.starts_with("Video recall") {
         0
     } else if label.starts_with("Other channels") {
         1
-    } else if label.starts_with("Memory") {
+    } else if label.starts_with("Companion") {
         2
     } else if label.starts_with("Skills written") {
         3
-    } else if label.starts_with("Companion") {
+    } else if label.starts_with("Memory") {
         4
-    } else if label == KB_FRAME_LABEL {
-        5
-    } else if label.starts_with("Earlier in this conversation") {
-        6
     } else if label == CLUSTER_FRAME_LABEL {
-        7
+        5
+    } else if label == CONTINUITY_FRAME_LABEL {
+        6
     } else if label.starts_with("Known facts") {
+        7
+    } else if label == KB_FRAME_LABEL {
         8
     } else {
-        5
+        4
     }
 }
 
-/// `text` cut to at most `max_chars` at a paragraph, else line, else
-/// sentence boundary no earlier than a third in, with a note that it was cut.
-/// `None` when no such boundary exists.
+/// `text` cut to at most `max_chars` (without a note: the layer adds it) at
+/// the latest paragraph, else line, else sentence, else whitespace boundary
+/// that is no earlier than a third of `max_chars`; a text with none is cut on
+/// a character edge at `max_chars`. `None` only when nothing would be left.
 fn shorten_at_boundary(text: &str, max_chars: usize) -> Option<String> {
     if text.len() <= max_chars {
         return Some(text.to_string());
@@ -457,38 +483,121 @@ fn shorten_at_boundary(text: &str, max_chars: usize) -> Option<String> {
     }
     let head = &text[..end];
     let sentence = [". ", "! ", "? "].iter().filter_map(|p| head.rfind(*p)).max().map(|i| i + 1);
-    let cut = [head.rfind("\n\n"), head.rfind('\n'), sentence]
+    let cut = [head.rfind("\n\n"), head.rfind('\n'), sentence, head.rfind(char::is_whitespace)]
         .into_iter()
         .flatten()
-        .find(|c| *c >= max_chars / 3)?;
+        .find(|c| *c >= max_chars / 3)
+        .unwrap_or(end);
     let kept = head[..cut].trim_end();
     if kept.is_empty() {
         return None;
     }
-    Some(format!("{kept}{FRAME_TRIM_NOTE}"))
+    Some(kept.to_string())
 }
 
-fn build_items(items: &[(&str, String)]) -> Option<String> {
-    let layers: Vec<(&str, Option<&str>)> = items.iter().map(|(l, t)| (*l, Some(t.as_str()))).collect();
+/// One layer broken into the items trimming works on. Items are in rank
+/// order (best first): paragraphs when the text has any, else lines. A
+/// knowledge-base layer's `Sources:` titles and the graph lines after them
+/// ride separately: when items are dropped or cut, the titles shrink to as
+/// many as items remain (citation i belongs to item i) and the graph lines,
+/// which describe the whole answer, go.
+struct Part<'a> {
+    label: &'a str,
+    lead: String,
+    items: Vec<String>,
+    sep: &'static str,
+    titles: Vec<String>,
+    extras: Vec<String>,
+    orig: usize,
+    cut: bool,
+}
+
+impl<'a> Part<'a> {
+    fn parse(label: &'a str, text: &str) -> Part<'a> {
+        let kb = label == KB_FRAME_LABEL;
+        let (body, tail) = match text.find(SOURCES_MARK) {
+            Some(i) if kb => (&text[..i], &text[i..]),
+            _ => (text, ""),
+        };
+        let (lead, body) = match body.split_once('\n') {
+            Some((first, rest)) if kb && first.starts_with('[') && first.ends_with(']') => (first.to_string(), rest),
+            _ => (String::new(), body),
+        };
+        let sep = if body.contains("\n\n") { "\n\n" } else { "\n" };
+        let mut items: Vec<String> = body.split(sep).map(str::trim).filter(|s| !s.is_empty()).map(str::to_string).collect();
+        if items.is_empty() {
+            items.push(body.to_string());
+        }
+        let mut titles = Vec::new();
+        let mut extras = Vec::new();
+        for line in tail.trim_start().lines().skip(1).filter(|l| !l.trim().is_empty()) {
+            match line.strip_prefix("  - ") {
+                Some(title) if extras.is_empty() => titles.push(title.to_string()),
+                _ => extras.push(line.to_string()),
+            }
+        }
+        let orig = items.len();
+        Part { label, lead, items, sep, titles, extras, orig, cut: false }
+    }
+
+    fn shrunk(&self) -> bool {
+        self.items.len() < self.orig || self.cut
+    }
+
+    fn text(&self) -> String {
+        let mut t = String::new();
+        if !self.lead.is_empty() {
+            t.push_str(&self.lead);
+            t.push('\n');
+        }
+        t.push_str(&self.items.join(self.sep));
+        let shrunk = self.shrunk();
+        if shrunk {
+            t.push_str(FRAME_TRIM_NOTE);
+        }
+        if !self.titles.is_empty() {
+            t.push_str(SOURCES_MARK);
+            let keep = if shrunk { self.items.len() } else { self.titles.len() };
+            for title in self.titles.iter().take(keep) {
+                t.push_str("\n  - ");
+                t.push_str(title);
+            }
+        }
+        if !shrunk {
+            for line in &self.extras {
+                t.push('\n');
+                t.push_str(line);
+            }
+        }
+        t
+    }
+}
+
+fn build_parts(parts: &[Part]) -> Option<String> {
+    let texts: Vec<String> = parts.iter().map(Part::text).collect();
+    let layers: Vec<(&str, Option<&str>)> = parts.iter().zip(&texts).map(|(p, t)| (p.label, Some(t.as_str()))).collect();
     build_data_frame(&layers)
 }
 
 /// The frame for `layers`, held to `budget_tokens` (see [`frame_budget`]).
-/// Layers go lowest priority first; the last one left is cut at a boundary,
-/// its citations removed with the text they cited; when less than a useful
-/// body would remain the frame is dropped. Within the budget the frame is
-/// exactly [`build_data_frame`]'s.
-pub(super) fn fit_data_frame(layers: &[(&str, Option<&str>)], budget_tokens: usize) -> (Option<String>, FrameFit) {
+/// Over budget, the lowest-priority layer ([`keep_rank`]) loses its last
+/// item, and goes whole when none is left; the knowledge base keeps its top
+/// item until every other layer is gone. The one item left is then cut at a
+/// boundary ([`shorten_at_boundary`]). When less than a useful body would
+/// remain the frame is dropped. Within the budget the frame is exactly
+/// [`build_data_frame`]'s.
+pub(super) fn fit_data_frame<'a>(layers: &[(&'a str, Option<&str>)], budget_tokens: usize) -> (Option<String>, FrameFit) {
     let Some(full) = build_data_frame(layers) else {
         return (None, FrameFit { budget: budget_tokens, ..FrameFit::default() });
     };
     let before = frame_tokens(&full);
-    let mut items: Vec<(&str, String)> = layers
+    let mut parts: Vec<Part<'a>> = layers
         .iter()
-        .filter_map(|(l, t)| t.map(str::trim).filter(|t| !t.is_empty()).map(|t| (*l, t.to_string())))
+        .filter_map(|(l, t)| t.map(str::trim).filter(|t| !t.is_empty()).map(|t| Part::parse(*l, t)))
         .collect();
-    let labels = |items: &[(&str, String)]| items.iter().map(|(l, _)| (*l).to_string()).collect::<Vec<_>>();
-    let mut fit = FrameFit { before, after: before, budget: budget_tokens, kept: labels(&items), ..FrameFit::default() };
+    let labels = |parts: &[Part]| parts.iter().map(|p| p.label.to_string()).collect::<Vec<_>>();
+    let all = labels(&parts);
+    let mut fit = FrameFit { before, after: before, budget: budget_tokens, kept: all.clone(), ..FrameFit::default() };
     if before <= budget_tokens {
         return (Some(full), fit);
     }
@@ -500,41 +609,47 @@ pub(super) fn fit_data_frame(layers: &[(&str, Option<&str>)], budget_tokens: usi
         (None, fit)
     };
     if budget_tokens < frame_overhead_tokens() + FRAME_MIN_BODY_TOKENS {
-        fit.dropped = fit.kept.clone();
+        fit.dropped = all;
         return gone(fit, "below_minimum");
     }
     fit.reason = "over_budget";
     let mut frame = full;
-    while frame_tokens(&frame) > budget_tokens && items.len() > 1 {
-        let Some(at) = items
+    while frame_tokens(&frame) > budget_tokens {
+        let Some(at) = parts
             .iter()
             .enumerate()
-            .min_by_key(|(i, (l, _))| (keep_rank(l), std::cmp::Reverse(*i)))
+            .min_by_key(|(i, p)| (keep_rank(p.label), std::cmp::Reverse(*i)))
             .map(|(i, _)| i)
         else {
             break;
         };
-        let (label, _) = items.remove(at);
-        fit.dropped.push(label.to_string());
-        let Some(f) = build_items(&items) else { break };
+        if parts[at].items.len() > 1 {
+            parts[at].items.pop();
+            fit.items_dropped += 1;
+            if !fit.trimmed.iter().any(|l| l == parts[at].label) {
+                fit.trimmed.push(parts[at].label.to_string());
+            }
+        } else if parts.len() > 1 {
+            let gone_part = parts.remove(at);
+            fit.dropped.push(gone_part.label.to_string());
+            fit.trimmed.retain(|l| l != gone_part.label);
+        } else {
+            break;
+        }
+        let Some(f) = build_parts(&parts) else { break };
         frame = f;
     }
     let over = frame_tokens(&frame).saturating_sub(budget_tokens);
     if over > 0 {
-        // One layer left. A knowledge-base layer's citations name pages the
-        // cut text may no longer rest on, so they go with the cut.
-        let text = items[0].1.as_str();
-        let cited = items[0].0 == KB_FRAME_LABEL;
-        let base: String = match text.find(SOURCES_MARK) {
-            Some(i) if cited => text[..i].to_string(),
-            _ => text.to_string(),
-        };
+        // One layer with one item left, and it is too big: cut it.
+        let base = parts[0].items[0].clone();
         let step = over * 5 / 2 + FRAME_TRIM_NOTE.len() + 16;
         let mut fitted = false;
         for attempt in 1..=6 {
             let Some(short) = shorten_at_boundary(&base, base.len().saturating_sub(step * attempt)) else { break };
-            items[0].1 = short;
-            let Some(f) = build_items(&items) else { break };
+            parts[0].items[0] = short;
+            parts[0].cut = true;
+            let Some(f) = build_parts(&parts) else { break };
             frame = f;
             if frame_tokens(&frame) <= budget_tokens {
                 fitted = true;
@@ -542,13 +657,15 @@ pub(super) fn fit_data_frame(layers: &[(&str, Option<&str>)], budget_tokens: usi
             }
         }
         if !fitted {
-            fit.dropped = layers.iter().filter(|(_, t)| t.is_some_and(|t| !t.trim().is_empty())).map(|(l, _)| (*l).to_string()).collect();
+            fit.dropped = all;
             return gone(fit, "cannot_trim");
         }
-        fit.trimmed.push(items[0].0.to_string());
+        if !fit.trimmed.iter().any(|l| l == parts[0].label) {
+            fit.trimmed.push(parts[0].label.to_string());
+        }
     }
     fit.after = frame_tokens(&frame);
-    fit.kept = labels(&items);
+    fit.kept = labels(&parts);
     (Some(frame), fit)
 }
 
@@ -2517,5 +2634,32 @@ mod kb_shape_tests {
         assert_eq!(code.matches("super::retrieval_use::ignores_retrieval(").count(), 2);
         assert_eq!(code.matches("super::retrieval_use::note_retrieval(&mut retrieved_text").count(), 2);
         assert_eq!(code.matches("super::retrieval_use::RETRIEVAL_UNUSED_NUDGE").count(), 2);
+    }
+}
+
+#[cfg(test)]
+mod frame_cut_tests {
+    use super::shorten_at_boundary;
+
+    /// Boundaries are tried in order paragraph, line, sentence, whitespace,
+    /// and only one at least a third of the way in counts.
+    #[test]
+    fn the_cut_takes_the_best_boundary_past_the_floor_else_a_char_edge() {
+        let para = format!("{}\n\n{}", "x".repeat(100), "y".repeat(200));
+        assert_eq!(shorten_at_boundary(&para, 150).unwrap(), "x".repeat(100), "paragraph at 100 >= 150/3");
+        let line = format!("{}\n{} {}", "x".repeat(100), "y".repeat(20), "z".repeat(200));
+        assert_eq!(shorten_at_boundary(&line, 150).unwrap(), "x".repeat(100), "no paragraph: the line break (100) is tried before the later space (121)");
+        let sentence = format!("{}. {}", "x".repeat(100), "y".repeat(200));
+        assert_eq!(shorten_at_boundary(&sentence, 150).unwrap(), format!("{}.", "x".repeat(100)));
+        let spaced = format!("{} {}", "x".repeat(100), "y".repeat(200));
+        assert_eq!(shorten_at_boundary(&spaced, 150).unwrap(), "x".repeat(100));
+        // The only boundary is a paragraph break 4 chars in: under the floor (150 / 3 = 50), so ignored.
+        let early = format!("head\n\n{}", "x".repeat(200));
+        assert_eq!(shorten_at_boundary(&early, 150).unwrap().len(), 150);
+        // No boundary at all, on a two-byte character: the edge is moved back to a char start.
+        let multi = "\u{e9}".repeat(100);
+        assert_eq!(shorten_at_boundary(&multi, 51).unwrap().len(), 50);
+        assert_eq!(shorten_at_boundary("short", 100).unwrap(), "short");
+        assert_eq!(shorten_at_boundary("abc", 0), None);
     }
 }

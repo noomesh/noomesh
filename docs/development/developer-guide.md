@@ -503,6 +503,25 @@ information" when the knowledge base already holds the fact
   (`loop.stall_detected_empty_response`), which costs two further model
   calls before the answer. A very small model (0.5B class) may instead reach
   for another tool on its first step, which costs it a further model turn.
+- **The block is budgeted to the window.** `frame_budget` / `fit_data_frame`
+  (`context.rs`) hold it to what is left of the turn's fit budget after the
+  system messages, tool schemas, the latest question, a history reserve
+  (the history there is, at most 25% of the budget) and 64 tokens of slack; on
+  a fit budget under 8,192 tokens (the compact-tier bound) also to at most 40%
+  of it. A block that fits is sent byte for byte. Otherwise, lowest priority
+  first (video, channels, companion devices, runtime skills, memory, cluster,
+  conversation continuity, user facts, knowledge base), each layer loses its
+  last items one at a time and goes whole when none is left; the knowledge
+  base keeps its top item until the rest are gone, its `Sources:` list shrinks
+  to the items that remain and its graph lines go with any cut; the last item
+  is cut at a paragraph, line, sentence or whitespace boundary (a character
+  edge if there is none). Under a floor of the fixed header plus 150 tokens
+  the block is dropped and the question goes alone. Older turns the block
+  crowds out are shed before it is attached and outlined into the continuity
+  layer (`attach_budgeted_data`). Logged as `retrieved_data_budgeted` and on
+  the `request_size` line (`data_before`, `data_budget`, `data_outcome`). Known
+  limit: a later step's tool result is added to the whole current turn, which a
+  4,096-token window may not hold.
 - **A post-tool answer that ignores the result is a stall.** After a turn that
   ran a retrieval tool (`noo_rag_query`, `noo_memory_search`,
   `noo_recall_search`, `noo_graph_semantic_search`), the loop re-nudges ONCE
