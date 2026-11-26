@@ -33,6 +33,13 @@ func TestParseFetchJob(t *testing.T) {
 		{"loaded LWCR text", 0, fetchPrintLWCR, fetchJobSpawnRefused},
 		{"not loaded", 113, "", fetchJobNotLoaded},
 		{"no launchctl", 127, "", fetchJobUnknown},
+		{"print failing for another reason", 1, "", fetchJobUnknown},
+		{"not found by its words", 1, "Could not find service \"net.noomesh.fetch\" in domain for system", fetchJobNotLoaded},
+		{"spawn scheduled with a stale 78", 0, "\tstate = spawn scheduled\n\tlast exit code = 78\n", fetchJobUnknown},
+		{"idle state but a pid", 0, "\tstate = not running\n\tpid = 99\n\tlast exit code = 78\n", fetchJobUnknown},
+		{"an unknown state", 0, "\tstate = xpcproxy\n\tlast exit code = 78\n", fetchJobUnknown},
+		{"lwcr only in an unrelated line", 0, "\tstate = not running\n\tpath = /Library/lwcr/x.plist\n\tlast exit code = 0\n", fetchJobIdle},
+		{"waiting with exit 78", 0, "\tstate = waiting\n\tlast exit code = 78: EX_CONFIG\n", fetchJobSpawnRefused},
 		{"garbage", 0, "\x00\xff not launchd output at all", fetchJobUnknown},
 		{"empty", 0, "", fetchJobUnknown},
 		{"running with a stale 78", 0, "\tstate = running\n\tlast exit code = 78\n", fetchJobRunning},
@@ -53,6 +60,7 @@ type fetchHarness struct {
 	now    time.Time
 	plist  string
 	exists bool
+	sleeps int
 }
 
 func newFetchHarness(t *testing.T) *fetchHarness {
@@ -66,6 +74,9 @@ func newFetchHarness(t *testing.T) *fetchHarness {
 	})
 	fetchRearmGOOS = "darwin"
 	fetchPlistExists = func(string) bool { return h.exists }
+	oldConfirm, oldKick := fetchConfirmSleep, fetchKickGOOS
+	t.Cleanup(func() { fetchConfirmSleep, fetchKickGOOS = oldConfirm, oldKick })
+	fetchConfirmSleep = func() { h.sleeps++ }
 	nowUTC = func() time.Time { return h.now }
 	bootstrapRetrySleep = func() {}
 	h.r = &fakeRunner{rc: map[string]int{}, stdout: map[string]string{}}
@@ -139,7 +150,7 @@ func TestFetchJobStateMachineFromEveryState(t *testing.T) {
 		h.e.Runner = &sequencedRunner{inner: h.r, printAnswers: []printAnswer{{0, fetchPrint78}}, bootstrapAnswers: []printAnswer{
 			{5, "Bootstrap failed: 5: Input/output error"}, {5, "Bootstrap failed: 5: Input/output error"}, {0, ""}}}
 		h.e.fetchJobCheck(context.Background(), true)
-		want := []string{"launchctl print " + fetchTarget, "launchctl bootout " + fetchTarget,
+		want := []string{"launchctl print " + fetchTarget, "launchctl print " + fetchTarget, "launchctl print " + fetchTarget, "launchctl bootout " + fetchTarget,
 			"launchctl bootstrap system " + h.plist, "launchctl bootstrap system " + h.plist, "launchctl bootstrap system " + h.plist,
 			"launchctl kickstart " + fetchTarget}
 		if got := h.r.joined(); strings.Join(got, "\n") != strings.Join(want, "\n") {
@@ -285,16 +296,68 @@ func TestFetchJobDoesNothingOffDarwinOrOutsideWorkerMode(t *testing.T) {
 	}
 }
 
-func TestFetchKickChecksTheJobAfterwards(t *testing.T) {
+// The real op, with the kick's argv pinned to the Mac's. A kick that worked
+// leaves launchd mid-spawn with the previous run's exit status on display:
+// acting on it would bootout the fetch just started.
+func TestFetchBundleOpChecksTheJobOnlyAfterAFailedKick(t *testing.T) {
+	t.Setenv("NOO_CONF_DIR", t.TempDir())
+	spawning := "system/net.noomesh.fetch = {\n\tstate = spawn scheduled\n\tlast exit code = 78\n}\n"
+
 	h := newFetchHarness(t)
-	h.e.Spool = t.TempDir()
+	fetchKickGOOS = "darwin"
+	h.r.stdout["print "+fetchTarget] = spawning
+	if rc, _ := opFetchBundle(context.Background(), h.e, "", nil); rc != 0 {
+		t.Fatalf("rc=%d", rc)
+	}
+	if got := h.launchctl(); got != "launchctl kickstart "+fetchTarget {
+		t.Fatalf("a successful kick must not be followed by a print, got:\n%s", got)
+	}
+
+	// The same mid-spawn answer after a FAILED kick is Unknown: still nothing.
+	h = newFetchHarness(t)
+	fetchKickGOOS = "darwin"
+	h.r.rc["kickstart"] = 113
+	h.r.stdout["print "+fetchTarget] = spawning
+	opFetchBundle(context.Background(), h.e, "", nil)
+	if strings.Contains(h.launchctl(), "bootout") || strings.Contains(h.launchctl(), "bootstrap") {
+		t.Fatalf("a mid-spawn print must not be acted on:\n%s", h.launchctl())
+	}
+	if !strings.Contains(h.launchctl(), "print "+fetchTarget) {
+		t.Fatalf("a failed kick must lead to a check:\n%s", h.launchctl())
+	}
+
+	// A failed kick of a job launchd does not have: bootstrap + kickstart.
+	h = newFetchHarness(t)
+	fetchKickGOOS = "darwin"
+	h.r.rc["kickstart"] = 113
 	h.r.rc["print "+fetchTarget] = 113
-	h.e.Runner = h.r
-	// opFetchBundle picks its argv by runtime.GOOS; on Linux CI the kick is
-	// systemctl, so drive the check the op calls directly.
-	h.e.fetchJobCheck(context.Background(), true)
+	opFetchBundle(context.Background(), h.e, "", nil)
 	if !strings.Contains(h.launchctl(), "bootstrap system "+h.plist) {
-		t.Fatalf("a refused kick must lead to a bootstrap:\n%s", h.launchctl())
+		t.Fatalf("a failed kick of an unloaded job must re-arm it:\n%s", h.launchctl())
+	}
+}
+
+// Idle-and-refused on the first print, running on a confirming one: left alone.
+func TestAJobThatStartsRunningBetweenThePrintsIsLeftAlone(t *testing.T) {
+	for _, at := range []int{1, 2} {
+		h := newFetchHarness(t)
+		answers := []printAnswer{{0, fetchPrint78}, {0, fetchPrint78}, {0, fetchPrint78}}
+		answers[at] = printAnswer{0, fetchPrintRunning}
+		h.e.Runner = &sequencedRunner{inner: h.r, printAnswers: answers}
+		h.e.fetchJobCheck(context.Background(), true)
+		if strings.Contains(h.launchctl(), "bootout") || strings.Contains(h.launchctl(), "bootstrap") || strings.Contains(h.launchctl(), "kickstart") {
+			t.Fatalf("running on print %d: the job must be left alone:\n%s", at+1, h.launchctl())
+		}
+		if h.sleeps != at {
+			t.Fatalf("expected %d confirming gap(s), got %d", at, h.sleeps)
+		}
+	}
+	// And a refused job that stays refused is re-armed after two gaps.
+	h := newFetchHarness(t)
+	h.r.stdout["print "+fetchTarget] = fetchPrint78
+	h.e.fetchJobCheck(context.Background(), true)
+	if h.sleeps != 2 || !strings.Contains(h.launchctl(), "bootout") {
+		t.Fatalf("sleeps=%d\n%s", h.sleeps, h.launchctl())
 	}
 }
 

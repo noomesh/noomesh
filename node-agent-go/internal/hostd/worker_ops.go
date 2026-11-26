@@ -324,11 +324,15 @@ func fetchPlistUser(plist string) string {
 // absorbed by the steady-state throttle.
 func opFetchBundle(ctx context.Context, e *Engine, _ string, _ *Command) (int, string) {
 	armExpectBundle(e)
-	argv := fetchKickArgv(runtime.GOOS)
+	argv := fetchKickArgv(fetchKickGOOS)
 	rc, stderr := e.Runner.Run(ctx, "/", nil, argv[0], argv[1:]...)
-	// A kick that fails because launchd refuses the job is the moment to look
-	// at it (darwin worker only; a no-op elsewhere).
-	e.fetchJobCheck(ctx, true)
+	// Only a kick that FAILED is the moment to look at the job (darwin worker
+	// only; a no-op elsewhere). After a kick that worked launchd is mid-spawn
+	// and still shows the previous run's exit status; acting on that would
+	// bootout the fetch that was just started.
+	if rc != 0 {
+		e.fetchJobCheck(ctx, true)
+	}
 	return rc, stderr
 }
 
