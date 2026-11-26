@@ -1233,6 +1233,22 @@ struct RequestSize {
     tool_tokens: usize,
     total: usize,
     window: usize,
+    /// The frame as built, in tokens, before it was held to its budget
+    /// (equal to `data` when it fit), and the budget it was held to.
+    data_before: usize,
+    data_budget: usize,
+    /// `none` | `untouched` | `trimmed` | `dropped` (see `context::FrameFit`).
+    data_outcome: &'static str,
+}
+
+impl RequestSize {
+    /// Record what the frame's budget did to it.
+    fn with_frame(mut self, fit: &super::context::FrameFit) -> RequestSize {
+        self.data_before = fit.before;
+        self.data_budget = fit.budget;
+        self.data_outcome = fit.outcome();
+        self
+    }
 }
 
 fn request_size(messages: &[Value], tools: &[Value], data_frame: Option<&str>, window: usize) -> RequestSize {
@@ -1252,6 +1268,9 @@ fn request_size(messages: &[Value], tools: &[Value], data_frame: Option<&str>, w
         tool_tokens,
         total: all + tool_tokens,
         window,
+        data_before: data,
+        data_budget: 0,
+        data_outcome: if data_frame.is_some() { "untouched" } else { "none" },
     }
 }
 
@@ -1288,6 +1307,11 @@ fn log_request_size(size: &RequestSize, calib: &crate::chat_context::Calibration
         tool_tokens = size.tool_tokens,
         total = size.total,
         window = size.window,
+        // The retrieved-data frame against its budget: what it was built at,
+        // the budget, and whether it was kept, trimmed or dropped.
+        data_before = size.data_before,
+        data_budget = size.data_budget,
+        data_outcome = size.data_outcome,
         calib_ratio = calib.ratio,
         calib_samples = calib.samples,
         "request_size"
@@ -1429,10 +1453,65 @@ fn prefill_ms_of(usage: &Value) -> Option<u64> {
 }
 
 /// What a turn cannot do without (raw estimate): its system messages, the
-/// person's own message, and the tool schemas.
-fn instructions_estimate(messages: &[Value], prompt: &str, tool_tokens: usize) -> usize {
+/// person's own message, the tool schemas, and the retrieved-data frame that
+/// is sent with the question (`frame_tokens`, 0 when there is none).
+fn instructions_estimate(messages: &[Value], prompt: &str, tool_tokens: usize, frame_tokens: usize) -> usize {
     let system: Vec<Value> = messages.iter().filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("system")).cloned().collect();
-    estimate_tokens(&system) + estimate_tokens(&[json!({"role": "user", "content": prompt})]) + tool_tokens
+    estimate_tokens(&system) + estimate_tokens(&[json!({"role": "user", "content": prompt})]) + tool_tokens + frame_tokens
+}
+
+/// Build the retrieved-data frame, hold it to the turn's budget
+/// (`context::frame_budget`), attach it to the final user message and, when
+/// earlier turns now crowd the window, shed the oldest as the first fit does.
+/// Returns the frame as sent and what the budget did to it. Within the budget
+/// the frame is exactly what `build_data_frame` makes.
+fn attach_budgeted_data(
+    messages: &mut Vec<Value>,
+    layers: &[(&str, Option<&str>)],
+    fit_budget: usize,
+    tool_tokens: usize,
+    conversation_id: &str,
+) -> (Option<String>, super::context::FrameFit) {
+    let budget = super::context::frame_budget(messages, fit_budget, tool_tokens);
+    let (frame, mut fit) = super::context::fit_data_frame(layers, budget);
+    let Some(frame) = frame else {
+        log_frame_fit(&fit, conversation_id);
+        return (None, fit);
+    };
+    if !super::context::attach_data_frame(messages, &frame) {
+        tracing::warn!("retrieved_data_dropped: no user message to attach the data frame to");
+        fit.after = 0;
+        fit.dropped_all = true;
+        fit.reason = "no_user_message";
+        fit.kept.clear();
+        log_frame_fit(&fit, conversation_id);
+        return (None, fit);
+    }
+    // The first fit ran before the frame existed and the budget set aside
+    // room for recent history only: shed the older turns that no longer fit.
+    // The latest question, which carries the frame, is never dropped.
+    fit_context_window(messages, fit_budget, tool_tokens);
+    log_frame_fit(&fit, conversation_id);
+    (Some(frame), fit)
+}
+
+/// One line when the frame was trimmed or dropped for the window, with the
+/// token counts before and after; silent when it fit.
+fn log_frame_fit(fit: &super::context::FrameFit, conversation_id: &str) {
+    if matches!(fit.outcome(), "none" | "untouched") {
+        return;
+    }
+    tracing::info!(
+        conversation_id,
+        outcome = fit.outcome(),
+        reason = fit.reason,
+        before_tokens = fit.before,
+        after_tokens = fit.after,
+        budget_tokens = fit.budget,
+        dropped = ?fit.dropped,
+        trimmed = ?fit.trimmed,
+        "retrieved_data_budgeted"
+    );
 }
 
 /// The context to name when a turn is refused (i802 PR-2, step 5): only a
@@ -2600,7 +2679,7 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
         }
     }
 
-    let data_frame = attach_retrieved_data(
+    let (data_frame, frame_fit) = attach_budgeted_data(
         &mut session.messages,
         &[
             ("Known facts about the user", temporal_ctx.as_deref()),
@@ -2613,12 +2692,17 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
             ("Skills written at runtime (evolved)", evolved_skills.as_deref()),
             ("Companion devices", companion_ctx.as_deref()),
         ],
+        fit_budget,
+        tool_toks,
+        &turn_conv,
     );
+    // A knowledge base cut out of the frame is not "already shown".
+    let rag_shown = rag_ctx.as_deref().filter(|_| frame_fit.has(super::context::KB_FRAME_LABEL));
     // The persona was built before the layers were fetched: when THIS turn's
     // frame carries the knowledge base, tell the model it is already shown
     // instead of "call noo_rag_query FIRST" (i1178a, half a).
-    super::context::mark_kb_shown(&mut session.messages, data_frame.as_deref(), rag_ctx.as_deref());
-    let kb_shown = super::context::kb_in_frame(data_frame.as_deref(), rag_ctx.as_deref());
+    super::context::mark_kb_shown(&mut session.messages, data_frame.as_deref(), rag_shown);
+    let kb_shown = super::context::kb_in_frame(data_frame.as_deref(), rag_shown);
     super::context::place_clock(&mut session.messages, chrono::Utc::now());
     if let Some(f) = data_frame.as_deref() {
         record_layer_chars(rt.metrics(), "retrieved_data_frame", f).await;
@@ -2640,14 +2724,14 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
         post_dedup_chars = deduped.len(),
         "context_injected"
     );
-    log_request_size(&request_size(&session.messages, &tool_schemas, data_frame.as_deref(), max_input), &calib, tier, "stream", &turn_conv);
+    log_request_size(&request_size(&session.messages, &tool_schemas, data_frame.as_deref(), max_input).with_frame(&frame_fit), &calib, tier, "stream", &turn_conv);
 
     // Instructions and the question alone too large for this backend's
     // context (i802 PR-2, step 5): say so instead of sending a prompt the
     // backend would cut. Not tried first: the next smaller tier (i802
     // follow-up "fall to Compact before refusing").
     let mut window_refusal: Option<String> = None;
-    if let Some(ctx) = window_refusal_ctx(&window, rt.max_context_tokens().is_some(), instructions_estimate(&session.messages, prompt, estimate_tool_tokens(&tool_schemas)), calib) {
+    if let Some(ctx) = window_refusal_ctx(&window, rt.max_context_tokens().is_some(), instructions_estimate(&session.messages, prompt, estimate_tool_tokens(&tool_schemas), data_frame.as_deref().map_or(0, super::context::frame_tokens)), calib) {
         let node = match rt.route_facts(&backend.url, &backend.backend_type).await {
             Some((n, _)) => n,
             None => super::backend::node_from_backend_url(&backend.url).unwrap_or_else(|| "its node".to_string()),
@@ -3901,7 +3985,7 @@ async fn run_inner_bound<R: HarnessRuntime>(
         }
     }
 
-    let data_frame = attach_retrieved_data(
+    let (data_frame, frame_fit) = attach_budgeted_data(
         &mut session.messages,
         &[
             ("Known facts about the user", temporal_ctx.as_deref()),
@@ -3914,12 +3998,17 @@ async fn run_inner_bound<R: HarnessRuntime>(
             ("Skills written at runtime (evolved)", evolved_skills.as_deref()),
             ("Companion devices", companion_ctx.as_deref()),
         ],
+        fit_budget,
+        tool_toks,
+        &turn_conv,
     );
+    // A knowledge base cut out of the frame is not "already shown".
+    let rag_shown = rag_ctx.as_deref().filter(|_| frame_fit.has(super::context::KB_FRAME_LABEL));
     // The persona was built before the layers were fetched: when THIS turn's
     // frame carries the knowledge base, tell the model it is already shown
     // instead of "call noo_rag_query FIRST" (i1178a, half a).
-    super::context::mark_kb_shown(&mut session.messages, data_frame.as_deref(), rag_ctx.as_deref());
-    let kb_shown = super::context::kb_in_frame(data_frame.as_deref(), rag_ctx.as_deref());
+    super::context::mark_kb_shown(&mut session.messages, data_frame.as_deref(), rag_shown);
+    let kb_shown = super::context::kb_in_frame(data_frame.as_deref(), rag_shown);
     super::context::place_clock(&mut session.messages, chrono::Utc::now());
     if let Some(f) = data_frame.as_deref() {
         record_layer_chars(rt.metrics(), "retrieved_data_frame", f).await;
@@ -3933,14 +4022,14 @@ async fn run_inner_bound<R: HarnessRuntime>(
         post_dedup_chars = deduped.len(),
         "context_injected_nonstream"
     );
-    log_request_size(&request_size(&session.messages, &tool_schemas, data_frame.as_deref(), max_input), &calib, tier, "nonstream", &turn_conv);
+    log_request_size(&request_size(&session.messages, &tool_schemas, data_frame.as_deref(), max_input).with_frame(&frame_fit), &calib, tier, "nonstream", &turn_conv);
 
     // Instructions and the question alone too large for this backend's
     // context (i802 PR-2, step 5): say so instead of sending a prompt the
     // backend would cut. Not tried first: the next smaller tier (i802
     // follow-up "fall to Compact before refusing").
     let mut window_refusal: Option<String> = None;
-    if let Some(ctx) = window_refusal_ctx(&window, rt.max_context_tokens().is_some(), instructions_estimate(&session.messages, prompt, estimate_tool_tokens(&tool_schemas)), calib) {
+    if let Some(ctx) = window_refusal_ctx(&window, rt.max_context_tokens().is_some(), instructions_estimate(&session.messages, prompt, estimate_tool_tokens(&tool_schemas), data_frame.as_deref().map_or(0, super::context::frame_tokens)), calib) {
         let node = match rt.route_facts(&backend.url, &backend.backend_type).await {
             Some((n, _)) => n,
             None => super::backend::node_from_backend_url(&backend.url).unwrap_or_else(|| "its node".to_string()),
@@ -4925,8 +5014,201 @@ mod request_size_tests {
     fn both_loop_paths_log_the_request_size() {
         let src = include_str!("agent_loop.rs").split("mod request_size_tests").next().unwrap();
         for path in ["\"stream\", &turn_conv);", "\"nonstream\", &turn_conv);"] {
-            assert!(src.contains(&format!("log_request_size(&request_size(&session.messages, &tool_schemas, data_frame.as_deref(), max_input), &calib, tier, {path}")), "{path}");
+            assert!(src.contains(&format!("log_request_size(&request_size(&session.messages, &tool_schemas, data_frame.as_deref(), max_input).with_frame(&frame_fit), &calib, tier, {path}")), "{path}");
         }
+    }
+}
+
+#[cfg(test)]
+mod frame_budget_tests {
+    use super::*;
+    use crate::chat_context::{max_input_for, Calibration};
+    use crate::coordinator::context::{build_data_frame, FrameFit, DATA_BEGIN, KB_FRAME_LABEL, USER_TEXT_MARK};
+
+    const QUESTION: &str = "What is the leave policy?";
+
+    fn tools() -> Vec<Value> {
+        (0..3)
+            .map(|i| json!({"type": "function", "function": {"name": format!("tool_{i}"), "description": "d".repeat(200), "parameters": {"type": "object", "properties": {"q": {"type": "string", "description": "p".repeat(40)}}}}}))
+            .collect()
+    }
+
+    /// A compact-tier-sized system prompt (~1,070 tokens in the estimate).
+    fn system() -> Value {
+        json!({"role": "system", "content": "s".repeat(2670)})
+    }
+
+    fn kb() -> String {
+        let paras: Vec<String> = (1..=4).map(|i| format!("Chunk {i}. {}", "Leave is accrued monthly. ".repeat(12))).collect();
+        format!("{}\nSources:\n  - Page A\n  - Page B\n  - Page C", paras.join("\n\n"))
+    }
+
+    fn memory() -> String {
+        (0..40).map(|i| format!("MEMORYLINE {i} an earlier message about leave")).collect::<Vec<_>>().join("\n")
+    }
+
+    fn video() -> String {
+        (0..12).map(|i| format!("VIDEOLINE {i} a clip about the office")).collect::<Vec<_>>().join("\n")
+    }
+
+    /// The layers a real turn builds: ~1,900 tokens of frame in all.
+    fn layers<'a>(kb: &'a str, mem: &'a str, vid: &'a str) -> Vec<(&'a str, Option<&'a str>)> {
+        vec![(KB_FRAME_LABEL, Some(kb)), ("Memory", Some(mem)), ("Video recall", Some(vid))]
+    }
+
+    fn total(messages: &[Value], tool_toks: usize) -> usize {
+        estimate_tokens(messages) + tool_toks
+    }
+
+    /// 4,096-token window: the frame is held to its budget by dropping the
+    /// lowest-ranked layers, and the assembled prompt fits the input budget.
+    #[test]
+    fn a_small_window_drops_the_lowest_ranked_layers_and_the_prompt_fits() {
+        let fit_budget = max_input_for(4096) as usize;
+        let tools = tools();
+        let tool_toks = estimate_tool_tokens(&tools);
+        let (kb, mem, vid) = (kb(), memory(), video());
+        let l = layers(&kb, &mem, &vid);
+        let full = build_data_frame(&l).unwrap();
+        assert!(super::super::context::frame_tokens(&full) > 1700, "the observed ~1,900-token frame");
+        let mut messages = vec![system(), json!({"role": "user", "content": QUESTION})];
+        assert!(total(&messages, tool_toks) + super::super::context::frame_tokens(&full) > fit_budget, "unbudgeted it overflows");
+        let (frame, fit) = attach_budgeted_data(&mut messages, &l, fit_budget, tool_toks, "t");
+        assert_eq!(fit.budget, fit_budget * 40 / 100);
+        assert_eq!(fit.outcome(), "trimmed");
+        assert_eq!(fit.dropped, vec!["Video recall".to_string(), "Memory".to_string()], "lowest rank first");
+        assert!(fit.trimmed.is_empty(), "{fit:?}");
+        assert_eq!(fit.kept, vec![KB_FRAME_LABEL.to_string()]);
+        assert!(fit.after <= fit.budget && fit.before > fit.budget, "{fit:?}");
+        let frame = frame.expect("kept");
+        assert!(!frame.contains("MEMORYLINE") && !frame.contains("VIDEOLINE"));
+        for page in ["Page A", "Page B", "Page C"] {
+            assert!(frame.contains(page), "the knowledge base is whole, so its citations stay: {page}");
+        }
+        assert!(total(&messages, tool_toks) <= fit_budget, "{} > {fit_budget}", total(&messages, tool_toks));
+        assert_eq!(messages[1]["content"].as_str().unwrap(), format!("{frame}\n\n{USER_TEXT_MARK}\n{QUESTION}"));
+    }
+
+    /// One layer too big for the budget is cut at a paragraph boundary; its
+    /// citations go with the cut, so the answer cites no page it was cut from.
+    #[test]
+    fn the_last_layer_is_cut_whole_paragraphs_and_loses_its_citations() {
+        let long = format!(
+            "{}\nSources:\n  - Page A\n  - Page B",
+            (1..=8).map(|i| format!("Chunk {i}. {}", "Leave is accrued monthly. ".repeat(12))).collect::<Vec<_>>().join("\n\n")
+        );
+        let l = vec![(KB_FRAME_LABEL, Some(long.as_str()))];
+        let (frame, fit) = super::super::context::fit_data_frame(&l, 900);
+        let frame = frame.expect("a useful body remains");
+        assert_eq!(fit.outcome(), "trimmed");
+        assert_eq!(fit.trimmed, vec![KB_FRAME_LABEL.to_string()]);
+        assert!(fit.after <= 900, "{fit:?}");
+        assert!(!frame.contains("Sources:") && !frame.contains("Page A"), "no citation of a cut page");
+        assert!(frame.contains("Chunk 1.") && !frame.contains("Chunk 8."));
+        assert!(frame.contains("the rest was left out"));
+        let body = frame.split(&format!("[{KB_FRAME_LABEL}]\n")).nth(1).unwrap().split("\n[...").next().unwrap();
+        for p in body.split("\n\n") {
+            assert!(p.starts_with("Chunk ") && p.ends_with("monthly."), "a whole paragraph, never mid-sentence: {p:?}");
+        }
+    }
+
+    /// 16,384-token window: nothing is trimmed and the frame is what
+    /// `build_data_frame` makes, byte for byte.
+    #[test]
+    fn a_large_window_sends_the_frame_untouched() {
+        let fit_budget = max_input_for(16384) as usize;
+        let tools = tools();
+        let tool_toks = estimate_tool_tokens(&tools);
+        let (kb, mem, vid) = (kb(), memory(), video());
+        let l = layers(&kb, &mem, &vid);
+        let mut messages = vec![system(), json!({"role": "user", "content": QUESTION})];
+        let (frame, fit) = attach_budgeted_data(&mut messages, &l, fit_budget, tool_toks, "t");
+        assert_eq!(fit.outcome(), "untouched");
+        assert_eq!(fit.before, fit.after);
+        assert_eq!(frame.as_deref(), build_data_frame(&l).as_deref());
+        assert_eq!(messages[1]["content"].as_str().unwrap(), format!("{}\n\n{USER_TEXT_MARK}\n{QUESTION}", frame.unwrap()));
+    }
+
+    /// Nothing useful fits: the frame is dropped with a reason, the question
+    /// is intact, and a turn whose instructions and question fit is not refused.
+    #[test]
+    fn a_window_with_no_room_drops_the_frame_and_does_not_refuse() {
+        let fit_budget = 1200;
+        let mut messages = vec![json!({"role": "system", "content": "s".repeat(1000)}), json!({"role": "user", "content": QUESTION})];
+        let (kb, mem, vid) = (kb(), memory(), video());
+        let l = layers(&kb, &mem, &vid);
+        let (frame, fit) = attach_budgeted_data(&mut messages, &l, fit_budget, 0, "t");
+        assert!(frame.is_none());
+        assert_eq!((fit.outcome(), fit.reason, fit.after), ("dropped", "below_minimum", 0), "{fit:?}");
+        assert!(fit.before > 0 && fit.kept.is_empty() && fit.dropped.len() == 3);
+        assert_eq!(messages[1]["content"].as_str().unwrap(), QUESTION, "the question is untouched");
+        let window = turn_window(None, Some(1500), 16384, 4096);
+        let need = instructions_estimate(&messages, QUESTION, 0, 0);
+        assert!(need < fit_budget);
+        assert_eq!(window_refusal_ctx(&TurnWindow { ctx: Some(1500), max_input: fit_budget }, false, need, Calibration::default()), None);
+        assert_eq!(window.ctx, Some(1500));
+    }
+
+    /// The refusal check counts the frame that will be sent.
+    #[test]
+    fn the_does_not_fit_estimate_includes_the_frame() {
+        let msgs = [json!({"role": "system", "content": "s".repeat(250)})];
+        let bare = instructions_estimate(&msgs, "q", 7, 0);
+        assert_eq!(instructions_estimate(&msgs, "q", 7, 500), bare + 500);
+        let small = turn_window(None, Some(4096), 16384, 4096);
+        let fresh = Calibration::default();
+        assert_eq!(window_refusal_ctx(&small, false, bare, fresh), None);
+        assert_eq!(window_refusal_ctx(&small, false, instructions_estimate(&msgs, "q", 7, 20_000), fresh), Some(4096));
+        let src = crate::test_src::own_code(include_str!("agent_loop.rs"));
+        assert_eq!(src.matches("data_frame.as_deref().map_or(0, super::context::frame_tokens)), calib)").count(), 2, "both loops pass the frame");
+    }
+
+    /// Long history is shed when the frame arrives, and a later re-fit keeps
+    /// both the budget and the frame in the last user message.
+    #[test]
+    fn history_makes_room_and_a_refit_keeps_the_budget() {
+        let fit_budget = max_input_for(4096) as usize;
+        let tools = tools();
+        let tool_toks = estimate_tool_tokens(&tools);
+        let mut messages = vec![system()];
+        for i in 0..5 {
+            messages.push(json!({"role": "user", "content": format!("earlier question {i} {}", "q".repeat(250))}));
+            messages.push(json!({"role": "assistant", "content": format!("earlier answer {i} {}", "a".repeat(250))}));
+        }
+        messages.push(json!({"role": "user", "content": QUESTION}));
+        assert!(total(&messages, tool_toks) <= fit_budget);
+        let (kb, mem, vid) = (kb(), memory(), video());
+        let (frame, fit) = attach_budgeted_data(&mut messages, &layers(&kb, &mem, &vid), fit_budget, tool_toks, "t");
+        assert!(frame.is_some() && fit.after <= fit.budget, "{fit:?}");
+        assert!(total(&messages, tool_toks) <= fit_budget, "{} > {fit_budget}", total(&messages, tool_toks));
+        let before = messages.clone();
+        let dropped = fit_context_window(&mut messages, fit_budget, tool_toks);
+        assert!(dropped.is_empty(), "the re-fit has nothing left to shed");
+        assert_eq!(messages, before);
+        let last = messages.last().unwrap()["content"].as_str().unwrap();
+        assert!(last.starts_with(DATA_BEGIN) && last.ends_with(QUESTION), "the frame stays in the last user message");
+    }
+
+    /// Both loops go through the budgeted attach and log what it did.
+    #[test]
+    fn both_loops_budget_the_frame_and_log_it() {
+        let own = crate::test_src::own_code(include_str!("agent_loop.rs"));
+        assert_eq!(own.matches("= attach_budgeted_data(").count(), 2);
+        assert_eq!(own.matches(".with_frame(&frame_fit)").count(), 2);
+        let helper = crate::test_src::fn_body(&own, "fn attach_budgeted_data(");
+        assert!(helper.contains("fit_context_window(messages, fit_budget, tool_tokens)"), "{helper}");
+        assert!(helper.contains("frame_budget(messages, fit_budget, tool_tokens)"));
+        let log = crate::test_src::fn_body(&own, "fn log_frame_fit(");
+        for field in ["before_tokens", "after_tokens", "budget_tokens", "reason", "\"retrieved_data_budgeted\""] {
+            assert!(log.contains(field), "{field}");
+        }
+        let line = crate::test_src::fn_body(&own, "fn log_request_size(");
+        assert!(line.contains("data_before") && line.contains("data_outcome"));
+        let mut fit = FrameFit::default();
+        assert_eq!(request_size(&[json!({"role": "user", "content": "q"})], &[], None, 4096).with_frame(&fit).data_outcome, "none");
+        fit.before = 900;
+        fit.dropped_all = true;
+        assert_eq!(request_size(&[json!({"role": "user", "content": "q"})], &[], None, 4096).with_frame(&fit).data_outcome, "dropped");
     }
 }
 
@@ -5177,7 +5459,7 @@ mod window_tests {
         assert!(too_small_line("m", "n", 4096, "vllm").ends_with("noo models switch <model> --backend vllm"));
         let no_verb = too_small_line("m", "n", 4096, "llamacpp");
         assert!(!no_verb.contains("noo models") && no_verb.ends_with("pick a model with a larger one"), "{no_verb}");
-        let need = instructions_estimate(&[json!({"role": "system", "content": "s".repeat(250)}), json!({"role": "assistant", "content": "a".repeat(999)})], "q", 7);
+        let need = instructions_estimate(&[json!({"role": "system", "content": "s".repeat(250)}), json!({"role": "assistant", "content": "a".repeat(999)})], "q", 7, 0);
         assert_eq!(need, (100 + 4) + 4 + 7, "system, the question and the tools; never history");
     }
 
