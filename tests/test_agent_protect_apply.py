@@ -345,6 +345,161 @@ def test_teardown_removes_the_drop_in_and_reloads(node: Node) -> None:
     assert node.calls() == ["systemctl daemon-reload"]
 
 
+# ── a bundle with no agent-env: report the installed hold, change nothing ────
+#
+# `agent_protect_rereport` runs in the else branch of the agent-env block. It
+# says `agent-protect=unchanged:N` only when the installed drop-in is exactly
+# what the INSTALLED env renders; every doubt says nothing.
+
+def snapshot(node: Node) -> dict:
+    """Every path under the node's temp dir (but the call log): bytes, mtime, mode."""
+    snap = {}
+    for p in sorted(node.tmp.rglob("*")):
+        if p == node.log or p.is_dir():
+            continue
+        st = p.stat()
+        snap[str(p)] = (p.read_bytes(), st.st_mtime_ns, st.st_ino, stat.S_IMODE(st.st_mode))
+    return snap
+
+
+def rereport(node: Node) -> subprocess.CompletedProcess:
+    return node.run('agent_protect_rereport "$ENVF"')
+
+
+def test_a_partial_bundle_restates_a_matching_hold_and_writes_nothing(node: Node) -> None:
+    before = installed(node)
+    n = len(rw_paths(node))
+    snap = snapshot(node)
+    r = rereport(node)
+    assert out(r, "APPLIED").split() == [f"agent-protect=unchanged:{n}"]
+    assert n >= 3
+    assert out(r, "RESTART") == "0"
+    assert node.calls() == [], "no systemctl: no reload, no restart"
+    assert snapshot(node) == snap, "no file created, touched or replaced"
+    assert node.dropin.read_bytes() == before
+    assert r.stderr == ""
+
+
+def test_a_partial_bundle_says_nothing_when_the_drop_in_differs(node: Node) -> None:
+    installed(node)
+    node.dropin.write_bytes(node.dropin.read_bytes().replace(b"ProtectSystem=strict", b"ProtectSystem=full"))
+    snap = snapshot(node)
+    r = rereport(node)
+    assert "agent-protect" not in out(r, "APPLIED")
+    assert out(r, "RESTART") == "0" and node.calls() == []
+    assert snapshot(node) == snap
+
+
+def test_a_partial_bundle_says_nothing_when_the_env_now_asks_for_another_path(node: Node) -> None:
+    installed(node)
+    node.write_env(NOO_AGENT_STATE=f"{node.tmp}/state", NOO_HOST_ROOTS=f"{node.tmp}/extra1")
+    snap = snapshot(node)
+    r = rereport(node)
+    assert "agent-protect" not in out(r, "APPLIED")
+    assert node.calls() == [] and snapshot(node) == snap
+
+
+def test_a_partial_bundle_says_nothing_when_the_drop_in_has_an_extra_trailing_byte(node: Node) -> None:
+    installed(node)
+    with node.dropin.open("ab") as f:
+        f.write(b"\n")
+    r = rereport(node)
+    assert "agent-protect" not in out(r, "APPLIED")
+
+
+def test_a_partial_bundle_says_nothing_when_the_drop_in_has_the_wrong_mode(node: Node) -> None:
+    installed(node)
+    node.dropin.chmod(0o600)
+    r = rereport(node)
+    assert "agent-protect" not in out(r, "APPLIED")
+
+
+def test_a_partial_bundle_says_nothing_when_the_env_file_is_missing(node: Node) -> None:
+    # The drop-in is the one an env with NO roots renders: what a missing env
+    # would also render if the missing file were read as empty. It must still
+    # say nothing, because the env that justified the hold cannot be read.
+    node.write_env()
+    assert out(node.run(), "RESTART") == "1"
+    node.log.write_text("")
+    assert out(rereport(node), "APPLIED").split() == ["agent-protect=unchanged:2"]
+    node.envf.unlink()
+    snap = snapshot(node)
+    r = rereport(node)
+    assert "agent-protect" not in out(r, "APPLIED")
+    assert node.calls() == [] and snapshot(node) == snap
+
+
+def test_a_partial_bundle_says_nothing_when_the_env_file_is_unreadable(node: Node) -> None:
+    if os.geteuid() == 0:
+        pytest.skip("root reads any file")
+    node.write_env()
+    assert out(node.run(), "RESTART") == "1"
+    node.envf.chmod(0)
+    try:
+        r = rereport(node)
+    finally:
+        node.envf.chmod(0o600)
+    assert "agent-protect" not in out(r, "APPLIED")
+
+
+def test_a_partial_bundle_says_nothing_when_the_drop_in_is_missing(node: Node) -> None:
+    node.normal_env()
+    snap = snapshot(node)
+    r = rereport(node)
+    assert "agent-protect" not in out(r, "APPLIED")
+    assert not node.dropin.exists() and not node.dropin_dir.exists()
+    assert node.calls() == [] and snapshot(node) == snap
+
+
+def test_a_partial_bundle_says_nothing_when_the_installed_env_has_a_bad_value(node: Node) -> None:
+    installed(node)
+    node.write_env(NOO_DATA_ROOT="/etc")
+    r = rereport(node)
+    assert "agent-protect" not in out(r, "APPLIED")
+    assert r.stderr == "", "a report-only branch adds no refusal line"
+
+
+def test_a_partial_bundle_on_a_host_without_systemd_says_nothing(node: Node) -> None:
+    installed(node)
+    node.extra_env = {"AP_SYSTEMD_DIR": str(node.tmp / "no-systemd-here")}
+    r = rereport(node)
+    assert "agent-protect" not in out(r, "APPLIED")
+
+
+def test_a_full_bundle_is_unchanged_by_the_rereport(node: Node) -> None:
+    """agent_protect_apply: the same calls and the same tags as before."""
+    node.normal_env()
+    r = node.run()
+    n = len(rw_paths(node))
+    assert out(r, "APPLIED").split() == [f"agent-protect={n}"] and out(r, "RESTART") == "1"
+    assert node.calls() == ["systemctl daemon-reload"]
+    node.log.write_text("")
+    r = node.run()
+    assert out(r, "APPLIED").split() == [f"agent-protect=unchanged:{n}"] and out(r, "RESTART") == "0"
+    assert node.calls() == []
+
+
+def test_the_rereport_is_the_else_of_the_agent_env_block_and_only_there() -> None:
+    call = "    agent_protect_rereport /etc/noo-node-agent.env\n"
+    assert APPLY.count(call) == 1
+    i = APPLY.index(call)
+    apply_call = APPLY.index('    agent_protect_apply "$WORK/files/agent-env"\n')
+    assert apply_call < i and APPLY[apply_call:i].count("\nelse\n") == 1
+    assert "\nfi\n" not in APPLY[apply_call:i]
+    assert APPLY[i + len(call):].startswith("fi\n")
+
+
+def test_the_rereport_function_never_writes_reloads_or_restarts() -> None:
+    m = re.search(r"\nagent_protect_rereport\(\) \{\n(.*?)\n\}\n", APPLY, re.S)
+    assert m
+    body = "\n".join(l for l in m.group(1).splitlines() if not l.lstrip().startswith("#"))
+    for banned in ("systemctl", "install ", "mktemp", "need_restart", "rm ", " mv ", "cp ", "tee ", "chmod", "chown"):
+        assert banned not in body, banned
+    assert not re.search(r"(?<![0-9&])>>?\s*[^&\s]", body), "no redirection to a file"
+    assert body.count('applied="$applied agent-protect=unchanged:$_ar_cnt"') == 1
+    assert "applied=" not in body.replace('applied="$applied agent-protect=unchanged:$_ar_cnt"', "")
+
+
 # ── source guards: the call sites ───────────────────────────────────────────
 
 def test_the_render_rides_the_agent_env_block_and_its_one_restart() -> None:
