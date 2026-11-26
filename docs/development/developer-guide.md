@@ -507,13 +507,14 @@ information" when the knowledge base already holds the fact
   (`context.rs`) hold it to what is left of the turn's fit budget after the
   system messages, tool schemas, the latest question, a history reserve
   (the history there is, at most 25% of the budget) and 64 tokens of slack; on
-  a fit budget under 8,192 tokens (the compact-tier bound) also to at most 40%
-  of it. A block that fits is sent byte for byte. Otherwise, lowest priority
+  a window whose real input budget (before calibration) is under 8,192
+  tokens, the compact-tier bound, also to at most 40% of the fit budget. A block that fits is sent byte for byte. Otherwise, lowest priority
   first (video, channels, companion devices, runtime skills, memory, cluster,
   conversation continuity, user facts, knowledge base), each layer loses its
   last items one at a time and goes whole when none is left; the knowledge
-  base keeps its top item until the rest are gone, its `Sources:` list shrinks
-  to the items that remain and its graph lines go with any cut; the last item
+  base keeps its top item until the rest are gone, its `Sources:` list
+  shrinks to the first title, and only while the first chunk (the worker's
+  `---` delimits chunks) is whole, and its graph lines go with any cut; the last item
   is cut at a paragraph, line, sentence or whitespace boundary (a character
   edge if there is none). Under a floor of the fixed header plus 150 tokens
   the block is dropped and the question goes alone. Older turns the block

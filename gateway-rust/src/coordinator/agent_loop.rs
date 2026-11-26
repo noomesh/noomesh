@@ -1472,9 +1472,10 @@ fn attach_budgeted_data(
     layers: &[(&str, Option<&str>)],
     fit_budget: usize,
     tool_tokens: usize,
+    max_input: usize,
     conversation_id: &str,
 ) -> (Option<String>, super::context::FrameFit) {
-    let budget = super::context::frame_budget(messages, fit_budget, tool_tokens);
+    let budget = super::context::frame_budget(messages, fit_budget, tool_tokens, max_input);
     let (mut frame, mut fit) = super::context::fit_data_frame(layers, budget);
     let shed = fit_context_window(messages, fit_budget.saturating_sub(fit.after), tool_tokens);
     if let Some(outline) = build_history_summary(&shed, conversation_id) {
@@ -2721,6 +2722,7 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
         ],
         fit_budget,
         tool_toks,
+        max_input,
         &turn_conv,
     );
     // A knowledge base cut out of the frame is not "already shown".
@@ -4027,6 +4029,7 @@ async fn run_inner_bound<R: HarnessRuntime>(
         ],
         fit_budget,
         tool_toks,
+        max_input,
         &turn_conv,
     );
     // A knowledge base cut out of the frame is not "already shown".
@@ -5069,13 +5072,13 @@ mod frame_budget_tests {
         json!({"role": "system", "content": "s".repeat(2670)})
     }
 
-    /// Four 320-char chunks (1,286 chars with the breaks), three citations
+    /// Four 320-char chunks (1,295 chars with the `---` breaks), three citations
     /// and two graph lines: 1,408 chars.
     fn kb() -> String {
         let paras: Vec<String> = (1..=4).map(|i| format!("Chunk {i}. {}", "Leave is accrued monthly. ".repeat(12).trim_end())).collect();
         format!(
             "{}\nSources:\n  - Page A\n  - Page B\n  - Page C\nKnowledge graph relationships:\n  - LEAVEGRAPH linked to policy (confidence: 80%)",
-            paras.join("\n\n")
+            paras.join("\n---\n")
         )
     }
 
@@ -5120,7 +5123,7 @@ mod frame_budget_tests {
         assert!(frame_tokens(&full) > 1800, "the observed ~1,900-token frame: {}", frame_tokens(&full));
         let mut messages = vec![system(), json!({"role": "user", "content": QUESTION})];
         assert!(total(&messages, tool_toks) + frame_tokens(&full) > fit_budget, "unbudgeted it overflows");
-        let (frame, fit) = attach_budgeted_data(&mut messages, &l, fit_budget, tool_toks, "t");
+        let (frame, fit) = attach_budgeted_data(&mut messages, &l, fit_budget, tool_toks, fit_budget, "t");
         assert_eq!(fit.budget, 1228);
         assert_eq!(fit.outcome(), "trimmed");
         assert_eq!(fit.dropped, vec!["Video recall".to_string()]);
@@ -5181,13 +5184,14 @@ mod frame_budget_tests {
         assert!(fit.after <= 560, "{fit:?}");
     }
 
-    /// Chunks go from the end; the citations list only the chunks left and
-    /// the graph lines go with the first cut. For every budget from the floor
-    /// up: k chunks kept means min(k, 3) titles, and the graph lines only
-    /// while all 4 chunks are there.
+    /// Chunks go from the end (the worker puts `---` between them). Citations
+    /// are not aligned to chunks, so a cut layer keeps at most the FIRST
+    /// title, and only while the first chunk is whole; the graph lines go
+    /// with the first cut. For every budget from the floor up.
     #[test]
-    fn knowledge_base_chunks_and_their_citations_leave_together() {
+    fn knowledge_base_chunks_are_cut_from_the_end_and_citations_shrink_to_the_first() {
         let kb = kb();
+        let chunk1 = format!("Chunk 1. {}", "Leave is accrued monthly. ".repeat(12).trim_end());
         let l = vec![(KB_FRAME_LABEL, Some(kb.as_str()))];
         let full = frame_tokens(&build_data_frame(&l).unwrap());
         let mut seen = std::collections::BTreeSet::new();
@@ -5204,22 +5208,80 @@ mod frame_budget_tests {
             if k == 4 {
                 assert!(titles == 3 && frame.contains("LEAVEGRAPH"), "{budget}");
             } else {
-                assert_eq!(titles, k, "{budget}: citations of chunks that are gone");
                 assert!(!frame.contains("LEAVEGRAPH"), "{budget}");
+                if frame.contains(&chunk1) {
+                    assert!(titles == 1 && frame.contains("Page A"), "{budget}: the first title beside a whole first chunk");
+                } else {
+                    assert_eq!(titles, 0, "{budget}: no Sources beside a cut first chunk");
+                }
             }
             seen.insert(k);
         }
         assert_eq!(seen.into_iter().collect::<Vec<_>>(), vec![1, 2, 3, 4], "every cut point was exercised");
     }
 
-    /// The last item alone is cut at a paragraph, line or sentence boundary.
-    /// 8 chunks of 320 chars, 2 citations, budget 900: 4 chunks are 880
-    /// tokens, 5 are 1,009. The citations shrink to the two that exist.
+    /// A chunk with three internal paragraphs is ONE item, and a trimmed
+    /// frame never lists a page whose chunks are not all there: Page B and
+    /// Page C appear only with all three chunks, Page A only with chunk 1
+    /// whole. Full frame ~754 tokens; budgets from the 472 floor.
+    #[test]
+    fn a_chunk_with_internal_paragraphs_stays_whole_and_sources_never_name_absent_pages() {
+        let a = "Leave is accrued monthly. ".repeat(5).trim_end().to_string();
+        let a2 = "Leave is accrued monthly. ".repeat(11).trim_end().to_string();
+        let text = format!(
+            "C1-P1 {a}\n\nC1-P2 {a}\n\nC1-P3 {a}\n---\nC2 {a2}\n---\nC3 {a2}\nSources:\n  - Page A\n  - Page B\n  - Page C"
+        );
+        let l = vec![(KB_FRAME_LABEL, Some(text.as_str()))];
+        let full = frame_tokens(&build_data_frame(&l).unwrap());
+        assert!((700..800).contains(&full), "{full}");
+        let mut shapes = std::collections::BTreeSet::new();
+        for budget in 472..=full {
+            let (frame, fit) = fit_data_frame(&l, budget);
+            let Some(frame) = frame else {
+                assert!(fit.dropped_all, "{budget}: {fit:?}");
+                continue;
+            };
+            assert!(fit.after <= budget, "{budget}: {fit:?}");
+            let (c1, c2, c3) = (frame.contains("C1-P3"), frame.contains("C2 "), frame.contains("C3 "));
+            assert!(!c2 || c1, "{budget}: chunks go from the end");
+            assert!(!c3 || c2, "{budget}");
+            for (page, whole) in [("Page A", c1), ("Page B", c3), ("Page C", c3)] {
+                assert!(!frame.contains(page) || whole, "{budget}: {page} listed but its text is absent");
+            }
+            shapes.insert((c1, c2, c3));
+        }
+        assert!(shapes.contains(&(true, true, true)) && shapes.contains(&(true, false, false)), "{shapes:?}");
+    }
+
+    /// The small-window bound is the REAL input budget (3,072 for a 4,096
+    /// window), whatever the calibration ratio does to the fit budget: at
+    /// ratios 0.4 and 0.3 the fit budgets are about 7,680 and 10,240 (under
+    /// and over 8,192) and both are capped at 40% of themselves. A 16,384
+    /// window (real 12,288) is uncapped at both: room only, fit - 482 (404
+    /// system + 14 question + 64 slack).
+    #[test]
+    fn the_small_window_bound_is_judged_on_the_real_budget_at_any_calibration() {
+        let bare = [json!({"role": "system", "content": "s".repeat(1000)}), json!({"role": "user", "content": QUESTION})];
+        for ratio in [0.4, 0.3] {
+            let calib = Calibration { ratio, samples: 3 };
+            let small = max_input_for(4096) as usize;
+            let fit = calib.estimate_budget(small as u64) as usize;
+            assert!((7679..=7680).contains(&fit) || (10239..=10240).contains(&fit), "{ratio}: {fit}");
+            assert_eq!(frame_budget(&bare, fit, 0, small), fit * 40 / 100, "{ratio}: capped");
+            let large = max_input_for(16384) as usize;
+            let fit = calib.estimate_budget(large as u64) as usize;
+            assert!(fit > 30_000, "{ratio}: {fit}");
+            assert_eq!(frame_budget(&bare, fit, 0, large), fit - 482, "{ratio}: uncapped");
+        }
+    }
+
+    /// 8 chunks of 320 chars joined by `---`, 2 citations, budget 900: 4
+    /// chunks are 880 tokens, 5 are 1,014. The citations shrink to the first.
     #[test]
     fn a_long_answer_loses_whole_chunks_from_the_end() {
         let long = format!(
             "{}\nSources:\n  - Page A\n  - Page B",
-            (1..=8).map(|i| format!("Chunk {i}. {}", "Leave is accrued monthly. ".repeat(12).trim_end())).collect::<Vec<_>>().join("\n\n")
+            (1..=8).map(|i| format!("Chunk {i}. {}", "Leave is accrued monthly. ".repeat(12).trim_end())).collect::<Vec<_>>().join("\n---\n")
         );
         let l = vec![(KB_FRAME_LABEL, Some(long.as_str()))];
         let (frame, fit) = fit_data_frame(&l, 900);
@@ -5229,12 +5291,12 @@ mod frame_budget_tests {
         assert!(fit.after <= 900, "{fit:?}");
         assert_eq!(count(&frame, "Chunk "), 4);
         assert!(frame.contains("Chunk 1.") && !frame.contains("Chunk 5."));
-        assert!(frame.contains("Page A") && frame.contains("Page B"));
+        assert!(frame.contains("Page A") && !frame.contains("Page B"), "only the first title survives a cut");
         assert!(frame.contains("the rest was left out"));
         let body = frame.split(&format!("[{KB_FRAME_LABEL}]\n")).nth(1).unwrap().split("\n[...").next().unwrap();
         assert_eq!(body, body.trim_end(), "no stray whitespace before the note");
-        for p in body.split("\n\n") {
-            assert!(p.starts_with("Chunk ") && p.ends_with("monthly."), "a whole paragraph, never mid-sentence: {p:?}");
+        for p in body.split("\n---\n") {
+            assert!(p.starts_with("Chunk ") && p.ends_with("monthly."), "a whole chunk, never mid-sentence: {p:?}");
         }
     }
 
@@ -5288,7 +5350,7 @@ mod frame_budget_tests {
         let built = build_data_frame(&l).unwrap();
         assert!((6000..8000).contains(&frame_tokens(&built)) && frame_tokens(&built) > fit_budget * 40 / 100, "{}", frame_tokens(&built));
         let mut messages = vec![system(), json!({"role": "user", "content": QUESTION})];
-        let (frame, fit) = attach_budgeted_data(&mut messages, &l, fit_budget, tool_toks, "t");
+        let (frame, fit) = attach_budgeted_data(&mut messages, &l, fit_budget, tool_toks, fit_budget, "t");
         assert_eq!(fit.budget, 10712);
         assert_eq!(fit.outcome(), "untouched");
         assert_eq!(fit.before, fit.after);
@@ -5306,16 +5368,16 @@ mod frame_budget_tests {
         let with_history = [sys.clone(), hist[0].clone(), hist[1].clone(), q.clone()];
         // History is 808 but only 25% of 3,000 = 750 is reserved:
         // 3,000 - 1,500 tools - 404 - 14 - 750 - 64 slack = 268.
-        assert_eq!(frame_budget(&with_history, 3000, 1500), 268);
+        assert_eq!(frame_budget(&with_history, 3000, 1500, 3000), 268);
         // No history: 3,000 - 1,500 - 404 - 14 - 64 = 1,018, under the 40% cap of 1,200.
-        assert_eq!(frame_budget(&bare, 3000, 1500), 1018);
+        assert_eq!(frame_budget(&bare, 3000, 1500, 3000), 1018);
         // Small history is reserved in full: 808 < 25% of 6,000 = 1,500.
         // room = 6,000 - 404 - 14 - 808 - 64 = 4,710, held to 40% = 2,400.
-        assert_eq!(frame_budget(&with_history, 6000, 0), 2400);
+        assert_eq!(frame_budget(&with_history, 6000, 0, 6000), 2400);
         // Just under the bound the 40% cap applies (3,276); at it, it does not.
-        assert_eq!(frame_budget(&bare, 8191, 0), 3276);
-        assert_eq!(frame_budget(&bare, 8192, 0), 8192 - 404 - 14 - 64);
-        assert_eq!(frame_budget(&bare, 9000, 0), 8518);
+        assert_eq!(frame_budget(&bare, 8191, 0, 8191), 3276);
+        assert_eq!(frame_budget(&bare, 8192, 0, 8192), 8192 - 404 - 14 - 64);
+        assert_eq!(frame_budget(&bare, 9000, 0, 9000), 8518);
     }
 
     /// Nothing useful fits: the frame is dropped with a reason, the question
@@ -5329,7 +5391,7 @@ mod frame_budget_tests {
         let mut messages = vec![json!({"role": "system", "content": "s".repeat(1000)}), json!({"role": "user", "content": QUESTION})];
         let (kb, mem, vid) = (kb(), memory(45), video());
         let l = layers(&kb, &mem, &vid);
-        let (frame, fit) = attach_budgeted_data(&mut messages, &l, fit_budget, 0, "t");
+        let (frame, fit) = attach_budgeted_data(&mut messages, &l, fit_budget, 0, fit_budget, "t");
         assert!(frame.is_none());
         assert_eq!(fit.budget, 440);
         assert_eq!((fit.outcome(), fit.reason, fit.after), ("dropped", "below_minimum", 0), "{fit:?}");
@@ -5374,11 +5436,11 @@ mod frame_budget_tests {
             messages.push(json!({"role": "assistant", "content": format!("earlier answer {i} {}", "a".repeat(580))}));
         }
         messages.push(json!({"role": "user", "content": QUESTION}));
-        assert_eq!(frame_budget(&messages, fit_budget, tool_toks), 728);
+        assert_eq!(frame_budget(&messages, fit_budget, tool_toks, fit_budget), 728);
         assert!(total(&messages, tool_toks) <= fit_budget);
         let small = "Chunk 1. Leave is accrued monthly.";
         let l = vec![(KB_FRAME_LABEL, Some(small))];
-        let (frame, fit) = attach_budgeted_data(&mut messages, &l, fit_budget, tool_toks, "t");
+        let (frame, fit) = attach_budgeted_data(&mut messages, &l, fit_budget, tool_toks, fit_budget, "t");
         let frame = frame.expect("attached");
         assert!(fit.after <= fit.budget, "{fit:?}");
         assert!(frame.contains("messages dropped from context") && frame.contains(&format!("[{CONTINUITY_FRAME_LABEL}]")), "{frame}");
@@ -5424,7 +5486,7 @@ mod frame_budget_tests {
         assert_eq!(own.matches("super::context::rag_if_kept(&frame_fit, rag_ctx.as_deref())").count(), 2);
         let helper = crate::test_src::fn_body(&own, "fn attach_budgeted_data(");
         assert!(helper.contains("fit_context_window(messages, fit_budget.saturating_sub(fit.after), tool_tokens)"), "{helper}");
-        assert!(helper.contains("frame_budget(messages, fit_budget, tool_tokens)"));
+        assert!(helper.contains("frame_budget(messages, fit_budget, tool_tokens, max_input)"));
         let log = crate::test_src::fn_body(&own, "fn log_frame_fit(");
         for field in ["before_tokens", "after_tokens", "budget_tokens", "reason", "items_dropped", "\"retrieved_data_budgeted\""] {
             assert!(log.contains(field), "{field}");
