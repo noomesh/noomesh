@@ -194,7 +194,7 @@ at a terminal (people only). `remove` asks for confirmation.
 A scheduled summary or report action (`daily_briefing`, `chat_digest`,
 `conversation_summarize`, `news_scan`, `goal_review`, `research_report`,
 `research_and_send`) runs unattended, so its prompt says that nobody can
-answer a question. If its answer opens by declining the task with no report after it (no heading or list), or is short and
+answer a question. If its answer opens by declining the task with no report after it (no heading or table; bullets do not count), or is short and
 ends by asking leave ("Shall I proceed?"), the gateway retries once with a
 corrective line. A second such answer is recorded as an `error` run with the
 reason `unattended_non_answer: declined` or `unattended_non_answer: asked_to_proceed`

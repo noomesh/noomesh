@@ -2088,14 +2088,10 @@ fn first_sentence(s: &str) -> String {
     s[..end].chars().take(300).collect()
 }
 
-/// A markdown heading or list/table line: the sign of a report.
+/// A markdown heading or table line: the sign of a report. Bullets and
+/// numbered lines do not count (a refusal can list its reasons).
 fn is_report_line(line: &str) -> bool {
-    let l = line.trim_start();
-    l.starts_with(['#', '|', '\u{2022}'])
-        || l.starts_with("- ")
-        || l.starts_with("* ")
-        || (l.starts_with(|c: char| c.is_ascii_digit())
-            && l.trim_start_matches(|c: char| c.is_ascii_digit()).starts_with(['.', ')']))
+    line.trim_start().starts_with(['#', '|'])
 }
 
 /// After an opener ("i cannot"), is a task word within four whole words?
@@ -2106,7 +2102,7 @@ fn task_word_after_opener(s: &str) -> bool {
 }
 
 /// Does the text OPEN by refusing the task, with no report after it? English
-/// only, deliberately narrow. A refusal that is followed by a heading or list
+/// only, deliberately narrow. A refusal that is followed by a heading or table
 /// line is a briefing that opens with a limitation, and is delivered.
 fn opens_with_decline(text: &str) -> bool {
     let norm = text.replace('\u{2019}', "'").to_lowercase();
@@ -6541,8 +6537,13 @@ mod non_answer_tests {
     fn a_briefing_that_opens_with_a_limitation_is_delivered_but_a_prose_refusal_is_not() {
         let briefing = "I cannot create a summary for node_a because it is offline.\n\n## Cluster\n- ctrl: healthy\n- cache 41%\n";
         assert_eq!(detect_non_answer(briefing), None);
-        let numbered = "I cannot generate the report for node_a.\n1. ctrl is healthy\n2. cache 41%";
-        assert_eq!(detect_non_answer(numbered), None);
+        let bulleted = "I cannot generate the briefing because:\n- the alert record lists active alerts\n- I need node data first.\n\nShall I proceed?";
+        assert_eq!(detect_non_answer(bulleted), Some(NonAnswer::Declined));
+        let padded = format!("{bulleted}\n{}", "- more reasons that pad the text well past the length limit.\n".repeat(20));
+        assert!(padded.chars().count() > 600);
+        assert_eq!(detect_non_answer(&padded), Some(NonAnswer::Declined));
+        let table = "I cannot create a summary for node_a.\n\n| node | state |\n|---|---|\n| ctrl | up |";
+        assert_eq!(detect_non_answer(table), None);
         // all-prose and long: still a refusal (there is no report after it)
         let long = format!("I cannot fulfill the request as instructed. {}", "It needs data I do not have. ".repeat(90));
         assert!(long.chars().count() > 2500);
