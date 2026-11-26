@@ -423,11 +423,15 @@ func TestSystemPlistDriftRecordsTheWantedEnvForEnrollResume(t *testing.T) {
 	for _, want := range []string{
 		"sudo " + plutilBin + " -replace EnvironmentVariables.OLLAMA_CONTEXT_LENGTH -string '8192' " + sys,
 		"sudo launchctl bootout system/" + newBrew + " 2>/dev/null || true",
-		"or run `noo enroll --resume`",
+		"lacks OLLAMA_CONTEXT_LENGTH, OLLAMA_KEEP_ALIVE: run `noo enroll --resume` on this Mac to apply them; or by hand on the Mac run `sudo",
 	} {
 		if !strings.Contains(rs[0].Reason, want) {
 			t.Errorf("reason lacks %q: %s", want, rs[0].Reason)
 		}
+	}
+	// The supported fix comes before every manual command.
+	if e, m := strings.Index(rs[0].Reason, "noo enroll --resume"), strings.Index(rs[0].Reason, "sudo"); e < 0 || m < 0 || e > m {
+		t.Errorf("enroll --resume must come before the sudo lines: %s", rs[0].Reason)
 	}
 }
 
