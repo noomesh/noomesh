@@ -1447,7 +1447,7 @@ pub(crate) const ROWS: &[Row] = &[
         scope: Scope::Node,
         verdicts: &[Verdict::Warn],
         meaning: "Refusals the node reports that no other row shows (a tuning env key, a models dir, a helper image, an MCP server), each as scope=target: reason.",
-        clears: "Read the reason, which names its own fix; `noo cluster show <node>` has the whole record. For a Mac's native Ollama missing noomesh's settings (`ollama_env`) run `noo enroll --resume` on that Mac.",
+        clears: "Read the reason, which names its own fix; `noo cluster show <node>` has the whole record. For a Mac's native Ollama missing noomesh's settings (`ollama_env`) run `noo enroll --resume` on that Mac (it asks for the Mac's admin password).",
         findings: &[],
         shown_as: None,
         doc: None,

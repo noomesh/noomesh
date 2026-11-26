@@ -403,9 +403,10 @@ func (g *OllamaGuard) reportSystemDrift() error {
 	}
 	// A job that is not loaded is not an error: bootout says "No such process".
 	cmds = append(cmds, "sudo launchctl bootout system/"+g.label()+" 2>/dev/null || true", "sudo launchctl bootstrap system "+plist)
-	// The supported fix first (verify and the alert read the list of keys up to
-	// the first colon, and name `noo enroll --resume` themselves); the manual
-	// commands after it.
+	// The supported fix first, the manual commands after it. `noo cluster
+	// verify` reads the key list between " lacks " and the first colon (keep
+	// that shape) and names the fix itself; the operator alert prints the
+	// whole reason as its detail.
 	reason := fmt.Sprintf("the native Ollama is a boot service (%s, root's), which this agent cannot edit, and it lacks %s: "+
 		"run `noo enroll --resume` on this Mac to apply them; or by hand on the Mac run `%s`", plist, strings.Join(keys, ", "), strings.Join(cmds, "; "))
 	refusals.Record("ollama_env", "ollama", reason)

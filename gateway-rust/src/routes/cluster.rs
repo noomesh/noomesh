@@ -1528,7 +1528,7 @@ fn reconcile_refusal_alert_text(node_id: &str, items: &[serde_json::Value]) -> S
     let mut text = format!("🧱 Node `{node_id}` refused {n} desired-state instruction(s). ");
     if ollama_env {
         text.push_str(&format!(
-            "Its native Ollama lacks settings noomesh wants and the node cannot write them itself: run `noo enroll --resume` on {node_id}. "
+            "Its native Ollama lacks settings noomesh wants and the node cannot write them itself: run `noo enroll --resume` on {node_id} (it asks for the Mac's admin password). "
         ));
     }
     if other {
@@ -12140,7 +12140,7 @@ mod reconcile_refusal_alert_text_tests {
     fn an_ollama_env_refusal_names_enroll_resume_on_that_node() {
         let items = vec![json!({"scope": "ollama_env", "target": "ollama", "reason": "r"})];
         let t = reconcile_refusal_alert_text("node-a", &items);
-        assert!(t.contains("run `noo enroll --resume` on node-a"), "{t}");
+        assert!(t.contains("run `noo enroll --resume` on node-a (it asks for the Mac's admin password)"), "{t}");
         assert!(!t.contains("widen") && !t.contains("fix the instruction"), "{t}");
     }
 
