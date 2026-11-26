@@ -332,12 +332,15 @@ pub(super) fn attach_data_frame(messages: &mut [Value], frame: &str) -> bool {
 // frame that already fits is returned byte for byte as [`build_data_frame`]
 // made it.
 
-/// On a window whose fit budget is under this many tokens the frame may take
-/// at most [`FRAME_MAX_PERCENT`] of it. 8,192 is the bound under which the
-/// loop already takes the compact prompt tier (`COMPACT_TIER_BELOW`): there
-/// the question, the tool results of later steps and the answer share a
-/// small space. At or above it the frame takes whatever room is left, so a
-/// large window is never trimmed while the frame fits.
+/// On a window whose REAL input budget (`max_input`, in the backend's
+/// tokens, before calibration) is under this many tokens the frame may take
+/// at most [`FRAME_MAX_PERCENT`] of the fit budget. 8,192 is the bound under
+/// which the loop already takes the compact prompt tier
+/// (`COMPACT_TIER_BELOW`): there the question, the tool results of later
+/// steps and the answer share a small space. At or above it the frame takes
+/// whatever room is left, so a large window is never trimmed while the frame
+/// fits. It is judged on real tokens so that the calibration ratio, which
+/// scales the fit budget, cannot move a window across it.
 pub(super) const FRAME_SMALL_WINDOW_BELOW: usize = 8192;
 /// The most of a small window's fit budget the frame may take, in percent.
 pub(super) const FRAME_MAX_PERCENT: usize = 40;
@@ -353,6 +356,8 @@ const FRAME_MIN_BODY_TOKENS: usize = 150;
 const FRAME_TRIM_NOTE: &str = "\n[... the rest was left out to fit the model's context window]";
 /// Where a knowledge-base layer's citations start.
 const SOURCES_MARK: &str = "\nSources:";
+/// What the worker puts between retrieved chunks.
+const KB_CHUNK_SEP: &str = "\n---\n";
 /// The label the loops give the long-conversation continuity layer.
 pub(super) const CONTINUITY_FRAME_LABEL: &str = "Earlier in this conversation (outline, summary, recall)";
 
@@ -370,10 +375,11 @@ fn frame_overhead_tokens() -> usize {
 /// The tokens the frame may take on this turn: what is left of
 /// `fit_budget` after the tool schemas, the system messages, the latest user
 /// message, the recent history kept back ([`FRAME_HISTORY_RESERVE_PERCENT`])
-/// and [`FRAME_SLACK_TOKENS`]. On a window under
-/// [`FRAME_SMALL_WINDOW_BELOW`] never more than [`FRAME_MAX_PERCENT`] of the
-/// budget. `messages` is the turn before the frame is attached.
-pub(super) fn frame_budget(messages: &[Value], fit_budget: usize, tool_tokens: usize) -> usize {
+/// and [`FRAME_SLACK_TOKENS`], all in fit-budget units. On a window whose
+/// real `max_input` is under [`FRAME_SMALL_WINDOW_BELOW`] never more than
+/// [`FRAME_MAX_PERCENT`] of the fit budget. `messages` is the turn before the
+/// frame is attached.
+pub(super) fn frame_budget(messages: &[Value], fit_budget: usize, tool_tokens: usize, max_input: usize) -> usize {
     let role = |m: &Value, r: &str| m.get("role").and_then(|x| x.as_str()) == Some(r);
     let system: Vec<Value> = messages.iter().filter(|m| role(m, "system")).cloned().collect();
     let system = super::estimate_tokens(&system);
@@ -385,7 +391,7 @@ pub(super) fn frame_budget(messages: &[Value], fit_budget: usize, tool_tokens: u
     let history = super::estimate_tokens(messages).saturating_sub(system + question);
     let reserve = history.min(fit_budget * FRAME_HISTORY_RESERVE_PERCENT / 100);
     let room = fit_budget.saturating_sub(tool_tokens + system + question + reserve + FRAME_SLACK_TOKENS);
-    if fit_budget < FRAME_SMALL_WINDOW_BELOW {
+    if max_input < FRAME_SMALL_WINDOW_BELOW {
         room.min(fit_budget * FRAME_MAX_PERCENT / 100)
     } else {
         room
@@ -496,11 +502,14 @@ fn shorten_at_boundary(text: &str, max_chars: usize) -> Option<String> {
 }
 
 /// One layer broken into the items trimming works on. Items are in rank
-/// order (best first): paragraphs when the text has any, else lines. A
-/// knowledge-base layer's `Sources:` titles and the graph lines after them
-/// ride separately: when items are dropped or cut, the titles shrink to as
-/// many as items remain (citation i belongs to item i) and the graph lines,
-/// which describe the whole answer, go.
+/// order (best first). The knowledge base's real delimiter is the worker's
+/// `\n---\n` between chunks; other text splits on blank lines, else lines.
+/// A knowledge-base layer's `Sources:` titles and the graph lines after them
+/// ride separately. Titles are NOT aligned to chunks (the worker cites only
+/// the chunks that have a title and the gateway keeps the first three), so
+/// once the layer is cut only the first title is kept, and only while the
+/// first chunk is whole; the graph lines, which describe the whole answer,
+/// go with any cut.
 struct Part<'a> {
     label: &'a str,
     lead: String,
@@ -523,7 +532,13 @@ impl<'a> Part<'a> {
             Some((first, rest)) if kb && first.starts_with('[') && first.ends_with(']') => (first.to_string(), rest),
             _ => (String::new(), body),
         };
-        let sep = if body.contains("\n\n") { "\n\n" } else { "\n" };
+        let sep = if kb && body.contains(KB_CHUNK_SEP) {
+            KB_CHUNK_SEP
+        } else if body.contains("\n\n") {
+            "\n\n"
+        } else {
+            "\n"
+        };
         let mut items: Vec<String> = body.split(sep).map(str::trim).filter(|s| !s.is_empty()).map(str::to_string).collect();
         if items.is_empty() {
             items.push(body.to_string());
@@ -555,9 +570,15 @@ impl<'a> Part<'a> {
         if shrunk {
             t.push_str(FRAME_TRIM_NOTE);
         }
-        if !self.titles.is_empty() {
+        let keep = if !shrunk {
+            self.titles.len()
+        } else if self.cut {
+            0
+        } else {
+            1
+        };
+        if keep > 0 && !self.titles.is_empty() {
             t.push_str(SOURCES_MARK);
-            let keep = if shrunk { self.items.len() } else { self.titles.len() };
             for title in self.titles.iter().take(keep) {
                 t.push_str("\n  - ");
                 t.push_str(title);
