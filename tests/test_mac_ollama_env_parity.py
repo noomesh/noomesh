@@ -69,7 +69,7 @@ def test_enroll_writes_the_tuning_it_reads_into_the_boot_plist():
 
 def test_the_refusal_still_offers_resume_only_while_it_applies_the_recorded_env():
     drift = GO.split("func (g *OllamaGuard) reportSystemDrift", 1)[1].split("\nfunc ", 1)[0]
-    assert "or run `noo enroll --resume`" in drift
+    assert "run `noo enroll --resume` on this Mac to apply them" in drift
     assert "g.recordWanted()" in drift
     assert "bootout system/" in drift and "2>/dev/null || true" in drift
 

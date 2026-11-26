@@ -1120,13 +1120,7 @@ async fn node_heartbeat(
                     crate::operator_alert::OperatorAlert::new(
                         "node.reconcile_refused",
                         &node_id,
-                        format!(
-                            "🧱 Node `{node_id}` refused {} desired-state instruction(s). \
-                             The node bounds what the controller may make it do (see the \
-                             node-agent trust contract); fix the instruction, or widen the \
-                             node's own declaration in its agent env file and restart its agent.",
-                            items.len()
-                        ),
+                        reconcile_refusal_alert_text(&node_id, items),
                     )
                     .detail(detail.clone())
                     .investigate(format!("noo cluster verify {node_id}")),
@@ -1518,6 +1512,33 @@ async fn node_register(
 /// event: a node re-registers on every agent restart, and paging on each
 /// would train the operator to ignore the one alert that matters.
 const PEER_IDENTITY_ALERT_COOLDOWN_SECS: i64 = 86_400;
+
+/// The scope a Mac agent records when its native Ollama is a root boot
+/// service lacking the settings noomesh wants.
+const OLLAMA_ENV_REFUSAL_SCOPE: &str = "ollama_env";
+
+/// The `node.reconcile_refused` alert text. Generic refusals say to fix the
+/// instruction or widen the node's declaration; an `ollama_env` refusal is
+/// neither (the settings are the node's to apply), so it names the supported
+/// fix on that node.
+fn reconcile_refusal_alert_text(node_id: &str, items: &[serde_json::Value]) -> String {
+    let n = items.len();
+    let ollama_env = items.iter().any(|r| r.get("scope").and_then(|x| x.as_str()) == Some(OLLAMA_ENV_REFUSAL_SCOPE));
+    let other = items.iter().any(|r| r.get("scope").and_then(|x| x.as_str()) != Some(OLLAMA_ENV_REFUSAL_SCOPE));
+    let mut text = format!("🧱 Node `{node_id}` refused {n} desired-state instruction(s). ");
+    if ollama_env {
+        text.push_str(&format!(
+            "Its native Ollama lacks settings noomesh wants and the node cannot write them itself: run `noo enroll --resume` on {node_id}. "
+        ));
+    }
+    if other {
+        text.push_str(
+            "The node bounds what the controller may make it do (see the node-agent trust contract); \
+             fix the instruction, or widen the node's own declaration in its agent env file and restart its agent.",
+        );
+    }
+    text.trim_end().to_string()
+}
 
 /// Same cadence as the peer-identity alert: a refusal is a standing
 /// condition an operator fixes once, not an event stream.
@@ -12107,5 +12128,38 @@ mod listing_backends_tests {
         let body = crate::test_src::fn_body(&own, "pub(crate) async fn collect_cluster_nodes(");
         assert!(body.contains("merge_gossip_backends("), "the listing merges");
         assert!(!body.contains("data[\"running_backends\"] = Value::Object("), "no wholesale replacement");
+    }
+}
+
+#[cfg(test)]
+mod reconcile_refusal_alert_text_tests {
+    use super::reconcile_refusal_alert_text;
+    use serde_json::json;
+
+    #[test]
+    fn an_ollama_env_refusal_names_enroll_resume_on_that_node() {
+        let items = vec![json!({"scope": "ollama_env", "target": "ollama", "reason": "r"})];
+        let t = reconcile_refusal_alert_text("node-a", &items);
+        assert!(t.contains("run `noo enroll --resume` on node-a"), "{t}");
+        assert!(!t.contains("widen") && !t.contains("fix the instruction"), "{t}");
+    }
+
+    #[test]
+    fn other_scopes_keep_the_generic_wording() {
+        let items = vec![json!({"scope": "models_dir", "target": "/m", "reason": "r"})];
+        let t = reconcile_refusal_alert_text("node-a", &items);
+        assert!(t.contains("refused 1 desired-state instruction(s)"), "{t}");
+        assert!(t.contains("fix the instruction, or widen the node's own declaration"), "{t}");
+        assert!(!t.contains("enroll --resume"), "{t}");
+    }
+
+    #[test]
+    fn a_mix_says_both() {
+        let items = vec![
+            json!({"scope": "ollama_env", "target": "ollama", "reason": "r"}),
+            json!({"scope": "models_dir", "target": "/m", "reason": "r"}),
+        ];
+        let t = reconcile_refusal_alert_text("node-a", &items);
+        assert!(t.contains("refused 2 ") && t.contains("noo enroll --resume") && t.contains("widen"), "{t}");
     }
 }
