@@ -322,10 +322,242 @@ pub(super) fn attach_data_frame(messages: &mut [Value], frame: &str) -> bool {
     true
 }
 
+// ── Budget ──────────────────────────────────────────────────────
+//
+// The frame is attached after the turn was fitted to its window, so on its
+// own it can push a small window over. [`frame_budget`] says how much of the
+// input budget the frame may take and [`fit_data_frame`] makes the frame fit
+// it: whole layers first (lowest priority first), then the one layer left is
+// cut at a paragraph or sentence boundary. On a window the frame already fits
+// the frame is returned byte for byte as [`build_data_frame`] made it.
+
+/// The most of the turn's input budget the frame may take, in percent.
+pub(super) const FRAME_MAX_PERCENT: usize = 40;
+/// How much of the input budget earlier turns keep before the frame is
+/// sized, in percent (or what history there is, if less).
+pub(super) const FRAME_HISTORY_RESERVE_PERCENT: usize = 25;
+/// Tokens kept back for what is added to the messages after the frame (the
+/// clock line, the knowledge-base note on the persona).
+const FRAME_SLACK_TOKENS: usize = 64;
+/// The least body (beyond the fixed header and markers) worth sending.
+const FRAME_MIN_BODY_TOKENS: usize = 150;
+/// Ends a layer that was cut.
+const FRAME_TRIM_NOTE: &str = "\n[... the rest was left out to fit the model's context window]";
+/// Where a knowledge-base layer's citations start.
+const SOURCES_MARK: &str = "\nSources:";
+
+/// The loop's token estimate (~2.5 chars/token) of `frame` as attached,
+/// with the line that introduces the user's text.
+pub(super) fn frame_tokens(frame: &str) -> usize {
+    (frame.len() + USER_TEXT_MARK.len() + 3) * 10 / 25
+}
+
+/// What the frame costs with no layers in it.
+fn frame_overhead_tokens() -> usize {
+    (DATA_BEGIN.len() + FRAME_HEADER.len() + DATA_END.len() + USER_TEXT_MARK.len() + 8) * 10 / 25
+}
+
+/// The tokens the frame may take on this turn: what is left of
+/// `fit_budget` after the tool schemas, the system messages, the latest user
+/// message and the recent history kept back, never more than
+/// [`FRAME_MAX_PERCENT`] of the budget. `messages` is the turn before the
+/// frame is attached.
+pub(super) fn frame_budget(messages: &[Value], fit_budget: usize, tool_tokens: usize) -> usize {
+    let role = |m: &Value, r: &str| m.get("role").and_then(|x| x.as_str()) == Some(r);
+    let system: Vec<Value> = messages.iter().filter(|m| role(m, "system")).cloned().collect();
+    let system = super::estimate_tokens(&system);
+    let question = messages
+        .iter()
+        .rposition(|m| role(m, "user"))
+        .map(|i| super::estimate_tokens(std::slice::from_ref(&messages[i])))
+        .unwrap_or(0);
+    let history = super::estimate_tokens(messages).saturating_sub(system + question);
+    let reserve = history.min(fit_budget * FRAME_HISTORY_RESERVE_PERCENT / 100);
+    let room = fit_budget.saturating_sub(tool_tokens + system + question + reserve + FRAME_SLACK_TOKENS);
+    room.min(fit_budget * FRAME_MAX_PERCENT / 100)
+}
+
+/// What [`fit_data_frame`] did, for the request's log line.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(super) struct FrameFit {
+    /// The frame as built, in tokens (0 when there was none).
+    pub before: usize,
+    /// The frame as sent, in tokens (0 when dropped).
+    pub after: usize,
+    /// The budget it was held to.
+    pub budget: usize,
+    /// Layers left out whole, lowest priority first.
+    pub dropped: Vec<String>,
+    /// Layers cut short.
+    pub trimmed: Vec<String>,
+    /// Layers in the frame as sent.
+    pub kept: Vec<String>,
+    /// Why anything was left out ("" when nothing was).
+    pub reason: &'static str,
+    /// The whole frame was left out.
+    pub dropped_all: bool,
+}
+
+impl FrameFit {
+    /// `none` | `untouched` | `trimmed` | `dropped`.
+    pub fn outcome(&self) -> &'static str {
+        if self.before == 0 {
+            "none"
+        } else if self.dropped_all {
+            "dropped"
+        } else if !self.dropped.is_empty() || !self.trimmed.is_empty() {
+            "trimmed"
+        } else {
+            "untouched"
+        }
+    }
+
+    /// The layer labelled `label` is in the frame as sent.
+    pub fn has(&self, label: &str) -> bool {
+        self.kept.iter().any(|l| l == label)
+    }
+}
+
+/// Lower is dropped first: the fungible domain facts go before identity and
+/// continuity (the same order the layers are assembled in).
+fn keep_rank(label: &str) -> u8 {
+    if label.starts_with("Video recall") {
+        0
+    } else if label.starts_with("Other channels") {
+        1
+    } else if label.starts_with("Memory") {
+        2
+    } else if label.starts_with("Skills written") {
+        3
+    } else if label.starts_with("Companion") {
+        4
+    } else if label == KB_FRAME_LABEL {
+        5
+    } else if label.starts_with("Earlier in this conversation") {
+        6
+    } else if label == CLUSTER_FRAME_LABEL {
+        7
+    } else if label.starts_with("Known facts") {
+        8
+    } else {
+        5
+    }
+}
+
+/// `text` cut to at most `max_chars` at a paragraph, else line, else
+/// sentence boundary no earlier than a third in, with a note that it was cut.
+/// `None` when no such boundary exists.
+fn shorten_at_boundary(text: &str, max_chars: usize) -> Option<String> {
+    if text.len() <= max_chars {
+        return Some(text.to_string());
+    }
+    let mut end = max_chars;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let head = &text[..end];
+    let sentence = [". ", "! ", "? "].iter().filter_map(|p| head.rfind(*p)).max().map(|i| i + 1);
+    let cut = [head.rfind("\n\n"), head.rfind('\n'), sentence]
+        .into_iter()
+        .flatten()
+        .find(|c| *c >= max_chars / 3)?;
+    let kept = head[..cut].trim_end();
+    if kept.is_empty() {
+        return None;
+    }
+    Some(format!("{kept}{FRAME_TRIM_NOTE}"))
+}
+
+fn build_items(items: &[(&str, String)]) -> Option<String> {
+    let layers: Vec<(&str, Option<&str>)> = items.iter().map(|(l, t)| (*l, Some(t.as_str()))).collect();
+    build_data_frame(&layers)
+}
+
+/// The frame for `layers`, held to `budget_tokens` (see [`frame_budget`]).
+/// Layers go lowest priority first; the last one left is cut at a boundary,
+/// its citations removed with the text they cited; when less than a useful
+/// body would remain the frame is dropped. Within the budget the frame is
+/// exactly [`build_data_frame`]'s.
+pub(super) fn fit_data_frame(layers: &[(&str, Option<&str>)], budget_tokens: usize) -> (Option<String>, FrameFit) {
+    let Some(full) = build_data_frame(layers) else {
+        return (None, FrameFit { budget: budget_tokens, ..FrameFit::default() });
+    };
+    let before = frame_tokens(&full);
+    let mut items: Vec<(&str, String)> = layers
+        .iter()
+        .filter_map(|(l, t)| t.map(str::trim).filter(|t| !t.is_empty()).map(|t| (*l, t.to_string())))
+        .collect();
+    let labels = |items: &[(&str, String)]| items.iter().map(|(l, _)| (*l).to_string()).collect::<Vec<_>>();
+    let mut fit = FrameFit { before, after: before, budget: budget_tokens, kept: labels(&items), ..FrameFit::default() };
+    if before <= budget_tokens {
+        return (Some(full), fit);
+    }
+    let gone = |mut fit: FrameFit, reason: &'static str| {
+        fit.after = 0;
+        fit.reason = reason;
+        fit.dropped_all = true;
+        fit.kept.clear();
+        (None, fit)
+    };
+    if budget_tokens < frame_overhead_tokens() + FRAME_MIN_BODY_TOKENS {
+        fit.dropped = fit.kept.clone();
+        return gone(fit, "below_minimum");
+    }
+    fit.reason = "over_budget";
+    let mut frame = full;
+    while frame_tokens(&frame) > budget_tokens && items.len() > 1 {
+        let Some(at) = items
+            .iter()
+            .enumerate()
+            .min_by_key(|(i, (l, _))| (keep_rank(l), std::cmp::Reverse(*i)))
+            .map(|(i, _)| i)
+        else {
+            break;
+        };
+        let (label, _) = items.remove(at);
+        fit.dropped.push(label.to_string());
+        let Some(f) = build_items(&items) else { break };
+        frame = f;
+    }
+    let over = frame_tokens(&frame).saturating_sub(budget_tokens);
+    if over > 0 {
+        // One layer left. A knowledge-base layer's citations name pages the
+        // cut text may no longer rest on, so they go with the cut.
+        let text = items[0].1.as_str();
+        let cited = items[0].0 == KB_FRAME_LABEL;
+        let base: String = match text.find(SOURCES_MARK) {
+            Some(i) if cited => text[..i].to_string(),
+            _ => text.to_string(),
+        };
+        let step = over * 5 / 2 + FRAME_TRIM_NOTE.len() + 16;
+        let mut fitted = false;
+        for attempt in 1..=6 {
+            let Some(short) = shorten_at_boundary(&base, base.len().saturating_sub(step * attempt)) else { break };
+            items[0].1 = short;
+            let Some(f) = build_items(&items) else { break };
+            frame = f;
+            if frame_tokens(&frame) <= budget_tokens {
+                fitted = true;
+                break;
+            }
+        }
+        if !fitted {
+            fit.dropped = layers.iter().filter(|(_, t)| t.is_some_and(|t| !t.trim().is_empty())).map(|(l, _)| (*l).to_string()).collect();
+            return gone(fit, "cannot_trim");
+        }
+        fit.trimmed.push(items[0].0.to_string());
+    }
+    fit.after = frame_tokens(&frame);
+    fit.kept = labels(&items);
+    (Some(frame), fit)
+}
+
 /// Build the data block from the fetched layers and attach it to the final
 /// user message. Returns the block when attached. If there is somewhere to
 /// put it nowhere (no user message), the material is DROPPED, never moved to
-/// the system message: losing context is the safe failure.
+/// the system message: losing context is the safe failure. The loops use
+/// the budgeted form; this one is the unbudgeted frame the tests build on.
+#[cfg(test)]
 pub(super) fn attach_retrieved_data(
     messages: &mut [Value],
     layers: &[(&str, Option<&str>)],
@@ -1536,7 +1768,7 @@ mod data_frame_tests {
     fn the_loop_sends_fetched_layers_through_the_frame_not_the_system_message() {
         let src = include_str!("agent_loop.rs");
         let code = crate::test_src::own_code(src);
-        assert!(code.matches("attach_retrieved_data(").count() >= 2, "both loops must attach the frame");
+        assert_eq!(code.matches("= attach_budgeted_data(").count(), 2, "both loops must attach the frame");
         for var in ["rag_ctx", "mem_ctx", "channel_ctx", "video_ctx", "temporal_ctx"] {
             assert!(!code.contains(&format!("Some(ref c) = {var} {{ push_layer")), "{var} is back on the system message");
         }

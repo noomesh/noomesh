@@ -82,7 +82,7 @@ pub(crate) use backend::{is_node_agent_url, with_backend_hint_url, warn_if_node_
 // Intra-module shared items, surfaced here so sibling files can reach
 // them via `use super::*` (private to this module tree).
 pub(crate) use backend::is_cloud_model;
-use context::{attach_retrieved_data, dedup_context_lines, record_layer_chars, time_layer};
+use context::{dedup_context_lines, record_layer_chars, time_layer};
 use session::{build_history_summary};
 
 pub use cloud::{cloud_gate, cloud_gate_body, cloud_gate_refusal};
