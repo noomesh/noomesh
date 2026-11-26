@@ -7386,10 +7386,9 @@ none /mnt/c/deeper tmpfs rw 0 0
     #[test]
     fn both_could_not_ask_messages_say_what_docker_could_not_answer() {
         assert_eq!(DOCKER_PS_SECS, 15);
-        for m in [DOCKER_DID_NOT_ANSWER] {
-            assert!(m.contains("`docker ps` did not answer within 15 s"), "{m}");
-            assert!(m.contains("replica containers"), "{m}");
-        }
+        let m = DOCKER_DID_NOT_ANSWER;
+        assert!(m.contains("`docker ps` did not answer within 15 s"), "{m}");
+        assert!(m.contains("replica containers"), "{m}");
         let src = include_str!("security_local.rs");
         let body = crate::test_src::fn_body(src, "pub fn pki_rotate_all(");
         assert_eq!(body.matches("did not answer within 15 s").count(), 2, "preflight and late refusal");
