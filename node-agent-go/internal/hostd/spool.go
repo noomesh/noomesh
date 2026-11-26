@@ -164,6 +164,10 @@ type Heartbeat struct {
 	// daemons. It is the backup-age signal that does not depend on the
 	// database or the heartbeat scheduler (see BackupFacts).
 	Backup *BackupFacts `json:"backup,omitempty"`
+	// FetchJob is the state of the Mac's bundle-fetch LaunchDaemon as this
+	// daemon last judged it (fetch_rearm.go). macOS worker only; absent
+	// elsewhere, before the first check, and on older daemons.
+	FetchJob *FetchJobFact `json:"fetch_job,omitempty"`
 }
 
 // HeartbeatFile is the fixed name callers look for. It is not a <name>.cmd

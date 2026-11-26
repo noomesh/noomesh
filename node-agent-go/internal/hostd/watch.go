@@ -62,6 +62,7 @@ func (e *Engine) Run(ctx context.Context, poll, heartbeat time.Duration) error {
 
 	for {
 		e.ScanOnce(ctx)
+		e.fetchJobCheck(ctx, false)
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
@@ -91,6 +92,7 @@ func (e *Engine) writeHeartbeat(started string, interval time.Duration) {
 		// as not running on the very next heartbeat.
 		JournalFollow: e.journalState(),
 	}
+	hb.FetchJob = e.fetchJobFact()
 	if e.Mode != ModeWorker {
 		hb.Backup = CollectBackupFacts(BackupDir())
 	}
