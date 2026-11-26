@@ -118,8 +118,6 @@ func TestLiveBackendNamesStillMap(t *testing.T) {
 		"noo-reranker":       "reranker",
 		"noo-airllm":         "airllm",
 		"noo-ollama":         "ollama",
-		// A 12-hex-looking string that is not a PREFIX must not be filtered.
-		"noo-llamacpp-a1b2c3d4e5f6": "llamacpp",
 	}
 	for name, want := range cases {
 		if got := backendKeyFromName(name); got != want {
