@@ -159,12 +159,33 @@ def test_the_home_fallback_finds_a_user_local_noo(glue, tmp_path):
 # ── 3. hostd boot restore, run for real ──────────────────────────────────
 
 
+def _sprintf_boot(template: str, lib: str) -> str:
+    """Render boot.go's Sprintf template the way Go does: the first verb is the
+    quoted lib path, the %d verbs are the script's time bounds (production
+    values, short enough for these fakes, which answer at once), %% is a
+    literal percent sign."""
+    nums = iter(["20", "15", "180", "150", "600", "15", "1440"])
+    out = []
+    for m in re.finditer(r"%(%|s|d)|[^%]+|%", template):
+        t = m.group(0)
+        if t == "%%":
+            out.append("%")
+        elif t == "%s":
+            out.append(f"'{lib}'")
+        elif t == "%d":
+            out.append(next(nums))
+        else:
+            out.append(t)
+    assert next(nums, None) is None, "bootRestoreScript has fewer %d bounds than the test supplies"
+    return "".join(out)
+
+
 def _boot_script(lib_secrets: Path) -> str:
     go = (REPO_ROOT / "node-agent-go" / "internal" / "hostd" / "boot.go").read_text()
     m = re.search(r"const bootRestoreScript = `(.*?)`\n", go, re.S)
     assert m, "bootRestoreScript not found"
-    assert m.group(1).count("%s") == 1, "one placeholder: lib-state-volume.sh is found beside lib-secrets.sh"
-    return m.group(1).replace("%s", f"'{lib_secrets}'")
+    assert m.group(1).count("%s") == 1 + m.group(1).count("%%s"), "one string placeholder: lib-state-volume.sh is found beside lib-secrets.sh"
+    return _sprintf_boot(m.group(1), str(lib_secrets))
 
 
 @pytest.fixture

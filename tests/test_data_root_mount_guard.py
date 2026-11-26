@@ -421,7 +421,7 @@ def test_hostd_boot_restore_runs_the_guard_before_anything_else():
     assert m
     script = m.group(1)
     guard = script.index("data_root_mount_boot_guard")
-    for later in ("secret_rundir)", "check_state_volume_open", "load_secrets", "docker start"):
+    for later in ("secret_rundir)", "check_state_volume_open", "load_secrets", '_noo_start "$id"'):
         assert guard < script.index(later), later
 
 
