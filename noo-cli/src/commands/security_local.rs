@@ -1473,7 +1473,9 @@ fn docker_restart(container: &str) {
 const NO_RESTART_NEEDED: &str = "on this machine no running service uses a rotated certificate: no restart is needed";
 const NO_CONSUMERS: &str = "on this machine no service consumes a rotated certificate";
 const NOTHING_ELSE_TO_RESTART: &str = "on this machine nothing else needs restarting";
-const DOCKER_DID_NOT_ANSWER: &str = "Docker did not answer, so which containers are running is unknown: these are EVERY consumer of a rotated certificate, running or not";
+/// The bound on `docker ps`, and the number the refusals name.
+const DOCKER_PS_SECS: u64 = 15;
+const DOCKER_DID_NOT_ANSWER: &str = "`docker ps` did not answer within 15 s, so which containers are running is unknown: these are EVERY consumer of a rotated certificate, running or not, plus any replica containers of the services above (running sandbox/worker replicas cannot be named without Docker)";
 const AGENT_COPY_NOTE: &str = "the agent's copy of its certificate under /etc/noo/pki is synced only by the reload path; --no-reload did not sync it";
 const OTHER_NODES_NOTE: &str = "certificates rotated for other machines are not restarted from here: they were delivered over the pull rail above (--no-deliver skips that, and says so above)";
 
@@ -1588,7 +1590,7 @@ fn local_hostname() -> String {
 /// (not runnable, a failed `docker ps`, or no answer in time): an empty list
 /// and "could not ask" must never read the same.
 fn docker_running_names() -> Option<Vec<String>> {
-    match crate::bounded::docker(&["ps", "--format", "{{.Names}}"], Duration::from_secs(15)) {
+    match crate::bounded::docker(&["ps", "--format", "{{.Names}}"], Duration::from_secs(DOCKER_PS_SECS)) {
         crate::bounded::Bounded::Answered(o) if o.status.success() => {
             Some(String::from_utf8_lossy(&o.stdout).split_whitespace().map(str::to_string).collect())
         }
@@ -5072,6 +5074,20 @@ pub fn pki_rotate_all(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         &format!("{} expiring certificate(s)", expiring.len()),
     );
 
+    // Preflight (reload mode): a Docker that cannot be asked is found out
+    // BEFORE anything changes, not after the certificates are already
+    // rotated and delivered. `--no-reload` needs no Docker answer.
+    if reload && docker_running_names().is_none() {
+        fail(
+            g.json,
+            ExitCode::Generic,
+            "docker_did_not_answer",
+            "`docker ps` did not answer within 15 s, so the consumers to restart cannot be found \
+             (running sandbox/worker replicas cannot be named without Docker): nothing was changed",
+            Some("aborting before rotation — nothing was changed; start Docker and re-run, or use --no-reload to rotate and restart by hand"),
+        );
+    }
+
     // Backup every expiring cert+key so a failed reload can revert.
     let now_ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -5257,8 +5273,10 @@ pub fn pki_rotate_all(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             ExitCode::Generic,
             "docker_did_not_answer",
             &format!(
-                "The certificates were rotated, but Docker did not answer, so no consumer was restarted and \
-                 none can be judged. Once Docker answers, run on this machine: {} (backup at {})",
+                "Docker stopped answering during the run: the certificates were rotated, but \
+                 `docker ps` did not answer within 15 s, so no consumer was restarted and none can be judged \
+                 (running sandbox/worker replicas cannot be named without Docker: restart any replica containers \
+                 of the services above too). Once Docker answers, run on this machine: {} (backup at {})",
                 report.commands.join("; "),
                 backup_dir.display()
             ),
@@ -7327,8 +7345,56 @@ none /mnt/c/deeper tmpfs rw 0 0
         let ask = body.find("if !docker_answered").expect("no could-not-ask refusal");
         assert!(ask < body.find("systemd_restart_unit(").unwrap());
         assert!(ask < body.find("restart_each(").unwrap());
-        // The revert summary names what was restarted too.
-        assert_eq!(body.matches("with_restarted(").count(), 5, "empty-list, accept, blind, revert, could-not-ask");
+        // `restarted` is emitted on success, blind, revert and the late refusal.
+        let at = |needle: &str| body.find(needle).unwrap_or_else(|| panic!("missing {needle}"));
+        let success = at("with_restarted(json_summary(&all_reloaded, Some(true)");
+        let blind = at("with_restarted(json_summary(&all_reloaded, None");
+        let revert = at("with_restarted(json_summary(&all_reloaded, healthy2, true)");
+        let late = at("with_restarted(json_summary(&[], None, false), &[])");
+        let late_fail = body[late..].find("\"docker_did_not_answer\"").expect("late refusal has no id") + late;
+        assert!(ask < late && late_fail < at("systemd_restart_unit("), "the late refusal precedes every restart");
+        assert!(success > ask && blind > success && revert > blind, "success, blind, revert follow the refusal in order");
+    }
+
+    /// The preflight asks Docker before any backup or rotation, and both
+    /// refusals leave through `fail` (non-zero), never a quiet return.
+    #[test]
+    fn rotate_all_asks_docker_before_changing_anything() {
+        let body = crate::test_src::fn_body(include_str!("security_local.rs"), "pub fn pki_rotate_all(");
+        let pre = body.find("reload && docker_running_names().is_none()").expect("no preflight");
+        assert!(pre > body.find("confirm_destructive(").unwrap(), "after the confirmation");
+        assert!(pre < body.find("backup_dir").unwrap(), "before the backup directory exists");
+        assert!(pre < body.find("create_dir_all").unwrap());
+        assert!(pre < body.find("rotate_all_expiring(").unwrap(), "before the rotation");
+        assert!(pre < body.find("deliver_node_certs(").unwrap(), "before any delivery");
+        // The preflight's failure path is a `fail(` with the id, in its own block.
+        let fail_at = body[pre..].find("fail(").expect("preflight does not fail") + pre;
+        let id_at = body[pre..].find("\"docker_did_not_answer\"").unwrap() + pre;
+        assert!(fail_at < id_at && id_at < body.find("backup_dir").unwrap());
+        assert!(body[pre..id_at].matches("fail(").count() == 1);
+        // The late refusal is `fail(` too, and says so truthfully.
+        let late = body.find("if !docker_answered").expect("no late refusal");
+        let late_fail = body[late..].find("fail(").expect("late refusal does not fail") + late;
+        assert!(body[late..late_fail].find("return").is_none(), "no quiet return before fail");
+        assert!(body[late_fail..].contains("the certificates were rotated"));
+        // docker_answered is the real answer at the call site, never a literal.
+        assert!(body.contains("let docker_answered = running.is_some();"));
+        assert!(!body.contains("docker_answered = true") && !body.contains("docker_answered: true"));
+        assert!(body.contains("with_would_restart(json_summary(&[], None, false), &to_restart, docker_answered)"));
+    }
+
+    #[test]
+    fn both_could_not_ask_messages_say_what_docker_could_not_answer() {
+        assert_eq!(DOCKER_PS_SECS, 15);
+        for m in [DOCKER_DID_NOT_ANSWER] {
+            assert!(m.contains("`docker ps` did not answer within 15 s"), "{m}");
+            assert!(m.contains("replica containers"), "{m}");
+        }
+        let src = include_str!("security_local.rs");
+        let body = crate::test_src::fn_body(src, "pub fn pki_rotate_all(");
+        assert_eq!(body.matches("did not answer within 15 s").count(), 2, "preflight and late refusal");
+        assert_eq!(body.matches("replicas cannot be named without Docker").count(), 2);
+        assert!(body.contains("nothing was changed"));
     }
 
     // ── trust-ca command construction ───────────────────────────────────

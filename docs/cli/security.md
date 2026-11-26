@@ -291,7 +291,8 @@ from here: they are delivered over the pull rail in the delivery step
 `would_restart` (the ordered container names) and `docker_answered` on
 that path. On the reload path Docker must answer before anything restarts
 (otherwise the command stops, rotated and unrestarted, and prints the
-follow-up), and `--json` adds `restarted`.
+follow-up), and `--json` adds `restarted`. In reload mode Docker is asked right after the
+confirmation, before the backup: if it cannot be asked, nothing is changed.
 
 ### Rotate the CA and re-key the fleet
 
