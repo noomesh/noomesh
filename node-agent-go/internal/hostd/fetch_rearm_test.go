@@ -16,7 +16,7 @@ import (
 const (
 	fetchPrintRunning = "system/net.noomesh.fetch = {\n\tactive count = 1\n\tpath = /Library/LaunchDaemons/net.noomesh.fetch.plist\n\tstate = running\n\n\tpid = 412\n\tlast exit code = (never exited)\n}\n"
 	fetchPrintIdleOK  = "system/net.noomesh.fetch = {\n\tactive count = 0\n\tpath = /Library/LaunchDaemons/net.noomesh.fetch.plist\n\tstate = not running\n\n\tlast exit code = 0\n\trun interval = 60 seconds\n}\n"
-	fetchPrint78      = "system/net.noomesh.fetch = {\n\tactive count = 0\n\tpath = /Library/LaunchDaemons/net.noomesh.fetch.plist\n\tstate = not running\n\n\tlast exit code = 78\n\trun interval = 60 seconds\n}\n"
+	fetchPrint78      = "system/net.noomesh.fetch = {\n\tactive count = 0\n\tpath = /Library/LaunchDaemons/net.noomesh.fetch.plist\n\tstate = not running\n\n\tlast exit code = 78\n\trun interval = 60 seconds\n\tproperties = runatload | inferred program | needs LWCR update | managed LWCR | has LWCR\n}\n"
 	fetchPrintLWCR    = "system/net.noomesh.fetch = {\n\tstate = not running\n\tlast exit status = (never exited)\n\treason = needs LWCR update\n}\n"
 )
 
@@ -113,11 +113,19 @@ func TestParseFetchJobAgainstRealSamples(t *testing.T) {
 		t.Fatalf("sample A with B's lines: %v", got)
 	}
 	// Each marker alone is enough.
-	if got := parseFetchJob(0, strings.Replace(fetchSampleA, "\tlast exit code = 0", fetchSampleBExit, 1)); got != fetchJobSpawnRefused {
-		t.Fatalf("exit 78 alone: %v", got)
+	if got := parseFetchJob(0, strings.Replace(fetchSampleA, "\tlast exit code = 0", fetchSampleBExit, 1)); got != fetchJobIdleExit78 {
+		t.Fatalf("exit 78 alone is the job's own failure, not a refusal: %v", got)
 	}
 	if got := parseFetchJob(0, strings.Replace(fetchSampleA, "\tproperties = runatload | inferred program", fetchSampleBProps, 1)); got != fetchJobSpawnRefused {
 		t.Fatalf("needs LWCR update alone: %v", got)
+	}
+	// Balanced braces: a truncated block (no closing brace) carrying the marker is Unknown.
+	truncated := strings.TrimSuffix(fetchSampleRefused(), "}\n")
+	if got := parseFetchJob(0, truncated); got != fetchJobUnknown {
+		t.Fatalf("truncated: %v", got)
+	}
+	if got := parseFetchJob(0, strings.Replace(fetchSampleRefused(), "\tdomain = system", "\tdomain = system\n\tstray = {", 1)); got != fetchJobUnknown {
+		t.Fatalf("stray open brace: %v", got)
 	}
 	// A healthy re-bootstrapped job may carry LWCR properties: not refused.
 	healthy := strings.Replace(fetchSampleA, "\tproperties = runatload | inferred program", "\tproperties = runatload | inferred program | managed LWCR | has LWCR", 1)
@@ -154,7 +162,10 @@ func TestParseFetchJob(t *testing.T) {
 	}{
 		{"running", 0, fetchPrintRunning, fetchJobRunning},
 		{"loaded idle ok", 0, fetchPrintIdleOK, fetchJobIdle},
-		{"loaded exit 78", 0, fetchPrint78, fetchJobSpawnRefused},
+		{"loaded exit 78 with the marker", 0, fetchPrint78, fetchJobSpawnRefused},
+		{"loaded exit 78 without the marker", 0, "\tstate = not running\n\tlast exit code = 78\n", fetchJobIdleExit78},
+		{"a stray open brace", 0, "\tstate = not running\n\tlast exit code = 0\n\tx = {\n", fetchJobUnknown},
+		{"a stray close brace", 0, "\tstate = not running\n\t}\n", fetchJobUnknown},
 		{"loaded LWCR text", 0, fetchPrintLWCR, fetchJobSpawnRefused},
 		{"not loaded", 113, "", fetchJobNotLoaded},
 		{"no launchctl", 127, "", fetchJobUnknown},
@@ -164,7 +175,7 @@ func TestParseFetchJob(t *testing.T) {
 		{"idle state but a pid", 0, "\tstate = not running\n\tpid = 99\n\tlast exit code = 78\n", fetchJobUnknown},
 		{"an unknown state", 0, "\tstate = xpcproxy\n\tlast exit code = 78\n", fetchJobUnknown},
 		{"lwcr only in an unrelated line", 0, "\tstate = not running\n\tpath = /Library/lwcr/x.plist\n\tlast exit code = 0\n", fetchJobIdle},
-		{"waiting with exit 78", 0, "\tstate = waiting\n\tlast exit code = 78: EX_CONFIG\n", fetchJobSpawnRefused},
+		{"waiting with exit 78", 0, "\tstate = waiting\n\tlast exit code = 78: EX_CONFIG\n", fetchJobIdleExit78},
 		{"garbage", 0, "\x00\xff not launchd output at all", fetchJobUnknown},
 		{"empty", 0, "", fetchJobUnknown},
 		{"running with a stale 78", 0, "\tstate = running\n\tlast exit code = 78\n", fetchJobRunning},
@@ -304,6 +315,34 @@ func TestFetchJobStateMachineFromEveryState(t *testing.T) {
 			t.Fatal("a plist was written")
 		}
 	})
+}
+
+// Exit 78 without launchd's marker is the job's own configuration failure: no
+// bootout, no bootstrap, one WARN per stretch, and the fact says so.
+func TestAnOwnExit78WithoutTheMarkerIsNotReArmedAndWarnsOnce(t *testing.T) {
+	h := newFetchHarness(t)
+	h.r.stdout["print "+fetchTarget] = strings.Replace(fetchSampleA, "\tlast exit code = 0", fetchSampleBExit, 1)
+	for i := 0; i < 4; i++ {
+		h.e.fetchJobCheck(context.Background(), true)
+		h.now = h.now.Add(31 * time.Minute)
+	}
+	if got := strings.Count(h.launchctl(), "launchctl print"); got != 4 || strings.Contains(h.launchctl(), "boot") || strings.Contains(h.launchctl(), "kickstart") {
+		t.Fatalf("nothing but prints expected:\n%s", h.launchctl())
+	}
+	if n := countLogs(h.logs, "itself exits 78"); n != 1 {
+		t.Fatalf("one warning expected, got %d: %v", n, h.logs)
+	}
+	if f := h.e.fetchJobFact(); f == nil || !strings.Contains(f.Detail, "itself exits 78") {
+		t.Fatalf("fact %+v", f)
+	}
+	// Healthy again, then 78 again: warned again (once per change of state).
+	h.r.stdout["print "+fetchTarget] = fetchSampleA
+	h.e.fetchJobCheck(context.Background(), true)
+	h.r.stdout["print "+fetchTarget] = strings.Replace(fetchSampleA, "\tlast exit code = 0", fetchSampleBExit, 1)
+	h.e.fetchJobCheck(context.Background(), true)
+	if n := countLogs(h.logs, "itself exits 78"); n != 2 {
+		t.Fatalf("expected a second warning after recovery, got %d", n)
+	}
 }
 
 func TestFetchJobChecksAreSpacedAndRearmsRateLimited(t *testing.T) {

@@ -79,6 +79,7 @@ const (
 	fetchJobNotLoaded                          // launchd has no such job
 	fetchJobRunning                            // an instance is running: never touch
 	fetchJobIdle                               // loaded, not running, last exit fine
+	fetchJobIdleExit78                         // idle, but the job's own last exit is 78 and launchd does not say it refused to spawn
 	fetchJobSpawnRefused                       // loaded, not running, spawn refused
 )
 
@@ -90,7 +91,7 @@ var fetchExit78Re = regexp.MustCompile(`^78\b`)
 // after the job's own state, and `arguments`/`environment` are blocks too).
 // The first occurrence of a key wins. Nesting is tracked by braces, so the
 // result does not depend on which `state =` line comes first.
-func fetchTopFields(out string) map[string]string {
+func fetchTopFields(out string) (map[string]string, bool) {
 	fields := map[string]string{}
 	depth := 0
 	for _, raw := range strings.Split(out, "\n") {
@@ -98,6 +99,9 @@ func fetchTopFields(out string) map[string]string {
 		switch {
 		case l == "}":
 			depth--
+			if depth < 0 {
+				return fields, false
+			}
 		case strings.HasSuffix(l, "{"):
 			depth++
 		case depth == 1:
@@ -108,7 +112,7 @@ func fetchTopFields(out string) map[string]string {
 			}
 		}
 	}
-	return fields
+	return fields, depth == 0
 }
 
 // parseFetchJob classifies `launchctl print system/<label>` (exit status and
@@ -118,11 +122,13 @@ func fetchTopFields(out string) map[string]string {
 // job-level `pid = ` line are Idle or SpawnRefused; everything else (another
 // state such as "spawn scheduled", a pid with an idle state, a failing print,
 // no state line, garbage) is Unknown, and Unknown means leave the job alone.
-// Refused is read only from the job's own lines: `last exit code|status = 78`
-// (real output: "78: EX_CONFIG"), or "needs LWCR update" on `properties =` /
-// `reason =` (real: `properties = runatload | inferred program | needs LWCR
-// update | managed LWCR | has LWCR`). "has LWCR" / "managed LWCR" alone do not
-// count: a healthy re-bootstrapped job may carry them.
+// Output whose braces do not balance (truncated, malformed) is Unknown.
+// Refused is read only from the job's own lines: "needs LWCR update" on
+// `properties =` / `reason =` (real: `properties = runatload | inferred
+// program | needs LWCR update | managed LWCR | has LWCR`). "has LWCR" /
+// "managed LWCR" alone do not count: a healthy re-bootstrapped job may carry
+// them. `last exit code|status = 78` (real: "78: EX_CONFIG") WITHOUT that
+// marker is the job's own configuration failure, IdleExit78: no re-arm.
 func parseFetchJob(rc int, out string) fetchJobStatus {
 	if rc != 0 {
 		if rc == 113 || strings.Contains(strings.ToLower(out), "could not find service") {
@@ -130,7 +136,10 @@ func parseFetchJob(rc int, out string) fetchJobStatus {
 		}
 		return fetchJobUnknown
 	}
-	f := fetchTopFields(out)
+	f, balanced := fetchTopFields(out)
+	if !balanced {
+		return fetchJobUnknown // truncated or malformed: whatever lines were seen
+	}
 	state, ok := f["state"]
 	if !ok {
 		return fetchJobUnknown
@@ -140,15 +149,17 @@ func parseFetchJob(rc int, out string) fetchJobStatus {
 	} else if (state != "not running" && state != "waiting") || pid {
 		return fetchJobUnknown
 	}
-	for _, k := range []string{"last exit code", "last exit status"} {
-		v := strings.ToLower(f[k])
-		if fetchExit78Re.MatchString(v) || strings.Contains(v, "spawn failed") {
-			return fetchJobSpawnRefused
-		}
-	}
+	// The launchd marker is the re-arm trigger. Exit 78 alone is the job's own
+	// configuration failure, which a re-arm does not fix.
 	for _, k := range []string{"properties", "reason"} {
 		if strings.Contains(strings.ToLower(f[k]), "needs lwcr update") {
 			return fetchJobSpawnRefused
+		}
+	}
+	for _, k := range []string{"last exit code", "last exit status"} {
+		v := strings.ToLower(f[k])
+		if fetchExit78Re.MatchString(v) || strings.Contains(v, "spawn failed") {
+			return fetchJobIdleExit78
 		}
 	}
 	return fetchJobIdle
@@ -163,6 +174,7 @@ type fetchRearm struct {
 	failures      int  // consecutive failed re-arms
 	pendingVerify bool // the last re-arm ran clean; the next sighting of the problem means it did not work
 	gaveUp        bool
+	warned78      bool // the own-exit-78 warning was logged for this stretch
 	fact          *FetchJobFact
 }
 
@@ -228,8 +240,15 @@ func (e *Engine) fetchJobCheck(ctx context.Context, force bool) {
 	plist := fetchLaunchdPlist()
 	switch parseFetchJob(rc, out) {
 	case fetchJobRunning, fetchJobIdle:
-		f.failures, f.pendingVerify = 0, false
+		f.failures, f.pendingVerify, f.warned78 = 0, false, false
 		f.setFact(now, FetchJobOK, "")
+	case fetchJobIdleExit78:
+		f.failures, f.pendingVerify = 0, false
+		if !f.warned78 {
+			f.warned78 = true
+			e.logf("WARN fetch job: %s itself exits 78 and launchd does not report a spawn refusal (no \"needs LWCR update\"); a re-arm does not fix that, so none is done", target)
+		}
+		f.setFact(now, FetchJobOK, "the fetch job itself exits 78 (its own configuration failure, not a launchd spawn refusal); not re-armed")
 	case fetchJobNotLoaded:
 		if !fetchPlistExists(plist) {
 			if f.fact == nil || f.fact.State != FetchJobPlistMissing {
@@ -257,6 +276,7 @@ func (e *Engine) fetchJobCheck(ctx context.Context, force bool) {
 		}
 		e.fetchRearmJob(ctx, r, f, now, plist, target, "loaded, not running, spawn refused", true)
 	default:
+		f.warned78 = false
 		e.logf("WARN fetch job: could not read `launchctl print %s` (rc=%d); leaving the job alone", target, rc)
 	}
 }
