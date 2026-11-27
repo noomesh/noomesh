@@ -226,15 +226,20 @@ def test_a_connection_reset_on_a_large_upload_refreshes_the_login_once_and_retri
     assert refreshes == [1] and calls == ["POST", "POST"]
 
     # A second reset is not refreshed again (once per run) and is raised.
-    calls.clear()
-    monkeypatch.setattr(urllib.request, "urlopen",
-                        lambda *a, **k: (_ for _ in ()).throw(urllib.error.URLError(OSError(8, "EOF"))))
+    seen = []
+
+    def reset(req, context=None, timeout=None):
+        seen.append(req.get_method())
+        raise urllib.error.URLError(OSError(8, "EOF"))
+
+    monkeypatch.setattr(urllib.request, "urlopen", reset)
     try:
         he._http("POST", "/p", big, "application/octet-stream")
         raise AssertionError("expected URLError")
     except urllib.error.URLError:
         pass
     assert refreshes == [1]
+    assert seen == ["POST"], "no retry on the second reset: exactly one POST"
 
 
 def test_a_small_request_reset_is_not_treated_as_an_auth_refusal(monkeypatch):
