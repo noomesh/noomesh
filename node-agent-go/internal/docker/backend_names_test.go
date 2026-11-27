@@ -78,6 +78,8 @@ func TestStunnelBackendKeyIsExact(t *testing.T) {
 		"other-stunnel-ollama":       "",
 		"stunnel-ollama":             "",
 		"noo-ollama":                 "",
+		"vllm-secondary":             "",
+		"ollama":                     "",
 	} {
 		if got := stunnelBackendKey(name); got != want {
 			t.Errorf("stunnelBackendKey(%q) = %q, want %q", name, got, want)
