@@ -457,6 +457,20 @@ impl<'a> MemoryProvider<'a> {
         }
     }
 
+    /// One page of one document, if `aud` may read the document
+    /// (`GET /api/v1/docs/{doc_id}/pages/{page_no}`).
+    pub async fn kb_doc_page(
+        &self,
+        aud: &Audience,
+        doc_id: &str,
+        page_no: i32,
+        max_chars: i32,
+    ) -> Result<Option<scope::DocPageRow>, sqlx::Error> {
+        match self {
+            Self::NatsTrellion(p) => p.kb_doc_page(aud, doc_id, page_no, max_chars).await,
+        }
+    }
+
     /// `metadata.roles` of EVERY document (null where untagged), for the
     /// audience summary on `GET /api/v1/docs?summary=1`.
     pub async fn kb_docs_roles_all(
@@ -1146,6 +1160,17 @@ impl NatsTrellion<'_> {
     ) -> Result<Option<scope::DocDetailRow>, sqlx::Error> {
         self.count("kb.doc_detail").await;
         scope::doc_detail(self.db, aud.roles(), doc_id).await
+    }
+
+    async fn kb_doc_page(
+        &self,
+        aud: &Audience,
+        doc_id: &str,
+        page_no: i32,
+        max_chars: i32,
+    ) -> Result<Option<scope::DocPageRow>, sqlx::Error> {
+        self.count("kb.doc_page").await;
+        scope::doc_page(self.db, aud.roles(), doc_id, page_no, max_chars).await
     }
 
     async fn kb_ingested_uri_meta(&self) -> Result<HashMap<String, bool>, sqlx::Error> {

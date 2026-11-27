@@ -280,6 +280,7 @@ pub const USAGE: &[(&[&str], &str, &str)] = &[
     (&["rag", "status"], "", "Show PageIndex RAG table counts and embedder state"),
     (&["rag", "docs"], "[--untagged] [--audience <role>] [--match <glob>] [--title <text>] [--limit <n>]", "List every document with audience, source and who ingested it; filterable"),
     (&["rag", "doc"], "<id>", "Show one document: audience, provenance, audience history and a text preview"),
+    (&["rag", "page"], "<doc-id> <page-no>", "Print the full text of one page of a document (pages count from 1; cut at 20000 characters)"),
     (&["rag", "ingest"], "<path>... [-t|--title <title>] [-r|--recursive] [--audience <role>[,<role>]]", "Ingest text files or a folder; audience defaults to you, share with team:<name> or company"),
     (&["rag", "scan"], "[-s|--source folders|drives|all]", "Run one synchronous ingest scan of watched folders and/or drives"),
     (&["rag", "deduplicate"], "[--dry-run] [-y|--yes]", "Delete duplicate (doc_id, page_no) pages, keeping the newest; confirms first"),

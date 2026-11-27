@@ -204,7 +204,7 @@ pub use prompt_skills::{
     prompt_skills_proposals,
 };
 pub use rag::{
-    rag_deduplicate, rag_doc, rag_docs, rag_held, rag_hold, rag_ingest, rag_purge, rag_query, rag_retag, rag_scan,
+    rag_deduplicate, rag_doc, rag_docs, rag_held, rag_hold, rag_ingest, rag_page, rag_purge, rag_query, rag_retag, rag_scan,
     rag_status, rag_unhold,
 };
 pub use security::{

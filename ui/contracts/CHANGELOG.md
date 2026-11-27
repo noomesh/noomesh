@@ -1,5 +1,15 @@
 # Contract changes
 
+## 2026-11-26
+
+Added `GET /api/v1/docs/{doc_id}/pages/{page_no}`: the full text of one page
+of a document (numbered from 1), read-only, with the same audience as
+`GET /api/v1/docs/{doc_id}`. Answers `{doc_id, page_no, page_count, title,
+char_count, text, truncated}`; text over 20,000 characters is cut and
+`truncated` is true. 404 for a missing or unreadable document (identical) and,
+for a readable one, for a page out of range; 400 for a non-UUID id or a
+non-numeric page. Additive.
+
 ## 2026-11-23
 
 `POST /api/external/rerank`: `results[].score` is now nullable. When the
