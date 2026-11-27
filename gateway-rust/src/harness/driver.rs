@@ -1656,6 +1656,7 @@ mod tests {
             role_prompt: None,
             stream: false,
             token: TURN_TOKEN.into(),
+            turn_id: None,
         };
         let e = run_turn_on(&ctx, &rail, &req, &crate::websocket::NullSink).await.unwrap_err();
         assert!(e.downcast_ref::<NeverReachedTheModel>().is_some(), "{e}");
@@ -1805,6 +1806,7 @@ mod tests {
             role_prompt: None,
             stream: false,
             token: TURN_TOKEN.into(),
+            turn_id: None,
         };
         let e = run_turn_on(&ctx, &rail, &turn, &crate::websocket::NullSink).await.unwrap_err();
         assert!(e.to_string().contains("foreign CLIs never run unjailed"), "{e}");
@@ -2315,6 +2317,7 @@ mod tests {
             role_prompt: None,
             stream: true,
             token: TURN_TOKEN.into(),
+            turn_id: None,
         };
         let r = run_turn_on(&ctx, &rail, &req, &crate::websocket::NullSink).await.unwrap();
         assert_eq!(r.response, "the answer is 42");

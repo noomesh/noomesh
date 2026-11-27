@@ -106,7 +106,8 @@ id in a subject has `.`, `*`, `>` and spaces replaced by `_`.
 `TurnRequest` fields: `conversation_id`, `prompt`, `channel`,
 `max_iterations`, `model` (optional), `user`, `enable_thinking` (default
 false), `role_prompt` (optional), `stream` (default false: send only the
-result), `token`.
+result), `token`, `turn_id` (optional; from 0.6.31, one random UUID per
+dispatch, used only to cancel the turn, see **Cancel** below).
 
 `TaskRequest` fields: `task_id`, `objective`, `conversation_id`,
 `thread_id`, `channel`, `user`, `model` (optional), `loops_done`,
@@ -118,6 +119,41 @@ a turn's ack also names the harness `kind` (from 0.6.13), which the
 gateway passes to the console as a `harness_dispatched` event so the person
 sees which node and kind are answering. The gateway waits 3 seconds. No ack, a reply that is not `ack: true`, or
 no responder means the work was not taken, and the gateway runs it itself.
+
+**Cancel (from 0.6.31).** A turn the gateway stops waiting for (the
+console tab closed, the HTTP client disconnected, the person's session was
+revoked, or the turn deadline passed) is also stopped on the node, so it no
+longer holds a slot or publishes events nobody reads. The gateway publishes
+one plain message, no reply expected, on the turn's own subject
+`harness.run.<node>`:
+
+```json
+{"kind": "cancel", "turn_id": "<the turn_id of the TurnRequest>"}
+```
+
+A harness keeps its running turns by `turn_id`. On a cancel for a turn it
+holds it aborts that turn's task (the model request and any vendor CLI
+child are dropped with it), which releases the turn's concurrency slot the
+same way a finished turn does, and logs one line. A `turn_id` it does not
+hold (the turn already ended, a second cancel, another node's turn) is
+ignored. A cancel names exactly one turn; the id is random per dispatch and
+is only ever sent on that node's `harness.run.<node>` subject, which only
+the gateway publishes to. A turn that ends with a result or an error is
+never cancelled afterwards.
+
+Mixed versions need no setting and no new bus grant: the cancel rides the
+subject every harness already subscribes to and the gateway already
+publishes to.
+
+- New gateway, older harness: the older harness reads every payload on the
+  subject as a `TurnRequest`; a cancel has none of its required fields, so it
+  is logged as unreadable and dropped. It is never taken as a turn. The
+  turn runs on until it ends or reaches its deadline, as before.
+- Older gateway, new harness: the request has no `turn_id`, so the turn is
+  not cancellable and nothing sends a cancel. Behaviour is as before.
+
+A foreign runner that implements its own `harness.run.<node>` subscription
+should treat a payload whose `kind` is `cancel` as above, not as a turn.
 
 **At capacity.** A harness at its `NOO_HARNESS_MAX_TURNS` limit replies
 `{"ack": false, "busy": true, "node": "<id>", "running": n, "capacity": N}`
