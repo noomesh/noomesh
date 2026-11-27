@@ -599,11 +599,15 @@ receives flat JSON events, each with a `type`:
 ```
 
 While a turn runs the gateway keeps reading the socket. If the client
-closes it, the connection ends, or a keepalive cannot be sent, the turn is
-stopped there (its model call included, so the node's slot is freed) and
-nothing more is written, as `/api/inference/chat` does when its client
-disconnects. A message the client sends during a turn is held, up to 16, and
-handled in order once the turn ends.
+closes it, the connection ends, or a keepalive cannot be sent, the gateway
+stops waiting for the turn and writes nothing more. A turn running in the
+gateway has its model call closed, so the backend's slot frees when the
+backend notices. A turn running in a node's harness is not yet told to stop:
+it runs to its end or its deadline (a follow-up will add that).
+`/api/inference/chat` stops waiting the same way when its client
+disconnects. Pings and pongs are ignored. A message the client sends during
+a turn is held, up to 16 messages or 1 MiB, and handled in order once the
+turn ends. A `Close` queued behind a full hold is seen when the turn ends.
 
 `done` (and the saved assistant message's metadata, and
 `/api/inference`'s `data`) carries `recall` when the turn ran
