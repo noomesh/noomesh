@@ -670,7 +670,10 @@ mod tests {
         assert!(detail.contains(gate), "doc_detail gates on DOC_VISIBLE, None = operator");
         let wrapper = crate::test_src::fn_body(&own, "pub async fn doc_page(");
         assert!(wrapper.contains("crate::repo::kb_docs::doc_page("), "the page query lives in the repo layer");
-        assert!(!wrapper.contains("sqlx::"), "no SQL of its own here");
+        let wl = wrapper.to_lowercase();
+        for q in ["sqlx::query", "query_as", "assertsqlsafe", "select"] {
+            assert!(!wl.contains(q), "the wrapper issues no query of its own, found {q}");
+        }
         // The query itself: the same predicate CONSTANT (imported, not copied).
         let repo = crate::test_src::own_code(include_str!("../repo/kb_docs.rs"));
         assert!(repo.contains("use crate::memory::scope::DOC_VISIBLE;"), "the constant is shared, not copied");
