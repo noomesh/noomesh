@@ -70,6 +70,7 @@ class Node:
         fake.write_text(
             '#!/bin/sh\necho "systemctl $*" >> "$CALLS"\n'
             'if [ "$1" = show ]; then\n'
+            '  [ -z "${SC_HANG:-}" ] || exec sleep 30\n'
             '  [ -z "${SC_FAIL:-}" ] || exit 1\n'
             '  case "$*" in\n'
             '    *NeedDaemonReload*) echo "${SC_NDR-no}" ;;\n'
@@ -452,6 +453,18 @@ def test_a_partial_bundle_says_nothing_unless_systemd_has_the_drop_in_loaded(nod
     assert non_show(node) == [] and snapshot(node) == snap
 
 
+@pytest.mark.parametrize("which", ["hang"])
+def test_a_hanging_systemctl_show_is_bounded_and_emits_no_tag(node: Node, which: str) -> None:
+    import time
+    installed(node)
+    node.extra_env = {"SC_HANG": "1"}
+    t0 = time.monotonic()
+    r = node.run('agent_protect_rereport "$ENVF"', pre="AP_SHOW_TIMEOUT=1\n")
+    assert time.monotonic() - t0 < 10
+    assert "agent-protect" not in out(r, "APPLIED")
+    assert non_show(node) == []
+
+
 def test_a_partial_bundle_says_nothing_without_a_systemctl(node: Node) -> None:
     installed(node)
     (node.bin / "systemctl").unlink()
@@ -551,7 +564,7 @@ def test_the_rereport_function_never_writes_reloads_or_restarts() -> None:
     assert m
     body = "\n".join(l for l in m.group(1).splitlines() if not l.lstrip().startswith("#"))
     sc = [l.strip() for l in body.splitlines() if "systemctl" in l and "command -v" not in l]
-    assert len(sc) == 2 and all("systemctl show -p " in l and " --value noo-node-agent.service" in l for l in sc), sc
+    assert len(sc) == 2 and all(l.startswith('[ "$(timeout "$AP_SHOW_TIMEOUT" systemctl show -p ') and " --value noo-node-agent.service 2>/dev/null)\" = " in l for l in sc), sc
     for banned in ("install ", "mktemp", "need_restart", "rm ", " mv ", "cp ", "tee ", "chmod", "chown"):
         assert banned not in body, banned
     assert not re.search(r"(?<![0-9&])>>?\s*[^&\s]", body.replace(">/dev/null", "")), "no redirection to a file"

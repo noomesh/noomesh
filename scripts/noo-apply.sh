@@ -1732,6 +1732,10 @@ AP_DENY_TREES="/etc /usr /boot /root /var/lib/docker /bin /sbin /lib /lib32 /lib
 # Denied as the path itself or anything above it; BELOW is allowed (a data
 # root under /home is a real layout, and ProtectHome needs it listed).
 AP_DENY_EXACT="/home"
+# The read-only `systemctl show` checks of agent_protect_rereport are bounded
+# (seconds), as this script bounds its other probes with `timeout`, which it
+# assumes exists. A test sets it shorter after sourcing the block.
+AP_SHOW_TIMEOUT=10
 AP_CHANGED=0
 AP_BAD_KEY=""
 AP_PATHS=""
@@ -1877,7 +1881,8 @@ agent_protect_apply() {
 # calls for, with the same renderer as agent_protect_apply, and say
 # `agent-protect=unchanged:N` ONLY when the installed drop-in is exactly that
 # (bytes, mode 644, owner) AND systemd has it loaded: `systemctl show` says
-# the unit needs no daemon-reload and ProtectSystem is what the drop-in sets.
+# the unit needs no daemon-reload and ProtectSystem is what the drop-in sets
+# (each call bounded by `timeout $AP_SHOW_TIMEOUT`; a timeout reads as no).
 # Anything else (no systemd or systemctl, env or drop-in missing or unreadable,
 # a bad value, any difference, any other answer) says NOTHING: never a claim
 # of a hold that is not proved. It writes no file, installs nothing, runs no
@@ -1899,8 +1904,8 @@ agent_protect_rereport() {
     [ "$_ar_want" = "$_ar_have" ] || return 0
     _ar_ps="$(printf '%s\n' "$_ar_want" | sed -n 's/^ProtectSystem=//p' | head -1)"
     [ -n "$_ar_ps" ] || return 0
-    [ "$(systemctl show -p NeedDaemonReload --value noo-node-agent.service 2>/dev/null)" = "no" ] || return 0
-    [ "$(systemctl show -p ProtectSystem --value noo-node-agent.service 2>/dev/null)" = "$_ar_ps" ] || return 0
+    [ "$(timeout "$AP_SHOW_TIMEOUT" systemctl show -p NeedDaemonReload --value noo-node-agent.service 2>/dev/null)" = "no" ] || return 0
+    [ "$(timeout "$AP_SHOW_TIMEOUT" systemctl show -p ProtectSystem --value noo-node-agent.service 2>/dev/null)" = "$_ar_ps" ] || return 0
     _ar_cnt="$(printf '%s\n' "$AP_PATHS" | grep -c .)" || return 0
     applied="$applied agent-protect=unchanged:$_ar_cnt"
 }
