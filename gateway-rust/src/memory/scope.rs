@@ -401,11 +401,9 @@ pub async fn doc_detail(
         .await
 }
 
-/// One page of one document for `GET /api/v1/docs/{doc_id}/pages/{page_no}`:
-/// the document's title, how many pages it has, whether the asked-for page
-/// exists, its text (cut by the query to the caller's `max_chars`) and the
-/// page's real length in characters.
-pub type DocPageRow = (Option<String>, i64, bool, Option<String>, Option<i32>);
+/// One page of one document for `GET /api/v1/docs/{doc_id}/pages/{page_no}`
+/// (the row type of [`crate::repo::kb_docs::doc_page`]).
+pub type DocPageRow = crate::repo::kb_docs::DocPageRow;
 
 /// One page of a document, if the caller may read the DOCUMENT.
 ///
@@ -415,9 +413,8 @@ pub type DocPageRow = (Option<String>, i64, bool, Option<String>, Option<i32>);
 /// then is the page count safe to tell. `page_no` is the stored
 /// `pages.page_no`, which the ingest path numbers from 1. Held documents are
 /// read exactly as [`doc_detail`] reads them (a hold keeps a document out of
-/// embedding and search, not out of a read by id), so no hold filter here.
-/// The text is cut to `max_chars` characters in the database; the caller asks
-/// for one more than it will show, to learn whether it was cut. Read-only.
+/// embedding and search, not out of a read by id). The query lives in
+/// `repo::kb_docs` and is gated by this module's [`DOC_VISIBLE`]. Read-only.
 pub async fn doc_page(
     db: &PgPool,
     roles: Option<&[String]>,
@@ -425,23 +422,7 @@ pub async fn doc_page(
     page_no: i32,
     max_chars: i32,
 ) -> Result<Option<DocPageRow>, sqlx::Error> {
-    let sql = format!(
-        "SELECT d.title, \
-                (SELECT COUNT(*) FROM pages c WHERE c.doc_id = d.doc_id), \
-                (pg.page_id IS NOT NULL), \
-                left(pg.text, $4), \
-                length(pg.text) \
-         FROM docs d LEFT JOIN pages pg ON pg.doc_id = d.doc_id AND pg.page_no = $3 \
-         WHERE d.doc_id = $2::uuid AND ($1::text[] IS NULL OR {DOC_VISIBLE}) \
-         ORDER BY pg.page_id LIMIT 1"
-    );
-    sqlx::query_as::<_, DocPageRow>(sqlx::AssertSqlSafe(&*sql))
-        .bind(roles)
-        .bind(doc_id)
-        .bind(page_no)
-        .bind(max_chars)
-        .fetch_optional(db)
-        .await
+    crate::repo::kb_docs::doc_page(db, roles, doc_id, page_no, max_chars).await
 }
 
 // ── entities ─────────────────────────────────────────────────────────
@@ -684,11 +665,18 @@ mod tests {
     #[test]
     fn doc_page_reads_through_the_same_audience_predicate_as_doc_detail() {
         let own = crate::test_src::own_code(include_str!("scope.rs"));
-        let page = crate::test_src::fn_body(&own, "pub async fn doc_page(");
         let detail = crate::test_src::fn_body(&own, "pub async fn doc_detail(");
         let gate = "($1::text[] IS NULL OR {DOC_VISIBLE})";
-        assert!(detail.contains(gate) && page.contains(gate), "both gate on DOC_VISIBLE, None = operator");
-        assert!(page.contains("d.doc_id = $2::uuid"));
+        assert!(detail.contains(gate), "doc_detail gates on DOC_VISIBLE, None = operator");
+        let wrapper = crate::test_src::fn_body(&own, "pub async fn doc_page(");
+        assert!(wrapper.contains("crate::repo::kb_docs::doc_page("), "the page query lives in the repo layer");
+        assert!(!wrapper.contains("sqlx::"), "no SQL of its own here");
+        // The query itself: the same predicate CONSTANT (imported, not copied).
+        let repo = crate::test_src::own_code(include_str!("../repo/kb_docs.rs"));
+        assert!(repo.contains("use crate::memory::scope::DOC_VISIBLE;"), "the constant is shared, not copied");
+        assert!(!repo.contains("jsonb_exists"), "the predicate text is not copied");
+        let page = crate::test_src::fn_body(&repo, "pub async fn doc_page(");
+        assert!(page.contains(gate) && page.contains("d.doc_id = $2::uuid"));
         // A hold keeps a document out of search, not out of a read by id: doc_detail
         // applies no hold filter, and neither does the page read.
         assert!(!detail.contains("not_held") && !page.contains("not_held"));

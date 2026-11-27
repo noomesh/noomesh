@@ -96,6 +96,7 @@ pub mod integration_pairing;
 pub mod integrations;
 pub mod graph;
 pub mod heartbeat;
+pub mod kb_docs;
 pub mod kb_grants;
 pub mod node_model_set_retry;
 pub mod node_workload_placements;
