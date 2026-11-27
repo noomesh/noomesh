@@ -19,7 +19,7 @@ KIT_DIR = ROOT / "internal/noomesh/licensing"
 def _kit(name: str) -> Path:
     path = KIT_DIR / name
     if not path.is_file():
-        pytest.skip(f"licensing kit not in this tree ({path.relative_to(ROOT)}); it lives in noomesh-internal")
+        pytest.skip(f"not in this tree: licensing kit ({path.relative_to(ROOT)}); it lives in noomesh-internal")
     return path
 
 

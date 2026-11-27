@@ -24,7 +24,6 @@ from . import _ci_skip_guard as _ci_skip_guard  # noqa: E402
 _ci_skip_guard.TESTS_DIR = Path(__file__).resolve().parent
 
 pytest_configure = _ci_skip_guard.pytest_configure
-pytest_sessionfinish = _ci_skip_guard.pytest_sessionfinish
 
 # What a run leaves out (trellion not public) and the count/names of tests that
 # skip themselves because their input is not in this tree. One place for
@@ -34,6 +33,11 @@ from . import _public_tree as _public_tree  # noqa: E402
 collect_ignore = _public_tree.collect_ignore_list()
 pytest_collection_modifyitems = _public_tree.pytest_collection_modifyitems
 pytest_terminal_summary = _public_tree.pytest_terminal_summary
+
+
+def pytest_sessionfinish(session, exitstatus):
+    _ci_skip_guard.pytest_sessionfinish(session, exitstatus)
+    _public_tree.pytest_sessionfinish(session, exitstatus)
 
 
 def _path_without_host_nvidia_smi(path: str) -> str:

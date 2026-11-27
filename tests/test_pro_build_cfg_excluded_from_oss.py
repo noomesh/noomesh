@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import re
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -67,7 +68,6 @@ def test_cfg_gated_pro_files_are_not_tracked_in_the_public_tree(script: str) -> 
         # since 2026-08-23). A literal rerun-if-changed the regex failed to
         # parse would show up here instead.
         stray = re.findall(r"rerun-if-changed=(?!\{)", build_rs.read_text())
-        stray = [m for m in stray]
         parsed = len(_guarded_paths(build_rs))
         assert len(stray) == parsed, f"{script}: {len(stray) - parsed} literal watch(es) the extraction did not parse"
         return
@@ -88,13 +88,21 @@ def test_every_cfg_gated_pro_file_is_gitignored() -> None:
             assert p in ignore or f"/{p}" in ignore, f"{p} (cfg-gated by {script}) is not in .gitignore"
 
 
-def test_the_guard_sees_a_tracked_pro_file(tmp_path: Path) -> None:
-    """The check is real: a cfg-gated path that git tracks is found."""
+def test_the_guard_sees_a_tracked_pro_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The guard itself is real: pointed at a repo that tracks a cfg-gated path, `_tracked` finds
+    it (and `_guarded_paths` reads the path out of the build script); an untracked copy is not found."""
     subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
-    (tmp_path / "x.rs").write_text("// pro\n")
-    subprocess.run(["git", "-C", str(tmp_path), "add", "x.rs"], check=True)
-    r = subprocess.run(["git", "-C", str(tmp_path), "ls-files", "--error-unmatch", "--", "x.rs"], capture_output=True)
-    assert r.returncode == 0
+    crate = tmp_path / "fake-crate"
+    crate.mkdir()
+    (crate / "build.rs").write_text('fn main() { println!("cargo:rerun-if-changed=src/pro.rs"); }\n')
+    (crate / "src").mkdir()
+    (crate / "src" / "pro.rs").write_text("// pro\n")
+    subprocess.run(["git", "-C", str(tmp_path), "add", "fake-crate/build.rs"], check=True)
+    monkeypatch.setattr(sys.modules[__name__], "REPO", tmp_path)
+    assert _guarded_paths(crate / "build.rs") == ["fake-crate/src/pro.rs"]
+    assert not _tracked("fake-crate/src/pro.rs"), "an untracked local copy is not a commit"
+    subprocess.run(["git", "-C", str(tmp_path), "add", "fake-crate/src/pro.rs"], check=True)
+    assert _tracked("fake-crate/src/pro.rs"), "a tracked cfg-gated path is found"
 
 
 def test_the_mesh_pro_baseline_stays_deleted() -> None:
