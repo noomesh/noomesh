@@ -15,7 +15,6 @@ on TRELLION_PUBLIC, which both runners set.
 
 from __future__ import annotations
 
-import ast
 import re
 from pathlib import Path
 
@@ -70,21 +69,38 @@ def test_the_mutants_python_lane_and_test_core_share_the_mechanism() -> None:
         assert re.search(rf"^{hook} = _public_tree\.", conftest, re.M), f"conftest must wire {hook}"
 
 
-def test_every_self_skip_reason_carries_the_prefix_the_summary_counts() -> None:
-    """Each test module that skips because a file or tree is absent says so with the prefix,
-    so the summary counts it. Every module that uses the prefix is checked."""
+# Phrases the suite uses for "this input is absent from the public tree".
+_ABSENCE = re.compile(r"not in this tree|not present|not part of|not shipped|lives in noomesh-internal", re.I)
+
+
+_SKIP_CALL = re.compile(r"""pytest\.skip\(\s*[fF]?(?P<q>["'])(?P<head>.*?)(?P=q)""")
+
+
+def test_every_absent_input_skip_reason_carries_the_prefix_the_summary_counts() -> None:
+    """Every `pytest.skip("...")` in any test file whose reason says an input is absent from this
+    tree starts with the prefix, so the summary counts it (`self_skips` matches on startswith).
+    A text scan, not an AST walk: some test files use syntax the running interpreter cannot parse."""
+    seen = 0
     for path in sorted(TESTS.glob("test_*.py")):
-        name = path.name
-        text = path.read_text()
-        if _public_tree.SELF_SKIP_PREFIX not in text or name == Path(__file__).name:
+        if path.name == Path(__file__).name:
             continue
-        tree = ast.parse(text)
-        reasons = []
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Call) and ast.unparse(node.func) == "pytest.skip" and node.args:
-                reasons.append(ast.unparse(node.args[0]))
-        for r in reasons:
-            assert _public_tree.SELF_SKIP_PREFIX in r, f"{name}: skip reason {r} lacks {_public_tree.SELF_SKIP_PREFIX!r}"
+        for m in _SKIP_CALL.finditer(path.read_text()):
+            reason = m.group("head")
+            if _ABSENCE.search(reason):
+                seen += 1
+                assert reason.startswith(_public_tree.SELF_SKIP_PREFIX), (
+                    f"{path.name}: skip reason {reason!r} says an input is absent "
+                    f"but does not start with {_public_tree.SELF_SKIP_PREFIX!r}"
+                )
+    assert seen, "no absent-input skip found: the scan matched nothing"
+
+
+def test_the_suite_size_bounds_fail_a_shrunk_or_over_skipping_run() -> None:
+    p = _public_tree.suite_size_problem
+    lo, hi = _public_tree.MIN_COLLECTED, _public_tree.MAX_SKIPPED
+    assert p(lo, hi) is None
+    assert "collected" in p(lo - 1, 0)
+    assert "skipped" in p(lo, hi + 1)
 
 
 def test_the_trellion_exclusions_follow_the_switch() -> None:

@@ -145,7 +145,7 @@ def test_the_intel_image_installs_the_package_with_its_metadata():
     found = sorted((Path(__file__).resolve().parents[1] / "docker").glob("Dockerfile.*intel"))
     path = found[0] if found else None
     if path is None:
-        pytest.skip("the intel image recipe is not part of this tree (public core)")
+        pytest.skip("not in this tree: the intel image recipe (public core)")
     df = path.read_text()
     run = [l for l in df.splitlines() if not l.lstrip().startswith("#")]
     body = "\n".join(run)

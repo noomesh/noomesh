@@ -82,7 +82,7 @@ def _skip_when_leak_check_is_not_shipped() -> None:
     """leak-check.sh is a migration tool the OSS sync does not ship, and the
     sync cuts its hook out of .pre-commit-config.yaml. Missing is not failed."""
     if not (ROOT / "scripts" / "leak-check.sh").exists():
-        pytest.skip("scripts/leak-check.sh is not present in this tree (not shipped)")
+        pytest.skip("not in this tree: scripts/leak-check.sh is not shipped")
 
 
 def test_the_leak_gate_is_the_same_script_locally_and_in_ci():

@@ -544,6 +544,8 @@ jobs:
         # A path that does not exist, so nothing mistakes a stray directory for
         # a sibling checkout.
         PAI_TRELLION_CHECKOUT: ${{ github.workspace }}/_no_sibling_checkout
+        # The run fails if the suite shrinks or over-skips (tests/_public_tree.py).
+        NOO_SUITE_BOUNDS: "1"
       run: |
         # Skips are expected here (no sibling checkouts, no bubblewrap).
         export NOO_STRICT_SKIPS=0

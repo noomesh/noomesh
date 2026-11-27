@@ -69,7 +69,7 @@ def test_include_str_targets_are_in_the_build_context(crate: str) -> None:
     """Every include_str!("../X") outside src/ must be COPYed."""
     src = REPO / crate / "src"
     if not src.exists():
-        pytest.skip(f"{crate} not present")
+        pytest.skip(f"not in this tree: {crate} is not present")
 
     copied = _copied_paths(_builder_stage(DOCKERFILE.read_text()))
     missing: list[str] = []
@@ -157,7 +157,7 @@ def test_dockerignore_parse_sees_the_tests_rule() -> None:
 def test_build_rs_is_in_the_build_context(crate: str) -> None:
     """A missing build.rs disables every cfg SILENTLY — no error, no warning."""
     if not (REPO / crate / "build.rs").exists():
-        pytest.skip(f"{crate}/build.rs not present")
+        pytest.skip(f"not in this tree: {crate}/build.rs is not present")
 
     copied = _copied_paths(_builder_stage(DOCKERFILE.read_text()))
     assert _is_copied(f"{crate}/build.rs", copied), (

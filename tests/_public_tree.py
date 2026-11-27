@@ -16,6 +16,9 @@ started from a red base on dev and every unscoped verdict was void. Now:
     keyed on the same TRELLION_PUBLIC variable both runners already set.
   * Every self-skip is counted and named in the pytest summary, so a rise in
     the count is seen.
+  * test-core sets NOO_SUITE_BOUNDS=1, and a run that collected fewer tests
+    than MIN_COLLECTED or skipped more than MAX_SKIPPED fails (below), so a
+    quiet shrinkage of the suite cannot pass the gate.
 """
 
 from __future__ import annotations
@@ -87,3 +90,37 @@ def pytest_terminal_summary(terminalreporter):
     terminalreporter.section(f"tests that skipped themselves ({SELF_SKIP_PREFIX!r}): {len(found)}")
     for nodeid, reason in sorted(found):
         terminalreporter.line(f"  {nodeid}  --  {reason}")
+
+
+# Suite-size bounds, enforced when the runner sets NOO_SUITE_BOUNDS=1 (test-core).
+# Observed 2026-11-27 on this PR's own `test-core (advisory)` run (full suite,
+# TRELLION_PUBLIC=true, run 45927667006): 5826 passed + 120 skipped = 5946 run.
+# Set a little inside those figures; raise MIN_COLLECTED as the suite grows and
+# lower MAX_SKIPPED as skips are removed. The floor applies only when trellion
+# is public (otherwise eleven modules are left out on purpose).
+BOUNDS_ENV = "NOO_SUITE_BOUNDS"
+MIN_COLLECTED = 5850
+MAX_SKIPPED = 135
+
+
+def suite_size_problem(collected: int, skipped: int, environ=os.environ) -> str | None:
+    if collected < MIN_COLLECTED and not trellion_absent(environ):
+        return f"the run collected {collected} tests, fewer than the floor {MIN_COLLECTED}: tests were left out"
+    if skipped > MAX_SKIPPED:
+        return f"{skipped} tests skipped, more than the ceiling {MAX_SKIPPED}: tests are skipping themselves"
+    return None
+
+
+def pytest_sessionfinish(session, exitstatus):
+    if os.environ.get(BOUNDS_ENV) != "1" or hasattr(session.config, "workerinput"):
+        return
+    tr = session.config.pluginmanager.get_plugin("terminalreporter")
+    if tr is None:
+        return
+    st = tr.stats
+    ran = sum(len(st.get(k, [])) for k in ("passed", "failed", "skipped", "error", "xfailed", "xpassed"))
+    problem = suite_size_problem(ran, len(st.get("skipped", [])))
+    tr.write_line(f"suite-size guard: {ran} run, {len(st.get('skipped', []))} skipped"
+                  f" (floor {MIN_COLLECTED}, ceiling {MAX_SKIPPED}): " + (problem or "ok"))
+    if problem:
+        session.exitstatus = 1
