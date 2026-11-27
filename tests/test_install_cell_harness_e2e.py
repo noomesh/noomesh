@@ -188,3 +188,69 @@ def test_the_evidence_records_the_turns_seconds():
     src = (ROOT / "scripts" / "install-cell" / "harness_e2e.py").read_text()
     body = src[src.index("def collect("):src.index("def verdict(")]
     assert 'E["turn_s"] = round(time.time() - t0, 1)' in body
+
+
+def test_a_connection_reset_on_a_large_upload_refreshes_the_login_once_and_retries_once(monkeypatch):
+    """i1392: a 401 on the big bundle POST arrives as a TLS EOF (URLError). The
+    judge refreshes once and retries once, never loops, and prints no token."""
+    import urllib.error
+    import urllib.request
+
+    calls, refreshes = [], []
+
+    class Resp:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            return b"{}"
+
+    def urlopen(req, context=None, timeout=None):
+        calls.append(req.get_method())
+        if len(calls) == 1:
+            raise urllib.error.URLError(OSError(8, "EOF"))
+        return Resp()
+
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(he.ws_chat, "cluster_ca", lambda: None)
+    monkeypatch.setattr(he.ws_chat, "token", lambda: "t")
+    monkeypatch.setattr(he.ws_chat, "refresh_via_cli", lambda: refreshes.append(1) or True)
+    monkeypatch.setattr(he, "_RESET_REFRESHED", False)
+    big = b"x" * he.LARGE_BODY
+    assert he._http("POST", "/p", big, "application/octet-stream") == (200, b"{}")
+    assert refreshes == [1] and calls == ["POST", "POST"]
+
+    # A second reset is not refreshed again (once per run) and is raised.
+    calls.clear()
+    monkeypatch.setattr(urllib.request, "urlopen",
+                        lambda *a, **k: (_ for _ in ()).throw(urllib.error.URLError(OSError(8, "EOF"))))
+    try:
+        he._http("POST", "/p", big, "application/octet-stream")
+        raise AssertionError("expected URLError")
+    except urllib.error.URLError:
+        pass
+    assert refreshes == [1]
+
+
+def test_a_small_request_reset_is_not_treated_as_an_auth_refusal(monkeypatch):
+    import urllib.error
+    import urllib.request
+
+    refreshes = []
+    monkeypatch.setattr(urllib.request, "urlopen",
+                        lambda *a, **k: (_ for _ in ()).throw(urllib.error.URLError(OSError(8, "EOF"))))
+    monkeypatch.setattr(he.ws_chat, "cluster_ca", lambda: None)
+    monkeypatch.setattr(he.ws_chat, "token", lambda: "t")
+    monkeypatch.setattr(he.ws_chat, "refresh_via_cli", lambda: refreshes.append(1) or True)
+    monkeypatch.setattr(he, "_RESET_REFRESHED", False)
+    try:
+        he._http("GET", "/p")
+        raise AssertionError("expected URLError")
+    except urllib.error.URLError:
+        pass
+    assert refreshes == []
