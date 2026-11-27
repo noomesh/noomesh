@@ -4327,7 +4327,7 @@ pub(crate) fn put_bytes(g: &Globals, path: &str, body: &[u8]) -> Result<serde_js
     let base = crate::envfile::gateway_url(&g.gateway_override);
     let url = format!("{base}{path}");
     let agent = crate::http::agent(g, &base, 120);
-    ensure_login_before_upload(g, body.len());
+    ensure_login_before_upload(g, path, body.len())?;
     let mut req = agent.put(&url).header("content-type", "application/octet-stream");
     if let Some(b) = crate::auth::bearer(g) {
         req = req.header("Authorization", &b);
@@ -4349,7 +4349,7 @@ pub(crate) fn post_bytes(g: &Globals, path: &str, body: &[u8]) -> Result<(), Str
     // 60 s plus a second per MB: a bundle carrying a staged vendor CLI
     // (i83 E1e) is a few hundred MB, which a flat 60 s cut off below ~5 MB/s.
     let agent = crate::http::agent(g, &base, 60 + (body.len() / 1_000_000) as u64);
-    ensure_login_before_upload(g, body.len());
+    ensure_login_before_upload(g, path, body.len())?;
     let mut req = agent.post(&url).header("content-type", "application/octet-stream");
     if let Some(b) = crate::auth::bearer(g) {
         req = req.header("Authorization", &b);
@@ -4383,14 +4383,30 @@ fn needs_login_preflight(len: usize, has_bearer: bool) -> bool {
 }
 
 /// One small authenticated request before a large upload, through the CLI's
-/// normal request path: a 401 there refreshes the stored login once, retries,
-/// and otherwise stops with the standard "sign in again" message and exit
-/// status (`http::auth_failed`). It returns only when the login is accepted,
-/// so an expired or revoked login is found BEFORE any body is written.
-fn ensure_login_before_upload(g: &Globals, len: usize) {
-    if needs_login_preflight(len, crate::auth::bearer(g).is_some()) {
-        crate::http::get_json(g, LOGIN_CHECK_PATH, true, 15);
+/// normal request path (`http::get_json_try`: a 401 refreshes the stored login
+/// once and retries). It never exits the process: a refused login or a
+/// gateway that does not answer comes back as the `Err` text the upload's own
+/// callers already handle, so a caller that survives a failed upload (the CLI
+/// asset phase of `noo upgrade`, the bundle-pull fallback) survives this too.
+/// `Ok` means the login was accepted, or the body is small and a credential
+/// is held.
+fn ensure_login_before_upload(g: &Globals, path: &str, len: usize) -> Result<(), String> {
+    if !needs_login_preflight(len, crate::auth::bearer(g).is_some()) {
+        return Ok(());
     }
+    crate::http::get_json_try(g, LOGIN_CHECK_PATH, true, 15)
+        .map(|_| ())
+        .map_err(|why| login_check_failed(path, &why))
+}
+
+/// The refusal text when the login check before an upload fails: said before
+/// any body was sent, naming both ways it can fail.
+fn login_check_failed(path: &str, why: &str) -> String {
+    format!(
+        "not uploading to {path}: the login check made first failed \
+         (the login was refused or the gateway did not answer): {why}. \
+         Run `noo auth status` to see the login, `noo auth login` to sign in again."
+    )
 }
 
 /// The identity read `noo auth status` makes: tiny, and answered only to an
@@ -5723,20 +5739,54 @@ mod tests {
     }
 
     /// i1397: the login check runs before the body is written, in both upload
-    /// functions. The check exits with the standard login message when the
-    /// login is refused, so reaching `.send(` means it passed.
+    /// functions, and is given the body's real length.
     #[test]
     fn both_uploads_check_the_login_before_sending_the_body() {
         let own = crate::test_src::own_code(include_str!("provision.rs"));
         for f in ["pub(crate) fn post_bytes(", "pub(crate) fn put_bytes("] {
             let body = crate::test_src::fn_body(&own, f);
-            let check = body.find("ensure_login_before_upload(").unwrap_or_else(|| panic!("{f} never checks the login"));
+            let call = "ensure_login_before_upload(g, path, body.len())?;";
+            let check = body.find(call).unwrap_or_else(|| panic!("{f} never checks the login with the body's length"));
             let send = body.find(".send(body)").unwrap_or_else(|| panic!("{f} no longer sends"));
             assert!(check < send, "{f} sends before it checks the login");
         }
         let pre = crate::test_src::fn_body(&own, "fn ensure_login_before_upload(");
         assert!(pre.contains("needs_login_preflight("), "the check ignores the decision");
-        assert!(pre.contains("crate::http::get_json(g, LOGIN_CHECK_PATH, true"), "the check is not an authenticated request through the CLI's own path");
+        assert!(pre.contains("crate::http::get_json_try(g, LOGIN_CHECK_PATH, true"), "the check is not an authenticated request through the CLI's own path");
+        for exiting in ["get_json(", "fail(", "exit(", "auth_failed("] {
+            assert!(!pre.replace("get_json_try(", "").contains(exiting), "the login check can exit the process via {exiting}");
+        }
+    }
+
+    /// i1397: the 2 MiB threshold, by value.
+    #[test]
+    fn the_large_upload_threshold_is_two_mebibytes() {
+        assert_eq!(super::LARGE_UPLOAD_BYTES, 2_097_152);
+    }
+
+    /// i1397: a failed login check is text, naming the path and both causes.
+    #[test]
+    fn a_failed_login_check_is_an_error_text_naming_the_fix() {
+        let m = super::login_check_failed("/api/cluster/provision-bundle/n1", "HTTP 401");
+        assert!(m.contains("/api/cluster/provision-bundle/n1") && m.contains("HTTP 401"), "{m}");
+        assert!(m.contains("refused") && m.contains("did not answer"), "{m}");
+        assert!(m.contains("noo auth login"), "{m}");
+    }
+
+    /// i1397: the two callers that survive a failed upload cannot be killed by
+    /// the login check: neither reaches an exiting request on its own.
+    #[test]
+    fn callers_that_survive_a_failed_upload_survive_a_failed_login_check() {
+        let own = crate::test_src::own_code(include_str!("provision.rs"));
+        let pull = crate::test_src::fn_body(&own, "pub(crate) fn stage_bundle_pull(");
+        assert!(pull.contains("post_bytes("), "stage_bundle_pull no longer uploads");
+        let up = crate::test_src::own_code(include_str!("upgrade.rs"));
+        let assets = crate::test_src::fn_body(&up, "fn upload_cli_assets(");
+        for (name, body) in [("stage_bundle_pull", pull), ("upload_cli_assets", assets)] {
+            for exiting in ["http::get_json(", "post_json(", "fail(", "exit("] {
+                assert!(!body.contains(exiting), "{name} reaches an exiting path: {exiting}");
+            }
+        }
     }
 
     /// i689(b): the agent comes from the signed lock's node-agent DIGEST.
