@@ -1040,7 +1040,7 @@ fn doc_page_outcome(id: &str, page_no: i32, row: Option<scope::DocPageRow>) -> R
     }
     let (text, truncated) = cap_page_text(text.as_deref().unwrap_or(""));
     // The page's real length; the shown length only when the query gave none.
-    let char_count = real_len.map_or_else(|| text.chars().count(), i64::from);
+    let char_count = real_len.map_or_else(|| i64::try_from(text.chars().count()).unwrap_or(i64::MAX), i64::from);
     Ok(json!({
         "doc_id": id,
         "page_no": page_no,
@@ -2736,7 +2736,7 @@ mod doc_page_tests {
     use super::*;
 
     fn found(text: Option<&str>) -> Option<scope::DocPageRow> {
-        Some((Some("T".into()), 5, true, text.map(String::from), text.map(|t| t.chars().count() as i32)))
+        Some((Some("T".into()), 5, true, text.map(String::from), text.map(|t| i32::try_from(t.chars().count()).unwrap_or(i32::MAX))))
     }
 
     #[test]
