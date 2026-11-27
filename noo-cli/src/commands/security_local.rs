@@ -1470,8 +1470,200 @@ fn docker_restart(container: &str) {
     let _ = Command::new("docker").args(["restart", container]).output();
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// Door sidecars: reloaded in place, backend untouched
+// ─────────────────────────────────────────────────────────────────────────
+
+/// The model-backend doors: `stunnel-<door>` sidecars whose backend container
+/// (`<door>`) shares the sidecar's network namespace (`network_mode:
+/// service:stunnel-<door>`, `depends_on ... restart: true`). Only the sidecar
+/// mounts the certificate, and stunnel re-reads cert, key and CA on SIGHUP,
+/// so a rotation reloads the sidecar in place and leaves the backend (a model
+/// server that can take minutes to load) running. A test pins this list to
+/// `docker-compose.cluster.yml`: a new `stunnel-*` service there that is not
+/// named here fails it.
+pub(crate) const DOOR_SIDECARS: [&str; 6] = ["llamacpp", "ollama", "ollama-embed", "ollama-embed-cpu", "vllm", "vllm-secondary"];
+
+/// The bound on one `docker kill` / `docker logs` call of a reload.
+const DOCKER_RELOAD_SECS: u64 = 15;
+/// How long to wait for stunnel to log the outcome of a reload.
+const RELOAD_WAIT: Duration = Duration::from_secs(10);
+/// stunnel 5.x lines that end a reload. NEED CONFIRMING against a real
+/// sidecar log. A failed reload keeps the old configuration and keeps
+/// serving the OLD certificate.
+const RELOAD_OK_MARKER: &str = "configuration successful";
+const RELOAD_FAILED_MARKERS: [&str; 3] = ["failed to reload", "configuration failed", "reload failed"];
+
+/// The door a container is the sidecar of (`noo-stunnel-ollama` is `ollama`),
+/// when it is one of [`DOOR_SIDECARS`].
+fn door_of(container: &str, prefix: &str) -> Option<&'static str> {
+    let svc = stack_service_of(container, prefix)?;
+    let door = svc.strip_prefix("stunnel-")?;
+    DOOR_SIDECARS.iter().copied().find(|d| *d == door)
+}
+
+/// One door sidecar to reload and the backend that shares its namespace
+/// (present only when the backend is among the consumers).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DoorReload {
+    sidecar: String,
+    backend: Option<String>,
+}
+
+/// Each consumer of a rotated certificate, classified: RELOAD (a door
+/// sidecar, its backend left out) or RESTART (everything else, in the order
+/// [`restart_list`] gave, the gateway last).
+#[derive(Debug, Default, PartialEq, Eq)]
+struct RotationPlan {
+    reload: Vec<DoorReload>,
+    restart: Vec<String>,
+}
+
+fn rotation_plan(consumers: &[String], prefix: &str) -> RotationPlan {
+    let mut reload: Vec<DoorReload> = Vec::new();
+    let mut held: Vec<String> = Vec::new();
+    for c in consumers {
+        let Some(door) = door_of(c, prefix) else { continue };
+        let backend = format!("{prefix}-{door}");
+        let backend = consumers.contains(&backend).then_some(backend);
+        held.push(c.clone());
+        held.extend(backend.iter().cloned());
+        reload.push(DoorReload { sidecar: c.clone(), backend });
+    }
+    let restart = consumers.iter().filter(|c| !held.contains(c)).cloned().collect();
+    RotationPlan { reload, restart }
+}
+
+/// What a reload came to. Only `Reloaded` is evidence the sidecar serves the
+/// new certificate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReloadOutcome {
+    Reloaded,
+    /// stunnel said the reload failed (or the signal could not be sent): it
+    /// keeps serving the old certificate.
+    Failed,
+    /// No outcome line within the wait: nothing shows the certificate changed.
+    Unknown,
+}
+
+/// The outcome in the sidecar's log text since the signal. Any failure line
+/// wins over a success line; no evidence is `Unknown`, never success.
+fn parse_reload_log(log: &str) -> ReloadOutcome {
+    let low = log.to_ascii_lowercase();
+    if RELOAD_FAILED_MARKERS.iter().any(|m| low.contains(m)) {
+        ReloadOutcome::Failed
+    } else if low.contains(RELOAD_OK_MARKER) {
+        ReloadOutcome::Reloaded
+    } else {
+        ReloadOutcome::Unknown
+    }
+}
+
+/// The containers to restart for one door after its reload: nothing when it
+/// reloaded; otherwise the backend then the sidecar (the order the consumer
+/// list has always used).
+fn door_fallback(door: &DoorReload, outcome: ReloadOutcome) -> Vec<String> {
+    if outcome == ReloadOutcome::Reloaded {
+        return Vec::new();
+    }
+    door.backend.iter().cloned().chain([door.sidecar.clone()]).collect()
+}
+
+/// What [`apply_consumers`] did.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Applied {
+    /// Door sidecars reloaded in place and verified.
+    reloaded: Vec<String>,
+    /// Every container restarted, fallbacks included.
+    restarted: Vec<String>,
+    /// Door sidecars whose reload was not verified, with why.
+    fell_back: Vec<(String, ReloadOutcome)>,
+}
+
+/// Reload each door, restart its backend and sidecar when the reload is not
+/// verified, then restart the rest of the plan (the gateway last). Doors go
+/// first so the gateway is always the last thing touched.
+fn apply_consumers(plan: &RotationPlan, mut reload: impl FnMut(&str) -> ReloadOutcome, mut restart: impl FnMut(&str)) -> Applied {
+    let mut done = Applied::default();
+    for door in &plan.reload {
+        let outcome = reload(&door.sidecar);
+        let fallback = door_fallback(door, outcome);
+        if fallback.is_empty() {
+            done.reloaded.push(door.sidecar.clone());
+        } else {
+            restart_each(&fallback, &mut restart);
+            done.restarted.extend(fallback);
+            done.fell_back.push((door.sidecar.clone(), outcome));
+        }
+    }
+    restart_each(&plan.restart, &mut restart);
+    done.restarted.extend(plan.restart.iter().cloned());
+    done
+}
+
+/// The line the reload path prints for one door's outcome.
+fn reload_outcome_line(sidecar: &str, outcome: ReloadOutcome) -> String {
+    match outcome {
+        ReloadOutcome::Reloaded => format!("{sidecar} reloaded in place (stunnel logged a successful reload); its backend was not restarted"),
+        ReloadOutcome::Failed => format!("{sidecar} did NOT reload (stunnel kept the old certificate): restarted it and its backend instead"),
+        ReloadOutcome::Unknown => format!("{sidecar} showed no reload outcome within {} s, so the new certificate is unconfirmed: restarted it and its backend instead", RELOAD_WAIT.as_secs()),
+    }
+}
+
+/// SIGHUP one door sidecar, then read its log since the signal for stunnel's
+/// outcome. Both docker calls are bounded.
+fn reload_door_sidecar(container: &str) -> ReloadOutcome {
+    let since = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| format!("{}.{:09}", d.as_secs(), d.subsec_nanos()))
+        .unwrap_or_else(|_| "0".to_string());
+    let limit = Duration::from_secs(DOCKER_RELOAD_SECS);
+    match crate::bounded::docker(&["kill", "-s", "HUP", container], limit) {
+        crate::bounded::Bounded::Answered(o) if o.status.success() => {}
+        _ => return ReloadOutcome::Failed,
+    }
+    let start = std::time::Instant::now();
+    loop {
+        std::thread::sleep(Duration::from_secs(1));
+        if let crate::bounded::Bounded::Answered(o) = crate::bounded::docker(&["logs", "--since", &since, container], limit) {
+            // stunnel logs to stderr; `docker logs` replays both streams.
+            let text = format!("{}\n{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+            let outcome = parse_reload_log(&text);
+            if outcome != ReloadOutcome::Unknown {
+                return outcome;
+            }
+        }
+        if start.elapsed() >= RELOAD_WAIT {
+            return ReloadOutcome::Unknown;
+        }
+    }
+}
+
+/// [`apply_consumers`] against Docker, printing each door's outcome.
+fn apply_to_stack(plan: &RotationPlan, json: bool) -> Applied {
+    let done = apply_consumers(
+        plan,
+        |c| {
+            let outcome = reload_door_sidecar(c);
+            if !json && outcome == ReloadOutcome::Reloaded {
+                ui::done(&reload_outcome_line(c, outcome));
+            }
+            outcome
+        },
+        docker_restart,
+    );
+    if !json {
+        for (c, outcome) in &done.fell_back {
+            ui::warned(&reload_outcome_line(c, *outcome));
+        }
+    }
+    done
+}
+
 const NO_RESTART_NEEDED: &str = "on this machine no running service uses a rotated certificate: no restart is needed";
 const NO_CONSUMERS: &str = "on this machine no service consumes a rotated certificate";
+const RELOAD_ONLY_NOTE: &str = "on this machine nothing needs restarting: the door sidecars above take the new certificate on a reload, and their backend containers keep running";
+const RELOAD_CHECK_NOTE: &str = "a door sidecar's backend does not need restarting; after the reload its log shows `Configuration successful` when the new certificate is served, and `Failed to reload` when stunnel kept the old one (then restart the sidecar and its backend)";
 const NOTHING_ELSE_TO_RESTART: &str = "on this machine nothing else needs restarting";
 /// The bound on `docker ps`, and the number the refusals name.
 const DOCKER_PS_SECS: u64 = 15;
@@ -1497,8 +1689,10 @@ fn stack_service_of(container: &str, prefix: &str) -> Option<String> {
 
 /// What `rotate-all --no-reload` tells the operator, as data.
 struct NoReloadInputs<'a> {
-    /// From [`restart_list`], gateway last.
+    /// From [`rotation_plan`]: what is restarted, gateway last.
     restart: &'a [String],
+    /// From [`rotation_plan`]: door sidecars reloaded in place.
+    reload: &'a [String],
     /// Whether Docker answered when the list was made.
     docker_answered: bool,
     /// The instance's container prefix (`noo`, or `noo-<name>`).
@@ -1517,6 +1711,9 @@ struct NoReloadInputs<'a> {
 #[derive(Debug, PartialEq, Eq)]
 struct NoReloadReport {
     warning: Option<String>,
+    /// Per door sidecar, `docker kill -s HUP <c>` then the log check: its
+    /// backend is not restarted.
+    reload_commands: Vec<String>,
     /// Commands to run on this machine, in order, gateway last.
     commands: Vec<String>,
     /// Muted closing lines.
@@ -1547,9 +1744,16 @@ fn no_reload_report(p: &NoReloadInputs) -> NoReloadReport {
     if let Some(g) = gateway {
         commands.push(format!("{noo} stack restart {g}"));
     }
+    let mut reload_commands: Vec<String> = Vec::new();
+    for c in p.reload {
+        reload_commands.push(format!("docker kill -s HUP {}", shquote(c)));
+        reload_commands.push(format!("docker logs --since 1m {}", shquote(c)));
+    }
     let mut notes: Vec<String> = Vec::new();
     if !commands.is_empty() {
         notes.push(NOTHING_ELSE_TO_RESTART.to_string());
+    } else if !reload_commands.is_empty() {
+        notes.push(RELOAD_ONLY_NOTE.to_string());
     } else if p.docker_answered {
         notes.push(NO_RESTART_NEEDED.to_string());
     } else {
@@ -1561,7 +1765,10 @@ fn no_reload_report(p: &NoReloadInputs) -> NoReloadReport {
     if p.other_nodes_rotated {
         notes.push(OTHER_NODES_NOTE.to_string());
     }
-    NoReloadReport { warning: (!p.docker_answered).then(|| DOCKER_DID_NOT_ANSWER.to_string()), commands, notes }
+    if !reload_commands.is_empty() {
+        notes.push(RELOAD_CHECK_NOTE.to_string());
+    }
+    NoReloadReport { warning: (!p.docker_answered).then(|| DOCKER_DID_NOT_ANSWER.to_string()), reload_commands, commands, notes }
 }
 
 /// `--no-reload` JSON: `would_restart` names, in order, the containers the
@@ -1570,6 +1777,27 @@ fn no_reload_report(p: &NoReloadInputs) -> NoReloadReport {
 fn with_would_restart(mut summary: serde_json::Value, restart: &[String], docker_answered: bool) -> serde_json::Value {
     summary["would_restart"] = serde_json::json!(restart);
     summary["docker_answered"] = serde_json::json!(docker_answered);
+    summary
+}
+
+/// `--no-reload` JSON: `would_reload` names, in order, the door sidecars the
+/// reload path would have reloaded in place (their backends are not restarted).
+fn with_would_reload(mut summary: serde_json::Value, reload: &[String]) -> serde_json::Value {
+    summary["would_reload"] = serde_json::json!(reload);
+    summary
+}
+
+/// Reload-path JSON: `restarted` is every container restarted (door
+/// fallbacks included), `reloaded_in_place` the door sidecars reloaded and
+/// verified, `reload_fallbacks` the doors whose reload was not verified.
+fn with_applied(mut summary: serde_json::Value, done: &Applied) -> serde_json::Value {
+    summary["restarted"] = serde_json::json!(done.restarted);
+    summary["reloaded_in_place"] = serde_json::json!(done.reloaded);
+    summary["reload_fallbacks"] = serde_json::json!(done
+        .fell_back
+        .iter()
+        .map(|(c, o)| serde_json::json!({ "container": c, "outcome": format!("{o:?}").to_lowercase() }))
+        .collect::<Vec<_>>());
     summary
 }
 
@@ -5224,13 +5452,17 @@ pub fn pki_rotate_all(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     let rotated_certs: Vec<(&str, &str)> = rotated.iter().map(|r| (r.name.as_str(), r.role)).collect();
     let to_restart = restart_list(&rotated_certs, &hostname, running.as_deref(), crate::envfile::instanced);
     let docker_answered = running.is_some();
+    // Door sidecars are reloaded in place; everything else restarts.
+    let plan = rotation_plan(&to_restart, &crate::envfile::container_prefix());
+    let reload_names: Vec<String> = plan.reload.iter().map(|d| d.sidecar.clone()).collect();
     let local_node_rotated = rotated.iter().any(|r| {
         r.role == "node"
             && cert_node_name(&r.name).is_some_and(|n| n.eq_ignore_ascii_case(&hostname))
     });
     let local_agent_unit = local_node_rotated && systemd_unit_known("noo-node-agent");
     let report = no_reload_report(&NoReloadInputs {
-        restart: &to_restart,
+        restart: &plan.restart,
+        reload: &reload_names,
         docker_answered,
         prefix: &crate::envfile::container_prefix(),
         instance: &crate::envfile::instance(),
@@ -5241,11 +5473,17 @@ pub fn pki_rotate_all(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
 
     if !reload {
         if g.json {
-            println!("{}", with_would_restart(json_summary(&[], None, false), &to_restart, docker_answered));
+            println!("{}", with_would_reload(with_would_restart(json_summary(&[], None, false), &plan.restart, docker_answered), &reload_names));
             return Ok(exit_for_deliveries(0));
         } else {
             if let Some(w) = &report.warning {
                 ui::warned(w);
+            }
+            if !report.reload_commands.is_empty() {
+                ui::close_warned("the rotated certificates reach these door sidecars on a reload (their backend containers keep running and are not restarted):");
+                for c in &report.reload_commands {
+                    println!("  {c}");
+                }
             }
             if !report.commands.is_empty() {
                 ui::close_warned("the rotated certificates take effect only once these restart on this machine, in this order:");
@@ -5277,7 +5515,7 @@ pub fn pki_rotate_all(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                  `docker ps` did not answer within 15 s, so no consumer was restarted and none can be judged \
                  (running sandbox/worker replicas cannot be named without Docker: restart any replica containers \
                  of the services above too). Once Docker answers, run on this machine: {} (backup at {})",
-                report.commands.join("; "),
+                report.reload_commands.iter().chain(&report.commands).cloned().collect::<Vec<_>>().join("; "),
                 backup_dir.display()
             ),
             None,
@@ -5314,17 +5552,20 @@ pub fn pki_rotate_all(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     }
 
     if !g.json {
-        ui::step(&format!("reloading consumers: {}", to_restart.join(", ")));
+        ui::step(&format!(
+            "reloading consumers: {}",
+            plan.restart.iter().chain(&reload_names).cloned().collect::<Vec<_>>().join(", ")
+        ));
     }
-    restart_each(&to_restart, docker_restart);
+    let applied = apply_to_stack(&plan, g.json);
 
     let gate = probe_health_gate(&to_restart, 150);
     let action = gate_action(&gate);
     if let (GateAction::Accept, GateOutcome::Healthy(detail)) = (action, &gate) {
         let mut all_reloaded = reloaded_units.clone();
-        all_reloaded.extend(to_restart.iter().cloned());
+        all_reloaded.extend(applied.reloaded.iter().chain(&applied.restarted).cloned());
         if g.json {
-            println!("{}", with_restarted(json_summary(&all_reloaded, Some(true), false), &to_restart));
+            println!("{}", with_applied(json_summary(&all_reloaded, Some(true), false), &applied));
         } else {
             ui::close_done(&format!("rotation applied: {detail}"));
             if undelivered > 0 {
@@ -5351,8 +5592,8 @@ pub fn pki_rotate_all(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         );
         if g.json {
             let mut all_reloaded = reloaded_units.clone();
-            all_reloaded.extend(to_restart.iter().cloned());
-            println!("{}", with_restarted(json_summary(&all_reloaded, None, false), &to_restart));
+            all_reloaded.extend(applied.reloaded.iter().chain(&applied.restarted).cloned());
+            println!("{}", with_applied(json_summary(&all_reloaded, None, false), &applied));
         }
         fail(
             g.json,
@@ -5403,19 +5644,19 @@ pub fn pki_rotate_all(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             ui::warned(&format!("pki/public/ was not re-synced to the restored certificates: {e}"));
         }
     }
-    restart_each(&to_restart, docker_restart);
+    let applied2 = apply_to_stack(&plan, g.json);
     let gate2 = probe_health_gate(&to_restart, 150);
     if g.json {
         // The same summary object as the other paths; a re-sync error is in
         // it, not dropped.
         let mut all_reloaded = reloaded_units.clone();
-        all_reloaded.extend(to_restart.iter().cloned());
+        all_reloaded.extend(applied2.reloaded.iter().chain(&applied2.restarted).cloned());
         let healthy2 = match &gate2 {
             GateOutcome::Healthy(_) => Some(true),
             GateOutcome::Unhealthy(_) => Some(false),
             GateOutcome::Blind(_) => None,
         };
-        let mut summary = with_restarted(json_summary(&all_reloaded, healthy2, true), &to_restart);
+        let mut summary = with_applied(json_summary(&all_reloaded, healthy2, true), &applied2);
         summary["public_view_errors"] = serde_json::json!(view.errors);
         println!("{summary}");
     }
@@ -7154,6 +7395,7 @@ none /mnt/c/deeper tmpfs rw 0 0
     fn inputs<'a>(restart: &'a [String], prefix: &'a str, instance: &'a str) -> NoReloadInputs<'a> {
         NoReloadInputs {
             restart,
+            reload: &[],
             docker_answered: true,
             prefix,
             instance,
@@ -7325,6 +7567,213 @@ none /mnt/c/deeper tmpfs rw 0 0
         restart_each(&[], |c| panic!("restarted {c} from an empty list"));
     }
 
+    // ── door sidecars: reload in place ──────────────────────────────────
+
+    /// `stunnel-*` service keys of the shipped compose, and the services that
+    /// join one's network namespace.
+    fn compose_stunnel_services(compose: &str) -> Vec<String> {
+        compose
+            .lines()
+            .filter_map(|l| l.strip_prefix("  stunnel-")?.strip_suffix(':'))
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn compose_namespace_doors(compose: &str) -> Vec<String> {
+        compose
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("network_mode: \"service:stunnel-")?.strip_suffix('"'))
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// The door list is the compose file's: every `stunnel-*` service there is
+    /// a door a backend shares the namespace of, and each is classified.
+    #[test]
+    fn door_sidecars_are_pinned_to_the_shipped_compose() {
+        let compose = include_str!("../../../docker-compose.cluster.yml");
+        let mut services = compose_stunnel_services(compose);
+        let mut sharing = compose_namespace_doors(compose);
+        services.sort();
+        sharing.sort();
+        sharing.dedup();
+        let mut classified: Vec<String> = DOOR_SIDECARS.iter().map(|d| (*d).to_string()).collect();
+        classified.sort();
+        assert_eq!(services, sharing, "a stunnel-* service in compose has no backend in its namespace (or the reverse): classify it");
+        assert_eq!(services, classified, "DOOR_SIDECARS drifted from docker-compose.cluster.yml: a new stunnel-* door must be classified here");
+        for door in DOOR_SIDECARS {
+            let backend = compose_service_block_of(compose, door).unwrap_or_else(|| panic!("no compose service {door}"));
+            assert!(backend.contains(&format!("network_mode: \"service:stunnel-{door}\"")), "{door}");
+            assert!(backend.contains("restart: true"), "{door} does not restart with its sidecar");
+            let sidecar = compose_service_block_of(compose, &format!("stunnel-{door}")).expect("sidecar");
+            assert!(sidecar.contains(&format!("/tls/services/{}:ro", if door == "vllm-secondary" { "vllm" } else { door })), "{door} sidecar mounts its leaf");
+        }
+    }
+
+    /// A service's block of the compose text (key line to the next key).
+    fn compose_service_block_of(compose: &str, name: &str) -> Option<String> {
+        let mut out = String::new();
+        let mut inside = false;
+        for line in compose.lines() {
+            if line.starts_with("  ") && !line.starts_with("   ") && line.trim_end().ends_with(':') && !line.trim().starts_with('#') {
+                if inside {
+                    break;
+                }
+                inside = line.trim() == format!("{name}:");
+                continue;
+            }
+            if inside {
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+        inside.then_some(out)
+    }
+
+    #[test]
+    fn the_plan_reloads_door_sidecars_and_restarts_the_rest() {
+        let c = names(&["noo-ollama", "noo-stunnel-ollama", "noo-nats", "noo-stunnel-nats", "noo-gateway"]);
+        let plan = rotation_plan(&c, "noo");
+        assert_eq!(plan.reload, vec![DoorReload { sidecar: "noo-stunnel-ollama".into(), backend: Some("noo-ollama".into()) }]);
+        assert_eq!(plan.restart, names(&["noo-nats", "noo-stunnel-nats", "noo-gateway"]), "the backend is not restarted, nats is");
+        // A backend without its sidecar running is restarted as before.
+        let lone = rotation_plan(&names(&["noo-ollama", "noo-gateway"]), "noo");
+        assert!(lone.reload.is_empty());
+        assert_eq!(lone.restart, names(&["noo-ollama", "noo-gateway"]));
+        // Instance prefixes classify too; a sidecar without its backend running reloads alone.
+        let inst = rotation_plan(&names(&["noo-galaxy-stunnel-vllm-secondary"]), "noo-galaxy");
+        assert_eq!(inst.reload, vec![DoorReload { sidecar: "noo-galaxy-stunnel-vllm-secondary".into(), backend: None }]);
+        assert!(inst.restart.is_empty());
+        // A stunnel that is not a door (an unclassified name) restarts.
+        assert_eq!(rotation_plan(&names(&["noo-stunnel-nats"]), "noo").restart, names(&["noo-stunnel-nats"]));
+    }
+
+    const LOG_OK: &str = "2026.11.26 10:00:01 LOG5[ui]: Reading configuration from file /tmp/stunnel.conf\n2026.11.26 10:00:01 LOG5[ui]: Configuration successful\n";
+    const LOG_FAILED: &str = "2026.11.26 10:00:01 LOG5[ui]: Reading configuration from file /tmp/stunnel.conf\n2026.11.26 10:00:01 LOG3[ui]: SSL_CTX_use_PrivateKey_file: key values mismatch\n2026.11.26 10:00:01 LOG3[ui]: Configuration failed\n2026.11.26 10:00:01 LOG3[ui]: Failed to reload configuration\n";
+    const LOG_QUIET: &str = "2026.11.26 10:00:05 LOG6[7]: s_connect: connected 127.0.0.1:8000\n";
+
+    #[test]
+    fn the_reload_log_parser_reads_success_failure_and_no_evidence() {
+        assert_eq!(parse_reload_log(LOG_OK), ReloadOutcome::Reloaded);
+        assert_eq!(parse_reload_log(LOG_FAILED), ReloadOutcome::Failed);
+        assert_eq!(parse_reload_log(LOG_QUIET), ReloadOutcome::Unknown);
+        assert_eq!(parse_reload_log(""), ReloadOutcome::Unknown);
+        // A failure anywhere wins: never report applied beside a failure line.
+        assert_eq!(parse_reload_log(&format!("{LOG_OK}{LOG_FAILED}")), ReloadOutcome::Failed);
+        assert_eq!(parse_reload_log("LOG3[ui]: FAILED TO RELOAD"), ReloadOutcome::Failed);
+    }
+
+    /// reload ok: no backend restart. failed or unknown: the backend then the sidecar.
+    #[test]
+    fn the_decision_table_falls_back_unless_the_reload_is_verified() {
+        let door = DoorReload { sidecar: "noo-stunnel-ollama".into(), backend: Some("noo-ollama".into()) };
+        assert!(door_fallback(&door, ReloadOutcome::Reloaded).is_empty());
+        for bad in [ReloadOutcome::Failed, ReloadOutcome::Unknown] {
+            assert_eq!(door_fallback(&door, bad), names(&["noo-ollama", "noo-stunnel-ollama"]), "{bad:?}");
+        }
+        let alone = DoorReload { sidecar: "noo-stunnel-ollama".into(), backend: None };
+        assert_eq!(door_fallback(&alone, ReloadOutcome::Unknown), names(&["noo-stunnel-ollama"]));
+    }
+
+    #[test]
+    fn apply_consumers_never_restarts_a_reloaded_doors_backend() {
+        let plan = rotation_plan(&names(&["noo-ollama", "noo-stunnel-ollama", "noo-vllm", "noo-stunnel-vllm", "noo-nats", "noo-gateway"]), "noo");
+        let mut hup: Vec<String> = Vec::new();
+        let mut restarted: Vec<String> = Vec::new();
+        let done = apply_consumers(
+            &plan,
+            |c| {
+                hup.push(c.to_string());
+                if c == "noo-stunnel-vllm" { ReloadOutcome::Unknown } else { ReloadOutcome::Reloaded }
+            },
+            |c| restarted.push(c.to_string()),
+        );
+        assert_eq!(hup, names(&["noo-stunnel-ollama", "noo-stunnel-vllm"]));
+        // ollama reloaded: its backend stayed. vllm unverified: backend, sidecar, then the rest, gateway last.
+        assert_eq!(restarted, names(&["noo-vllm", "noo-stunnel-vllm", "noo-nats", "noo-gateway"]));
+        assert!(!restarted.contains(&"noo-ollama".to_string()) && !restarted.contains(&"noo-stunnel-ollama".to_string()));
+        assert_eq!(done.reloaded, names(&["noo-stunnel-ollama"]));
+        assert_eq!(done.restarted, restarted);
+        assert_eq!(done.fell_back, vec![("noo-stunnel-vllm".to_string(), ReloadOutcome::Unknown)]);
+        let failed = apply_consumers(&plan, |_| ReloadOutcome::Failed, |_| {});
+        assert!(failed.reloaded.is_empty(), "a failed reload is never reported as reloaded");
+        assert_eq!(failed.fell_back.len(), 2);
+    }
+
+    #[test]
+    fn the_outcome_lines_say_what_happened() {
+        assert!(reload_outcome_line("s", ReloadOutcome::Reloaded).contains("not restarted"));
+        assert!(reload_outcome_line("s", ReloadOutcome::Failed).contains("did NOT reload"));
+        let u = reload_outcome_line("s", ReloadOutcome::Unknown);
+        assert!(u.contains("unconfirmed") && u.contains("restarted it and its backend"), "{u}");
+    }
+
+    #[test]
+    fn no_reload_names_the_hup_and_the_check_and_json_lists_would_reload() {
+        let reload = names(&["noo-stunnel-ollama"]);
+        let restart = names(&["noo-nats", "noo-gateway"]);
+        let mut p = inputs(&restart, "noo", "");
+        p.reload = &reload;
+        let r = no_reload_report(&p);
+        assert_eq!(r.reload_commands, names(&["docker kill -s HUP noo-stunnel-ollama", "docker logs --since 1m noo-stunnel-ollama"]));
+        assert_eq!(r.commands, names(&["noo stack restart nats", "noo stack restart gateway"]));
+        assert!(r.notes.contains(&RELOAD_CHECK_NOTE.to_string()));
+        assert!(RELOAD_CHECK_NOTE.contains("backend does not need restarting"));
+        // Only door sidecars: nothing else to restart, and it says so truthfully.
+        let only = no_reload_report(&NoReloadInputs { restart: &[], ..p });
+        assert!(only.commands.is_empty());
+        assert_eq!(only.notes, names(&[RELOAD_ONLY_NOTE, RELOAD_CHECK_NOTE]));
+        let j = with_would_reload(with_would_restart(serde_json::json!({}), &restart, true), &reload);
+        assert_eq!(j["would_reload"], serde_json::json!(["noo-stunnel-ollama"]));
+        assert_eq!(j["would_restart"], serde_json::json!(["noo-nats", "noo-gateway"]));
+        let done = Applied { reloaded: reload.clone(), restarted: restart.clone(), fell_back: vec![("noo-stunnel-vllm".into(), ReloadOutcome::Failed)] };
+        let j = with_applied(serde_json::json!({}), &done);
+        assert_eq!(j["reloaded_in_place"], serde_json::json!(["noo-stunnel-ollama"]));
+        assert_eq!(j["restarted"], serde_json::json!(["noo-nats", "noo-gateway"]));
+        assert_eq!(j["reload_fallbacks"], serde_json::json!([{ "container": "noo-stunnel-vllm", "outcome": "failed" }]));
+    }
+
+    /// Both docker calls of a reload are bounded, the signal goes before the
+    /// log read, and no unbounded `Command` is used.
+    #[test]
+    fn the_reload_sends_hup_then_reads_the_log_through_the_bounded_helper() {
+        let src = include_str!("security_local.rs");
+        let body = crate::test_src::fn_body(src, "fn reload_door_sidecar(");
+        assert_eq!(body.matches("crate::bounded::docker(").count(), 2);
+        let kill = body.find("&[\"kill\", \"-s\", \"HUP\", container]").expect("no HUP");
+        let logs = body.find("&[\"logs\", \"--since\", &since, container]").expect("no log read");
+        assert!(kill < logs, "the log is read after the signal");
+        assert!(body.find("let since").unwrap() < kill, "the log window starts before the signal");
+        assert!(!body.contains("Command::new"), "docker only through the bounded helper");
+        assert!(body.contains("parse_reload_log(") && body.contains("RELOAD_WAIT"));
+        assert!(body.contains("return ReloadOutcome::Failed") && body.trim_end().contains("ReloadOutcome::Unknown"));
+    }
+
+    /// The HUP goes out only after the service's files are written (the
+    /// rotation, then on a revert the restore and the public-view re-sync),
+    /// and a door's backend is never passed to a restart on the success path.
+    #[test]
+    fn the_hup_follows_the_files_and_the_backend_is_never_restarted_on_success() {
+        let src = include_str!("security_local.rs");
+        let body = crate::test_src::fn_body(src, "pub fn pki_rotate_all(");
+        let first = body.find("apply_to_stack(&plan,").expect("no apply");
+        assert!(body.find("rotate_all_expiring(").unwrap() < first, "rotate, then reload");
+        let second = body[first + 1..].find("apply_to_stack(&plan,").expect("no revert apply") + first + 1;
+        let restore = body.find("copy_tree(&backup_dir").unwrap();
+        let resync = body.find("sync_public_view()").unwrap();
+        assert!(restore < resync && resync < second, "restore, re-sync, then reload on a revert");
+        assert!(first < restore, "the first reload is the forward one");
+        let apply = crate::test_src::fn_body(src, "fn apply_consumers(");
+        assert!(!apply.contains(".backend"), "only door_fallback names a backend");
+        assert_eq!(apply.matches("restart_each(").count(), 2);
+        assert!(apply.contains("restart_each(&plan.restart, &mut restart)"));
+        assert!(apply.contains("door_fallback(door, outcome)"));
+        let fallback = crate::test_src::fn_body(src, "fn door_fallback(");
+        assert!(fallback.find("Reloaded").unwrap() < fallback.find("backend").unwrap(), "a verified reload returns before any backend is named");
+        let apply_stack = crate::test_src::fn_body(src, "fn apply_to_stack(");
+        assert!(apply_stack.contains("reload_door_sidecar(c)") && apply_stack.contains("docker_restart"));
+    }
+
     #[test]
     fn rotate_all_computes_the_list_once_and_never_says_bare_stack_restart() {
         let body = crate::test_src::fn_body(include_str!("security_local.rs"), "pub fn pki_rotate_all(");
@@ -7337,19 +7786,22 @@ none /mnt/c/deeper tmpfs rw 0 0
         assert!(!body.contains("\"noo stack restart\""), "the bare whole-stack restart is gone");
         // Both restart loops (reload, revert) walk to_restart itself, and
         // nothing narrows it after it is made.
-        assert_eq!(body.matches("restart_each(&to_restart,").count(), 2);
-        for narrowing in ["to_restart.retain", "to_restart.truncate", "to_restart.pop", "to_restart.remove", "to_restart.clear"] {
+        // (the plan splits it once into reload and restart; both loops apply the plan).
+        assert_eq!(body.matches("apply_to_stack(&plan,").count(), 2);
+        assert_eq!(body.matches("rotation_plan(&to_restart,").count(), 1);
+        assert!(!body.contains("restart_each("), "rotate-all restarts only through apply_to_stack");
+        for narrowing in ["to_restart.retain", "to_restart.truncate", "to_restart.pop", "to_restart.remove", "to_restart.clear", "plan.restart.retain", "plan.restart.remove"] {
             assert!(!body.contains(narrowing), "{narrowing}");
         }
         // Docker must answer before the first restart (the unit or a container).
         let ask = body.find("if !docker_answered").expect("no could-not-ask refusal");
         assert!(ask < body.find("systemd_restart_unit(").unwrap());
-        assert!(ask < body.find("restart_each(").unwrap());
+        assert!(ask < body.find("apply_to_stack(").unwrap());
         // `restarted` is emitted on success, blind, revert and the late refusal.
         let at = |needle: &str| body.find(needle).unwrap_or_else(|| panic!("missing {needle}"));
-        let success = at("with_restarted(json_summary(&all_reloaded, Some(true)");
-        let blind = at("with_restarted(json_summary(&all_reloaded, None");
-        let revert = at("with_restarted(json_summary(&all_reloaded, healthy2, true)");
+        let success = at("with_applied(json_summary(&all_reloaded, Some(true)");
+        let blind = at("with_applied(json_summary(&all_reloaded, None");
+        let revert = at("with_applied(json_summary(&all_reloaded, healthy2, true)");
         let late = at("with_restarted(json_summary(&[], None, false), &[])");
         let late_fail = body[late..].find("\"docker_did_not_answer\"").expect("late refusal has no id") + late;
         assert!(ask < late && late_fail < at("systemd_restart_unit("), "the late refusal precedes every restart");
@@ -7380,7 +7832,7 @@ none /mnt/c/deeper tmpfs rw 0 0
         // docker_answered is the real answer at the call site, never a literal.
         assert!(body.contains("let docker_answered = running.is_some();"));
         assert!(!body.contains("docker_answered = true") && !body.contains("docker_answered: true"));
-        assert!(body.contains("with_would_restart(json_summary(&[], None, false), &to_restart, docker_answered)"));
+        assert!(body.contains("with_would_restart(json_summary(&[], None, false), &plan.restart, docker_answered)"));
     }
 
     #[test]

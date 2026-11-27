@@ -35,14 +35,14 @@ def test_the_blind_branch_exits_before_any_revert_step():
     revert_at = body.index("copy_tree(&backup_dir", blind)
     assert exit_at < revert_at, "the Blind branch must fail() before the revert's copy_tree"
     branch = body[blind:revert_at]
-    assert "copy_tree" not in branch and '"restart"' not in branch and "restart_each" not in branch, branch
+    assert "copy_tree" not in branch and '"restart"' not in branch and "restart_each" not in branch and "apply_to_stack" not in branch, branch
 
 
 def test_the_resync_precedes_the_restart_in_the_revert_path():
     body = _body()
     revert = body.index("copy_tree(&backup_dir")
     resync = body.index("sync_public_view()", revert)
-    restart = body.index("restart_each(&to_restart", revert)
+    restart = body.index("apply_to_stack(&plan", revert)
     assert revert < resync < restart, "restore, then re-sync pki/public/, then restart"
 
 
