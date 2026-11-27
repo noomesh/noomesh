@@ -146,9 +146,10 @@ type GPUBackend struct {
 }
 
 // GPUBackendContainers lists the agent's own backend containers that request
-// a GPU, stopped ones included. Only containers the agent manages (the
-// `noo-<backend>` name convention backendKeyFromName enforces) are returned:
-// anything else on the host is foreign and is never touched.
+// a GPU, stopped ones included. Only a container whose name is EXACTLY one of
+// the agent's backend containers (backendNames, derived from backendSpecs) is
+// returned: anything else on the host, a look-alike or another instance's
+// `noo-<instance>-<backend>` included, is foreign and is never touched.
 func (c *Client) GPUBackendContainers(ctx context.Context) ([]GPUBackend, error) {
 	if c == nil || c.docker == nil {
 		return nil, fmt.Errorf("docker unavailable")

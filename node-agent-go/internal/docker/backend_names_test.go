@@ -84,3 +84,19 @@ func TestStunnelBackendKeyIsExact(t *testing.T) {
 		}
 	}
 }
+
+// The agent is one host process with no container-prefix setting: it creates,
+// dials and reports the fixed `noo-<backend>` names only. A named instance's
+// compose backends (`noo-<instance>-<backend>`) are not its backends, and the
+// name alone cannot tell an instance from an unrelated container (`noo-rhaddon-
+// ollama` has the same shape), so no `noo-<x>-<backend>` form is accepted.
+func TestNamedInstanceBackendsAreNotTheAgentsBackends(t *testing.T) {
+	for _, name := range []string{
+		"noo-galaxy-vllm", "noo-galaxy-ollama", "noo-galaxy-llamacpp",
+		"noo-galaxy-reranker", "noo-galaxy-vllm-secondary", "noo-rhaddon-ollama",
+	} {
+		if got := backendKeyFromName(name); got != "" {
+			t.Errorf("%q must not be a backend, got %q", name, got)
+		}
+	}
+}

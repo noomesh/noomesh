@@ -88,7 +88,10 @@ MCP door, the model cache — is already bound by anything that is not a
 running container of this instance. The error names the ports; fix by
 stopping the other service or giving this instance a different
 `NOO_PORT_OFFSET`. `:8081` is deliberately not checked (the host-native
-node agent owns it). `stop`, `status` and `logs` never refuse.
+node agent owns it). That agent is one per host and recognises only the
+backend containers it names itself (`noo-vllm`, `noo-ollama`, ...), by exact
+name: a named instance's compose backends (`noo-galaxy-vllm`) are not its
+backends, so it neither reports nor manages them. `stop`, `status` and `logs` never refuse.
 
 ### Drive an instance from anywhere
 
