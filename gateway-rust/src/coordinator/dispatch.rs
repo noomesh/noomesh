@@ -570,10 +570,9 @@ pub async fn try_dispatch<S: TurnSink>(
     // before the turn ends (tab closed, client gone, revoke) or the deadline
     // passes, the guard tells the node's harness to stop it. Disarmed when
     // the node refuses, has no responder, or ends the turn itself.
-    let mut cancel = turn_cancel::CancelGuard::new(turn_id, {
+    let mut cancel = turn_cancel::guard_for(turn_id, &node, {
         let nats = state.nats.clone();
-        let subject = harness_run_subject(&node);
-        move |payload| turn_cancel::publish_detached(nats, subject, payload)
+        move |subject, payload| turn_cancel::publish_detached(nats, subject, payload)
     });
     let ack = tokio::time::timeout(
         ACK_TIMEOUT,
@@ -623,9 +622,7 @@ pub async fn try_dispatch<S: TurnSink>(
     let terminal = relay_turn(events, sink, deadline).await;
     // A terminal event (result or error) means the node's turn is over. No
     // terminal means the deadline passed: the guard stays armed and stops it.
-    if terminal.is_some() {
-        cancel.disarm();
-    }
+    turn_cancel::disarm_on_terminal(&mut cancel, terminal.as_ref());
     // Whatever the turn's tools did NOT do, the channel pipeline reads
     // from THIS task's locals after we return: replay the remote record.
     origin.gated_record().replay();

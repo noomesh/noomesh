@@ -575,21 +575,16 @@ pub async fn run() -> Result<()> {
             _ = stop.changed() => { stopping = true; break }
             m = turns.next() => match m { Some(m) => m, None => break },
         };
-        let req: coordinator::TurnRequest = match turn_cancel::parse_inbound(&msg.payload) {
-            turn_cancel::Inbound::Turn(r) => *r,
-            // The gateway abandoned a turn: stop the one it names, if it is
-            // still here. The permit and the registry entry go with the
-            // aborted task, the same drop a normal finish takes.
-            turn_cancel::Inbound::Cancel(id) => {
-                if running_turns.cancel(&id) {
-                    tracing::info!(turn = %id, "harness: the gateway abandoned this turn; cancelled and its slot released");
-                }
+        let req: coordinator::TurnRequest = match turn_cancel::handle_inbound(&running_turns, &msg.payload) {
+            turn_cancel::Handled::Turn(r) => *r,
+            // The gateway abandoned a turn and it was still here: it is being
+            // stopped (a driver turn kills its CLI group and cleans up, then
+            // its slot is released the way a finished turn's is).
+            turn_cancel::Handled::Cancelled(id) => {
+                tracing::info!(turn = %id, "harness: the gateway abandoned this turn; cancelling it and releasing its slot");
                 continue;
             }
-            turn_cancel::Inbound::Unreadable(e) => {
-                tracing::warn!(error = %e, "harness: unreadable turn request");
-                continue;
-            }
+            turn_cancel::Handled::Ignored => continue,
         };
         if !crate::harness::egress_selftest::serving() {
             // Fail closed: the hold's latest check is not held. Busy: the gateway
@@ -619,7 +614,7 @@ pub async fn run() -> Result<()> {
         let pinned = pinned.clone();
         let node = node.clone();
         let driver = driver.clone();
-        turn_cancel::spawn_tracked(&running_turns, req.turn_id.clone(), permit, async move {
+        turn_cancel::spawn_tracked(&running_turns, req.turn_id.clone(), driver.is_some(), permit, async move {
             // Our OWN node id on the subject — the grant is written against it.
             let sink = NatsTurnSink::new(nats.clone(), &node, &req.conversation_id);
             let outcome = match driver.as_deref() {

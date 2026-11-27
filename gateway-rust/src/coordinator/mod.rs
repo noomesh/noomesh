@@ -42,8 +42,8 @@ pub(crate) mod responses_wire;
 mod runtime;
 mod session;
 mod summary;
-pub(crate) mod turn_cancel;
 pub(crate) mod thinking;
+pub(crate) mod turn_cancel;
 
 // Public API — preserves the pre-split `crate::coordinator::X` paths.
 // (`allow(unused_imports)`: some re-exports are reachable-but-unreferenced

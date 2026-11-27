@@ -132,14 +132,30 @@ one plain message, no reply expected, on the turn's own subject
 ```
 
 A harness keeps its running turns by `turn_id`. On a cancel for a turn it
-holds it aborts that turn's task (the model request and any vendor CLI
-child are dropped with it), which releases the turn's concurrency slot the
-same way a finished turn does, and logs one line. A `turn_id` it does not
-hold (the turn already ended, a second cancel, another node's turn) is
-ignored. A cancel names exactly one turn; the id is random per dispatch and
-is only ever sent on that node's `harness.run.<node>` subject, which only
-the gateway publishes to. A turn that ends with a result or an error is
-never cancelled afterwards.
+holds:
+
+- a turn run by a vendor CLI (the driver) is signalled. The harness kills
+  the CLI's whole process group (the CLI and every tool subprocess it
+  started, by the same kill the turn deadline uses), then runs the turn's
+  usual end-of-turn cleanup: the minted door key is revoked, the key file,
+  system prompt and per-turn workspace are removed, the usage the turn
+  already consumed is reported, and the wire translator is shut down. The
+  turn saves no answer and sends no result. If the turn has not ended 15 s
+  after the signal it is aborted outright;
+- a turn run by the harness's own loop is aborted at once, which drops its
+  model request so the backend stops.
+
+Either way the turn's concurrency slot is released the way a finished
+turn's is, and one line is logged. A `turn_id` it does not hold (the turn
+already ended, a second cancel, another node's turn) is ignored. A cancel
+names exactly one turn; the id is random per dispatch and is only ever sent
+on that node's `harness.run.<node>` subject, which only the gateway
+publishes to. A turn that ends with a result or an error is never cancelled
+afterwards.
+
+A cancel is a plain publish with no retry. One sent while the harness is
+restarting or draining (it has dropped its subscription) is missed, and
+the turn then runs to its deadline, as it did before this existed.
 
 Mixed versions need no setting and no new bus grant: the cancel rides the
 subject every harness already subscribes to and the gateway already
