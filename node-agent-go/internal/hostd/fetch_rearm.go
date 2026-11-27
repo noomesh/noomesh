@@ -82,22 +82,47 @@ const (
 	fetchJobSpawnRefused                       // loaded, not running, spawn refused
 )
 
-var (
-	fetchStateRe  = regexp.MustCompile(`(?m)^\s*state = (.+?)\s*$`)
-	fetchPIDRe    = regexp.MustCompile(`(?m)^\s*pid = \d+`)
-	fetchStatusRe = regexp.MustCompile(`(?m)^\s*(last exit (?:code|status)|reason) = (.*?)\s*$`)
-	fetchExit78Re = regexp.MustCompile(`^78\b`)
-)
+var fetchExit78Re = regexp.MustCompile(`^78\b`)
+
+// fetchTopFields returns the `key = value` lines that belong to the job
+// itself: the ones directly inside the outer `system/<label> = {` block, not
+// those of a nested block (the coalitions carry their own `state = active`,
+// after the job's own state, and `arguments`/`environment` are blocks too).
+// The first occurrence of a key wins. Nesting is tracked by braces, so the
+// result does not depend on which `state =` line comes first.
+func fetchTopFields(out string) map[string]string {
+	fields := map[string]string{}
+	depth := 0
+	for _, raw := range strings.Split(out, "\n") {
+		l := strings.TrimSpace(raw)
+		switch {
+		case l == "}":
+			depth--
+		case strings.HasSuffix(l, "{"):
+			depth++
+		case depth == 1:
+			if k, v, ok := strings.Cut(l, " = "); ok {
+				if _, seen := fields[k]; !seen {
+					fields[k] = strings.TrimSpace(v)
+				}
+			}
+		}
+	}
+	return fields
+}
 
 // parseFetchJob classifies `launchctl print system/<label>` (exit status and
 // stdout). Pure and strict: only the specific "not found" signal (exit 113 or
-// launchd's own words) is NotLoaded; only `state = running` is Running; only
-// the exact idle states ("not running", "waiting") with no `pid = ` line are
-// Idle or SpawnRefused; everything else (another state such as "spawn
-// scheduled", a pid with an idle state, a failing print, no state line,
-// garbage) is Unknown, and Unknown means leave the job alone. Refused is read
-// only from the job's own `last exit code|status =` and `reason =` lines:
-// exit 78, or "LWCR" / "spawn failed".
+// launchd's own words) is NotLoaded; only the job's own `state = running` is
+// Running; only the exact idle states ("not running", "waiting") with no
+// job-level `pid = ` line are Idle or SpawnRefused; everything else (another
+// state such as "spawn scheduled", a pid with an idle state, a failing print,
+// no state line, garbage) is Unknown, and Unknown means leave the job alone.
+// Refused is read only from the job's own lines: `last exit code|status = 78`
+// (real output: "78: EX_CONFIG"), or "needs LWCR update" on `properties =` /
+// `reason =` (real: `properties = runatload | inferred program | needs LWCR
+// update | managed LWCR | has LWCR`). "has LWCR" / "managed LWCR" alone do not
+// count: a healthy re-bootstrapped job may carry them.
 func parseFetchJob(rc int, out string) fetchJobStatus {
 	if rc != 0 {
 		if rc == 113 || strings.Contains(strings.ToLower(out), "could not find service") {
@@ -105,19 +130,24 @@ func parseFetchJob(rc int, out string) fetchJobStatus {
 		}
 		return fetchJobUnknown
 	}
-	m := fetchStateRe.FindStringSubmatch(out)
-	if m == nil {
+	f := fetchTopFields(out)
+	state, ok := f["state"]
+	if !ok {
 		return fetchJobUnknown
 	}
-	if m[1] == "running" {
+	if _, pid := f["pid"]; state == "running" {
 		return fetchJobRunning
-	}
-	if (m[1] != "not running" && m[1] != "waiting") || fetchPIDRe.MatchString(out) {
+	} else if (state != "not running" && state != "waiting") || pid {
 		return fetchJobUnknown
 	}
-	for _, l := range fetchStatusRe.FindAllStringSubmatch(out, -1) {
-		v := strings.ToLower(l[2])
-		if fetchExit78Re.MatchString(v) || strings.Contains(v, "lwcr") || strings.Contains(v, "spawn failed") {
+	for _, k := range []string{"last exit code", "last exit status"} {
+		v := strings.ToLower(f[k])
+		if fetchExit78Re.MatchString(v) || strings.Contains(v, "spawn failed") {
+			return fetchJobSpawnRefused
+		}
+	}
+	for _, k := range []string{"properties", "reason"} {
+		if strings.Contains(strings.ToLower(f[k]), "needs lwcr update") {
 			return fetchJobSpawnRefused
 		}
 	}
