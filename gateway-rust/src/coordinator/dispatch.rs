@@ -32,6 +32,7 @@ use crate::auth::Role;
 use crate::state::AppState;
 use crate::websocket::{legacy_turn_subject, relay_turn, turn_subject, TurnSink, HARNESS_RESULT_EVENT};
 
+use super::turn_cancel;
 use super::CoordinatorResult;
 
 /// One turn, as handed to a harness.
@@ -54,6 +55,11 @@ pub struct TurnRequest {
     pub stream: bool,
     /// The rail credential for this turn.
     pub token: String,
+    /// One random id per dispatch, so the gateway can tell the harness to
+    /// stop THIS turn if it abandons it (`turn_cancel`). Absent from an
+    /// older gateway's request: the turn then cannot be cancelled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
 }
 
 /// The subject a node's harness takes turns on.
@@ -546,6 +552,7 @@ pub async fn try_dispatch<S: TurnSink>(
     let scoped = state.nats.subscribe(turn_subject(&node, conversation_id)).await?;
     let legacy = state.nats.subscribe(legacy_turn_subject(conversation_id)).await?;
     let events = futures::stream::select(scoped, legacy);
+    let turn_id = turn_cancel::new_turn_id();
     let req = TurnRequest {
         conversation_id: conversation_id.to_string(),
         prompt: prompt.to_string(),
@@ -557,7 +564,17 @@ pub async fn try_dispatch<S: TurnSink>(
         role_prompt: role_prompt.map(str::to_string),
         stream,
         token,
+        turn_id: Some(turn_id.clone()),
     };
+    // From here the node may be running the turn. If this future is dropped
+    // before the turn ends (tab closed, client gone, revoke) or the deadline
+    // passes, the guard tells the node's harness to stop it. Disarmed when
+    // the node refuses, has no responder, or ends the turn itself.
+    let mut cancel = turn_cancel::CancelGuard::new(turn_id, {
+        let nats = state.nats.clone();
+        let subject = harness_run_subject(&node);
+        move |payload| turn_cancel::publish_detached(nats, subject, payload)
+    });
     let ack = tokio::time::timeout(
         ACK_TIMEOUT,
         // The ack comes back on THIS node's reply prefix, which its principal
@@ -570,12 +587,14 @@ pub async fn try_dispatch<S: TurnSink>(
             let body: Value = serde_json::from_slice(&msg.payload).unwrap_or(Value::Null);
             if body.get("ack").and_then(|a| a.as_bool()) != Some(true) {
                 tracing::warn!(node = %node, reply = %body, "harness dispatch: refused; running in process");
+                cancel.disarm();
                 return Ok(None);
             }
             ack_kind(&body)
         }
         Ok(Err(e)) => {
             tracing::info!(node = %node, error = %e, "harness dispatch: no responder; running in process");
+            cancel.disarm();
             return Ok(None);
         }
         Err(_) => {
@@ -602,6 +621,11 @@ pub async fn try_dispatch<S: TurnSink>(
     let _guard = crate::routes::communication::register_origin(conversation_id, origin.clone());
 
     let terminal = relay_turn(events, sink, deadline).await;
+    // A terminal event (result or error) means the node's turn is over. No
+    // terminal means the deadline passed: the guard stays armed and stops it.
+    if terminal.is_some() {
+        cancel.disarm();
+    }
     // Whatever the turn's tools did NOT do, the channel pipeline reads
     // from THIS task's locals after we return: replay the remote record.
     origin.gated_record().replay();
@@ -654,6 +678,7 @@ mod tests {
             role_prompt: None,
             stream: true,
             token: "t".into(),
+            turn_id: Some("t-1".into()),
         };
         let back: TurnRequest = serde_json::from_value(serde_json::to_value(&req).unwrap()).unwrap();
         assert_eq!(back, req);

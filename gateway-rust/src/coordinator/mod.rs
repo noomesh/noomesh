@@ -42,6 +42,7 @@ pub(crate) mod responses_wire;
 mod runtime;
 mod session;
 mod summary;
+pub(crate) mod turn_cancel;
 pub(crate) mod thinking;
 
 // Public API — preserves the pre-split `crate::coordinator::X` paths.

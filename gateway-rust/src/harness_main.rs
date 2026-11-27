@@ -44,7 +44,7 @@ use anyhow::{anyhow, Result};
 use futures::StreamExt;
 use serde_json::json;
 
-use crate::coordinator::{self, ResolvedBackend, RemoteRuntime};
+use crate::coordinator::{self, turn_cancel, ResolvedBackend, RemoteRuntime};
 use crate::websocket::{NatsTurnSink, TurnSink, HARNESS_RESULT_EVENT};
 
 fn env(name: &str) -> Result<String> {
@@ -446,6 +446,9 @@ pub async fn run() -> Result<()> {
     let mut tasks = nats.queue_subscribe(crate::tasks::task_subject(&node), "harness".to_string()).await?;
     let drain = drain_bound(&|k| std::env::var(k).ok());
     let mut stop = stop_signal();
+    // The turns this harness runs, by the gateway's turn id, so a cancel can
+    // abort the one it names.
+    let running_turns: Arc<turn_cancel::TurnRegistry> = Arc::default();
     // The tasks this harness holds right now, by id: a hand-back of a task
     // that is already here (the gateway hands a node's unfinished tasks
     // back on every `harness.ready`) is acknowledged as taken and never
@@ -572,9 +575,18 @@ pub async fn run() -> Result<()> {
             _ = stop.changed() => { stopping = true; break }
             m = turns.next() => match m { Some(m) => m, None => break },
         };
-        let req: coordinator::TurnRequest = match serde_json::from_slice(&msg.payload) {
-            Ok(r) => r,
-            Err(e) => {
+        let req: coordinator::TurnRequest = match turn_cancel::parse_inbound(&msg.payload) {
+            turn_cancel::Inbound::Turn(r) => *r,
+            // The gateway abandoned a turn: stop the one it names, if it is
+            // still here. The permit and the registry entry go with the
+            // aborted task, the same drop a normal finish takes.
+            turn_cancel::Inbound::Cancel(id) => {
+                if running_turns.cancel(&id) {
+                    tracing::info!(turn = %id, "harness: the gateway abandoned this turn; cancelled and its slot released");
+                }
+                continue;
+            }
+            turn_cancel::Inbound::Unreadable(e) => {
                 tracing::warn!(error = %e, "harness: unreadable turn request");
                 continue;
             }
@@ -607,8 +619,7 @@ pub async fn run() -> Result<()> {
         let pinned = pinned.clone();
         let node = node.clone();
         let driver = driver.clone();
-        tokio::spawn(async move {
-            let _permit = permit;
+        turn_cancel::spawn_tracked(&running_turns, req.turn_id.clone(), permit, async move {
             // Our OWN node id on the subject — the grant is written against it.
             let sink = NatsTurnSink::new(nats.clone(), &node, &req.conversation_id);
             let outcome = match driver.as_deref() {
