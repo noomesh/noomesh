@@ -120,9 +120,10 @@ empty root or `/` (it says so and writes nothing).
   filesystem alone. If the data root is on that recorded filesystem the launch
   proceeds and the data root is written back into the record; any other
   filesystem is refused exactly as before.
-- A record with neither a `data_root` nor a filesystem identity is damaged. The
+  The operator sees `NOTE: .noo-data-root-id named this filesystem but no data root; wrote the data root back (...)`.
+- A record with neither a `data_root` nor a non-empty filesystem identity (an empty `uuid=`, or an empty source and target) is damaged. The
   refusal says so (not "the data disk is not mounted") and names the repair:
-  check `findmnt -T <data root>`, then `NOO_DATA_ROOT_RERECORD=1 noo stack start`.
+  the launch is refused (at boot, the boot guard also stops the running containers and records them on its `stopped:` line); check `findmnt -T <data root>`, then `NOO_DATA_ROOT_RERECORD=1 noo stack start`.
 
 ### Nodes: the agent's own check (0.6.30)
 
