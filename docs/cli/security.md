@@ -223,11 +223,12 @@ CA**: it scans, confirms, backs up to `pki/.rotate-backup-<ts>`,
 re-issues every leaf expiring within `--warn-days`, delivers node certs
 on the pull rail (no fallback — a node with no birth cert on record must
 be re-enrolled first), restarts the consumers with the
-gateway last, and waits for them (up to 150 s). **Docker's own health
+gateway last (a model backend's TLS door sidecar, `stunnel-<backend>`,
+is instead reloaded in place; see below), and waits for them (up to 150 s). **Docker's own health
 decides whether a rotation is reverted; the CLI's HTTP probe of `/health`
 can confirm a rotation but never condemns one on a failure of its own side.**
 
-- **Healthy** (done): every restarted container is running and, for those
+- **Healthy** (done): every restarted or reloaded container is running and, for those
   with a healthcheck, Docker reports `healthy` (not merely "not
   unhealthy": a container still `starting` is not healthy yet), or
   `/health` answered 200 with no container not running or `unhealthy`.
@@ -272,9 +273,31 @@ so. Nothing expiring prints `no certificates expiring within N days`.
 Leaf rotation also runs unattended from the `cert_auto_rotate` autonomy
 location when enabled.
 
+**Door sidecars reload in place.** Only the sidecar of a model backend
+door (`stunnel-ollama`, `-ollama-embed`, `-ollama-embed-cpu`, `-llamacpp`,
+`-vllm`, `-vllm-secondary`) mounts the certificate; the backend shares its
+network namespace. Once every file is written, rotate-all sends the sidecar
+`SIGHUP` (`docker kill -s HUP`), which makes stunnel re-read the certificate,
+key and CA while the container, its open connections and the backend keep
+running; the backend is not restarted, so a model server that takes minutes
+to load stays up. The reload is then verified from the sidecar's log since
+the signal: `Configuration successful` means it serves the new certificate;
+`Failed to reload` (stunnel keeps serving the OLD certificate) or no outcome
+within 10 s means it is unconfirmed, and the command falls back to restarting
+the backend and then the sidecar, and says so. Everything else (gateway,
+NATS, Postgres, the node agent, replicas) restarts as before. The health gate
+judges the reloaded sidecars with the restarted containers and the revert
+rules are unchanged; a revert restores the files and reloads (verified, with
+the same fallback) instead of restarting. `pki rotate-ca` still restarts its
+consumers. A change to a sidecar's configuration (not its certificate) still
+needs a restart.
+
 `--no-reload` does not restart anything; it prints what to run **on
-this machine**, from the same list the reload path restarts (the running
-containers that present a rotated certificate, plus running replicas),
+this machine**, from the same list the reload path acts on (the running
+containers that present a rotated certificate, plus running replicas).
+For door sidecars it prints `docker kill -s HUP <sidecar>` and
+`docker logs --since 1m <sidecar>` (look for `Configuration successful`; the
+backend needs no restart), then, gateway last,
 gateway last: `sudo systemctl restart noo-node-agent` (plain `systemctl`
 as root) when this machine's node certificate rotated and the agent is a
 host unit; one `noo stack restart <service>...` for the named services
@@ -288,10 +311,13 @@ restart is needed. The agent's copy under `/etc/noo/pki` is synced only by
 the reload path. Certificates rotated for other machines are not restarted
 from here: they are delivered over the pull rail in the delivery step
 (skipped, and said so, with `--no-deliver`). `--json` adds
-`would_restart` (the ordered container names) and `docker_answered` on
-that path. On the reload path Docker must answer before anything restarts
+`would_restart` (the ordered container names), `would_reload` (the door
+sidecars to reload in place) and `docker_answered` on that path. On the reload path Docker must answer before anything restarts
 (otherwise the command stops, rotated and unrestarted, and prints the
-follow-up), and `--json` adds `restarted`. In reload mode Docker is asked right after the
+follow-up), and `--json` adds `restarted` (every container restarted, door fallbacks
+included), `reloaded_in_place` (door sidecars reloaded and verified) and
+`reload_fallbacks` (doors whose reload was not verified, with the outcome);
+`reloaded` lists everything that took the new certificate. In reload mode Docker is asked right after the
 confirmation, before the backup: if it cannot be asked, nothing is changed.
 
 ### Rotate the CA and re-key the fleet
