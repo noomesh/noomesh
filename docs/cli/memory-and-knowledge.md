@@ -304,7 +304,7 @@ see [add-ons.md](../getting-started/add-ons.md).
 | `noo rag status` | — | Show PageIndex RAG table counts and embedder state |
 | `noo rag docs` | `[--untagged] [--audience <role>] [--match <glob>] [--title <text>] [--limit <n>]` | List every document with audience, source and who ingested it; filterable |
 | `noo rag doc` | `<id>` | Show one document: audience, provenance, audience history and a text preview |
-| `noo rag page` | `<doc-id> <page-no>` | Print the full text of one page of a document (pages count from 1; cut at 20000 characters) |
+| `noo rag page` | `<doc-id> <page-no>` | Print one page of a document in full (pages count from 1; cut at 20000 characters) |
 | `noo rag ingest` | `<path>... [-t\|--title <title>] [-r\|--recursive] [--audience <role>[,<role>]]` | Ingest text files or a folder; audience defaults to you, share with team:<name> or company |
 | `noo rag scan` | `[-s\|--source folders\|drives\|all]` | Run one synchronous ingest scan of watched folders and/or drives |
 | `noo rag deduplicate` | `[--dry-run] [-y\|--yes]` | Delete duplicate (doc_id, page_no) pages, keeping the newest; confirms first |
