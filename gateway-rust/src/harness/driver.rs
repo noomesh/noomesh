@@ -914,14 +914,7 @@ pub async fn spawn_cli_as(argv: &[String], env: &BTreeMap<String, String>, cwd: 
             } else {
                 timed_out = true;
             }
-            #[cfg(unix)]
-            if let Some(pid) = child.id() {
-                // SAFETY: kill(2) on the process group this child leads.
-                unsafe {
-                    libc::kill(-(pid as i32), libc::SIGKILL);
-                }
-            }
-            let _ = child.start_kill();
+            kill_process_group(&mut child);
             break child.wait().await.ok();
         }
         let next = stall
@@ -931,7 +924,15 @@ pub async fn spawn_cli_as(argv: &[String], env: &BTreeMap<String, String>, cwd: 
             .unwrap_or(Duration::MAX)
             .min(deadline.saturating_duration_since(now))
             .clamp(Duration::from_millis(50), Duration::from_millis(500));
-        tokio::time::sleep(next).await;
+        tokio::select! {
+            _ = tokio::time::sleep(next) => {}
+            // The gateway abandoned this turn: the same group kill as the
+            // timeout. The caller's end-of-turn cleanup then runs as usual.
+            _ = crate::coordinator::turn_cancel::cancelled() => {
+                kill_process_group(&mut child);
+                break child.wait().await.ok();
+            }
+        }
     };
     // A grandchild that left the group could hold a pipe open: bound the wait.
     let collect = |h: Option<tokio::task::JoinHandle<Vec<u8>>>| async move {
@@ -950,6 +951,20 @@ pub async fn spawn_cli_as(argv: &[String], env: &BTreeMap<String, String>, cwd: 
         stalled,
         elapsed: started.elapsed(),
     })
+}
+
+/// SIGKILL the CLI's whole process group (it leads one; its tool
+/// subprocesses are in it), then the child itself. The ONE kill: the
+/// timeout, the stall bound and a cancelled turn all come through here.
+fn kill_process_group(child: &mut tokio::process::Child) {
+    #[cfg(unix)]
+    if let Some(pid) = child.id() {
+        // SAFETY: kill(2) on the process group this child leads.
+        unsafe {
+            libc::kill(-(pid as i32), libc::SIGKILL);
+        }
+    }
+    let _ = child.start_kill();
 }
 
 fn resolve_program(prog: &str, path: Option<&str>) -> Option<PathBuf> {
@@ -1096,6 +1111,12 @@ async fn invoke<R: DriverRail>(
     rail.report_usage(&usage, &ctx.pinned.model, &ctx.kind.kind, task_id).await;
     rail.door_key_revoke(&key.key_id).await;
     translator.shutdown().await;
+    if crate::coordinator::turn_cancel::is_cancelled() {
+        // Cleanup above ran in full; usage was reported because the model
+        // calls made before the cancel were real.
+        tracing::info!(kind = %ctx.kind.kind, "harness driver: turn cancelled by the gateway; CLI group killed, key revoked, files removed");
+        bail!("the turn was cancelled by the gateway");
+    }
     if let Ok(o) = &run {
         tracing::info!(kind = %ctx.kind.kind, task = task_id.unwrap_or(""), code = ?o.code, timed_out = o.timed_out, stalled_after_secs = o.stalled.map(|d| d.as_secs()), secs = o.elapsed.as_secs(), "harness driver: CLI finished");
     }
@@ -2327,5 +2348,82 @@ mod tests {
         assert_eq!(c.keys_revoked.len(), 1);
         assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0, "the turn's workspace is removed");
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A cancelled driver turn kills the CLI's whole process group (a
+    /// grandchild included), then runs the usual end-of-turn cleanup: the
+    /// door key is revoked, usage reported, the key file and workspace gone,
+    /// and the slot released. Usage IS reported: the model calls made before
+    /// the cancel were real.
+    #[tokio::test]
+    async fn a_cancelled_turn_kills_the_cli_group_and_cleans_up() {
+        use crate::coordinator::turn_cancel::{cancel_message, handle_inbound, spawn_tracked, Handled, TurnRegistry};
+        fn alive(pid: i32) -> bool {
+            match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+                Ok(s) => s.rsplit(')').next().and_then(|r| r.trim().chars().next()).is_some_and(|st| st != 'Z'),
+                Err(_) => false,
+            }
+        }
+        async fn pid_of(path: &Path) -> i32 {
+            for _ in 0..100 {
+                if let Some(p) = std::fs::read_to_string(path).ok().and_then(|t| t.trim().parse().ok()) {
+                    return p;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            panic!("{} never appeared", path.display());
+        }
+        let root = scratch("cancel");
+        let pids = scratch("cancel-pids");
+        let script = format!("echo $$ > {d}/sh; sleep 300 & echo $! > {d}/child; wait", d = pids.display());
+        let k = kind(&["sh", "-c", &script], &[], &[]);
+        let ctx = Arc::new(ctx_for(&k, &root, "60"));
+        let rail = Arc::new(FakeRail::new());
+        let req = TurnRequest {
+            conversation_id: "c-cancel".into(),
+            prompt: "hi".into(),
+            channel: "dashboard".into(),
+            max_iterations: 5,
+            model: None,
+            user: "alice".into(),
+            enable_thinking: false,
+            role_prompt: None,
+            stream: false,
+            token: TURN_TOKEN.into(),
+            turn_id: Some("turn-cancel".into()),
+        };
+        let reg = Arc::new(TurnRegistry::default());
+        let slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let result: Arc<std::sync::Mutex<Option<String>>> = Arc::default();
+        let (c, r, q, out) = (ctx.clone(), rail.clone(), req.clone(), result.clone());
+        let job = spawn_tracked(&reg, req.turn_id.clone(), true, slots.clone().try_acquire_owned().unwrap(), async move {
+            let e = run_turn_on(&c, &*r, &q, &crate::websocket::NullSink).await.err().map(|e| e.to_string());
+            *out.lock().unwrap() = e;
+        });
+        let (sh, grandchild) = (pid_of(&pids.join("sh")).await, pid_of(&pids.join("child")).await);
+        assert!(alive(sh) && alive(grandchild));
+        assert_eq!(handle_inbound(&reg, &cancel_message("turn-cancel")), Handled::Cancelled("turn-cancel".into()));
+        assert!(tokio::time::timeout(Duration::from_secs(10), job).await.expect("the turn ends within the grace").is_ok(), "it ended by itself, not by abort");
+        for _ in 0..100 {
+            if !alive(sh) && !alive(grandchild) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(!alive(sh), "the CLI is dead");
+        assert!(!alive(grandchild), "its tool subprocess in the group is dead too");
+        assert_eq!(result.lock().unwrap().as_deref(), Some("the turn was cancelled by the gateway"));
+        {
+            let c = rail.calls.lock().unwrap();
+            assert_eq!(c.keys_minted, 1);
+            assert_eq!(c.keys_revoked, vec!["key-1".to_string()], "the door key is revoked");
+            assert_eq!(c.usage.len(), 1, "usage is reported");
+            assert!(c.saved.is_empty(), "a cancelled turn saves no answer");
+        }
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0, "the key file and the turn's workspace are removed");
+        assert_eq!(slots.available_permits(), 1, "the slot is released");
+        assert_eq!(reg.running(), 0);
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(pids);
     }
 }
