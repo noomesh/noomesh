@@ -1876,14 +1876,20 @@ agent_protect_apply() {
 # has reads as unknown to `noo cluster verify`. Render what the INSTALLED env
 # calls for, with the same renderer as agent_protect_apply, and say
 # `agent-protect=unchanged:N` ONLY when the installed drop-in is exactly that
-# (bytes, mode 644, owner). Anything else (no systemd, env or drop-in missing
-# or unreadable, a bad value, any difference) says NOTHING: never a claim of
-# a hold that is not proved. It writes no file, installs nothing, never
-# reloads systemd and never asks for a restart.
+# (bytes, mode 644, owner) AND systemd has it loaded: `systemctl show` says
+# the unit needs no daemon-reload and ProtectSystem is what the drop-in sets.
+# Anything else (no systemd or systemctl, env or drop-in missing or unreadable,
+# a bad value, any difference, any other answer) says NOTHING: never a claim
+# of a hold that is not proved. It writes no file, installs nothing, runs no
+# systemctl verb but `show`, and never asks for a restart. A data directory
+# created after the drop-in was rendered makes it differ (a bare path becomes
+# listed with `-` or the reverse), so the tag is then withheld until the next
+# full bundle.
 agent_protect_rereport() {
     [ -d "${AP_SYSTEMD_DIR:-/run/systemd/system}" ] || return 0
     [ -f "$1" ] && [ -r "$1" ] || return 0
     [ -f "$AGENT_DROPIN" ] && [ -r "$AGENT_DROPIN" ] || return 0
+    command -v systemctl >/dev/null 2>&1 || return 0
     ap_collect "$1" || return 0
     if [ -n "$AP_STAT_OWNER" ]; then
         [ "$(stat -c '%a %U:%G' "$AGENT_DROPIN" 2>/dev/null)" = "644 $AP_STAT_OWNER" ] || return 0
@@ -1891,8 +1897,11 @@ agent_protect_rereport() {
     _ar_want="$(ap_render; printf x)" || return 0
     _ar_have="$(cat -- "$AGENT_DROPIN"; printf x)" || return 0
     [ "$_ar_want" = "$_ar_have" ] || return 0
+    _ar_ps="$(printf '%s\n' "$_ar_want" | sed -n 's/^ProtectSystem=//p' | head -1)"
+    [ -n "$_ar_ps" ] || return 0
+    [ "$(systemctl show -p NeedDaemonReload --value noo-node-agent.service 2>/dev/null)" = "no" ] || return 0
+    [ "$(systemctl show -p ProtectSystem --value noo-node-agent.service 2>/dev/null)" = "$_ar_ps" ] || return 0
     _ar_cnt="$(printf '%s\n' "$AP_PATHS" | grep -c .)" || return 0
-    [ "$_ar_cnt" -ge 1 ] || return 0
     applied="$applied agent-protect=unchanged:$_ar_cnt"
 }
 
@@ -2960,11 +2969,6 @@ if [ -f "$WORK/files/agent-env" ]; then
     # The agent's filesystem hold, from the same staged env (agent_protect).
     # A change sets need_restart: the one agent restart at the end.
     agent_protect_apply "$WORK/files/agent-env"
-else
-    # No agent-env in this bundle: re-state the hold the node already has, from
-    # the installed env and drop-in, so this apply's report still carries it.
-    # Report only; nothing is written (agent_protect_rereport).
-    agent_protect_rereport /etc/noo-node-agent.env
 fi
 
 # nats-creds — the node's OWN NATS credential. Applied AFTER
@@ -3508,6 +3512,11 @@ if [ -f /etc/noo-harness.env ] && id -u noo-harness >/dev/null 2>&1; then
 fi
 # Every install above succeeded: raise the release floor to what §1c verified.
 release_floor_write "$RELEASE_OK_VERSION" "$RELEASE_OK_STACK"
+# A bundle with no agent-env: say whether the node's installed protection
+# matches its agent config and is loaded (agent_protect_rereport). Here, after
+# the empty-bundle refusal, so the tag is only ever added to a bundle that
+# applied something. Report only; nothing is written.
+[ -f "$WORK/files/agent-env" ] || agent_protect_rereport /etc/noo-node-agent.env
 logger -t noo-apply "applied:$applied (node=$NODE_ID, verified-by=$SIG_VIA)" 2>/dev/null || true
 echo "applied:$applied"
 echo "verified-by: $SIG_VIA"

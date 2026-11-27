@@ -170,7 +170,7 @@ pub(crate) const ROWS: &[Row] = &[
         name: "agent protect",
         scope: Scope::Controller,
         verdicts: &[Verdict::Warn, Verdict::Fail],
-        meaning: "Whether each Linux node agent runs held to only the filesystem paths it must write. A certificate or single-purpose push to a node (`noo security pki push-nodes`, a key or CA rotation) re-states the hold the node already has when the installed drop-in still matches its agent config; when it cannot confirm that, the hold reads unknown until the node's next full provision.",
+        meaning: "Whether each Linux node agent runs held to only the filesystem paths it must write. A certificate or single-purpose push to a node (`noo security pki push-nodes`, a key or CA rotation) reports the hold when the installed protection matches the node's agent config and is loaded; when it cannot confirm that (a data directory created after install can change what the config calls for), the hold reads unknown until the node's next full provision.",
         clears: "Run `noo cluster provision <node> --wait`; for a refused setting fix that setting on the node, then provision.",
         findings: &[],
         shown_as: None,
