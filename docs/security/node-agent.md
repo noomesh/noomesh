@@ -452,6 +452,8 @@ hairpin that is not the node's own, and every call to it then fails TLS.
   <address>:<port> answered with <node>'s own key: nothing to re-issue"
   (exit 0; `--json`: `changed: false, proven: true`); not proven, it fails
   like any other proof, and nothing is issued.
+  The proof pins the node's key and chain; it does not check the server name
+  on the wire.
 - **FAIL with no remedy:** that address is also another node's (registered,
   dialled, or in its leaf). Investigate first; `push-nodes` refuses it too,
   unless `--allow-shared-address <addr>` names it.

@@ -4428,9 +4428,10 @@ fn pki_push_node_prove(g: &Globals, node: &str, days: i64, yes: bool) -> Result<
     let covered = ClusterCa::cert_names(&leaf).is_ok_and(|n| n.ips.iter().chain(n.dns.iter()).any(|a| a.eq_ignore_ascii_case(&host)));
     if !g.json {
         println!("{}", ui::phase("plan"));
-        let then = match covered {
-            true => format!("its certificate already covers {host}, so nothing is re-issued"),
-            false => format!("then re-issue its certificate for {host}"),
+        let then = if covered {
+            format!("its certificate already covers {host}, so nothing is re-issued")
+        } else {
+            format!("then re-issue its certificate for {host}")
         };
         println!("  {}", ui::muted(&format!("prove that {host}:{port} is served by {node}; {then}")));
     }
