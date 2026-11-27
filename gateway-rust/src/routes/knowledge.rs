@@ -1032,19 +1032,21 @@ fn cap_page_text(text: &str) -> (String, bool) {
 /// no count. Only once the document is readable does an absent page say how
 /// many pages exist.
 fn doc_page_outcome(id: &str, page_no: i32, row: Option<scope::DocPageRow>) -> Result<Value, AppError> {
-    let Some((title, page_count, found, text)) = row else {
+    let Some((title, page_count, found, text, real_len)) = row else {
         return Err(AppError::NotFound(format!("no document {id}")));
     };
     if !found {
         return Err(AppError::NotFound(format!("document {id} has no page {page_no} (it has {page_count} pages, numbered from 1)")));
     }
     let (text, truncated) = cap_page_text(text.as_deref().unwrap_or(""));
+    // The page's real length; the shown length only when the query gave none.
+    let char_count = real_len.map_or_else(|| text.chars().count(), i64::from);
     Ok(json!({
         "doc_id": id,
         "page_no": page_no,
         "page_count": page_count,
         "title": title,
-        "char_count": text.chars().count(),
+        "char_count": char_count,
         "text": text,
         "truncated": truncated,
     }))
@@ -1055,7 +1057,8 @@ fn doc_page_outcome(id: &str, page_no: i32, row: Option<scope::DocPageRow>) -> R
 /// `GET /api/v1/docs/{doc_id}` applies: a missing document and one the caller
 /// may not read both answer `404 no document <id>`; the page count is told
 /// only for a readable document whose page is out of range (also 404). A page
-/// is cut to 20,000 characters with `truncated: true`. `400` when the
+/// is cut to 20,000 characters with `truncated: true`; `char_count` is the page's real length.
+/// A page outside 1..=page_count is a 404 that names the page count. `400` when the
 /// document id is not a UUID or the page is not a whole number.
 async fn doc_page(
     State(state): State<Arc<AppState>>,
@@ -2733,7 +2736,7 @@ mod doc_page_tests {
     use super::*;
 
     fn found(text: Option<&str>) -> Option<scope::DocPageRow> {
-        Some((Some("T".into()), 5, true, text.map(String::from)))
+        Some((Some("T".into()), 5, true, text.map(String::from), text.map(|t| t.chars().count() as i32)))
     }
 
     #[test]
@@ -2767,7 +2770,16 @@ mod doc_page_tests {
     fn a_long_page_says_it_was_truncated() {
         let v = doc_page_outcome("id1", 1, found(Some(&"x".repeat(DOC_PAGE_MAX_CHARS + 1)))).unwrap();
         assert_eq!(v["truncated"], true);
-        assert_eq!(v["char_count"], DOC_PAGE_MAX_CHARS);
+        assert_eq!(v["char_count"], DOC_PAGE_MAX_CHARS + 1, "char_count is the real length, not the shown one");
+        assert_eq!(v["text"].as_str().unwrap().chars().count(), DOC_PAGE_MAX_CHARS);
+    }
+
+    #[test]
+    fn char_count_is_the_real_length_when_the_query_reports_one() {
+        let row = Some((Some("T".into()), 2, true, Some("x".repeat(DOC_PAGE_MAX_CHARS + 1)), Some(123_456)));
+        let v = doc_page_outcome("id1", 1, row).unwrap();
+        assert_eq!(v["char_count"], 123_456);
+        assert_eq!(v["truncated"], true);
     }
 
     #[test]
@@ -2776,7 +2788,7 @@ mod doc_page_tests {
         let Err(AppError::NotFound(m)) = doc_page_outcome("id1", 1, None) else { panic!("expected 404") };
         assert_eq!(m, "no document id1");
         assert!(!m.contains('5'), "no count without visibility");
-        let Err(AppError::NotFound(m)) = doc_page_outcome("id1", 9, Some((None, 5, false, None))) else {
+        let Err(AppError::NotFound(m)) = doc_page_outcome("id1", 9, Some((None, 5, false, None, None))) else {
             panic!("expected 404")
         };
         assert!(m.contains("no page 9") && m.contains("5 pages"), "{m}");

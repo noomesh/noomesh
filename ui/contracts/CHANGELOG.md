@@ -6,8 +6,8 @@ Added `GET /api/v1/docs/{doc_id}/pages/{page_no}`: the full text of one page
 of a document (numbered from 1), read-only, with the same audience as
 `GET /api/v1/docs/{doc_id}`. Answers `{doc_id, page_no, page_count, title,
 char_count, text, truncated}`; text over 20,000 characters is cut and
-`truncated` is true. 404 for a missing or unreadable document (identical) and,
-for a readable one, for a page out of range; 400 for a non-UUID id or a
+`truncated` is true and `char_count` stays the page's real length. 404 for a missing or unreadable document (identical) and,
+for a readable one, for a page outside 1..page_count (0 and negatives included, the 404 names the page count); 400 for a non-UUID id or a
 non-numeric page. Additive.
 
 ## 2026-11-23

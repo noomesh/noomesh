@@ -403,8 +403,9 @@ pub async fn doc_detail(
 
 /// One page of one document for `GET /api/v1/docs/{doc_id}/pages/{page_no}`:
 /// the document's title, how many pages it has, whether the asked-for page
-/// exists, and its text (cut by the query to the caller's `max_chars`).
-pub type DocPageRow = (Option<String>, i64, bool, Option<String>);
+/// exists, its text (cut by the query to the caller's `max_chars`) and the
+/// page's real length in characters.
+pub type DocPageRow = (Option<String>, i64, bool, Option<String>, Option<i32>);
 
 /// One page of a document, if the caller may read the DOCUMENT.
 ///
@@ -428,7 +429,8 @@ pub async fn doc_page(
         "SELECT d.title, \
                 (SELECT COUNT(*) FROM pages c WHERE c.doc_id = d.doc_id), \
                 (pg.page_id IS NOT NULL), \
-                left(pg.text, $4) \
+                left(pg.text, $4), \
+                length(pg.text) \
          FROM docs d LEFT JOIN pages pg ON pg.doc_id = d.doc_id AND pg.page_no = $3 \
          WHERE d.doc_id = $2::uuid AND ($1::text[] IS NULL OR {DOC_VISIBLE}) \
          ORDER BY pg.page_id LIMIT 1"
@@ -694,7 +696,7 @@ mod tests {
         for w in ["UPDATE ", "INSERT ", "DELETE ", "UPSERT", "TRUNCATE"] {
             assert!(!up.contains(w), "doc_page is read-only, found {w}");
         }
-        assert!(page.contains("LIMIT 1") && page.contains("left(pg.text, $4)"), "one row, text cut in the query");
+        assert!(page.contains("LIMIT 1") && page.contains("left(pg.text, $4)") && page.contains("length(pg.text)"), "one row, text cut in the query");
     }
 
     #[test]
@@ -1192,8 +1194,10 @@ mod tests {
         // ── one page ────────────────────────────────────────────────────
         let p = doc_page(db, None, &x1, 2, 100).await.unwrap().expect("admin reads a page of x1");
         assert!(p.2 && p.1 == 4 && p.3.as_deref().is_some_and(|t| t.starts_with("P2")), "page 2 of 4");
+        assert!(p.4.is_some_and(|n| n > 0), "the real length comes back");
         let cut = doc_page(db, None, &x1, 1, 1).await.unwrap().unwrap();
         assert_eq!(cut.3.as_deref().map(|t| t.chars().count()), Some(1), "the query cuts the text");
+        assert!(cut.4.is_some_and(|n| n > 1), "the real length is not the cut length");
         let beyond = doc_page(db, None, &x1, 9, 100).await.unwrap().expect("readable, page absent");
         assert!(!beyond.2 && beyond.1 == 4 && beyond.3.is_none(), "out of range keeps the count");
         assert!(!doc_page(db, None, &x1, 0, 100).await.unwrap().unwrap().2, "pages are numbered from 1");
