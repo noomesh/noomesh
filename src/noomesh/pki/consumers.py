@@ -24,11 +24,7 @@ def cert_consumers(name: str, role: str, local_hostname: str = "") -> list[str]:
         return ["noo-gateway"]
     if role == "service":
         svc = Path(name).parent.name
-        out = [f"noo-{svc}", f"noo-stunnel-{svc}"]
-        if svc == "vllm":
-            # vllm-secondary's door mounts the same services/vllm leaf.
-            out += ["noo-stunnel-vllm-secondary", "noo-vllm-secondary"]
-        return out
+        return [f"noo-{svc}", f"noo-stunnel-{svc}"]
     if role == "node" and local_hostname and Path(name).parent.name == local_hostname:
         return ["noo-node-agent"]
     return []
