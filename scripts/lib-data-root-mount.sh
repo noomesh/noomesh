@@ -184,10 +184,19 @@ _drm_evaluate() {
     fi
 
     local bad=""
-    if [ -z "$rec_root" ] && [ -z "$kind" ]; then
-        # Neither a data root nor a filesystem identity: nothing to compare.
+    local _ident=""
+    if [ -z "$rec_root" ]; then
+        # A record without a data root is healed only on a NON-EMPTY recorded
+        # identity: "" == "" must never count as a match.
+        case "$kind" in
+            uuid) _ident="$(_drm_get uuid "$rec")" ;;
+            mount) _ident="$(_drm_get source "$rec")$(_drm_get target "$rec")" ;;
+        esac
+    fi
+    if [ -z "$rec_root" ] && [ -z "$_ident" ]; then
+        # No data root and no usable filesystem identity: nothing to compare.
         DRM_VERDICT="refuse"; DRM_KIND="damaged"
-        DRM_MSG="the record $rec holds no data_root and no filesystem identity (the file is damaged), so the filesystem under $root cannot be compared with anything"
+        DRM_MSG="the record $rec holds no data_root and no usable filesystem identity (the file is damaged), so the filesystem under $root cannot be compared with anything"
         _drm_explain "$root" "$rec" "$rec_root" "$kind"; return 0
     fi
     # A record that names a filesystem but not the data root it was taken for
@@ -314,7 +323,7 @@ _drm_refusal_text() {
     if [ "$DRM_KIND" = "damaged" ]; then
         printf '%s\n' \
 "REFUSED: not starting — $DRM_MSG." \
-"  Nothing was created, changed or started. This is a damaged record, not a missing disk." \
+"  The launch was refused and the data root was not created or modified. This is a damaged record, not a missing disk." \
 "  repair:   NOO_DATA_ROOT_RERECORD=1 noo stack start   (re-records the filesystem under ${root:-<data root>} once; check it first with: findmnt -T ${root:-<data root>})"
         return 0
     fi

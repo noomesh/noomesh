@@ -653,3 +653,45 @@ def test_the_not_mounted_wording_is_not_used_when_the_record_itself_names_the_ro
     run(rig, FAKE_UUID="rootfs-9999", FAKE_SOURCE="/dev/sda2", FAKE_TARGET="/")
     r = run(rig, FAKE_UUID="rootfs-8888", FAKE_SOURCE="/dev/sda2", FAKE_TARGET="/")
     assert "RC=1" in r.stdout and "the data disk is not mounted" not in r.stderr
+
+
+def test_an_empty_identity_is_never_healed_as_a_match(rig):
+    # uuid kind, empty uuid, filesystem without a UUID: "" == "" must not pass
+    run(rig, FAKE_UUID="")
+    f = rig["install"] / ".noo-data-root-id"
+    f.write_text("".join(ln for ln in f.read_text().splitlines(True) if not ln.startswith("data_root=")))
+    f.write_text(f.read_text().replace("id_kind=mount", "id_kind=uuid"))
+    before = f.read_text()
+    r = run(rig, FAKE_UUID="", FAKE_EUID="0", FAKE_USER="root")
+    assert "RC=1" in r.stdout and "damaged" in r.stderr, r.stderr
+    assert "NOO_DATA_ROOT_RERECORD=1 noo stack start" in r.stderr
+    assert f.read_text() == before
+
+
+def test_a_mount_kind_record_without_data_root_heals_only_on_the_same_mount(rig):
+    run(rig, FAKE_UUID="")
+    f = rig["install"] / ".noo-data-root-id"
+    assert "id_kind=mount" in record(rig)
+    f.write_text("".join(ln for ln in f.read_text().splitlines(True) if not ln.startswith("data_root=")))
+    other = run(rig, FAKE_UUID="", FAKE_SOURCE="/dev/other")
+    assert "RC=1" in other.stdout and "not on its recorded filesystem" in other.stderr, other.stderr
+    ok = run(rig, FAKE_UUID="")
+    assert "RC=0" in ok.stdout, ok.stderr
+    assert f"data_root={rig['data']}\n" in record(rig)
+
+
+def test_a_mount_kind_record_with_empty_source_and_target_is_damaged(rig):
+    f = rig["install"] / ".noo-data-root-id"
+    f.write_text("id_kind=mount\nsource=\ntarget=\nfstype=\n")
+    r = run(rig, FAKE_UUID="")
+    assert "RC=1" in r.stdout and "damaged" in r.stderr, r.stderr
+
+
+def test_a_normal_record_is_not_rewritten_on_launch(rig):
+    run(rig)
+    f = rig["install"] / ".noo-data-root-id"
+    before = f.read_bytes()
+    mt = f.stat().st_mtime_ns
+    r = run(rig)
+    assert "RC=0" in r.stdout and "wrote the data root back" not in r.stderr
+    assert f.read_bytes() == before and f.stat().st_mtime_ns == mt
