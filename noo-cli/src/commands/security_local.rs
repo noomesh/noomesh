@@ -7759,6 +7759,17 @@ none /mnt/c/deeper tmpfs rw 0 0
         assert!(r.find("let since").unwrap() < r.find("\"kill\"").unwrap());
     }
 
+    /// `pki_rotate_ca` orders its restart list sidecar-first after the
+    /// gateway-last sort and before the restart loop.
+    #[test]
+    fn rotate_ca_orders_door_pairs_sidecar_first() {
+        let body = crate::test_src::fn_body(include_str!("security_local.rs"), "pub fn pki_rotate_ca(");
+        let sort = body.find("to_restart.sort_by_key(|c| c.ends_with(\"-gateway\"))").expect("no gateway-last sort");
+        let order = body.find("sidecar_first(&to_restart").expect("rotate-ca does not order door pairs");
+        let each = body.find("for c in &to_restart {").expect("no restart loop");
+        assert!(sort < order && order < each, "sort, then sidecar_first, then restart");
+    }
+
     #[test]
     fn apply_consumers_never_restarts_a_reloaded_doors_backend() {
         let plan = rotation_plan(&names(&["noo-ollama", "noo-stunnel-ollama", "noo-vllm", "noo-stunnel-vllm", "noo-nats", "noo-gateway"]), "noo");
