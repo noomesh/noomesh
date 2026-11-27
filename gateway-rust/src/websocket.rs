@@ -616,20 +616,38 @@ pub enum TurnEnd<T> {
 /// read until the turn ends, which is the backpressure it had before.
 pub const TURN_HELD_MAX: usize = 16;
 
+/// Most bytes held while a turn runs, on top of [`TURN_HELD_MAX`]. Once the
+/// held messages total this much the socket is not read until the turn ends,
+/// so a `Close` queued behind them is seen when the turn ends.
+pub const TURN_HELD_MAX_BYTES: usize = 1024 * 1024;
+
+/// What the console loop does with an inbound message that arrives mid-turn.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Inbound {
+    /// The client is leaving.
+    Close,
+    /// Nothing to act on (a ping or pong): discarded, as the main loop does.
+    Ignore,
+    /// A message the main loop acts on after the turn; its size in bytes.
+    Hold(usize),
+}
+
 /// [`run_turn_with_keepalive`] that also reads the client while the turn
 /// runs. Dropping `run` cancels the turn (its model call included), which is
 /// what the HTTP chat route's `AbortTurnOnDrop` does to its spawned task: a
 /// client that has left must not keep a model slot busy. A message that is
-/// not a close (`is_close`) is pushed on `held`, in arrival order, for the
-/// caller to handle after the turn; none is dropped. `keepalive` returns
-/// false when the frame could not be queued (the client is gone).
+/// not a close is classified by `classify`: a ping or pong is discarded (it
+/// would only fill the hold), anything else is pushed on `held`, in arrival
+/// order, for the caller to handle after the turn; none of those is dropped.
+/// `keepalive` returns false when the frame could not be queued (the client
+/// is gone).
 pub async fn run_turn_watching_client<T, K, KF, S, M, E>(
     run: impl std::future::Future<Output = T>,
     revoked: impl std::future::Future<Output = ()>,
     every: std::time::Duration,
     mut keepalive: K,
     inbound: &mut S,
-    is_close: impl Fn(&M) -> bool,
+    classify: impl Fn(&M) -> Inbound,
     held: &mut std::collections::VecDeque<M>,
 ) -> TurnEnd<T>
 where
@@ -642,6 +660,7 @@ where
     tokio::pin!(revoked);
     let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut held_bytes = 0usize;
     loop {
         // Same order as `run_turn_with_keepalive`: revoke, then the turn's
         // result, then the client, then the tick.
@@ -649,9 +668,15 @@ where
             biased;
             _ = &mut revoked => return TurnEnd::Revoked,
             r = &mut run => return TurnEnd::Done(r),
-            item = inbound.next(), if held.len() < TURN_HELD_MAX => match item {
-                Some(Ok(m)) if is_close(&m) => return TurnEnd::ClientGone,
-                Some(Ok(m)) => held.push_back(m),
+            item = inbound.next(), if held.len() < TURN_HELD_MAX && held_bytes < TURN_HELD_MAX_BYTES => match item {
+                Some(Ok(m)) => match classify(&m) {
+                    Inbound::Close => return TurnEnd::ClientGone,
+                    Inbound::Ignore => {}
+                    Inbound::Hold(n) => {
+                        held_bytes = held_bytes.saturating_add(n);
+                        held.push_back(m);
+                    }
+                },
                 Some(Err(_)) | None => return TurnEnd::ClientGone,
             },
             _ = tick.tick() => {
@@ -787,8 +812,15 @@ mod session_tests {
         1
     }
 
-    fn is_close(m: &&'static str) -> bool {
-        *m == "close"
+    /// "close" closes, "ping" is ignored, anything else is held (1 byte each
+    /// unless it is "big", which is the byte cap).
+    fn is_close(m: &&'static str) -> Inbound {
+        match *m {
+            "close" => Inbound::Close,
+            "ping" => Inbound::Ignore,
+            "big" => Inbound::Hold(TURN_HELD_MAX_BYTES),
+            _ => Inbound::Hold(1),
+        }
     }
 
     /// One inbound item after `secs`, then a socket that stays open.
@@ -953,6 +985,49 @@ mod session_tests {
         assert_eq!(end, TurnEnd::Done(5));
         assert_eq!(held.len(), TURN_HELD_MAX);
         assert_eq!(inbound.next().await, Some(Ok("m")), "the rest was not read");
+    }
+
+    /// Pings are discarded, not held: they cannot fill the hold, so a later
+    /// close is still seen.
+    #[tokio::test(start_paused = true)]
+    async fn pings_mid_turn_are_not_held_and_a_later_close_is_seen() {
+        use futures::StreamExt;
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut items: Vec<Item> = vec![Ok("ping"); 100];
+        items.push(Ok("close"));
+        let mut inbound = futures::stream::iter(items).chain(futures::stream::pending());
+        let mut held = std::collections::VecDeque::new();
+        let end = run_turn_watching_client(
+            hour_long_turn(DropFlag(dropped.clone())),
+            std::future::pending(),
+            TURN_KEEPALIVE,
+            || async { true },
+            &mut inbound,
+            is_close,
+            &mut held,
+        )
+        .await;
+        assert_eq!(end, TurnEnd::ClientGone);
+        assert!(held.is_empty(), "pings were held");
+        assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    /// Past the byte cap the socket is not read: the close behind it is seen
+    /// when the turn ends.
+    #[tokio::test(start_paused = true)]
+    async fn the_hold_is_bounded_by_bytes_too() {
+        use futures::StreamExt;
+        let run = async {
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            5
+        };
+        let items: Vec<Item> = vec![Ok("big"), Ok("after"), Ok("close")];
+        let mut inbound = futures::stream::iter(items).chain(futures::stream::pending());
+        let mut held = std::collections::VecDeque::new();
+        let end = run_turn_watching_client(run, std::future::pending(), TURN_KEEPALIVE, || async { true }, &mut inbound, is_close, &mut held).await;
+        assert_eq!(end, TurnEnd::Done(5), "the close behind a full hold was not read");
+        assert_eq!(held.into_iter().collect::<Vec<_>>(), vec!["big"]);
+        assert_eq!(inbound.next().await, Some(Ok("after")));
     }
 
     #[tokio::test(start_paused = true)]

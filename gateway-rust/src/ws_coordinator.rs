@@ -266,7 +266,12 @@ async fn handle_chat(
                         async move { w.send_keepalive().await }
                     },
                     &mut stream,
-                    |m: &Message| matches!(m, Message::Close(_)),
+                    |m: &Message| match m {
+                        Message::Close(_) => crate::websocket::Inbound::Close,
+                        Message::Ping(_) | Message::Pong(_) => crate::websocket::Inbound::Ignore,
+                        Message::Text(t) => crate::websocket::Inbound::Hold(t.len()),
+                        Message::Binary(b) => crate::websocket::Inbound::Hold(b.len()),
+                    },
                     &mut held,
                 )
                 .await
@@ -392,6 +397,15 @@ mod tests {
         assert!(!body.contains("run_turn_with_keepalive("), "the turn is back to ignoring its client");
         assert!(body.contains("TurnEnd::ClientGone"), "a client that left is no longer handled apart");
         assert!(body.contains("held.pop_front()"), "messages held mid-turn are no longer handled first");
+        // Held messages are drained BEFORE the socket is read again.
+        let pop = body.find("held.pop_front()").unwrap();
+        let read = body.find("stream.next()").expect("the loop no longer reads the socket");
+        assert!(pop < read, "the socket is read before the held messages are drained");
+        // A client that left gets no further frame: its arm breaks before any send.
+        let gone = body.find("TurnEnd::ClientGone =>").expect("no ClientGone arm");
+        let arm = &body[gone..];
+        let brk = arm.find("break;").expect("the ClientGone arm no longer ends the loop");
+        assert!(!arm[..brk].contains("send"), "the ClientGone arm writes to a dead socket");
     }
 
     #[test]
