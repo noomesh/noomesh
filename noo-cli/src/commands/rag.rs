@@ -504,7 +504,7 @@ fn render_page(d: &serde_json::Value) -> String {
         d["char_count"],
     );
     if d["truncated"].as_bool().unwrap_or(false) {
-        head.push_str(" (truncated)");
+        head.push_str(" (showing first 20,000)");
     }
     let text = d["text"].as_str().unwrap_or("");
     format!("{head}\n\n{text}{}", if text.ends_with('\n') { "" } else { "\n" })
@@ -523,6 +523,11 @@ pub fn rag_page(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         return Ok(0);
     }
     print!("{}", render_page(&body));
+    let (n, count) = (body["page_no"].as_i64().unwrap_or(0), body["page_count"].as_i64().unwrap_or(0));
+    if (1..count).contains(&n) {
+        let next = format!("noo rag page {id} {}", n + 1);
+        ui::guide(&[(next.as_str(), "the next page")]);
+    }
     Ok(0)
 }
 
@@ -1877,9 +1882,9 @@ mod tests {
         let d = serde_json::json!({"doc_id": "x", "page_no": 2, "page_count": 7, "title": "Q3 budget",
             "char_count": 11, "text": "hello\nworld", "truncated": false});
         assert_eq!(render_page(&d), "Q3 budget · page 2 of 7 · 11 chars\n\nhello\nworld\n");
-        let cut = serde_json::json!({"page_no": 1, "page_count": 1, "title": null, "char_count": 20000,
+        let cut = serde_json::json!({"page_no": 1, "page_count": 1, "title": null, "char_count": 50000,
             "text": "abc\n", "truncated": true});
-        assert_eq!(render_page(&cut), "(untitled) · page 1 of 1 · 20000 chars (truncated)\n\nabc\n");
+        assert_eq!(render_page(&cut), "(untitled) · page 1 of 1 · 50000 chars (showing first 20,000)\n\nabc\n");
     }
 
     #[test]

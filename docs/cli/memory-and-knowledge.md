@@ -66,7 +66,7 @@ and ends with `269 documents · 0 untagged · admin 150 · user:* 80 · company
 together. `rag doc` shows one document's provenance, audience history and a
 text preview; `rag page <id> <n>` prints the full text of one page
 (pages count from 1; a page over 20,000 characters is cut and marked
-`(truncated)`). `retag` refuses an empty audience; the full workflow is under
+`(showing first 20,000)`). `retag` refuses an empty audience; the full workflow is under
 "Reviewing document audiences" in [config](../reference/config.md).
 
 ### Hold documents out of embedding and search
