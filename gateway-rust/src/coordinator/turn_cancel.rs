@@ -37,6 +37,7 @@
 
 use std::collections::HashMap;
 use std::future::Future;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use serde_json::{json, Value};
@@ -197,6 +198,8 @@ pub fn disarm_on_terminal<F: FnOnce(Vec<u8>), T>(guard: &mut CancelGuard<F>, ter
 #[derive(Default)]
 pub struct TurnRegistry {
     turns: Mutex<HashMap<String, Running>>,
+    /// Turns the backstop had to stop before they finished their cleanup.
+    forced: AtomicUsize,
 }
 
 struct Running {
@@ -221,22 +224,40 @@ impl TurnRegistry {
 
     /// Stop the turn named `id`. `false` when no such turn is running (it
     /// finished, was already cancelled, or never was here): nothing happens.
-    pub fn cancel(&self, id: &str) -> bool {
+    pub fn cancel(self: &Arc<Self>, id: &str) -> bool {
         let Some(running) = self.lock().remove(id) else { return false };
         if running.graceful {
             let _ = running.signal.send(true);
             let abort = running.abort.clone();
+            let this = Arc::clone(self);
+            let turn = id.to_string();
             let backstop = async move {
                 tokio::time::sleep(CANCEL_GRACE).await;
-                abort.abort();
+                this.force_stop(&abort, &turn);
             };
             if !spawn_detached(backstop) {
-                running.abort.abort();
+                self.force_stop(&running.abort, id);
             }
         } else {
             running.abort.abort();
         }
         true
+    }
+
+    /// The backstop: abort a turn that did not end within the grace. A turn
+    /// that ended by itself is left alone and logs nothing.
+    fn force_stop(&self, abort: &AbortHandle, turn: &str) {
+        if abort.is_finished() {
+            return;
+        }
+        self.forced.fetch_add(1, Ordering::Relaxed);
+        tracing::error!(turn = %turn, grace_secs = CANCEL_GRACE.as_secs(), "harness: a cancelled turn was force-stopped before its cleanup completed");
+        abort.abort();
+    }
+
+    /// How many cancelled turns the backstop force-stopped.
+    pub fn forced_stops(&self) -> usize {
+        self.forced.load(Ordering::Relaxed)
     }
 
     pub fn running(&self) -> usize {
@@ -257,7 +278,7 @@ pub enum Handled {
 
 /// The harness's one entry for an inbound payload: a cancel is applied to
 /// `registry`, a turn is handed back, anything else is logged and ignored.
-pub fn handle_inbound(registry: &TurnRegistry, payload: &[u8]) -> Handled {
+pub fn handle_inbound(registry: &Arc<TurnRegistry>, payload: &[u8]) -> Handled {
     match parse_inbound(payload) {
         Inbound::Turn(r) => Handled::Turn(r),
         Inbound::Cancel(id) => {
@@ -575,6 +596,8 @@ mod tests {
         assert!(reg.cancel("turn-a"));
         assert!(!settle(job).await, "it ended by itself, not by abort");
         assert!(*cleaned.lock().unwrap(), "its cleanup ran to the end");
+        tokio::time::advance(CANCEL_GRACE + Duration::from_secs(1)).await;
+        assert_eq!(reg.forced_stops(), 0, "a turn that ended itself is never force-stopped or logged");
         assert_eq!((slots.available_permits(), reg.running()), (1, 0));
     }
 
@@ -591,6 +614,7 @@ mod tests {
         assert!(!job.is_finished(), "still within the grace");
         assert!(settle(job).await, "aborted at the grace");
         assert_eq!(slots.available_permits(), 1);
+        assert_eq!(reg.forced_stops(), 1, "the force-stop error path is taken exactly once");
     }
 
     #[tokio::test]
