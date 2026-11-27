@@ -20,6 +20,131 @@ const (
 	fetchPrintLWCR    = "system/net.noomesh.fetch = {\n\tstate = not running\n\tlast exit status = (never exited)\n\treason = needs LWCR update\n}\n"
 )
 
+// fetchSampleA is a real `launchctl print` of the idle fetch job after a good
+// run, captured on a Mac node (user anonymised). Note the nested coalition
+// `state = active` lines AFTER the job's own `state = not running`, and no
+// `pid =` and no `reason =` line.
+const fetchSampleA = `system/net.noomesh.fetch = {
+	active count = 0
+	path = /Library/LaunchDaemons/net.noomesh.fetch.plist
+	type = LaunchDaemon
+	state = not running
+
+	program = /usr/local/bin/noo
+	arguments = {
+		/usr/local/bin/noo
+		node
+		fetch
+		--user
+		nodeuser
+	}
+
+	stdout path = /Library/Logs/noomesh-fetch.log
+	stderr path = /Library/Logs/noomesh-fetch.log
+	default environment = {
+		PATH => /usr/bin:/bin:/usr/sbin:/sbin
+	}
+
+	environment = {
+		OSLogRateLimit => 64
+		XPC_SERVICE_NAME => net.noomesh.fetch
+	}
+
+	domain = system
+	minimum runtime = 10
+	exit timeout = 5
+	runs = 2993
+	last exit code = 0
+
+	resource coalition = {
+		ID = 4361
+		type = resource
+		state = active
+		active count = 1
+		name = net.noomesh.fetch
+	}
+
+	jetsam coalition = {
+		ID = 4362
+		type = jetsam
+		state = active
+		active count = 1
+		name = net.noomesh.fetch
+	}
+
+	spawn type = daemon (3)
+	jetsam priority = 40
+	jetsam memory limit (active) = (unlimited)
+	jetsam memory limit (inactive) = (unlimited)
+	jetsamproperties category = daemon
+	jetsam thread limit = 32
+	cpumon = default
+	run interval = 60 seconds
+
+	properties = runatload | inferred program
+}
+`
+
+// Sample B: the refused state seen on the same Mac. Only these two lines of it
+// were kept; the rest has sample A's shape, so the fixture is sample A with the
+// two lines substituted.
+const (
+	fetchSampleBExit  = "\tlast exit code = 78: EX_CONFIG"
+	fetchSampleBProps = "\tproperties = runatload | inferred program | needs LWCR update | managed LWCR | has LWCR"
+)
+
+func fetchSampleRefused() string {
+	o := strings.Replace(fetchSampleA, "\tlast exit code = 0", fetchSampleBExit, 1)
+	return strings.Replace(o, "\tproperties = runatload | inferred program", fetchSampleBProps, 1)
+}
+
+// fetchSampleRunning is CONSTRUCTED from sample A, not captured: the job's own
+// state flipped and a pid line added.
+func fetchSampleRunning() string {
+	o := strings.Replace(fetchSampleA, "\tstate = not running", "\tstate = running\n\tpid = 4321", 1)
+	return strings.Replace(o, "\tlast exit code = 0", "\tlast exit code = (never exited)", 1)
+}
+
+func TestParseFetchJobAgainstRealSamples(t *testing.T) {
+	if got := parseFetchJob(0, fetchSampleA); got != fetchJobIdle {
+		t.Fatalf("sample A: %v", got)
+	}
+	if got := parseFetchJob(0, fetchSampleRefused()); got != fetchJobSpawnRefused {
+		t.Fatalf("sample A with B's lines: %v", got)
+	}
+	// Each marker alone is enough.
+	if got := parseFetchJob(0, strings.Replace(fetchSampleA, "\tlast exit code = 0", fetchSampleBExit, 1)); got != fetchJobSpawnRefused {
+		t.Fatalf("exit 78 alone: %v", got)
+	}
+	if got := parseFetchJob(0, strings.Replace(fetchSampleA, "\tproperties = runatload | inferred program", fetchSampleBProps, 1)); got != fetchJobSpawnRefused {
+		t.Fatalf("needs LWCR update alone: %v", got)
+	}
+	// A healthy re-bootstrapped job may carry LWCR properties: not refused.
+	healthy := strings.Replace(fetchSampleA, "\tproperties = runatload | inferred program", "\tproperties = runatload | inferred program | managed LWCR | has LWCR", 1)
+	if got := parseFetchJob(0, healthy); got != fetchJobIdle {
+		t.Fatalf("has/managed LWCR without needs-update: %v", got)
+	}
+	// Constructed, not captured.
+	if got := parseFetchJob(0, fetchSampleRunning()); got != fetchJobRunning {
+		t.Fatalf("running: %v", got)
+	}
+	// The nested coalition state lines come BEFORE the job's own: the job's own
+	// state is still the one at the job's level, not the first in the text.
+	nestedFirst := "system/net.noomesh.fetch = {\n\tresource coalition = {\n\t\tstate = active\n\t}\n\tstate = not running\n\tlast exit code = 0\n}\n"
+	if got := parseFetchJob(0, nestedFirst); got != fetchJobIdle {
+		t.Fatalf("nested active first: %v", got)
+	}
+	runningNestedFirst := "system/net.noomesh.fetch = {\n\tresource coalition = {\n\t\tstate = active\n\t\tpid = 7\n\t}\n\tstate = running\n\tpid = 4321\n}\n"
+	if got := parseFetchJob(0, runningNestedFirst); got != fetchJobRunning {
+		t.Fatalf("running with nested first: %v", got)
+	}
+	// A nested pid or nested exit 78 is not the job's own.
+	nestedPid := "system/x = {\n\tstate = not running\n\tsub = {\n\t\tpid = 9\n\t\tlast exit code = 78\n\t}\n\tlast exit code = 0\n}\n"
+	if got := parseFetchJob(0, nestedPid); got != fetchJobIdle {
+		t.Fatalf("nested pid/78: %v", got)
+	}
+}
+
 func TestParseFetchJob(t *testing.T) {
 	for _, c := range []struct {
 		name string
@@ -46,7 +171,11 @@ func TestParseFetchJob(t *testing.T) {
 		{"a nonzero exit that is not 78", 0, "\tstate = not running\n\tlast exit code = 1\n", fetchJobIdle},
 		{"exit 780 is not 78", 0, "\tstate = not running\n\tlast exit code = 780\n", fetchJobIdle},
 	} {
-		if got := parseFetchJob(c.rc, c.out); got != c.want {
+		out := c.out
+		if c.rc == 0 && !strings.Contains(out, "system/") {
+			out = "system/net.noomesh.fetch = {\n" + out + "}\n" // the fragments below are the job's own lines
+		}
+		if got := parseFetchJob(c.rc, out); got != c.want {
 			t.Errorf("%s: got %v want %v", c.name, got, c.want)
 		}
 	}
