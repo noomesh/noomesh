@@ -1382,7 +1382,14 @@ pub(crate) fn cert_consumers(name: &str, role: &str, local_hostname: &str) -> Ve
         "gateway" => vec!["noo-gateway".into()],
         "service" => {
             let svc = parent_name(name);
-            vec![format!("noo-{svc}"), format!("noo-stunnel-{svc}")]
+            let mut v = vec![format!("noo-{svc}"), format!("noo-stunnel-{svc}")];
+            // vllm-secondary's door mounts the SAME `services/vllm` leaf
+            // (its compose service has no leaf of its own).
+            if svc == "vllm" {
+                v.push("noo-stunnel-vllm-secondary".to_string());
+                v.push("noo-vllm-secondary".to_string());
+            }
+            v
         }
         "node" if !local_hostname.is_empty() && parent_name(name) == local_hostname => {
             vec!["noo-node-agent".into()]
@@ -1488,11 +1495,13 @@ pub(crate) const DOOR_SIDECARS: [&str; 6] = ["llamacpp", "ollama", "ollama-embed
 const DOCKER_RELOAD_SECS: u64 = 15;
 /// How long to wait for stunnel to log the outcome of a reload.
 const RELOAD_WAIT: Duration = Duration::from_secs(10);
-/// stunnel 5.x lines that end a reload. NEED CONFIRMING against a real
-/// sidecar log. A failed reload keeps the old configuration and keeps
-/// serving the OLD certificate.
+/// stunnel 5.x lines that end a reload. Observed on stunnel 5.75: the
+/// success line "Configuration successful" and that a broken pair logs
+/// "Failed to reload" while the old configuration (and certificate) keeps
+/// serving. "configuration failed" is the assumed primary failure marker (it
+/// also catches "Reloading configuration failed"); not yet seen verbatim.
 const RELOAD_OK_MARKER: &str = "configuration successful";
-const RELOAD_FAILED_MARKERS: [&str; 3] = ["failed to reload", "configuration failed", "reload failed"];
+const RELOAD_FAILED_MARKERS: [&str; 2] = ["configuration failed", "failed to reload"];
 
 /// The door a container is the sidecar of (`noo-stunnel-ollama` is `ollama`),
 /// when it is one of [`DOOR_SIDECARS`].
@@ -1560,13 +1569,41 @@ fn parse_reload_log(log: &str) -> ReloadOutcome {
 }
 
 /// The containers to restart for one door after its reload: nothing when it
-/// reloaded; otherwise the backend then the sidecar (the order the consumer
-/// list has always used).
+/// reloaded; otherwise the SIDECAR first, then the backend: the backend
+/// shares the sidecar's network namespace, so restarting the sidecar after
+/// it would leave the backend without networking.
 fn door_fallback(door: &DoorReload, outcome: ReloadOutcome) -> Vec<String> {
     if outcome == ReloadOutcome::Reloaded {
         return Vec::new();
     }
-    door.backend.iter().cloned().chain([door.sidecar.clone()]).collect()
+    std::iter::once(door.sidecar.clone()).chain(door.backend.iter().cloned()).collect()
+}
+
+/// `list` with every door pair (sidecar and backend both present) ordered
+/// sidecar first, backend right after it. The backend shares the sidecar's
+/// network namespace, so a backend restarted BEFORE its sidecar is left with
+/// a dead namespace. Other entries keep their order (the gateway stays last).
+fn sidecar_first(list: &[String], prefix: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for c in list {
+        if out.contains(c) {
+            continue;
+        }
+        let pair = DOOR_SIDECARS.iter().find_map(|d| {
+            let (sidecar, backend) = (format!("{prefix}-stunnel-{d}"), format!("{prefix}-{d}"));
+            (*c == sidecar || *c == backend).then_some((sidecar, backend))
+        });
+        match pair {
+            Some((sidecar, backend)) if list.contains(&sidecar) => {
+                out.push(sidecar);
+                if list.contains(&backend) {
+                    out.push(backend);
+                }
+            }
+            _ => out.push(c.clone()),
+        }
+    }
+    out
 }
 
 /// What [`apply_consumers`] did.
@@ -1605,8 +1642,8 @@ fn apply_consumers(plan: &RotationPlan, mut reload: impl FnMut(&str) -> ReloadOu
 fn reload_outcome_line(sidecar: &str, outcome: ReloadOutcome) -> String {
     match outcome {
         ReloadOutcome::Reloaded => format!("{sidecar} reloaded in place (stunnel logged a successful reload); its backend was not restarted"),
-        ReloadOutcome::Failed => format!("{sidecar} did NOT reload (stunnel kept the old certificate): restarted it and its backend instead"),
-        ReloadOutcome::Unknown => format!("{sidecar} showed no reload outcome within {} s, so the new certificate is unconfirmed: restarted it and its backend instead", RELOAD_WAIT.as_secs()),
+        ReloadOutcome::Failed => format!("{sidecar} did NOT reload (stunnel kept the old certificate): restarted it, then its backend, instead"),
+        ReloadOutcome::Unknown => format!("{sidecar} showed no reload outcome within {} s, so the new certificate is unconfirmed: restarted it, then its backend, instead", RELOAD_WAIT.as_secs()),
     }
 }
 
@@ -3814,6 +3851,7 @@ pub fn pki_rotate_ca(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         }
     }
     to_restart.sort_by_key(|c| c.ends_with("-gateway"));
+    let to_restart = sidecar_first(&to_restart, &crate::envfile::container_prefix());
     for c in &to_restart {
         let _ = Command::new("docker").args(["restart", c]).output();
     }
@@ -5587,7 +5625,7 @@ pub fn pki_rotate_all(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         let restore = copy_back_command(
             &backup_dir.display().to_string(),
             &ca.dir.display().to_string(),
-            &to_restart,
+            &sidecar_first(&to_restart, &crate::envfile::container_prefix()),
             &crate::envfile::instance(),
         );
         if g.json {
@@ -5630,7 +5668,7 @@ pub fn pki_rotate_all(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                 copy_back_command(
                     &backup_dir.display().to_string(),
                     &ca.dir.display().to_string(),
-                    &to_restart,
+                    &sidecar_first(&to_restart, &crate::envfile::container_prefix()),
                     &crate::envfile::instance(),
                 )
             )),
@@ -7661,6 +7699,7 @@ none /mnt/c/deeper tmpfs rw 0 0
         // A failure anywhere wins: never report applied beside a failure line.
         assert_eq!(parse_reload_log(&format!("{LOG_OK}{LOG_FAILED}")), ReloadOutcome::Failed);
         assert_eq!(parse_reload_log("LOG3[ui]: FAILED TO RELOAD"), ReloadOutcome::Failed);
+        assert_eq!(parse_reload_log("LOG3[ui]: Reloading configuration failed"), ReloadOutcome::Failed);
     }
 
     /// reload ok: no backend restart. failed or unknown: the backend then the sidecar.
@@ -7669,10 +7708,55 @@ none /mnt/c/deeper tmpfs rw 0 0
         let door = DoorReload { sidecar: "noo-stunnel-ollama".into(), backend: Some("noo-ollama".into()) };
         assert!(door_fallback(&door, ReloadOutcome::Reloaded).is_empty());
         for bad in [ReloadOutcome::Failed, ReloadOutcome::Unknown] {
-            assert_eq!(door_fallback(&door, bad), names(&["noo-ollama", "noo-stunnel-ollama"]), "{bad:?}");
+            assert_eq!(door_fallback(&door, bad), names(&["noo-stunnel-ollama", "noo-ollama"]), "{bad:?}");
         }
         let alone = DoorReload { sidecar: "noo-stunnel-ollama".into(), backend: None };
         assert_eq!(door_fallback(&alone, ReloadOutcome::Unknown), names(&["noo-stunnel-ollama"]));
+    }
+
+    /// For every door, whichever path restarts the pair, the sidecar goes first.
+    #[test]
+    fn every_door_pair_restarts_sidecar_before_backend() {
+        for door in DOOR_SIDECARS {
+            let (sidecar, backend) = (format!("noo-stunnel-{door}"), format!("noo-{door}"));
+            // fallback and revert fallback
+            let d = DoorReload { sidecar: sidecar.clone(), backend: Some(backend.clone()) };
+            assert_eq!(door_fallback(&d, ReloadOutcome::Failed), vec![sidecar.clone(), backend.clone()], "{door}");
+            // the copy-back list, from the legacy backend-first consumer order
+            let legacy = vec![backend.clone(), sidecar.clone(), "noo-gateway".to_string()];
+            assert_eq!(sidecar_first(&legacy, "noo"), vec![sidecar.clone(), backend.clone(), "noo-gateway".to_string()], "{door}");
+            let cmd = copy_back_command("/b", "/p", &sidecar_first(&legacy, "noo"), "");
+            assert!(cmd.ends_with(&format!("docker restart {sidecar} {backend} noo-gateway")), "{cmd}");
+        }
+        // a backend whose sidecar is not running is untouched; instances work
+        assert_eq!(sidecar_first(&names(&["noo-ollama", "noo-nats"]), "noo"), names(&["noo-ollama", "noo-nats"]));
+        assert_eq!(
+            sidecar_first(&names(&["noo-galaxy-vllm", "noo-galaxy-stunnel-vllm"]), "noo-galaxy"),
+            names(&["noo-galaxy-stunnel-vllm", "noo-galaxy-vllm"])
+        );
+    }
+
+    /// The vllm leaf is mounted by both vllm doors: a vllm rotation reaches the secondary too.
+    #[test]
+    fn a_vllm_rotation_reaches_the_secondary_door() {
+        let c = cert_consumers("services/vllm/service.crt", "service", "host1");
+        assert_eq!(c, names(&["noo-vllm", "noo-stunnel-vllm", "noo-stunnel-vllm-secondary", "noo-vllm-secondary"]));
+        let plan = rotation_plan(&sidecar_first(&c, "noo"), "noo");
+        assert_eq!(plan.reload.len(), 2);
+        assert_eq!(plan.reload[1], DoorReload { sidecar: "noo-stunnel-vllm-secondary".into(), backend: Some("noo-vllm-secondary".into()) });
+        assert!(plan.restart.is_empty());
+        let running = names(&["noo-stunnel-vllm-secondary", "noo-gateway"]);
+        assert_eq!(restart_list(&[("services/vllm/service.crt", "service")], "host1", Some(&running), str::to_string), names(&["noo-stunnel-vllm-secondary"]));
+    }
+
+    #[test]
+    fn the_gate_sees_the_full_list_and_the_log_window_opens_before_the_hup() {
+        let src = include_str!("security_local.rs");
+        let body = crate::test_src::fn_body(src, "pub fn pki_rotate_all(");
+        assert_eq!(body.matches("probe_health_gate(&to_restart, 150)").count(), 2, "both gates judge every consumer, reloaded sidecars and backends included");
+        assert!(!body.contains("probe_health_gate(&plan"));
+        let r = crate::test_src::fn_body(src, "fn reload_door_sidecar(");
+        assert!(r.find("let since").unwrap() < r.find("\"kill\"").unwrap());
     }
 
     #[test]
@@ -7689,8 +7773,8 @@ none /mnt/c/deeper tmpfs rw 0 0
             |c| restarted.push(c.to_string()),
         );
         assert_eq!(hup, names(&["noo-stunnel-ollama", "noo-stunnel-vllm"]));
-        // ollama reloaded: its backend stayed. vllm unverified: backend, sidecar, then the rest, gateway last.
-        assert_eq!(restarted, names(&["noo-vllm", "noo-stunnel-vllm", "noo-nats", "noo-gateway"]));
+        // ollama reloaded: its backend stayed. vllm unverified: sidecar, backend, then the rest, gateway last.
+        assert_eq!(restarted, names(&["noo-stunnel-vllm", "noo-vllm", "noo-nats", "noo-gateway"]));
         assert!(!restarted.contains(&"noo-ollama".to_string()) && !restarted.contains(&"noo-stunnel-ollama".to_string()));
         assert_eq!(done.reloaded, names(&["noo-stunnel-ollama"]));
         assert_eq!(done.restarted, restarted);
@@ -7705,7 +7789,7 @@ none /mnt/c/deeper tmpfs rw 0 0
         assert!(reload_outcome_line("s", ReloadOutcome::Reloaded).contains("not restarted"));
         assert!(reload_outcome_line("s", ReloadOutcome::Failed).contains("did NOT reload"));
         let u = reload_outcome_line("s", ReloadOutcome::Unknown);
-        assert!(u.contains("unconfirmed") && u.contains("restarted it and its backend"), "{u}");
+        assert!(u.contains("unconfirmed") && u.contains("restarted it, then its backend"), "{u}");
     }
 
     #[test]

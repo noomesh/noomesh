@@ -284,7 +284,11 @@ to load stays up. The reload is then verified from the sidecar's log since
 the signal: `Configuration successful` means it serves the new certificate;
 `Failed to reload` (stunnel keeps serving the OLD certificate) or no outcome
 within 10 s means it is unconfirmed, and the command falls back to restarting
-the backend and then the sidecar, and says so. Everything else (gateway,
+the sidecar and then the backend (the backend shares the sidecar's network
+namespace, so it must restart after it), and says so; the copy-back command
+printed on a kept or failed rotation orders a door pair the same way. A
+vllm rotation also reloads `stunnel-vllm-secondary`, which mounts the same
+leaf. Everything else (gateway,
 NATS, Postgres, the node agent, replicas) restarts as before. The health gate
 judges the reloaded sidecars with the restarted containers and the revert
 rules are unchanged; a revert restores the files and reloads (verified, with
