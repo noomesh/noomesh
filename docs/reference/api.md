@@ -598,6 +598,13 @@ receives flat JSON events, each with a `type`:
 {"type": "keepalive"}
 ```
 
+While a turn runs the gateway keeps reading the socket. If the client
+closes it, the connection ends, or a keepalive cannot be sent, the turn is
+stopped there (its model call included, so the node's slot is freed) and
+nothing more is written, as `/api/inference/chat` does when its client
+disconnects. A message the client sends during a turn is held, up to 16, and
+handled in order once the turn ends.
+
 `done` (and the saved assistant message's metadata, and
 `/api/inference`'s `data`) carries `recall` when the turn ran
 conversation recall: `{"status": "ok", "hits": N}`, or `{"status":
