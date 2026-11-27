@@ -2364,19 +2364,28 @@ mod tests {
                 Err(_) => false,
             }
         }
-        async fn pid_of(path: &Path) -> i32 {
-            for _ in 0..100 {
-                if let Some(p) = std::fs::read_to_string(path).ok().and_then(|t| t.trim().parse().ok()) {
+        fn listing(dir: &Path) -> String {
+            let mut out = Vec::new();
+            if let Ok(rd) = std::fs::read_dir(dir) {
+                for e in rd.flatten() {
+                    out.push(format!("{}{}", e.path().display(), if e.path().is_dir() { format!(" [{}]", listing(&e.path())) } else { String::new() }));
+                }
+            }
+            out.join(", ")
+        }
+        async fn pid_of(root: &Path, name: &str) -> i32 {
+            for _ in 0..200 {
+                let found = std::fs::read_dir(root).into_iter().flatten().flatten().map(|e| e.path().join("work").join(name)).find_map(|f| std::fs::read_to_string(f).ok());
+                if let Some(p) = found.and_then(|t| t.trim().parse().ok()) {
                     return p;
                 }
-                tokio::time::sleep(Duration::from_millis(50)).await;
+                tokio::time::sleep(Duration::from_millis(100)).await;
             }
-            panic!("{} never appeared", path.display());
+            panic!("the fake CLI never wrote {name}: it did not start, or the jail denied the write. Under {}: {}", root.display(), listing(root));
         }
         let root = scratch("cancel");
-        let pids = scratch("cancel-pids");
-        let script = format!("echo $$ > {d}/sh; sleep 300 & echo $! > {d}/child; wait", d = pids.display());
-        let k = kind(&["sh", "-c", &script], &[], &[]);
+        let script = "echo $$ > pid_sh; sleep 300 & echo $! > pid_child; wait";
+        let k = kind(&["sh", "-c", script], &[], &[]);
         let ctx = Arc::new(ctx_for(&k, &root, "60"));
         let rail = Arc::new(FakeRail::new());
         let req = TurnRequest {
@@ -2400,7 +2409,7 @@ mod tests {
             let e = run_turn_on(&c, &*r, &q, &crate::websocket::NullSink).await.err().map(|e| e.to_string());
             *out.lock().unwrap() = e;
         });
-        let (sh, grandchild) = (pid_of(&pids.join("sh")).await, pid_of(&pids.join("child")).await);
+        let (sh, grandchild) = (pid_of(&root, "pid_sh").await, pid_of(&root, "pid_child").await);
         assert!(alive(sh) && alive(grandchild));
         assert_eq!(handle_inbound(&reg, &cancel_message("turn-cancel")), Handled::Cancelled("turn-cancel".into()));
         assert!(tokio::time::timeout(Duration::from_secs(10), job).await.expect("the turn ends within the grace").is_ok(), "it ended by itself, not by abort");
@@ -2424,6 +2433,5 @@ mod tests {
         assert_eq!(slots.available_permits(), 1, "the slot is released");
         assert_eq!(reg.running(), 0);
         let _ = std::fs::remove_dir_all(root);
-        let _ = std::fs::remove_dir_all(pids);
     }
 }

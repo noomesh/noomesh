@@ -134,10 +134,19 @@ where
 }
 
 /// Publish `payload` on `subject` without waiting, from a sync context.
-pub fn publish_detached(nats: async_nats::Client, subject: String, payload: Vec<u8>) {
+/// Private: the only caller is [`nats_guard`], whose subject comes from
+/// `harness_run_subject`, so this file never publishes to anything else.
+fn publish_detached(nats: async_nats::Client, subject: String, payload: Vec<u8>) {
     spawn_detached(async move {
         let _ = nats.publish(subject, payload.into()).await;
     });
+}
+
+/// The guard for a dispatch to `node` on the live bus: on drop it publishes
+/// the cancel on `harness.run.<node>` and nowhere else (never a `worker.*`
+/// subject; the subject is built here, not taken from the caller).
+pub fn nats_guard(turn_id: String, node: &str, nats: async_nats::Client) -> CancelGuard<impl FnOnce(Vec<u8>)> {
+    guard_for(turn_id, node, move |subject, payload| publish_detached(nats, subject, payload))
 }
 
 /// Armed when a turn is handed to a harness. If it is dropped still armed
@@ -594,7 +603,7 @@ mod tests {
     fn the_wiring_is_in_the_dispatch_and_the_harness() {
         let dispatch = include_str!("dispatch.rs");
         let body = crate::test_src::fn_body(dispatch, "pub async fn try_dispatch");
-        assert!(body.contains("turn_cancel::guard_for(turn_id, &node,"), "try_dispatch arms a guard for the request's node");
+        assert!(body.contains("turn_cancel::nats_guard(turn_id, &node, state.nats.clone())"), "try_dispatch arms a guard for the request's node");
         assert!(body.contains("turn_id: Some(turn_id.clone())"), "the request carries the turn id");
         assert_eq!(body.matches("cancel.disarm();").count(), 2, "refused and no responder");
         assert!(body.contains("turn_cancel::disarm_on_terminal(&mut cancel, terminal.as_ref());"));

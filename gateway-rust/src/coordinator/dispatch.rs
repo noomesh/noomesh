@@ -570,10 +570,7 @@ pub async fn try_dispatch<S: TurnSink>(
     // before the turn ends (tab closed, client gone, revoke) or the deadline
     // passes, the guard tells the node's harness to stop it. Disarmed when
     // the node refuses, has no responder, or ends the turn itself.
-    let mut cancel = turn_cancel::guard_for(turn_id, &node, {
-        let nats = state.nats.clone();
-        move |subject, payload| turn_cancel::publish_detached(nats, subject, payload)
-    });
+    let mut cancel = turn_cancel::nats_guard(turn_id, &node, state.nats.clone());
     let ack = tokio::time::timeout(
         ACK_TIMEOUT,
         // The ack comes back on THIS node's reply prefix, which its principal
