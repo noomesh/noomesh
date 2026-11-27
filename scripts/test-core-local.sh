@@ -24,6 +24,8 @@
 #   PAI_TRELLION_CHECKOUT     a path with no sibling checkout, as in CI
 #   NOO_KB_AUDIENCE_TEST_DSN  passed through if you set it (a local pgvector);
 #                             unset, those tests skip
+#   NOO_SUITE_BOUNDS          1 on a full run (not with pytest arguments): the suite-size
+#                             floor and skip ceiling, as in CI
 #   NOO_TEST_CORE_VENV        where the venv lives (default under ~/.cache); a
 #                             path you choose is yours: nothing else is touched
 #   NOO_TEST_CORE_VENVS_KEEP  (developer-tool tuning, not a product switch) how many per-checkout venvs the default base keeps
@@ -163,7 +165,7 @@ INSTALL_STEP="Install dependencies"
 RUN_STEP="Run tests"
 SWITCH="TRELLION_PUBLIC"
 # Every env key of the steps above must be supplied below.
-HANDLED_ENV=(TRELLION_PUBLIC PAI_TRELLION_CHECKOUT NOO_KB_AUDIENCE_TEST_DSN)
+HANDLED_ENV=(TRELLION_PUBLIC PAI_TRELLION_CHECKOUT NOO_KB_AUDIENCE_TEST_DSN NOO_SUITE_BOUNDS)
 
 ci_step() { uv run -q --no-project --python "$py" --with pyyaml python scripts/ci_step.py "$@"; }
 
@@ -222,4 +224,7 @@ export VIRTUAL_ENV="$venv" PATH="$venv/bin:$PATH"
 if [ "$#" -gt 0 ]; then
   exec pytest "$@"
 fi
+# The suite-size floor and skip ceiling (tests/_public_tree.py) apply to the
+# FULL run only, as in CI; a scoped run (arguments above) never sets this.
+export NOO_SUITE_BOUNDS=1
 exec bash -e -c "$run_body"
