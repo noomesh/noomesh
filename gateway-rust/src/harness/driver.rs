@@ -1052,6 +1052,19 @@ pub fn task_prompt(req: &TaskRequest, loop_no: u32, last_note: Option<&str>, cla
     p
 }
 
+/// How long each gateway call of a cancelled turn's cleanup may take. The
+/// rail's own client waits far longer; a cancel must finish inside
+/// [`crate::coordinator::turn_cancel::CANCEL_GRACE`].
+const CLEANUP_CALL_TIMEOUT: Duration = Duration::from_secs(4);
+
+/// One gateway call of a cancelled turn's cleanup, bounded; a call that
+/// times out is named in the log and the rest of the cleanup goes on.
+async fn cleanup_call<F: std::future::Future<Output = ()>>(what: &str, call: F) {
+    if tokio::time::timeout(CLEANUP_CALL_TIMEOUT, call).await.is_err() {
+        tracing::warn!(call = what, secs = CLEANUP_CALL_TIMEOUT.as_secs(), "harness driver: a cancelled turn's cleanup call timed out; going on with the rest");
+    }
+}
+
 // ── one invocation ──────────────────────────────────────────────────────
 
 /// Translator up, door key minted, CLI run, usage reported, key revoked,
@@ -1102,16 +1115,24 @@ async fn invoke<R: DriverRail>(
         spawn_cli_as(&argv, &env, &ws.work, timeout, &ws.jail_spec(ctx, &mcp), None, Some(stall)).await
     }
     .await;
+    let cancelled = crate::coordinator::turn_cancel::is_cancelled();
     let _ = std::fs::remove_file(ws.mcp_path());
     if let Some(p) = ws.system_prompt_path(&ctx.launch) {
         let _ = std::fs::remove_file(p);
     }
     let _ = std::fs::remove_file(ws.codex_config_path(ctx.kind.cli.as_deref().unwrap_or(&ctx.kind.kind)));
     let usage = translator.usage();
-    rail.report_usage(&usage, &ctx.pinned.model, &ctx.kind.kind, task_id).await;
-    rail.door_key_revoke(&key.key_id).await;
+    if cancelled {
+        // The files are gone already; the calls to the gateway come next,
+        // each bounded so the whole cleanup fits inside the cancel grace.
+        cleanup_call("revoking the door key", rail.door_key_revoke(&key.key_id)).await;
+        cleanup_call("reporting usage", rail.report_usage(&usage, &ctx.pinned.model, &ctx.kind.kind, task_id)).await;
+    } else {
+        rail.report_usage(&usage, &ctx.pinned.model, &ctx.kind.kind, task_id).await;
+        rail.door_key_revoke(&key.key_id).await;
+    }
     translator.shutdown().await;
-    if crate::coordinator::turn_cancel::is_cancelled() {
+    if cancelled {
         // Cleanup above ran in full; usage was reported because the model
         // calls made before the cancel were real.
         tracing::info!(kind = %ctx.kind.kind, "harness driver: turn cancelled by the gateway; CLI group killed, key revoked, files removed");
@@ -1506,11 +1527,13 @@ mod tests {
         stop_at_check: Option<u32>,
         /// A question parks the task: every check after one says no.
         parks_on_ask: bool,
+        /// `door_key_revoke` never answers.
+        revoke_stalls: bool,
     }
 
     impl FakeRail {
         fn new() -> Self {
-            Self { calls: Mutex::new(Calls::default()), key_ttl_secs: 900, stop_at_check: None, parks_on_ask: true }
+            Self { calls: Mutex::new(Calls::default()), key_ttl_secs: 900, stop_at_check: None, parks_on_ask: true, revoke_stalls: false }
         }
     }
 
@@ -1539,6 +1562,9 @@ mod tests {
             })
         }
         async fn door_key_revoke(&self, key_id: &str) {
+            if self.revoke_stalls {
+                std::future::pending::<()>().await;
+            }
             self.calls.lock().unwrap().keys_revoked.push(key_id.to_string());
         }
         async fn save(&self, role: &str, content: &str) {
@@ -2357,6 +2383,26 @@ mod tests {
     /// the cancel were real.
     #[tokio::test]
     async fn a_cancelled_turn_kills_the_cli_group_and_cleans_up() {
+        cancel_case(false).await;
+    }
+
+    /// The cleanup's calls to the gateway are each bounded on a cancel: a
+    /// door whose revoke never answers costs the turn one bounded wait, the
+    /// files are already gone, usage is still reported, and the turn ends
+    /// itself inside the grace (no force-stop).
+    #[tokio::test]
+    async fn a_cancelled_turn_whose_revoke_never_answers_still_ends_inside_the_grace() {
+        cancel_case(true).await;
+        let src = include_str!("driver.rs");
+        let call = crate::test_src::fn_body(src, "async fn cleanup_call<F: std::future::Future<Output = ()>>");
+        assert!(call.contains("harness driver: a cancelled turn's cleanup call timed out"), "the timeout is logged");
+        assert!(call.contains("tokio::time::timeout(CLEANUP_CALL_TIMEOUT, call)"));
+        let invoke = crate::test_src::fn_body(src, "async fn invoke<R: DriverRail>");
+        let (revoke, usage) = (invoke.find("cleanup_call(\"revoking the door key\"").unwrap(), invoke.find("cleanup_call(\"reporting usage\"").unwrap());
+        assert!(revoke < usage, "the revoke comes before the usage report");
+    }
+
+    async fn cancel_case(stall_revoke: bool) {
         use crate::coordinator::turn_cancel::{cancel_message, handle_inbound, spawn_tracked, Handled, TurnRegistry};
         fn alive(pid: i32) -> bool {
             match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
@@ -2386,8 +2432,14 @@ mod tests {
         let root = scratch("cancel");
         let script = "echo $$ > pid_sh; sleep 300 & echo $! > pid_child; wait";
         let k = kind(&["sh", "-c", script], &[], &[]);
-        let ctx = Arc::new(ctx_for(&k, &root, "60"));
-        let rail = Arc::new(FakeRail::new());
+        let mut ctx = ctx_for(&k, &root, "60");
+        // Keep the workspace on a stalled revoke, to look at what is left
+        // while the call hangs; the files are removed before it starts.
+        ctx.keep_workdir = stall_revoke;
+        let ctx = Arc::new(ctx);
+        let mut fake = FakeRail::new();
+        fake.revoke_stalls = stall_revoke;
+        let rail = Arc::new(fake);
         let req = TurnRequest {
             conversation_id: "c-cancel".into(),
             prompt: "hi".into(),
@@ -2413,6 +2465,7 @@ mod tests {
         assert!(alive(sh) && alive(grandchild));
         assert_eq!(handle_inbound(&reg, &cancel_message("turn-cancel")), Handled::Cancelled("turn-cancel".into()));
         assert!(tokio::time::timeout(Duration::from_secs(10), job).await.expect("the turn ends within the grace").is_ok(), "it ended by itself, not by abort");
+        assert_eq!(reg.forced_stops(), 0, "no force-stop");
         for _ in 0..100 {
             if !alive(sh) && !alive(grandchild) {
                 break;
@@ -2425,11 +2478,34 @@ mod tests {
         {
             let c = rail.calls.lock().unwrap();
             assert_eq!(c.keys_minted, 1);
-            assert_eq!(c.keys_revoked, vec!["key-1".to_string()], "the door key is revoked");
+            if stall_revoke {
+                assert!(c.keys_revoked.is_empty(), "the revoke never answered");
+            } else {
+                assert_eq!(c.keys_revoked, vec!["key-1".to_string()], "the door key is revoked");
+            }
             assert_eq!(c.usage.len(), 1, "usage is reported");
             assert!(c.saved.is_empty(), "a cancelled turn saves no answer");
         }
-        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0, "the key file and the turn's workspace are removed");
+        if stall_revoke {
+            // Kept workspace: the files that held the door key are gone.
+            fn files(dir: &Path, out: &mut Vec<PathBuf>) {
+                for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+                    if e.path().is_dir() {
+                        files(&e.path(), out);
+                    } else {
+                        out.push(e.path());
+                    }
+                }
+            }
+            let mut all = Vec::new();
+            files(&root, &mut all);
+            for f in all {
+                let text = std::fs::read_to_string(&f).unwrap_or_default();
+                assert!(!text.contains("noo-sk-door-1"), "{} still holds the door key", f.display());
+            }
+        } else {
+            assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0, "the key file and the turn's workspace are removed");
+        }
         assert_eq!(slots.available_permits(), 1, "the slot is released");
         assert_eq!(reg.running(), 0);
         let _ = std::fs::remove_dir_all(root);

@@ -140,8 +140,13 @@ holds:
   usual end-of-turn cleanup: the minted door key is revoked, the key file,
   system prompt and per-turn workspace are removed, the usage the turn
   already consumed is reported, and the wire translator is shut down. The
-  turn saves no answer and sends no result. If the turn has not ended 15 s
-  after the signal it is aborted outright;
+  turn saves no answer and sends no result. The key file, system prompt
+  and codex config are removed first (no network needed); then the calls
+  to the gateway each get at most 4 s (the key revoke, then the usage
+  report) and a call that times out is logged and skipped, so the whole
+  cleanup fits inside the grace. If the turn has not ended 15 s after the
+  signal it is aborted outright, and the harness logs an error naming the
+  turn;
 - a turn run by the harness's own loop is aborted at once, which drops its
   model request so the backend stops.
 
