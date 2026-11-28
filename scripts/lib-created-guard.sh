@@ -56,7 +56,13 @@ noo_created_guard() {
     if [ -n "${NOO_ISOLATED_SERVICES:-}" ]; then
         local kept=() _id _svc
         for _id in "${ids[@]}"; do
-            _svc=$(docker inspect --format '{{ index .Config.Labels "com.docker.compose.service" }}' "$_id" 2>/dev/null)
+            # Bounded: a container Docker does not answer for is a held one.
+            if declare -F _noo_bounded >/dev/null; then
+                _svc=$(_noo_bounded "${NOO_DOCKER_PROBE_SECS:-10}" docker inspect --format '{{ index .Config.Labels "com.docker.compose.service" }}' "$_id" 2>/dev/null) \
+                    || { [ "$?" -eq 124 ] && continue; }
+            else
+                _svc=$(docker inspect --format '{{ index .Config.Labels "com.docker.compose.service" }}' "$_id" 2>/dev/null)
+            fi
             case " $NOO_ISOLATED_SERVICES " in *" $_svc "*) [ -n "$_svc" ] && continue ;; esac
             kept+=("$_id")
         done

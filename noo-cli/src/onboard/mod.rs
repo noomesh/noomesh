@@ -1529,7 +1529,13 @@ fn print_final_summary(ctx: &Ctx) {
                 let code = sh::run_script_streamed(ctx, "noomesh-restart.sh", &["--force", "gateway", "--data-warning-shown"]);
                 // https always — the gateway has no plaintext listener.
                 let health = "https://localhost:8080/health".to_string();
-                if code == 0 && sh::wait_for_http(ctx, &health, 120) {
+                // 75 = the launcher left something out (named above): for
+                // `restart --force gateway` that is the gateway itself, held or
+                // needing a held service. The OLD gateway may still answer
+                // /health, so health proves nothing here.
+                if code == 75 {
+                    ctx.warn("Gateway was NOT restarted (the launcher left it out: Docker does not answer for it or a container it needs, named above) — the posture change is not live; after a reboot of this host run: noo stack restart --force gateway");
+                } else if code == 0 && sh::wait_for_http(ctx, &health, 120) {
                     ctx.success("Gateway restarted — posture active");
                 } else {
                     ctx.warn("Gateway restart did not complete — run: noo stack restart --force gateway");

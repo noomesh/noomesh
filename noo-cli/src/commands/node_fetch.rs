@@ -13,8 +13,8 @@
 //!
 //! Adaptive cadence: while `<home>/noomesh/expect-bundle` exists (enroll
 //! writes it, a successful apply removes it) every tick polls; otherwise
-//! only every fifth tick (5 min), which is why `noo cluster provision
-//! --wait` allows six.
+//! only every third tick (about 5 minutes at the tick's real pace), which is
+//! why `noo cluster provision --wait` allows six.
 
 use crate::{Globals, Unhandled};
 use std::path::{Path, PathBuf};

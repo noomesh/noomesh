@@ -401,6 +401,30 @@ pub async fn doc_detail(
         .await
 }
 
+/// One page of one document for `GET /api/v1/docs/{doc_id}/pages/{page_no}`
+/// (the row type of [`crate::repo::kb_docs::doc_page`]).
+pub type DocPageRow = crate::repo::kb_docs::DocPageRow;
+
+/// One page of a document, if the caller may read the DOCUMENT.
+///
+/// `None` is "no such document or not readable by you", the same answer as
+/// [`doc_detail`] (never a probe for which ids exist). `Some` with the page
+/// flag false means the document is readable but has no page `page_no`; only
+/// then is the page count safe to tell. `page_no` is the stored
+/// `pages.page_no`, which the ingest path numbers from 1. Held documents are
+/// read exactly as [`doc_detail`] reads them (a hold keeps a document out of
+/// embedding and search, not out of a read by id). The query lives in
+/// `repo::kb_docs` and is gated by this module's [`DOC_VISIBLE`]. Read-only.
+pub async fn doc_page(
+    db: &PgPool,
+    roles: Option<&[String]>,
+    doc_id: &str,
+    page_no: i32,
+    max_chars: i32,
+) -> Result<Option<DocPageRow>, sqlx::Error> {
+    crate::repo::kb_docs::doc_page(db, roles, doc_id, page_no, max_chars).await
+}
+
 // ── entities ─────────────────────────────────────────────────────────
 
 pub async fn entity_search(
@@ -637,6 +661,34 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::collections::{BTreeSet, HashMap};
+
+    #[test]
+    fn doc_page_reads_through_the_same_audience_predicate_as_doc_detail() {
+        let own = crate::test_src::own_code(include_str!("scope.rs"));
+        let detail = crate::test_src::fn_body(&own, "pub async fn doc_detail(");
+        let gate = "($1::text[] IS NULL OR {DOC_VISIBLE})";
+        assert!(detail.contains(gate), "doc_detail gates on DOC_VISIBLE, None = operator");
+        let wrapper = crate::test_src::fn_body(&own, "pub async fn doc_page(");
+        assert!(wrapper.contains("crate::repo::kb_docs::doc_page("), "the page query lives in the repo layer");
+        let wl = wrapper.to_lowercase();
+        for q in ["query_as", "assertsqlsafe", "select"] {
+            assert!(!wl.contains(q), "the wrapper issues no query of its own, found {q}");
+        }
+        // The query itself: the same predicate CONSTANT (imported, not copied).
+        let repo = crate::test_src::own_code(include_str!("../repo/kb_docs.rs"));
+        assert!(repo.contains("use crate::memory::scope::DOC_VISIBLE;"), "the constant is shared, not copied");
+        assert!(!repo.contains("jsonb_exists"), "the predicate text is not copied");
+        let page = crate::test_src::fn_body(&repo, "pub async fn doc_page<");
+        assert!(page.contains(gate) && page.contains("d.doc_id = $2::uuid"));
+        // A hold keeps a document out of search, not out of a read by id: doc_detail
+        // applies no hold filter, and neither does the page read.
+        assert!(!detail.contains("not_held") && !page.contains("not_held"));
+        let up = page.to_uppercase();
+        for w in ["UPDATE ", "INSERT ", "DELETE ", "UPSERT", "TRUNCATE"] {
+            assert!(!up.contains(w), "doc_page is read-only, found {w}");
+        }
+        assert!(page.contains("LIMIT 1") && page.contains("left(pg.text, $4)") && page.contains("length(pg.text)"), "one row, text cut in the query");
+    }
 
     #[test]
     fn the_worker_answer_parses_and_malformed_ones_fail_closed() {
@@ -1129,6 +1181,21 @@ mod tests {
         assert!(doc_detail(db, Some(&a), &w.doc["legacy"]).await.unwrap().is_none(), "untagged is unreadable to A");
         assert!(doc_detail(db, Some(&a), &x1).await.unwrap().is_some(), "x1 carries user:a");
         assert!(doc_detail(db, Some(&a), &uid()).await.unwrap().is_none(), "missing = unreadable");
+
+        // ── one page ────────────────────────────────────────────────────
+        let p = doc_page(db, None, &x1, 2, 100).await.unwrap().expect("admin reads a page of x1");
+        assert!(p.2 && p.1 == 4 && p.3.as_deref().is_some_and(|t| t.starts_with("P2")), "page 2 of 4");
+        assert!(p.4.is_some_and(|n| n > 0), "the real length comes back");
+        let cut = doc_page(db, None, &x1, 1, 1).await.unwrap().unwrap();
+        assert_eq!(cut.3.as_deref().map(|t| t.chars().count()), Some(1), "the query cuts the text");
+        assert!(cut.4.is_some_and(|n| n > 1), "the real length is not the cut length");
+        let beyond = doc_page(db, None, &x1, 9, 100).await.unwrap().expect("readable, page absent");
+        assert!(!beyond.2 && beyond.1 == 4 && beyond.3.is_none(), "out of range keeps the count");
+        assert!(!doc_page(db, None, &x1, 0, 100).await.unwrap().unwrap().2, "pages are numbered from 1");
+        assert!(doc_page(db, Some(&a), &x1, 1, 100).await.unwrap().is_some_and(|r| r.2), "x1 carries user:a");
+        assert!(doc_page(db, Some(&a), &b_doc, 1, 100).await.unwrap().is_none(), "A cannot read a page of B's document");
+        assert!(doc_page(db, Some(&a), &w.doc["legacy"], 1, 100).await.unwrap().is_none(), "untagged is unreadable to A");
+        assert!(doc_page(db, Some(&a), &uid(), 1, 100).await.unwrap().is_none(), "missing = unreadable");
         drop_world(w).await;
     }
 }

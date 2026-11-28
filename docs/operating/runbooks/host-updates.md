@@ -166,6 +166,37 @@ gateway, the database, monitoring, the embed doors) and exits 75, which
 embedder (profile `embed-cpu`, when enabled) takes the embeddings
 meanwhile; the gateway already treats it as a peer endpoint.
 
+### If Docker does not answer for one container
+
+A container whose process survives SIGKILL can leave Docker unable to remove
+it, and every Docker call that names that container (`docker inspect`
+included) then never returns. As its first step, before anything inspects,
+stops or removes a container, `noo stack start` and `noo stack restart` ask
+Docker about every container of the project with a bound (10 s, then once
+more with 30 s; `NOO_DOCKER_PROBE_SECS`, `NOO_DOCKER_REPROBE_SECS`), six at a
+time. A container that does not answer either time is named once, with what
+stops working without it; the likely cause is a process that did not exit,
+and only a reboot of the host removes it. If Docker will not even list the
+containers, nothing is started and the launcher exits 1.
+
+From then on no call the launcher makes names that container: the snapshot,
+the re-own steps, the removals of retired or switched-off services and the
+Created guard skip it. Compose is also not asked to touch the services linked
+to it: the door whose network namespace it joins, a service that joins its
+namespace, and a service compose restarts together with it (read from the
+rendered compose config, never from a list). The rest is started in stages: the
+data stores and the bus (postgres, redis, nats), a bounded wait for them to be
+healthy or running, then the other services layer by layer in dependency order
+with the same wait. A stage that is not ready in time is said and the start
+goes on. A container of this start left in `Created` is started by name
+afterwards; leftovers of other projects, out-of-profile services and services
+scaled to 0 are not started. The launcher exits 75 once the rest is up
+(`noo upgrade --stack` reports "stack up except <service>"), and 1 only when a
+service that was not held did not come up. If a held container is the gateway
+or the database, the launcher says in so many words that the controller is not
+up. A named start or restart of a held service, of a service linked to it or of
+one that needs it, does nothing for that service and exits 75.
+
 `noo cluster verify --controller` keeps the hold visible in its
 `GPU services` row. A GPU driver fault clears with a reboot of the host;
 then `noo stack start` starts the held services.

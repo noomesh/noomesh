@@ -223,12 +223,106 @@ CA**: it scans, confirms, backs up to `pki/.rotate-backup-<ts>`,
 re-issues every leaf expiring within `--warn-days`, delivers node certs
 on the pull rail (no fallback — a node with no birth cert on record must
 be re-enrolled first), restarts the consumers with the
-gateway last, health-probes, and on failure restores the backup and
-restarts again (exit 1). A node that did not take its cert makes the
+gateway last (a model backend's TLS door sidecar, `stunnel-<backend>`,
+is instead reloaded in place; see below), and waits for them (up to 150 s). **Docker's own health
+decides whether a rotation is reverted; the CLI's HTTP probe of `/health`
+can confirm a rotation but never condemns one on a failure of its own side.**
+
+- **Healthy** (done): every restarted or reloaded container is running and, for those
+  with a healthcheck, Docker reports `healthy` (not merely "not
+  unhealthy": a container still `starting` is not healthy yet), or
+  `/health` answered 200 with no container not running or `unhealthy`.
+- **Reverted** (the backup is restored, the consumers restart again,
+  `pki/public/` is re-synced to the restored certificates, exit 1): at the
+  deadline a restarted container is not running, Docker reports one
+  `unhealthy`, or `/health` was reached over a verified TLS connection to
+  this machine and answered a non-200 status. If the revert's own gate
+  fails the same way the message says "REVERT DID NOT RECOVER"; if it
+  cannot tell, it says the revert could not be verified.
+- **Kept, not confirmed** (`rotation_unconfirmed`, exit 1, nothing
+  restarted again) for everything else at the deadline: a container still
+  `starting`; no address to probe; no trust anchor; nothing answering
+  `/health`; and every failure on the CLI's side, such as a certificate
+  name mismatch (the gateway certificate does not name the address the
+  gateway is now bound to) or an unknown issuer (a stale `$NOO_TLS_CA`).
+  The new certificates stay, and so do node certificates already
+  delivered (same CA). The message says what Docker reported (`running;
+  health: healthy|starting|none`), the URL probed and the error, to run
+  `noo cluster verify --wait`, and the copy-back from the backup
+  (`cp -a`, `noo security pki fix-modes` to re-sync `pki/public/`,
+  `docker restart`, with `--instance` when one is in use). A `docker
+  inspect` that fails or says nothing is "state unknown": neither healthy
+  nor bad, so alone it ends here, never in a revert. If a revert's
+  restore fails part-way the message says the restore is PARTIAL and names
+  the backup.
+
+`/health` is probed at the address the gateway is bound to: `NOO_BIND_ADDR`,
+else `NOO_BIND_MODE` (read from the environment, then `.env`, as the
+launcher reads them): the tailnet address on a tailnet controller,
+`127.0.0.1` for `local` or `all`, and a literal IP address in
+`NOO_BIND_MODE` as itself (any other value, such as a host name or a mode
+in the wrong case, is not an address: the bind is then unknown). With no
+bind known, the configured
+gateway URL is tried, and its answer counts only when its host is this
+machine. `pki rotate-ca` runs the same wait but only warns
+(`rotated_with_warnings`); it never reverts. Certificate scans (`status`,
+`rotate-all`, `cluster verify`) skip the dot-directories of the PKI dir
+(`.rotate-backup-*`, `.forgotten-*`). A node that did not take its cert makes the
 exit code 1 too; `--no-deliver`/`--no-reload` skip those steps and say
 so. Nothing expiring prints `no certificates expiring within N days`.
 Leaf rotation also runs unattended from the `cert_auto_rotate` autonomy
 location when enabled.
+
+**Door sidecars reload in place.** Only the sidecar of a model backend
+door (`stunnel-ollama`, `-ollama-embed`, `-ollama-embed-cpu`, `-llamacpp`,
+`-vllm`, `-vllm-secondary`) mounts the certificate; the backend shares its
+network namespace. Once every file is written, rotate-all sends the sidecar
+`SIGHUP` (`docker kill -s HUP`), which makes stunnel re-read the certificate,
+key and CA while the container, its open connections and the backend keep
+running; the backend is not restarted, so a model server that takes minutes
+to load stays up. The reload is then verified from the sidecar's log since
+the signal: `Configuration successful` means it serves the new certificate;
+`Failed to reload` (stunnel keeps serving the OLD certificate) or no outcome
+within 10 s means it is unconfirmed, and the command falls back to restarting
+the sidecar and then the backend (the backend shares the sidecar's network
+namespace, so it must restart after it), and says so; the copy-back command
+printed on a kept or failed rotation orders a door pair the same way. A
+vllm rotation also reloads `stunnel-vllm-secondary`, which mounts the same
+leaf. Everything else (gateway,
+NATS, Postgres, the node agent, replicas) restarts as before. The health gate
+judges the reloaded sidecars with the restarted containers and the revert
+rules are unchanged; a revert restores the files and reloads (verified, with
+the same fallback) instead of restarting. `pki rotate-ca` still restarts its
+consumers. A change to a sidecar's configuration (not its certificate) still
+needs a restart.
+
+`--no-reload` does not restart anything; it prints what to run **on
+this machine**, from the same list the reload path acts on (the running
+containers that present a rotated certificate, plus running replicas).
+For door sidecars it prints `docker kill -s HUP <sidecar>` and
+`docker logs --since 1m <sidecar>` (look for `Configuration successful`; the
+backend needs no restart), then, gateway last,
+gateway last: `sudo systemctl restart noo-node-agent` (plain `systemctl`
+as root) when this machine's node certificate rotated and the agent is a
+host unit; one `noo stack restart <service>...` for the named services
+and the gateway on its own command last (`noo --instance <name> stack
+restart ...` for a named instance); `docker restart <container>` for a
+container with no service name (a replica). It then says nothing else on
+this machine needs restarting, or, when nothing needs restarting, that no
+restart is needed. When Docker does not answer, it says so and prints every
+consumer of a rotated certificate, running or not, and never says no
+restart is needed. The agent's copy under `/etc/noo/pki` is synced only by
+the reload path. Certificates rotated for other machines are not restarted
+from here: they are delivered over the pull rail in the delivery step
+(skipped, and said so, with `--no-deliver`). `--json` adds
+`would_restart` (the ordered container names), `would_reload` (the door
+sidecars to reload in place) and `docker_answered` on that path. On the reload path Docker must answer before anything restarts
+(otherwise the command stops, rotated and unrestarted, and prints the
+follow-up), and `--json` adds `restarted` (every container restarted, door fallbacks
+included), `reloaded_in_place` (door sidecars reloaded and verified) and
+`reload_fallbacks` (doors whose reload was not verified, with the outcome);
+`reloaded` lists everything that took the new certificate. In reload mode Docker is asked right after the
+confirmation, before the backup: if it cannot be asked, nothing is changed.
 
 ### Rotate the CA and re-key the fleet
 
@@ -560,7 +654,7 @@ hardware (decision 2026-10-26).
 | `noo security pki rotate-signing-key` | `[<node>] [--deliver-only] [-y\|--yes]` | Mint the fleet code-signing key and deliver its public half to every node (-y to confirm) |
 | `noo security secrets absorb-files` | `[-y\|--yes]` | Fold file credentials and legacy secrets/*.txt into env.sops; shreds what reads back (-y) |
 | `noo security pki issue-node` | `<node> [<ip>] [--days <n>] [--mint-only]` | Issue a node cert and deliver it, waiting for the node to confirm it applied |
-| `noo security pki push-nodes` | `[<node>] [--days <n>] [--yes] [--allow-shared-address <addr>] [<node> --prove]` | Re-issue node certs and stage them on the rail; --prove first checks the node's address |
+| `noo security pki push-nodes` | `[<node>] [--days <n>] [--yes] [--allow-shared-address <addr>] [<node> --prove]` | Re-issue node certs and stage them on the rail; --prove proves the node's address first |
 | `noo security trust-ca` | `[<ca_path>]` | Install the cluster CA into the OS trust store (default $NOO_PKI_DIR/ca.crt) |
 | `noo security untrust-ca` | `[-y\|--yes]` | Remove the cluster CA (by name) from the OS trust store; asks for confirmation (-y) |
 

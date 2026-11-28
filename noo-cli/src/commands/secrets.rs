@@ -4321,15 +4321,40 @@ pub(crate) fn container_routable_host(name: &str) -> Option<String> {
 /// Docker assigns a new one on recreate and never on restart, which is exactly
 /// the distinction `rotate` has to prove: a restart keeps the old environment.
 fn container_created(name: &str) -> Option<String> {
-    let out = Command::new("docker")
-        .args(["inspect", "-f", "{{.Created}}", name])
-        .output()
-        .ok()?;
+    // Bounded: a container Docker does not answer for (a process that
+    // survived SIGKILL) would hold this call, and so the whole rotation,
+    // forever. No answer in time reads as "unknown", like a failed inspect.
+    let out = match crate::bounded::docker(&["inspect", "-f", "{{.Created}}", name], std::time::Duration::from_secs(10)) {
+        crate::bounded::Bounded::Answered(out) => out,
+        _ => return None,
+    };
     if !out.status.success() {
         return None;
     }
     let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
     if s.is_empty() { None } else { Some(s) }
+}
+
+/// The stamp a lookup records when Docker did not answer for the container in
+/// time (a process that survived SIGKILL: the call never returns). Not a real
+/// stamp: [`recreate_verdicts`] reads it as "unknown", never as "absent".
+pub(crate) const STAMP_NO_ANSWER: &str = "\u{1}docker-did-not-answer";
+
+/// Like [`container_created`], but a timeout (or a Docker that cannot be run)
+/// is [`STAMP_NO_ANSWER`], not `None`: "no such container" and "Docker did not
+/// answer" must not read the same, or a consumer whose container is held
+/// would be reported as not part of this install.
+fn container_stamp(name: &str) -> Option<String> {
+    match crate::bounded::docker(&["inspect", "-f", "{{.Created}}", name], std::time::Duration::from_secs(10)) {
+        crate::bounded::Bounded::Answered(out) => {
+            if !out.status.success() {
+                return None;
+            }
+            let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if s.is_empty() { None } else { Some(s) }
+        }
+        _ => Some(STAMP_NO_ANSWER.to_string()),
+    }
 }
 
 /// What happened to one consumer across a recreate, judged by its `Created`
@@ -4349,6 +4374,10 @@ pub(crate) enum RecreateVerdict {
     /// Present before, gone after. The recreate removed it and did not bring
     /// it back — a failure, and a louder one than Unchanged.
     Vanished,
+    /// Docker did not answer for its container before or after (held: a
+    /// process that survived SIGKILL). It cannot have been recreated and may
+    /// still hold the OLD value: a failure, never "not part of this install".
+    Held,
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -4359,7 +4388,7 @@ pub(crate) enum RecreateVerdict {
 /// the evidence a recreate actually happened (#258), and the provision verb
 /// needs the same evidence a rotation does.
 pub(crate) fn container_created_pub(name: &str) -> Option<String> {
-    container_created(name)
+    container_stamp(name)
 }
 
 /// Write one provisioned value into the store, atomically.
@@ -4458,6 +4487,10 @@ pub(crate) enum LauncherScope {
     Nothing { absent: Vec<String> },
     /// A scoped recreate would be unsafe or unanswerable; restart the stack.
     Full { reason: String },
+    /// Every holder that exists is one Docker does not answer for (held: a
+    /// process that survived SIGKILL): the launcher must not be run for them,
+    /// and the plan must not say they are absent.
+    Held { held: Vec<String> },
 }
 
 /// The questions the scope decision asks of the container runtime. A trait so
@@ -4465,6 +4498,10 @@ pub(crate) enum LauncherScope {
 pub(crate) trait StackProbe {
     /// A container of this name exists (running or not).
     fn present(&self, container: &str) -> bool;
+    /// Docker did not answer for this container in time (held). Default: no.
+    fn held(&self, _container: &str) -> bool {
+        false
+    }
     fn running(&self, container: &str) -> bool;
     /// Compose service names this container's service `depends_on`
     /// (compose records them on the container as a label).
@@ -4477,15 +4514,20 @@ impl StackProbe for DockerProbe {
     fn present(&self, container: &str) -> bool {
         container_created(container).is_some()
     }
+    fn held(&self, container: &str) -> bool {
+        container_stamp(container).as_deref() == Some(STAMP_NO_ANSWER)
+    }
     fn running(&self, container: &str) -> bool {
         container_running(container)
     }
     fn depends_on(&self, container: &str) -> Vec<String> {
-        let out = Command::new("docker")
-            .args(["inspect", "-f", "{{index .Config.Labels \"com.docker.compose.depends_on\"}}", container])
-            .output();
+        // Bounded, like every other lookup of a container here.
+        let out = crate::bounded::docker(
+            &["inspect", "-f", "{{index .Config.Labels \"com.docker.compose.depends_on\"}}", container],
+            std::time::Duration::from_secs(10),
+        );
         match out {
-            Ok(o) if o.status.success() => parse_depends_on(&String::from_utf8_lossy(&o.stdout)),
+            crate::bounded::Bounded::Answered(o) if o.status.success() => parse_depends_on(&String::from_utf8_lossy(&o.stdout)),
             _ => Vec::new(),
         }
     }
@@ -4510,8 +4552,12 @@ pub(crate) fn parse_depends_on(label: &str) -> Vec<String> {
 /// `--no-deps`, so a dependency that is down would stay down and the consumer
 /// would come up against nothing). Otherwise a full restart, with the reason.
 pub(crate) fn launcher_scope(containers: &[String], prefix: &str, probe: &dyn StackProbe) -> LauncherScope {
-    let present: Vec<&String> = containers.iter().filter(|c| probe.present(c)).collect();
+    let held: Vec<String> = containers.iter().filter(|c| probe.held(c)).cloned().collect();
+    let present: Vec<&String> = containers.iter().filter(|c| !held.contains(c) && probe.present(c)).collect();
     if present.is_empty() {
+        if !held.is_empty() {
+            return LauncherScope::Held { held };
+        }
         return LauncherScope::Nothing { absent: containers.to_vec() };
     }
     let lead = format!("{prefix}-");
@@ -4554,6 +4600,9 @@ impl LauncherScope {
                 format!("nothing — {} not present on this box", absent.join(", "))
             }
             LauncherScope::Full { reason } => format!("Restarts the stack: {reason}"),
+            LauncherScope::Held { held } => {
+                format!("nothing — {} held (Docker does not answer for it); only a reboot of this host clears it", held.join(", "))
+            }
         }
     }
 
@@ -4565,7 +4614,7 @@ impl LauncherScope {
                 v.extend(services.iter().cloned());
                 Some(v)
             }
-            LauncherScope::Nothing { .. } => None,
+            LauncherScope::Nothing { .. } | LauncherScope::Held { .. } => None,
             LauncherScope::Full { .. } => Some(vec!["--force".to_string()]),
         }
     }
@@ -4851,7 +4900,9 @@ pub(crate) fn recreate_verdicts(
         .map(|c| {
             let b = before.get(c).cloned().flatten();
             let a = after.get(c).cloned().flatten();
+            let unknown = |x: &Option<String>| x.as_deref() == Some(STAMP_NO_ANSWER);
             let v = match (b, a) {
+                (b, a) if unknown(&b) || unknown(&a) => RecreateVerdict::Held,
                 (None, None) => RecreateVerdict::NotRunning,
                 (Some(_), None) => RecreateVerdict::Vanished,
                 (None, Some(_)) => RecreateVerdict::Recreated,
@@ -5579,7 +5630,7 @@ pub fn secrets_rotate(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         // "recreated with the new values". So the verdict is taken from each
         // consumer's `Created` stamp, before and after, not from the script.
         let before: BTreeMap<String, Option<String>> =
-            consumers.iter().map(|c| (c.clone(), container_created(c))).collect();
+            consumers.iter().map(|c| (c.clone(), container_stamp(c))).collect();
         // Same binary as this process — see mesh.rs::run_script for why.
         let cli_bin = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_default();
         let st = Command::new("bash")
@@ -5588,18 +5639,30 @@ pub fn secrets_rotate(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             .current_dir(&root)
             .env("NOO_CLI_BIN", &cli_bin)
             .status();
-        if !matches!(st, Ok(s) if s.success()) {
+        // Exit 75: the launcher left out a container Docker does not answer
+        // for (lib-stuck-container.sh) and recreated the rest. The verdicts
+        // below say which consumers did get the new value.
+        let partial = matches!(&st, Ok(s) if s.code() == Some(75));
+        if partial && !g.json {
+            println!("{}", ui::muted("the launcher recreated the stack EXCEPT a container Docker does not answer for (named above): a consumer left out still holds the old value until the host is rebooted"));
+        }
+        if !partial && !matches!(st, Ok(s) if s.success()) {
             if !g.json {
                 ui::close_failed("stack recreate failed — the store IS rotated", Some("noo stack restart --force"));
             }
             return Ok(1);
         }
         let after: BTreeMap<String, Option<String>> =
-            consumers.iter().map(|c| (c.clone(), container_created(c))).collect();
+            consumers.iter().map(|c| (c.clone(), container_stamp(c))).collect();
         let verdicts = recreate_verdicts(&consumers, &before, &after);
         let stale: Vec<&str> = verdicts
             .iter()
-            .filter(|(_, v)| matches!(v, RecreateVerdict::Unchanged | RecreateVerdict::Vanished))
+            .filter(|(_, v)| matches!(v, RecreateVerdict::Unchanged | RecreateVerdict::Vanished | RecreateVerdict::Held))
+            .map(|(c, _)| c.as_str())
+            .collect();
+        let held: Vec<&str> = verdicts
+            .iter()
+            .filter(|(_, v)| *v == RecreateVerdict::Held)
             .map(|(c, _)| c.as_str())
             .collect();
         let off: Vec<&str> = verdicts
@@ -5612,6 +5675,7 @@ pub fn secrets_rotate(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                 "restart": "ran",
                 "recreated": verdicts.iter().filter(|(_, v)| *v == RecreateVerdict::Recreated).map(|(c, _)| c).collect::<Vec<_>>(),
                 "not_recreated": stale,
+                "held": held,
                 "not_running": off,
             }));
             return Ok(if stale.is_empty() { 0 } else { 1 });
@@ -5622,14 +5686,16 @@ pub fn secrets_rotate(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                 RecreateVerdict::NotRunning => ui::status_line(Glyph::Bullet, &format!("{c}  {}", ui::muted("not running here (add-on off) — nothing to recreate"))),
                 RecreateVerdict::Unchanged => ui::status_line(Glyph::Err, &format!("{c}  NOT recreated — same container as before; it still holds the OLD value")),
                 RecreateVerdict::Vanished => ui::status_line(Glyph::Err, &format!("{c}  gone — it was running before the recreate and is not now")),
+                RecreateVerdict::Held => ui::status_line(Glyph::Err, &format!("{c}  NOT recreated: its container is held (Docker does not answer for it); it still holds the OLD value until this host is rebooted")),
             };
             println!("{line}");
         }
         if stale.is_empty() {
             ui::close_done("every running consumer was recreated with the new values");
         } else {
+            let said = if partial { "the launcher exited 75 (a container was left out) and" } else { "the launcher exited 0 but" };
             ui::close_failed(
-                &format!("the launcher exited 0 but {} consumer(s) still hold the old value: {}", stale.len(), stale.join(", ")),
+                &format!("{said} {} consumer(s) still hold the old value: {}", stale.len(), stale.join(", ")),
                 Some("noo stack restart --force <service>   (if it is profile-gated, the launcher must select its profile)"),
             );
             return Ok(1);
@@ -6243,6 +6309,29 @@ mod tests {
     }
     fn names(v: &[&str]) -> Vec<String> { v.iter().map(|s| s.to_string()).collect() }
 
+    /// A consumer whose container Docker does not answer for is not "not
+    /// present on this box": the plan says it is held, the launcher is not run.
+    struct HeldStack;
+    impl StackProbe for HeldStack {
+        fn present(&self, _c: &str) -> bool { false }
+        fn held(&self, c: &str) -> bool { c == "noo-rhaddon" }
+        fn running(&self, _c: &str) -> bool { false }
+        fn depends_on(&self, _c: &str) -> Vec<String> { Vec::new() }
+    }
+
+    #[test]
+    fn a_held_consumer_is_named_held_in_the_plan_not_absent() {
+        let scope = launcher_scope(&names(&["noo-rhaddon", "noo-rhaddon-b"]), "noo", &HeldStack);
+        assert_eq!(scope, LauncherScope::Held { held: names(&["noo-rhaddon"]) });
+        assert_eq!(scope.launcher_args(), None, "the launcher is not run for a held container");
+        let line = scope.plan_line();
+        assert!(line.contains("noo-rhaddon held (Docker does not answer for it)"), "{line}");
+        assert!(!line.contains("not present"), "{line}");
+        // none held: today's line, unchanged
+        let absent = launcher_scope(&names(&["noo-rhaddon-b"]), "noo", &HeldStack);
+        assert_eq!(absent.plan_line(), "nothing — noo-rhaddon-b not present on this box");
+    }
+
     #[test]
     fn provisioning_a_consumer_recreates_only_its_own_service() {
         let t = provision_targets("evolve").unwrap();
@@ -6399,6 +6488,29 @@ mod tests {
         // and a consumer the maps do not even mention reads the same way
         let v = recreate_verdicts(&consumers, &stamps(&[]), &stamps(&[]));
         assert_eq!(v[0].1, RecreateVerdict::NotRunning);
+    }
+
+    /// Exit 75 with a consumer whose container Docker did not answer for,
+    /// before and after: it was NOT recreated and must not read as "not part
+    /// of this install". A container that is genuinely absent stays as it was.
+    #[test]
+    fn a_consumer_docker_did_not_answer_for_is_held_not_absent() {
+        use super::STAMP_NO_ANSWER;
+        let consumers = vec!["noo-rhaddon".to_string(), "noo-rhaddon-b".to_string()];
+        let no_answer = Some(STAMP_NO_ANSWER);
+        let v = recreate_verdicts(
+            &consumers,
+            &stamps(&[("noo-rhaddon", no_answer), ("noo-rhaddon-b", None)]),
+            &stamps(&[("noo-rhaddon", no_answer), ("noo-rhaddon-b", None)]),
+        );
+        assert_eq!(v[0].1, RecreateVerdict::Held);
+        assert_eq!(v[1].1, RecreateVerdict::NotRunning, "genuinely absent: today's 'nothing to recreate'");
+        // one side only is enough: it cannot be proven recreated
+        let v = recreate_verdicts(&consumers[..1], &stamps(&[("noo-rhaddon", Some("t1"))]), &stamps(&[("noo-rhaddon", no_answer)]));
+        assert_eq!(v[0].1, RecreateVerdict::Held);
+        // exit-0 paths unchanged: a stamp that moved is still Recreated
+        let v = recreate_verdicts(&consumers[..1], &stamps(&[("noo-rhaddon", Some("t1"))]), &stamps(&[("noo-rhaddon", Some("t2"))]));
+        assert_eq!(v[0].1, RecreateVerdict::Recreated);
     }
 
     #[test]

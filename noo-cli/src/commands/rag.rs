@@ -399,6 +399,7 @@ pub fn rag_docs(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     };
     let mut hints: Vec<(&str, &str)> = vec![
         ("noo rag doc <id>", "audience, provenance, history and a text preview"),
+        ("noo rag page <id> <n>", "the full text of one page"),
         ("noo rag retag --doc-id <id> --role <r> --relabel", "change one document's audience (dry-run)"),
     ];
     if untagged > 0 && !want.untagged {
@@ -490,6 +491,43 @@ pub fn rag_doc(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         ("noo rag retag --doc-id <id> --role <r> --relabel", "change this document's audience (dry-run)"),
         ("noo rag docs", "back to the full list"),
     ]);
+    Ok(0)
+}
+
+/// One page, for a person: a header line, then the text as stored. Pure.
+fn render_page(d: &serde_json::Value) -> String {
+    let mut head = format!(
+        "{} · page {} of {} · {} chars",
+        d["title"].as_str().filter(|t| !t.is_empty()).unwrap_or("(untitled)"),
+        d["page_no"],
+        d["page_count"],
+        d["char_count"],
+    );
+    if d["truncated"].as_bool().unwrap_or(false) {
+        head.push_str(" (showing first 20,000)");
+    }
+    let text = d["text"].as_str().unwrap_or("");
+    format!("{head}\n\n{text}{}", if text.ends_with('\n') { "" } else { "\n" })
+}
+
+/// `noo rag page DOC-ID PAGE-NO` — GET /api/v1/docs/{id}/pages/{n}: the full
+/// text of one page (numbered from 1), cut at 20,000 characters.
+pub fn rag_page(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
+    let (id, page) = match args {
+        [id, page] if !id.starts_with('-') && !page.starts_with('-') => (id.clone(), page.clone()),
+        _ => return Err(Unhandled),
+    };
+    let body = get_json(g, &format!("/api/v1/docs/{}/pages/{}", urlencode(&id), urlencode(&page)), true, 15);
+    if g.json {
+        println!("{body}");
+        return Ok(0);
+    }
+    print!("{}", render_page(&body));
+    let (n, count) = (body["page_no"].as_i64().unwrap_or(0), body["page_count"].as_i64().unwrap_or(0));
+    if (1..count).contains(&n) {
+        let next = format!("noo rag page {id} {}", n + 1);
+        ui::guide(&[(next.as_str(), "the next page")]);
+    }
     Ok(0)
 }
 
@@ -1837,6 +1875,16 @@ mod tests {
             "audience_history": [], "page_count": 0, "text_preview": null});
         let out = render_doc(&old);
         assert!(out.contains("unknown") && out.contains("never changed") && out.contains("no text stored"), "{out}");
+    }
+
+    #[test]
+    fn page_renders_one_header_line_then_the_text() {
+        let d = serde_json::json!({"doc_id": "x", "page_no": 2, "page_count": 7, "title": "Q3 budget",
+            "char_count": 11, "text": "hello\nworld", "truncated": false});
+        assert_eq!(render_page(&d), "Q3 budget · page 2 of 7 · 11 chars\n\nhello\nworld\n");
+        let cut = serde_json::json!({"page_no": 1, "page_count": 1, "title": null, "char_count": 50000,
+            "text": "abc\n", "truncated": true});
+        assert_eq!(render_page(&cut), "(untitled) · page 1 of 1 · 50000 chars (showing first 20,000)\n\nabc\n");
     }
 
     #[test]

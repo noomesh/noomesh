@@ -11467,6 +11467,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/docs/{doc_id}/pages/{page_no}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Read one page of a document
+         * @description [native] The full text of ONE page of a document, read-only. Pages are numbered from 1, as stored. `char_count` is the page's real length; text over 20,000 characters is cut on a character boundary and `truncated` is true. Same audience as the document view: a missing document and one the caller cannot read both answer `404 no document <id>`; only for a readable document whose page is outside 1..page_count (0 and negatives included) does the 404 name the page count. 400 for an id that is not a UUID or a page that is not a whole number.
+         */
+        get: operations["doc_page"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -27672,6 +27692,37 @@ export interface operations {
                 content: {
                     "application/json": {
                         [key: string]: unknown;
+                    };
+                };
+            };
+        };
+    };
+    doc_page: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                doc_id: string;
+                page_no: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        doc_id?: string;
+                        page_no?: number;
+                        page_count?: number;
+                        title?: string | null;
+                        char_count?: number;
+                        text?: string;
+                        truncated?: boolean;
                     };
                 };
             };

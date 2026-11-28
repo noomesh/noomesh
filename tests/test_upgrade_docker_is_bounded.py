@@ -119,8 +119,6 @@ MIGRATED: dict[str, dict[str, str]] = {
         "psql_stdin": "pipes SQL into psql; its failure is its own error text",
         "try_login": "a login probe whose failure is classified by its stderr",
         "container_routable_host": "inspect for an address; None is 'no address'",
-        "container_created": "inspect for the created time (present())",
-        "depends_on": "inspect of compose labels; empty on failure",
     },
     "commands/cluster_push_secrets.rs": {
         "gateway_env_digest": "exec of a digest in the gateway",

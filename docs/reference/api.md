@@ -598,6 +598,17 @@ receives flat JSON events, each with a `type`:
 {"type": "keepalive"}
 ```
 
+While a turn runs the gateway keeps reading the socket. If the client
+closes it, the connection ends, or a keepalive cannot be sent, the gateway
+stops waiting for the turn and writes nothing more. A turn running in the
+gateway has its model call closed, so the backend's slot frees when the
+backend notices. A turn running in a node's harness is not yet told to stop:
+it runs to its end or its deadline (a follow-up will add that).
+`/api/inference/chat` stops waiting the same way when its client
+disconnects. Pings and pongs are ignored. A message the client sends during
+a turn is held, up to 16 messages or 1 MiB, and handled in order once the
+turn ends. A `Close` queued behind a full hold is seen when the turn ends.
+
 `done` (and the saved assistant message's metadata, and
 `/api/inference`'s `data`) carries `recall` when the turn ran
 conversation recall: `{"status": "ok", "hits": N}`, or `{"status":
@@ -705,6 +716,7 @@ Served by the trellion add-on; every route answers `503` with
 | GET | `/api/v1/rag/status` | store health |
 | GET | `/api/v1/docs` | ingested documents, newest first. A restricted caller sees only documents whose audience overlaps theirs (untagged ones are invisible to them); Operator+ items also carry `roles`, `provenance` and `audience_history_len`. Query: `limit` (200, max 2000), `offset`, `summary=1` (wraps the answer as `{docs, summary: {total, untagged, by_audience}}`), and the filters `untagged=1`, `audience=<tag>` (`user:*` = any personal tier), `match=<source_uri glob>`, `q=<title text>` |
 | GET | `/api/v1/docs/{doc_id}` | one document: row, page count, first ~1000 characters. Operator+ also get `roles`, `provenance`, `audience_history` and the whole `metadata`. `400` for an id that is not a UUID; `404` for a missing document **and** for one the caller cannot read (identical) |
+| GET | `/api/v1/docs/{doc_id}/pages/{page_no}` | the full text of one page of a document, read-only (`noo rag page`). Pages are numbered from 1, as stored. Answers `{doc_id, page_no, page_count, title, char_count, text, truncated}`; `char_count` is the page's real length, and text over 20,000 characters is cut on a character boundary with `truncated` `true`. Same audience as the document view (a held document reads like it does there): `404 no document <id>` for a missing document **and** for one the caller cannot read (identical); `404` naming the page count only for a readable document when the page is outside 1..page_count (0 and negatives included); `400` for an id that is not a UUID or a page that is not a whole number |
 | POST | `/api/v1/ingest/scan` | scan watched folders and drives now (`?source=folders\|drives\|all`, default `all`; `400` on anything else); answers `{results}` |
 | GET | `/api/v1/graph/stats`, `/entities`, `/entities/{entity_id}`, `/entities/{entity_id}/neighbors`, `/overview`, `/clusters/overview` | knowledge-graph reads (SQL-internal, no worker round-trip). `overview` takes `limit` (200, max 500), `entity_type`, `min_degree` (2) |
 | GET | `/api/v1/graph/clusters/audit` | read-only audit of how each cluster mixes audience tiers, what a `{company, system}` reader sees of it, and untagged-document coverage (`?limit=` caps the per-cluster list, default 1000, max 5000). Needs an unrestricted audience (admin or `kb:unrestricted`); anyone else gets `403` |

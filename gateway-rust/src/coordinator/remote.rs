@@ -242,6 +242,20 @@ impl HarnessRuntime for RemoteRuntime {
         crate::harness::profile::chat_context_for(&pinned.model)
     }
 
+    /// The engine window for the pinned model, from the agent's
+    /// `/harness/placement` `chat_windows` (the controller's own reading for
+    /// its in-process chats, `chat_context::window_for`, carried to the node).
+    /// Looked up by the pin AS GIVEN, with no gate on the backend type: the
+    /// shipped harness is pinned `auto` / `openai` (its env file; the node's
+    /// proxy substitutes the real model), and the agent states the window of
+    /// `auto` (the smallest across the node's chat placements) under that
+    /// name. `None` (the loop keeps its global window, as before) for any
+    /// endpoint but the pinned one, or when the agent sent no entry.
+    async fn chat_window(&self, backend: &ResolvedBackend) -> Option<u64> {
+        let pinned = self.pinned.as_ref().filter(|p| p.url == backend.url)?;
+        crate::harness::profile::chat_window_for(&pinned.model)
+    }
+
     async fn route_facts(&self, url: &str, _backend: &str) -> Option<(String, Option<super::classes::Slots>)> {
         // The placed endpoint is this node's; the slots come live from its
         // agent (`: queued ahead=N` and the occupancy headers), not from here.
@@ -521,6 +535,10 @@ mod tests {
     use super::*;
     use axum::{routing::post, Json, Router};
     use std::sync::Mutex;
+
+    /// The decided-context and engine-window tables are process-wide: the
+    /// tests that install them take this first, so none reads another's.
+    static TABLES: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     /// A stand-in gateway that records every op and the bearer it came
     /// with, and answers a fixed body per op name.
@@ -960,6 +978,7 @@ mod tests {
     /// stamped and the loop fell back to the global guess.
     #[tokio::test]
     async fn a_node_harness_turn_carries_the_decided_context_on_the_wire() {
+        let _tables = TABLES.lock().await;
         let seen = Arc::new(Mutex::new(Vec::new()));
         let gw = fake_gateway(seen.clone()).await;
         let bodies: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
@@ -996,6 +1015,110 @@ mod tests {
         let body = bodies.lock().unwrap().first().cloned().expect("the model was called");
         assert_eq!(body["options"]["num_ctx"], serde_json::json!(32768), "{body}");
         assert_eq!(body["options"]["num_predict"], serde_json::json!(crate::chat_context::reserve_for(32768)), "the reply reserve of the decided window: {body}");
+    }
+
+    /// i1411: a node harness fits a turn to the engine's own window for a
+    /// llama.cpp or vLLM placement (`/harness/placement` `chat_windows`), as
+    /// the gateway does for its in-process chats. A 4096 llama.cpp placement
+    /// gives a 3072-token prompt budget, not the global 12288; a missing
+    /// value (an older agent) or an unusable one keeps the global window; an
+    /// Ollama takes its decided context as before. One test, because the
+    /// tables are process-wide.
+    #[tokio::test]
+    async fn a_node_harness_fits_a_turn_to_the_engines_window() {
+        let _tables = TABLES.lock().await;
+        use super::super::agent_loop::window_max_input;
+        let rt = |pinned: &ResolvedBackend| RemoteRuntime {
+            gateway: "http://127.0.0.1:1".into(),
+            token: "t".into(),
+            client: reqwest::Client::new(),
+            metrics: Arc::new(crate::metrics::MetricsState::new()),
+            max_context_tokens: None,
+            max_session_messages: 1,
+            skills: crate::prompt_skills::SkillRegistry::default(),
+            runbooks: Vec::new(),
+            pinned: Some(pinned.clone()),
+        };
+        let llama = ResolvedBackend { url: "http://noo-llamacpp:8085".into(), model: "win-llama-3b".into(), backend_type: "llamacpp".into(), api_format: "llamacpp".into() };
+        let vllm = ResolvedBackend { url: "http://noo-vllm:8000".into(), model: "win-vllm-7b".into(), backend_type: "vllm".into(), api_format: "openai".into() };
+        let (global_len, reserve) = (16384u32, 4096u32);
+        let global_input = 12_288usize;
+
+        // An older agent: no `chat_windows`. Today's behaviour exactly.
+        crate::harness::profile::set_chat_windows(crate::harness::profile::chat_windows_of(&serde_json::json!({"placed": true})));
+        assert_eq!(rt(&llama).chat_window(&llama).await, None);
+        assert_eq!(window_max_input(&rt(&llama), &llama, global_len, reserve).await, global_input, "no value: the global window");
+
+        // The agent's table, with a zero and an absurd entry beside the two real ones.
+        let placement = serde_json::json!({"placed": true,
+            "chat_windows": {"win-llama-3b": 4096, "win-vllm-7b": 8192, "win-zero": 0, "win-absurd": 99_999_999_999u64, "auto": 4096}});
+        crate::harness::profile::set_chat_windows(crate::harness::profile::chat_windows_of(&placement));
+
+        assert_eq!(rt(&llama).chat_window(&llama).await, Some(4096));
+        assert_eq!(window_max_input(&rt(&llama), &llama, global_len, reserve).await, 3072, "4096 less its 1024 reserve, not the global 12288");
+        assert_eq!(rt(&vllm).chat_window(&vllm).await, Some(8192));
+        assert_eq!(window_max_input(&rt(&vllm), &vllm, global_len, reserve).await, 6144, "a vLLM placement likewise");
+
+        // The shipped pin (noo-harness.env.tmpl): model `auto`, backend `openai`.
+        // The agent states the window of `auto` (the smallest across the
+        // node's chat placements); the turn follows it.
+        let auto = ResolvedBackend { url: "http://127.0.0.1:8080".into(), model: "auto".into(), backend_type: "openai".into(), api_format: "openai".into() };
+        assert_eq!(rt(&auto).chat_window(&auto).await, Some(4096));
+        assert_eq!(window_max_input(&rt(&auto), &auto, global_len, reserve).await, 3072, "the production pin fits 4096, not the global 12288");
+        // The lookup is the PIN's model, not the backend argument's.
+        let other_model = ResolvedBackend { model: "win-vllm-7b".into(), ..auto.clone() };
+        assert_eq!(rt(&auto).chat_window(&other_model).await, Some(4096), "keyed by the pin");
+        assert_eq!(rt(&llama).chat_window(&ResolvedBackend { model: "auto".into(), ..llama.clone() }).await, Some(4096), "the pin's own entry, not the argument's");
+
+        // Ollama keeps its own table (`chat_num_ctx`, pinned by the test above),
+        // asked before this one; the agent's `auto:latest` entry serves the shipped pin.
+
+        // Only the pinned endpoint is this node's.
+        let elsewhere = ResolvedBackend { url: "http://elsewhere:8085".into(), ..llama.clone() };
+        assert_eq!(rt(&llama).chat_window(&elsewhere).await, None);
+
+        // Zero, absurd, and absent entries are the global window.
+        for model in ["win-zero", "win-absurd", "win-not-in-table"] {
+            let b = ResolvedBackend { model: model.into(), ..llama.clone() };
+            assert_eq!(rt(&b).chat_window(&b).await, None, "{model}");
+            assert_eq!(window_max_input(&rt(&b), &b, global_len, reserve).await, global_input, "{model}");
+        }
+
+        // A table with no entry for the pinned model, and a cleared table.
+        crate::harness::profile::set_chat_windows(crate::harness::profile::chat_windows_of(&serde_json::json!({"chat_windows": {"other-model": 4096}})));
+        assert_eq!(rt(&llama).chat_window(&llama).await, None);
+        crate::harness::profile::set_chat_windows(None);
+        assert_eq!(rt(&vllm).chat_window(&vllm).await, None);
+    }
+
+    /// i1411: for the shipped `auto` pin the agent states one window in both
+    /// tables. Through one runtime the Ollama lookup and the engine lookup
+    /// agree, and the turn is fitted once, to that single window.
+    #[tokio::test]
+    async fn the_auto_pin_is_fitted_once_when_both_tables_state_it() {
+        use super::super::agent_loop::window_max_input;
+        let _tables = TABLES.lock().await;
+        let placement = serde_json::json!({"placed": true, "chat_contexts": {"auto:latest": 4096}, "chat_windows": {"auto": 4096}});
+        crate::harness::profile::set_chat_contexts(crate::harness::profile::chat_contexts_of(&placement));
+        crate::harness::profile::set_chat_windows(crate::harness::profile::chat_windows_of(&placement));
+        let auto = ResolvedBackend { url: "http://127.0.0.1:8080".into(), model: "auto".into(), backend_type: "openai".into(), api_format: "openai".into() };
+        let rt = RemoteRuntime {
+            gateway: "http://127.0.0.1:1".into(),
+            token: "t".into(),
+            client: reqwest::Client::new(),
+            metrics: Arc::new(crate::metrics::MetricsState::new()),
+            max_context_tokens: None,
+            max_session_messages: 1,
+            skills: crate::prompt_skills::SkillRegistry::default(),
+            runbooks: Vec::new(),
+            pinned: Some(auto.clone()),
+        };
+        assert_eq!(rt.chat_num_ctx(&auto).await, Some(4096));
+        assert_eq!(rt.chat_window(&auto).await, Some(4096));
+        assert_eq!(rt.chat_num_ctx(&auto).await, rt.chat_window(&auto).await, "the two lookups agree");
+        assert_eq!(window_max_input(&rt, &auto, 16384, 4096).await, 3072, "one window: 4096 less its reserve, not applied twice");
+        crate::harness::profile::set_chat_contexts(None);
+        crate::harness::profile::set_chat_windows(None);
     }
 
     /// i411, P3: a body with nothing readable in it is the backend's error,

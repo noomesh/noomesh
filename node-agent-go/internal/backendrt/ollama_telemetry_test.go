@@ -6,6 +6,8 @@ package backendrt
 import (
 	"errors"
 	"github.com/noomesh/noomesh/node-agent-go/internal/refusals"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -390,5 +392,139 @@ func TestConvergeRewritesAChangedProfileContextAndRestartsOnce(t *testing.T) {
 	if _, restarted, _ := g.Converge(); !restarted ||
 		!f.had(plutilBin+" -replace EnvironmentVariables.OLLAMA_CONTEXT_LENGTH -string 8192 "+plist) {
 		t.Errorf("a changed default must converge: restarted=%v %v", restarted, f.cmds)
+	}
+}
+
+// A boot-service plist the agent cannot edit: the refusal names every sudo
+// command (a bootout of a job that is not loaded is tolerated), and the wanted
+// tuning is recorded for `noo enroll --resume`, which writes the same values.
+func TestSystemPlistDriftRecordsTheWantedEnvForEnrollResume(t *testing.T) {
+	refusals.Reset()
+	t.Cleanup(refusals.Reset)
+	f := &fakeMac{env: map[string]string{"OLLAMA_NO_CLOUD": "1"}, procEnv: procWith}
+	sys := OllamaSystemPlistPath(newBrew)
+	g := &OllamaGuard{Home: "/Users/m", UID: 501, Run: f.run, Exists: func(p string) bool { return p == sys }}
+	g.WantedFile = filepath.Join(t.TempDir(), "noomesh", OllamaWantedEnvFile)
+	g.TuningKnown = func() bool { return true }
+	g.Tuning = func() map[string]string {
+		return map[string]string{"OLLAMA_CONTEXT_LENGTH": "8192", "OLLAMA_KEEP_ALIVE": "-1", "OLLAMA_HOST": "0.0.0.0"}
+	}
+	if managed, restarted, err := g.Converge(); err != nil || !managed || restarted {
+		t.Fatalf("managed=%v restarted=%v err=%v", managed, restarted, err)
+	}
+	b, err := os.ReadFile(g.WantedFile)
+	if err != nil || string(b) != "{\"known\":true,\"env\":{\"OLLAMA_CONTEXT_LENGTH\":\"8192\",\"OLLAMA_KEEP_ALIVE\":\"-1\"}}\n" {
+		t.Fatalf("wanted file = %q, %v", b, err)
+	}
+	rs := refusals.List()
+	if len(rs) != 1 || rs[0].Scope != "ollama_env" {
+		t.Fatalf("refusals = %+v", rs)
+	}
+	for _, want := range []string{
+		"sudo " + plutilBin + " -replace EnvironmentVariables.OLLAMA_CONTEXT_LENGTH -string '8192' " + sys,
+		"sudo launchctl bootout system/" + newBrew + " 2>/dev/null || true",
+		"lacks OLLAMA_CONTEXT_LENGTH, OLLAMA_KEEP_ALIVE: run `noo enroll --resume` on this Mac to apply them; or by hand on the Mac run `sudo",
+	} {
+		if !strings.Contains(rs[0].Reason, want) {
+			t.Errorf("reason lacks %q: %s", want, rs[0].Reason)
+		}
+	}
+	// The supported fix comes before every manual command.
+	if e, m := strings.Index(rs[0].Reason, "noo enroll --resume"), strings.Index(rs[0].Reason, "sudo"); e < 0 || m < 0 || e > m {
+		t.Errorf("enroll --resume must come before the sudo lines: %s", rs[0].Reason)
+	}
+}
+
+// Production wires the wanted-file path: the agent's own constructor puts it
+// at ~/noomesh/ollama-env.json, where `noo enroll` reads it.
+func TestNewOllamaGuardRecordsTheWantedEnvUnderTheNodeHome(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	g := NewOllamaGuard()
+	if want := filepath.Join(home, "noomesh", OllamaWantedEnvFile); g.WantedFile != want {
+		t.Fatalf("WantedFile = %q, want %q", g.WantedFile, want)
+	}
+	if g.TuningKnown == nil {
+		t.Fatal("production guard has no TuningKnown: the wanted file would never be written")
+	}
+}
+
+// The file follows the wanted set whether or not the plist drifted: a key
+// that leaves the placements leaves the file, and an empty set is "{}".
+func TestWantedEnvFileTracksTheSetWithoutDriftAndLeavesNoTempFile(t *testing.T) {
+	refusals.Reset()
+	t.Cleanup(refusals.Reset)
+	sys := OllamaSystemPlistPath(newBrew)
+	f := &fakeMac{env: map[string]string{"OLLAMA_NO_CLOUD": "1", "OLLAMA_KEEP_ALIVE": "-1"}, procEnv: procWith}
+	g := &OllamaGuard{Home: "/Users/m", UID: 501, Run: f.run, Exists: func(p string) bool { return p == sys }}
+	dir := filepath.Join(t.TempDir(), "noomesh")
+	g.WantedFile = filepath.Join(dir, OllamaWantedEnvFile)
+	g.TuningKnown = func() bool { return true }
+	set := map[string]string{"OLLAMA_KEEP_ALIVE": "-1"}
+	g.Tuning = func() map[string]string { return set }
+	read := func() string {
+		b, err := os.ReadFile(g.WantedFile)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(b)
+	}
+	g.Converge() // the plist already matches: no drift
+	if got := read(); got != "{\"known\":true,\"env\":{\"OLLAMA_KEEP_ALIVE\":\"-1\"}}\n" {
+		t.Fatalf("file = %q", got)
+	}
+	set = map[string]string{} // the key left the placements; still no drift
+	g.Converge()
+	if got := read(); got != "{\"known\":true,\"env\":{}}\n" {
+		t.Fatalf("file = %q", got)
+	}
+	if st, _ := os.Stat(g.WantedFile); st.Mode().Perm() != 0o640 {
+		t.Errorf("mode = %v", st.Mode().Perm())
+	}
+	if ents, _ := os.ReadDir(dir); len(ents) != 1 {
+		t.Errorf("temp file left behind: %v", ents)
+	}
+}
+
+// Before the reconciler has read the desired state the tuning is unknown, not
+// empty: nothing is written and an older file survives. After it, an empty
+// set is written as known-empty.
+func TestWantedEnvFileIsLeftAloneUntilTheDesiredStateIsKnown(t *testing.T) {
+	refusals.Reset()
+	t.Cleanup(refusals.Reset)
+	sys := OllamaSystemPlistPath(newBrew)
+	f := &fakeMac{env: map[string]string{"OLLAMA_NO_CLOUD": "1"}, procEnv: procWith}
+	g := &OllamaGuard{Home: "/Users/m", UID: 501, Run: f.run, Exists: func(p string) bool { return p == sys }}
+	g.WantedFile = filepath.Join(t.TempDir(), OllamaWantedEnvFile)
+	old := "{\"known\":true,\"env\":{\"OLLAMA_KEEP_ALIVE\":\"-1\"}}\n"
+	if err := os.WriteFile(g.WantedFile, []byte(old), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	known := false
+	g.TuningKnown = func() bool { return known }
+	g.Tuning = func() map[string]string { return map[string]string{} }
+	g.Converge()
+	if b, _ := os.ReadFile(g.WantedFile); string(b) != old {
+		t.Fatalf("an unknown set rewrote the file: %q", b)
+	}
+	known = true
+	g.Converge()
+	if b, _ := os.ReadFile(g.WantedFile); string(b) != "{\"known\":true,\"env\":{}}\n" {
+		t.Fatalf("file = %q", b)
+	}
+}
+
+// The process-wide signal is false until SetOllamaTuning runs, even with nil.
+func TestOllamaTuningKnownFollowsSetOllamaTuning(t *testing.T) {
+	tuningMu.Lock()
+	tuningKnown = false
+	tuningMu.Unlock()
+	t.Cleanup(func() { SetOllamaTuning(nil) })
+	if OllamaTuningKnown() {
+		t.Fatal("known before any desired state")
+	}
+	SetOllamaTuning(nil)
+	if !OllamaTuningKnown() {
+		t.Fatal("SetOllamaTuning(nil) is a known-empty set")
 	}
 }

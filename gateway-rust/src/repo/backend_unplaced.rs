@@ -80,16 +80,18 @@ pub fn parse(node: &str, key: &str, value: &str) -> Option<Tombstone> {
 
 /// What desired-config ships: `(unplaced, expired)`. `unplaced` is
 /// `[{backend, role, unplaced_at}]` for every tombstone that is at most
-/// [`TTL_SECS`] old and whose `(backend, role)` is not in `placements` (a
-/// re-place wins, even before its PUT deleted the key). `expired` are the
+/// [`TTL_SECS`] old and whose backend no placement names, in any role or
+/// state (a re-place wins, even before its PUT deleted the key; one role's
+/// unplace while another role keeps the backend placed ships nothing). `expired` are the
 /// keys past the TTL (or with a time in the future by more than the TTL,
 /// a clock that cannot be trusted), for the caller to delete. Pure: the
 /// placements array is the one desired-config sends, and nothing here ever
 /// adds to it.
 pub fn ship(tombstones: &[Tombstone], placements: &[Value], now_unix: i64) -> (Vec<Value>, Vec<String>) {
-    let placed = |b: &str, r: &str| {
-        placements.iter().any(|p| p["backend"].as_str() == Some(b) && p["role"].as_str().unwrap_or("chat") == r)
-    };
+    // Any placement of the backend, in any role or state (the agent's
+    // `wantedBackend`): one role's unplace while another role keeps the
+    // backend placed is no reap authority, and is not shipped as one.
+    let placed = |b: &str| placements.iter().any(|p| p["backend"].as_str() == Some(b));
     let mut unplaced = Vec::new();
     let mut expired = Vec::new();
     for t in tombstones {
@@ -98,7 +100,7 @@ pub fn ship(tombstones: &[Tombstone], placements: &[Value], now_unix: i64) -> (V
             expired.push(t.key.clone());
             continue;
         }
-        if placed(&t.backend, &t.role) {
+        if placed(&t.backend) {
             continue;
         }
         unplaced.push(json!({"backend": t.backend, "role": t.role, "unplaced_at": t.unplaced_at}));
@@ -295,14 +297,33 @@ mod tests {
         assert_eq!(e, vec![old.key]);
     }
 
-    /// A tombstone whose (backend, role) is placed again is never shipped:
-    /// the placement wins.
+    /// A tombstone whose backend any placement still names, in any role or
+    /// state, is never shipped: the placement wins. An embed unplace while
+    /// the chat role keeps ollama placed ships nothing for ollama.
     #[test]
-    fn a_placed_slot_is_never_shipped_as_unplaced() {
+    fn a_placed_backend_ships_no_tombstone_in_any_role() {
         let placements = vec![json!({"backend": "ollama", "role": "chat", "desired_state": "running"})];
         let (u, _) = ship(&[tomb("ollama", "chat", NOW - 5), tomb("ollama", "embed", NOW - 5)], &placements, NOW);
-        assert_eq!(u.len(), 1);
-        assert_eq!(u[0]["role"], "embed");
+        assert!(u.is_empty(), "a backend still placed in another role shipped {u:?}");
+        let stopped = vec![json!({"backend": "ollama", "role": "chat", "desired_state": "stopped"})];
+        assert!(ship(&[tomb("ollama", "embed", NOW - 5)], &stopped, NOW).0.is_empty(), "a stopped placement still names the backend");
+        let other = vec![json!({"backend": "vllm", "role": "chat", "desired_state": "running"})];
+        assert_eq!(ship(&[tomb("ollama", "embed", NOW - 5)], &other, NOW).0.len(), 1, "another backend's placement does not hold this one");
+    }
+
+    /// cf's rc.7 sequence: the embed role is unplaced while chat keeps ollama
+    /// placed (nothing ships), then the chat role is unplaced (both
+    /// tombstones ship, each with its own time, and the agent acts on the
+    /// newest).
+    #[test]
+    fn the_last_role_s_unplace_is_what_ships_the_backend() {
+        let embed = tomb("ollama", "embed", NOW - 1500);
+        let chat_placed = vec![json!({"backend": "ollama", "role": "chat", "desired_state": "running"})];
+        assert!(ship(std::slice::from_ref(&embed), &chat_placed, NOW).0.is_empty());
+        let chat = tomb("ollama", "chat", NOW - 2);
+        let (u, _) = ship(&[embed, chat], &[], NOW);
+        assert_eq!(u.len(), 2);
+        assert!(u.iter().any(|x| x["role"] == "chat" && x["unplaced_at"] == json!(at(NOW - 2))));
     }
 
     /// `ship` never touches `placements`: it takes them by reference and its

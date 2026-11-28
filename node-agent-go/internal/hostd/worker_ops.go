@@ -171,10 +171,16 @@ var (
 )
 
 func bootstrapOutwaitingTeardown(ctx context.Context, r Runner) (int, string) {
+	return bootstrapPlistOutwaitingTeardown(ctx, r, HarnessLaunchdPlist)
+}
+
+// bootstrapPlistOutwaitingTeardown is the same bounded wait for any system
+// job's plist (the fetch re-arm, fetch_rearm.go, uses it for its own).
+func bootstrapPlistOutwaitingTeardown(ctx context.Context, r Runner, plist string) (int, string) {
 	var rc int
 	var stderr string
 	for attempt := 0; attempt <= bootstrapRetries; attempt++ {
-		rc, stderr = r.Run(ctx, "/", nil, "launchctl", "bootstrap", "system", HarnessLaunchdPlist)
+		rc, stderr = r.Run(ctx, "/", nil, "launchctl", "bootstrap", "system", plist)
 		if rc == 0 || !strings.Contains(stderr, "Input/output error") {
 			return rc, stderr
 		}
@@ -318,8 +324,16 @@ func fetchPlistUser(plist string) string {
 // absorbed by the steady-state throttle.
 func opFetchBundle(ctx context.Context, e *Engine, _ string, _ *Command) (int, string) {
 	armExpectBundle(e)
-	argv := fetchKickArgv(runtime.GOOS)
-	return e.Runner.Run(ctx, "/", nil, argv[0], argv[1:]...)
+	argv := fetchKickArgv(fetchKickGOOS)
+	rc, stderr := e.Runner.Run(ctx, "/", nil, argv[0], argv[1:]...)
+	// Only a kick that FAILED is the moment to look at the job (darwin worker
+	// only; a no-op elsewhere). After a kick that worked launchd is mid-spawn
+	// and still shows the previous run's exit status; acting on that would
+	// bootout the fetch that was just started.
+	if rc != 0 {
+		e.fetchJobCheck(ctx, true)
+	}
+	return rc, stderr
 }
 
 // FetchLaunchdLabel is the Mac fetch job: a system LaunchDaemon with a 60s

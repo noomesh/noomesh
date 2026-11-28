@@ -421,7 +421,7 @@ def test_hostd_boot_restore_runs_the_guard_before_anything_else():
     assert m
     script = m.group(1)
     guard = script.index("data_root_mount_boot_guard")
-    for later in ("secret_rundir)", "check_state_volume_open", "load_secrets", "docker start"):
+    for later in ("secret_rundir)", "check_state_volume_open", "load_secrets", '_noo_start "$id"'):
         assert guard < script.index(later), later
 
 
@@ -568,3 +568,130 @@ def test_the_report_carries_the_postgres_note(rig):
     run(rig, FAKE_EUID="0", FAKE_USER="root")
     r = run(rig, fn="data_root_mount_report", **_pg_unlistable(rig))
     assert "RC=0" in r.stdout and "could not be listed as rhowner" in r.stdout, r.stdout
+
+
+# ── one normal form for the data root; a record is never written empty ────
+# record: noomesh-internal i1398
+
+
+@pytest.mark.parametrize("suffix", ["", "/", "//", "///"])
+def test_trailing_slashes_name_the_same_root_in_evaluate_and_writer(rig, suffix):
+    r = run(rig, NOO_DATA_ROOT=str(rig["data"]) + suffix)
+    assert "RC=0" in r.stdout, r.stderr
+    assert f"data_root={rig['data']}\n" in record(rig)
+    # every spelling then passes against the one record
+    for other in ("", "/", "//"):
+        again = run(rig, NOO_DATA_ROOT=str(rig["data"]) + other)
+        assert "RC=0" in again.stdout and "REFUSED" not in again.stderr, (other, again.stderr)
+
+
+def test_a_root_of_only_slashes_is_skipped_and_writes_nothing(rig):
+    for v in ("/", "//", "///"):
+        r = run(rig, NOO_DATA_ROOT=v)
+        assert "RC=0" in r.stdout, r.stderr
+        assert not (rig["install"] / ".noo-data-root-id").exists(), v
+
+
+@pytest.mark.parametrize("val", ["", "/", "//"])
+def test_the_writer_refuses_an_empty_or_slash_root_and_says_why(rig, val):
+    script = f'source {LIB}\n_drm_evaluate\nrc=0; _drm_write_record || rc=$?\necho "RC=$rc"\n'
+    env = dict(rig["env"], NOO_DATA_ROOT=val)
+    r = subprocess.run(["bash", "-c", script], cwd=rig["install"], env=env, capture_output=True, text=True, timeout=60)
+    assert "RC=1" in r.stdout, r.stderr
+    assert "NOO_DATA_ROOT is empty or only slashes" in r.stderr
+    assert not (rig["install"] / ".noo-data-root-id").exists()
+
+
+def _strip_data_root(rig):
+    f = rig["install"] / ".noo-data-root-id"
+    f.write_text("".join(ln for ln in f.read_text().splitlines(True) if not ln.startswith("data_root=")))
+
+
+def test_a_record_with_an_id_but_no_data_root_on_the_same_filesystem_is_repaired(rig):
+    run(rig)
+    _strip_data_root(rig)
+    r = run(rig)
+    assert "RC=0" in r.stdout and "REFUSED" not in r.stderr, r.stderr
+    assert f"data_root={rig['data']}\n" in record(rig)
+    assert f"uuid={UUID_A}" in record(rig)
+    assert "RC=0" in run(rig).stdout
+
+
+def test_a_record_with_an_empty_data_root_value_is_repaired_the_same_way(rig):
+    run(rig)
+    f = rig["install"] / ".noo-data-root-id"
+    f.write_text(re.sub(r"(?m)^data_root=.*$", "data_root=", f.read_text()))
+    r = run(rig)
+    assert "RC=0" in r.stdout, r.stderr
+    assert f"data_root={rig['data']}\n" in record(rig)
+
+
+def test_a_record_with_no_data_root_still_refuses_another_filesystem(rig):
+    run(rig)
+    _strip_data_root(rig)
+    for env in (
+        {"FAKE_UUID": UUID_B},
+        {"FAKE_UUID": "rootfs-9999", "FAKE_SOURCE": "/dev/sda2", "FAKE_TARGET": "/"},
+    ):
+        r = run(rig, **env)
+        assert "RC=1" in r.stdout and "not on its recorded filesystem" in r.stderr, r.stderr
+        assert "data_root=" not in record(rig), "a refused launch rewrote the record"
+
+
+def test_a_record_with_no_data_root_and_no_identity_refuses_and_names_the_repair(rig):
+    (rig["install"] / ".noo-data-root-id").write_text("# nothing useful\nrecorded_at=2026-01-01T00:00:00Z\n")
+    r = run(rig)
+    assert "RC=1" in r.stdout and "damaged" in r.stderr, r.stderr
+    assert "not mounted" not in r.stderr
+    assert "NOO_DATA_ROOT_RERECORD=1 noo stack start" in r.stderr
+    ok = run(rig, NOO_DATA_ROOT_RERECORD="1")
+    assert "RC=0" in ok.stdout, ok.stderr
+    assert f"data_root={rig['data']}\n" in record(rig)
+
+
+def test_the_not_mounted_wording_is_not_used_when_the_record_itself_names_the_root_fs(rig):
+    run(rig, FAKE_UUID="rootfs-9999", FAKE_SOURCE="/dev/sda2", FAKE_TARGET="/")
+    r = run(rig, FAKE_UUID="rootfs-8888", FAKE_SOURCE="/dev/sda2", FAKE_TARGET="/")
+    assert "RC=1" in r.stdout and "the data disk is not mounted" not in r.stderr
+
+
+def test_an_empty_identity_is_never_healed_as_a_match(rig):
+    # uuid kind, empty uuid, filesystem without a UUID: "" == "" must not pass
+    run(rig, FAKE_UUID="")
+    f = rig["install"] / ".noo-data-root-id"
+    f.write_text("".join(ln for ln in f.read_text().splitlines(True) if not ln.startswith("data_root=")))
+    f.write_text(f.read_text().replace("id_kind=mount", "id_kind=uuid"))
+    before = f.read_text()
+    r = run(rig, FAKE_UUID="", FAKE_EUID="0", FAKE_USER="root")
+    assert "RC=1" in r.stdout and "damaged" in r.stderr, r.stderr
+    assert "NOO_DATA_ROOT_RERECORD=1 noo stack start" in r.stderr
+    assert f.read_text() == before
+
+
+def test_a_mount_kind_record_without_data_root_heals_only_on_the_same_mount(rig):
+    run(rig, FAKE_UUID="")
+    f = rig["install"] / ".noo-data-root-id"
+    assert "id_kind=mount" in record(rig)
+    f.write_text("".join(ln for ln in f.read_text().splitlines(True) if not ln.startswith("data_root=")))
+    other = run(rig, FAKE_UUID="", FAKE_SOURCE="/dev/other")
+    assert "RC=1" in other.stdout and "not on its recorded filesystem" in other.stderr, other.stderr
+    ok = run(rig, FAKE_UUID="")
+    assert "RC=0" in ok.stdout, ok.stderr
+    assert f"data_root={rig['data']}\n" in record(rig)
+
+
+def test_a_mount_kind_record_with_empty_source_and_target_is_damaged(rig):
+    f = rig["install"] / ".noo-data-root-id"
+    f.write_text("id_kind=mount\nsource=\ntarget=\nfstype=\n")
+    r = run(rig, FAKE_UUID="")
+    assert "RC=1" in r.stdout and "damaged" in r.stderr, r.stderr
+
+
+def test_a_normal_record_is_not_rewritten_on_launch(rig):
+    run(rig)
+    f = rig["install"] / ".noo-data-root-id"
+    before = f.read_bytes()
+    mt = f.stat().st_mtime_ns
+    r = run(rig)
+    assert "RC=0" in r.stdout and "wrote the data root back" not in r.stderr
+    assert f.read_bytes() == before and f.stat().st_mtime_ns == mt

@@ -190,6 +190,7 @@ const NATIVE: &[(&[&str], Handler)] = &[
     (&["rag", "status"], commands::rag_status),
     (&["rag", "docs"], commands::rag_docs),
     (&["rag", "doc"], commands::rag_doc),
+    (&["rag", "page"], commands::rag_page),
     (&["rag", "ingest"], commands::rag_ingest),
     (&["rag", "scan"], commands::rag_scan),
     (&["rag", "deduplicate"], commands::rag_deduplicate),

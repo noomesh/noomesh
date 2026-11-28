@@ -1382,7 +1382,14 @@ pub(crate) fn cert_consumers(name: &str, role: &str, local_hostname: &str) -> Ve
         "gateway" => vec!["noo-gateway".into()],
         "service" => {
             let svc = parent_name(name);
-            vec![format!("noo-{svc}"), format!("noo-stunnel-{svc}")]
+            let mut v = vec![format!("noo-{svc}"), format!("noo-stunnel-{svc}")];
+            // vllm-secondary's door mounts the SAME `services/vllm` leaf
+            // (its compose service has no leaf of its own).
+            if svc == "vllm" {
+                v.push("noo-stunnel-vllm-secondary".to_string());
+                v.push("noo-vllm-secondary".to_string());
+            }
+            v
         }
         "node" if !local_hostname.is_empty() && parent_name(name) == local_hostname => {
             vec!["noo-node-agent".into()]
@@ -1420,6 +1427,423 @@ pub(crate) fn replica_consumers(name: &str, running: &[String]) -> Vec<String> {
         .collect()
 }
 
+/// The containers a set of rotated certificates needs restarted, in restart
+/// order: running consumers (`cert_consumers`, remapped to this instance by
+/// `remap`) plus running replicas (`replica_consumers`), each once, the
+/// gateway last. `rotated` is `(pki-relative name, role)`. Both `rotate-all`
+/// paths use it: the reload path restarts exactly this list, and `--no-reload`
+/// prints the follow-up for exactly this list.
+///
+/// `running` is `None` when Docker could not be asked: the list is then every
+/// consumer of a rotated certificate, running or not (replicas cannot be
+/// known), so a follow-up built from it can only over-name, never omit.
+pub(crate) fn restart_list(
+    rotated: &[(&str, &str)],
+    local_hostname: &str,
+    running: Option<&[String]>,
+    remap: impl Fn(&str) -> String,
+) -> Vec<String> {
+    let mut to_restart: Vec<String> = Vec::new();
+    for (name, role) in rotated {
+        for c in cert_consumers(name, role, local_hostname) {
+            // cert_consumers speaks default-instance names; remap ONCE
+            // here so the running-set match, the restarts and the health
+            // probe all see this instance's real container names.
+            let c = remap(&c);
+            if running.is_none_or(|r| r.contains(&c)) && !to_restart.contains(&c) {
+                to_restart.push(c);
+            }
+        }
+        for c in replica_consumers(name, running.unwrap_or_default()) {
+            if !to_restart.contains(&c) {
+                to_restart.push(c);
+            }
+        }
+    }
+    // Suffix compare: instance prefixes vary (noo-gateway / noo-galaxy-gateway).
+    to_restart.sort_by_key(|c| c.ends_with("-gateway")); // stable: gateway last
+    to_restart
+}
+
+/// Run `restart` on each container of `list`, in order: the reload and the
+/// revert loops both go through here, so what restarts is exactly the list.
+fn restart_each(list: &[String], mut restart: impl FnMut(&str)) {
+    for c in list {
+        restart(c);
+    }
+}
+
+fn docker_restart(container: &str) {
+    let _ = Command::new("docker").args(["restart", container]).output();
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Door sidecars: reloaded in place, backend untouched
+// ─────────────────────────────────────────────────────────────────────────
+
+/// The model-backend doors: `stunnel-<door>` sidecars whose backend container
+/// (`<door>`) shares the sidecar's network namespace (`network_mode:
+/// service:stunnel-<door>`, `depends_on ... restart: true`). Only the sidecar
+/// mounts the certificate, and stunnel re-reads cert, key and CA on SIGHUP,
+/// so a rotation reloads the sidecar in place and leaves the backend (a model
+/// server that can take minutes to load) running. A test pins this list to
+/// `docker-compose.cluster.yml`: a new `stunnel-*` service there that is not
+/// named here fails it.
+pub(crate) const DOOR_SIDECARS: [&str; 6] = ["llamacpp", "ollama", "ollama-embed", "ollama-embed-cpu", "vllm", "vllm-secondary"];
+
+/// The bound on one `docker kill` / `docker logs` call of a reload.
+const DOCKER_RELOAD_SECS: u64 = 15;
+/// How long to wait for stunnel to log the outcome of a reload.
+const RELOAD_WAIT: Duration = Duration::from_secs(10);
+/// stunnel 5.x lines that end a reload. Observed on stunnel 5.75: the
+/// success line "Configuration successful" and that a broken pair logs
+/// "Failed to reload" while the old configuration (and certificate) keeps
+/// serving. "configuration failed" is the assumed primary failure marker (it
+/// also catches "Reloading configuration failed"); not yet seen verbatim.
+const RELOAD_OK_MARKER: &str = "configuration successful";
+const RELOAD_FAILED_MARKERS: [&str; 2] = ["configuration failed", "failed to reload"];
+
+/// The door a container is the sidecar of (`noo-stunnel-ollama` is `ollama`),
+/// when it is one of [`DOOR_SIDECARS`].
+fn door_of(container: &str, prefix: &str) -> Option<&'static str> {
+    let svc = stack_service_of(container, prefix)?;
+    let door = svc.strip_prefix("stunnel-")?;
+    DOOR_SIDECARS.iter().copied().find(|d| *d == door)
+}
+
+/// One door sidecar to reload and the backend that shares its namespace
+/// (present only when the backend is among the consumers).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DoorReload {
+    sidecar: String,
+    backend: Option<String>,
+}
+
+/// Each consumer of a rotated certificate, classified: RELOAD (a door
+/// sidecar, its backend left out) or RESTART (everything else, in the order
+/// [`restart_list`] gave, the gateway last).
+#[derive(Debug, Default, PartialEq, Eq)]
+struct RotationPlan {
+    reload: Vec<DoorReload>,
+    restart: Vec<String>,
+}
+
+fn rotation_plan(consumers: &[String], prefix: &str) -> RotationPlan {
+    let mut reload: Vec<DoorReload> = Vec::new();
+    let mut held: Vec<String> = Vec::new();
+    for c in consumers {
+        let Some(door) = door_of(c, prefix) else { continue };
+        let backend = format!("{prefix}-{door}");
+        let backend = consumers.contains(&backend).then_some(backend);
+        held.push(c.clone());
+        held.extend(backend.iter().cloned());
+        reload.push(DoorReload { sidecar: c.clone(), backend });
+    }
+    let restart = consumers.iter().filter(|c| !held.contains(c)).cloned().collect();
+    RotationPlan { reload, restart }
+}
+
+/// What a reload came to. Only `Reloaded` is evidence the sidecar serves the
+/// new certificate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReloadOutcome {
+    Reloaded,
+    /// stunnel said the reload failed (or the signal could not be sent): it
+    /// keeps serving the old certificate.
+    Failed,
+    /// No outcome line within the wait: nothing shows the certificate changed.
+    Unknown,
+}
+
+/// The outcome in the sidecar's log text since the signal. Any failure line
+/// wins over a success line; no evidence is `Unknown`, never success.
+fn parse_reload_log(log: &str) -> ReloadOutcome {
+    let low = log.to_ascii_lowercase();
+    if RELOAD_FAILED_MARKERS.iter().any(|m| low.contains(m)) {
+        ReloadOutcome::Failed
+    } else if low.contains(RELOAD_OK_MARKER) {
+        ReloadOutcome::Reloaded
+    } else {
+        ReloadOutcome::Unknown
+    }
+}
+
+/// The containers to restart for one door after its reload: nothing when it
+/// reloaded; otherwise the SIDECAR first, then the backend: the backend
+/// shares the sidecar's network namespace, so restarting the sidecar after
+/// it would leave the backend without networking.
+fn door_fallback(door: &DoorReload, outcome: ReloadOutcome) -> Vec<String> {
+    if outcome == ReloadOutcome::Reloaded {
+        return Vec::new();
+    }
+    std::iter::once(door.sidecar.clone()).chain(door.backend.iter().cloned()).collect()
+}
+
+/// `list` with every door pair (sidecar and backend both present) ordered
+/// sidecar first, backend right after it. The backend shares the sidecar's
+/// network namespace, so a backend restarted BEFORE its sidecar is left with
+/// a dead namespace. Other entries keep their order (the gateway stays last).
+fn sidecar_first(list: &[String], prefix: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for c in list {
+        if out.contains(c) {
+            continue;
+        }
+        let pair = DOOR_SIDECARS.iter().find_map(|d| {
+            let (sidecar, backend) = (format!("{prefix}-stunnel-{d}"), format!("{prefix}-{d}"));
+            (*c == sidecar || *c == backend).then_some((sidecar, backend))
+        });
+        match pair {
+            Some((sidecar, backend)) if list.contains(&sidecar) => {
+                out.push(sidecar);
+                if list.contains(&backend) {
+                    out.push(backend);
+                }
+            }
+            _ => out.push(c.clone()),
+        }
+    }
+    out
+}
+
+/// What [`apply_consumers`] did.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Applied {
+    /// Door sidecars reloaded in place and verified.
+    reloaded: Vec<String>,
+    /// Every container restarted, fallbacks included.
+    restarted: Vec<String>,
+    /// Door sidecars whose reload was not verified, with why.
+    fell_back: Vec<(String, ReloadOutcome)>,
+}
+
+/// Reload each door, restart its backend and sidecar when the reload is not
+/// verified, then restart the rest of the plan (the gateway last). Doors go
+/// first so the gateway is always the last thing touched.
+fn apply_consumers(plan: &RotationPlan, mut reload: impl FnMut(&str) -> ReloadOutcome, mut restart: impl FnMut(&str)) -> Applied {
+    let mut done = Applied::default();
+    for door in &plan.reload {
+        let outcome = reload(&door.sidecar);
+        let fallback = door_fallback(door, outcome);
+        if fallback.is_empty() {
+            done.reloaded.push(door.sidecar.clone());
+        } else {
+            restart_each(&fallback, &mut restart);
+            done.restarted.extend(fallback);
+            done.fell_back.push((door.sidecar.clone(), outcome));
+        }
+    }
+    restart_each(&plan.restart, &mut restart);
+    done.restarted.extend(plan.restart.iter().cloned());
+    done
+}
+
+/// The line the reload path prints for one door's outcome.
+fn reload_outcome_line(sidecar: &str, outcome: ReloadOutcome) -> String {
+    match outcome {
+        ReloadOutcome::Reloaded => format!("{sidecar} reloaded in place (stunnel logged a successful reload); its backend was not restarted"),
+        ReloadOutcome::Failed => format!("{sidecar} did NOT reload (stunnel kept the old certificate): restarted it, then its backend, instead"),
+        ReloadOutcome::Unknown => format!("{sidecar} showed no reload outcome within {} s, so the new certificate is unconfirmed: restarted it, then its backend, instead", RELOAD_WAIT.as_secs()),
+    }
+}
+
+/// SIGHUP one door sidecar, then read its log since the signal for stunnel's
+/// outcome. Both docker calls are bounded.
+fn reload_door_sidecar(container: &str) -> ReloadOutcome {
+    let since = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| format!("{}.{:09}", d.as_secs(), d.subsec_nanos()))
+        .unwrap_or_else(|_| "0".to_string());
+    let limit = Duration::from_secs(DOCKER_RELOAD_SECS);
+    match crate::bounded::docker(&["kill", "-s", "HUP", container], limit) {
+        crate::bounded::Bounded::Answered(o) if o.status.success() => {}
+        _ => return ReloadOutcome::Failed,
+    }
+    let start = std::time::Instant::now();
+    loop {
+        std::thread::sleep(Duration::from_secs(1));
+        if let crate::bounded::Bounded::Answered(o) = crate::bounded::docker(&["logs", "--since", &since, container], limit) {
+            // stunnel logs to stderr; `docker logs` replays both streams.
+            let text = format!("{}\n{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+            let outcome = parse_reload_log(&text);
+            if outcome != ReloadOutcome::Unknown {
+                return outcome;
+            }
+        }
+        if start.elapsed() >= RELOAD_WAIT {
+            return ReloadOutcome::Unknown;
+        }
+    }
+}
+
+/// [`apply_consumers`] against Docker, printing each door's outcome.
+fn apply_to_stack(plan: &RotationPlan, json: bool) -> Applied {
+    let done = apply_consumers(
+        plan,
+        |c| {
+            let outcome = reload_door_sidecar(c);
+            if !json && outcome == ReloadOutcome::Reloaded {
+                ui::done(&reload_outcome_line(c, outcome));
+            }
+            outcome
+        },
+        docker_restart,
+    );
+    if !json {
+        for (c, outcome) in &done.fell_back {
+            ui::warned(&reload_outcome_line(c, *outcome));
+        }
+    }
+    done
+}
+
+const NO_RESTART_NEEDED: &str = "on this machine no running service uses a rotated certificate: no restart is needed";
+const NO_CONSUMERS: &str = "on this machine no service consumes a rotated certificate";
+const RELOAD_ONLY_NOTE: &str = "on this machine nothing needs restarting: the door sidecars above take the new certificate on a reload, and their backend containers keep running";
+const RELOAD_CHECK_NOTE: &str = "a door sidecar's backend does not need restarting; after the reload its log shows `Configuration successful` when the new certificate is served, and `Failed to reload` when stunnel kept the old one (then restart the sidecar and its backend)";
+const NOTHING_ELSE_TO_RESTART: &str = "on this machine nothing else needs restarting";
+/// The bound on `docker ps`, and the number the refusals name.
+const DOCKER_PS_SECS: u64 = 15;
+const DOCKER_DID_NOT_ANSWER: &str = "`docker ps` did not answer within 15 s, so which containers are running is unknown: these are EVERY consumer of a rotated certificate, running or not, plus any replica containers of the services above (running sandbox/worker replicas cannot be named without Docker)";
+const AGENT_COPY_NOTE: &str = "the agent's copy of its certificate under /etc/noo/pki is synced only by the reload path; --no-reload did not sync it";
+const OTHER_NODES_NOTE: &str = "certificates rotated for other machines are not restarted from here: they were delivered over the pull rail above (--no-deliver skips that, and says so above)";
+
+/// The compose service a container is, when `noo stack restart <service>`
+/// can name it: containers are `<prefix>-<service>` (`noo-gateway` is
+/// `gateway`, `noo-stunnel-nats` is `stunnel-nats`). A replica
+/// (`<project>-sandbox-extra-1`) has no container_name and no service of its
+/// own to name, so it has none.
+fn stack_service_of(container: &str, prefix: &str) -> Option<String> {
+    if container.contains("-extra-") {
+        return None;
+    }
+    container
+        .strip_prefix(prefix)
+        .and_then(|rest| rest.strip_prefix('-'))
+        .filter(|svc| !svc.is_empty())
+        .map(str::to_string)
+}
+
+/// What `rotate-all --no-reload` tells the operator, as data.
+struct NoReloadInputs<'a> {
+    /// From [`rotation_plan`]: what is restarted, gateway last.
+    restart: &'a [String],
+    /// From [`rotation_plan`]: door sidecars reloaded in place.
+    reload: &'a [String],
+    /// Whether Docker answered when the list was made.
+    docker_answered: bool,
+    /// The instance's container prefix (`noo`, or `noo-<name>`).
+    prefix: &'a str,
+    /// The named instance (`--instance`), empty for the default one.
+    instance: &'a str,
+    /// This machine's node certificate rotated and `noo-node-agent` is a
+    /// host unit: the reload path restarts it with systemctl.
+    local_agent_unit: bool,
+    /// The reload path runs systemctl directly as root, `sudo -n` otherwise.
+    am_root: bool,
+    /// A node certificate for another machine was rotated.
+    other_nodes_rotated: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct NoReloadReport {
+    warning: Option<String>,
+    /// Per door sidecar, `docker kill -s HUP <c>` then the log check: its
+    /// backend is not restarted.
+    reload_commands: Vec<String>,
+    /// Commands to run on this machine, in order, gateway last.
+    commands: Vec<String>,
+    /// Muted closing lines.
+    notes: Vec<String>,
+}
+
+fn no_reload_report(p: &NoReloadInputs) -> NoReloadReport {
+    let noo = if p.instance.is_empty() { "noo".to_string() } else { format!("noo --instance {}", shquote(p.instance)) };
+    let mut services: Vec<String> = Vec::new();
+    let mut docker: Vec<String> = Vec::new();
+    let mut gateway: Option<String> = None;
+    for c in p.restart {
+        match stack_service_of(c, p.prefix) {
+            Some(svc) if c.ends_with("-gateway") => gateway = Some(svc),
+            Some(svc) => services.push(svc),
+            None => docker.push(format!("docker restart {}", shquote(c))),
+        }
+    }
+    let mut commands: Vec<String> = Vec::new();
+    if p.local_agent_unit {
+        // What the reload path runs: systemctl as root, `sudo -n systemctl` otherwise.
+        commands.push(if p.am_root { "systemctl restart noo-node-agent".into() } else { "sudo systemctl restart noo-node-agent".into() });
+    }
+    if !services.is_empty() {
+        commands.push(format!("{noo} stack restart {}", services.join(" ")));
+    }
+    commands.extend(docker);
+    if let Some(g) = gateway {
+        commands.push(format!("{noo} stack restart {g}"));
+    }
+    let mut reload_commands: Vec<String> = Vec::new();
+    for c in p.reload {
+        reload_commands.push(format!("docker kill -s HUP {}", shquote(c)));
+        reload_commands.push(format!("docker logs --since 1m {}", shquote(c)));
+    }
+    let mut notes: Vec<String> = Vec::new();
+    if !commands.is_empty() {
+        notes.push(NOTHING_ELSE_TO_RESTART.to_string());
+    } else if !reload_commands.is_empty() {
+        notes.push(RELOAD_ONLY_NOTE.to_string());
+    } else if p.docker_answered {
+        notes.push(NO_RESTART_NEEDED.to_string());
+    } else {
+        notes.push(NO_CONSUMERS.to_string());
+    }
+    if p.local_agent_unit {
+        notes.push(AGENT_COPY_NOTE.to_string());
+    }
+    if p.other_nodes_rotated {
+        notes.push(OTHER_NODES_NOTE.to_string());
+    }
+    if !reload_commands.is_empty() {
+        notes.push(RELOAD_CHECK_NOTE.to_string());
+    }
+    NoReloadReport { warning: (!p.docker_answered).then(|| DOCKER_DID_NOT_ANSWER.to_string()), reload_commands, commands, notes }
+}
+
+/// `--no-reload` JSON: `would_restart` names, in order, the containers the
+/// reload path would have restarted (every consumer when Docker did not
+/// answer), and `docker_answered` says which.
+fn with_would_restart(mut summary: serde_json::Value, restart: &[String], docker_answered: bool) -> serde_json::Value {
+    summary["would_restart"] = serde_json::json!(restart);
+    summary["docker_answered"] = serde_json::json!(docker_answered);
+    summary
+}
+
+/// `--no-reload` JSON: `would_reload` names, in order, the door sidecars the
+/// reload path would have reloaded in place (their backends are not restarted).
+fn with_would_reload(mut summary: serde_json::Value, reload: &[String]) -> serde_json::Value {
+    summary["would_reload"] = serde_json::json!(reload);
+    summary
+}
+
+/// Reload-path JSON: `restarted` is every container restarted (door
+/// fallbacks included), `reloaded_in_place` the door sidecars reloaded and
+/// verified, `reload_fallbacks` the doors whose reload was not verified.
+fn with_applied(mut summary: serde_json::Value, done: &Applied) -> serde_json::Value {
+    summary["restarted"] = serde_json::json!(done.restarted);
+    summary["reloaded_in_place"] = serde_json::json!(done.reloaded);
+    summary["reload_fallbacks"] = serde_json::json!(done
+        .fell_back
+        .iter()
+        .map(|(c, o)| serde_json::json!({ "container": c, "outcome": format!("{o:?}").to_lowercase() }))
+        .collect::<Vec<_>>());
+    summary
+}
+
+/// Reload-path JSON: `restarted` names the containers that were restarted.
+fn with_restarted(mut summary: serde_json::Value, restart: &[String]) -> serde_json::Value {
+    summary["restarted"] = serde_json::json!(restart);
+    summary
+}
+
 fn local_hostname() -> String {
     std::fs::read_to_string("/proc/sys/kernel/hostname")
         .map(|s| s.trim().to_string())
@@ -1427,80 +1851,519 @@ fn local_hostname() -> String {
         .unwrap_or_default()
 }
 
-fn running_containers() -> Vec<String> {
-    let out = Command::new("docker")
-        .args(["ps", "--format", "{{.Names}}"])
-        .output();
-    match out {
-        Ok(o) => String::from_utf8_lossy(&o.stdout)
-            .split_whitespace()
-            .map(str::to_string)
-            .collect(),
-        Err(_) => Vec::new(),
+/// The running container names, or `None` when Docker could not be asked
+/// (not runnable, a failed `docker ps`, or no answer in time): an empty list
+/// and "could not ask" must never read the same.
+fn docker_running_names() -> Option<Vec<String>> {
+    match crate::bounded::docker(&["ps", "--format", "{{.Names}}"], Duration::from_secs(DOCKER_PS_SECS)) {
+        crate::bounded::Bounded::Answered(o) if o.status.success() => {
+            Some(String::from_utf8_lossy(&o.stdout).split_whitespace().map(str::to_string).collect())
+        }
+        _ => None,
     }
 }
 
-/// All restarted containers running (and not unhealthy); gateway serving
-/// /health if present. Port of `security_cli.py::_probe_health`, except that
-/// the `https://localhost:8080/health` probe VERIFIES the certificate (the
-/// Python original passed `verify=False`).
-fn probe_health(containers: &[String], timeout_secs: u64) -> (bool, String) {
-    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
-    loop {
-        let mut bad: Vec<String> = Vec::new();
-        for c in containers {
-            let out = Command::new("docker")
-                .args([
-                    "inspect",
-                    "-f",
-                    "{{.State.Running}} {{if .State.Health}}{{.State.Health.Status}}{{end}}",
-                    c,
-                ])
-                .output();
-            let state = out
-                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-                .unwrap_or_default();
-            if !state.starts_with("true") || state.contains("unhealthy") {
-                bad.push(c.clone());
+fn running_containers() -> Vec<String> {
+    docker_running_names().unwrap_or_default()
+}
+
+/// What the gateway's `/health` probe found.
+#[derive(Debug, PartialEq, Eq, Clone)]
+enum GwHealth {
+    /// No gateway among the restarted containers: nothing to probe.
+    NotApplicable,
+    /// Answered 200 over a verified TLS connection.
+    Ok,
+    /// Answered a status other than 200 over a verified TLS connection.
+    Answered(u16),
+    /// Nothing answered (refused, reset, unreachable, timed out): the error.
+    NothingAnswered(String),
+    /// Something answered, but this CLI could not verify it (name mismatch,
+    /// unknown issuer, protocol error): the error. A client-side failure:
+    /// it says nothing about the gateway.
+    BadAnswer(String),
+    /// No trust anchor to verify with: the probe could not even be made.
+    NoTrust(String),
+    /// No address to probe could be determined (see [`health_probe_url`]).
+    NoAddress(String),
+}
+
+/// What docker reports about one restarted container.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum DockerState {
+    /// `docker inspect` said the container is not running (an explicit `false`).
+    NotRunning,
+    /// `docker inspect` failed or said nothing parseable (docker missing,
+    /// daemon hiccup, unknown name): neither healthy nor bad. Alone, it ends
+    /// Blind; it is never a reason to revert.
+    Unknown,
+    /// Running, healthcheck says `unhealthy`.
+    Unhealthy,
+    /// Running, healthcheck has not passed yet.
+    Starting,
+    /// Running, healthcheck says `healthy`.
+    Healthy,
+    /// Running, the image has no healthcheck.
+    NoCheck,
+}
+
+/// Parse `docker inspect -f '{{.State.Running}} {{if .State.Health}}{{.State.Health.Status}}{{end}}'`.
+/// The health word is compared whole: `unhealthy` contains `healthy`.
+/// Only an explicit `false` first word is [`DockerState::NotRunning`]; empty
+/// or unparseable output is [`DockerState::Unknown`].
+fn parse_docker_state(out: &str) -> DockerState {
+    let mut w = out.split_whitespace();
+    match w.next() {
+        Some("true") => {}
+        Some("false") => return DockerState::NotRunning,
+        _ => return DockerState::Unknown,
+    }
+    match w.next() {
+        Some("healthy") => DockerState::Healthy,
+        Some("unhealthy") => DockerState::Unhealthy,
+        Some("starting") => DockerState::Starting,
+        None => DockerState::NoCheck,
+        // A health state this CLI does not know is not evidence of health.
+        Some(_) => DockerState::Starting,
+    }
+}
+
+/// The state a `docker inspect` run says: `None` when it could not be
+/// spawned, else (exit succeeded, stdout). A failed inspect says nothing
+/// about the container, so it is Unknown, never "not running".
+fn docker_state_of(ran: Option<(bool, &str)>) -> DockerState {
+    match ran {
+        Some((true, stdout)) => parse_docker_state(stdout),
+        _ => DockerState::Unknown,
+    }
+}
+
+fn docker_state_word(s: DockerState) -> &'static str {
+    match s {
+        DockerState::NotRunning => "not running",
+        DockerState::Unknown => "state unknown (docker inspect gave no answer)",
+        DockerState::Unhealthy => "running; health: unhealthy",
+        DockerState::Starting => "running; health: starting",
+        DockerState::Healthy => "running; health: healthy",
+        DockerState::NoCheck => "running; health: none",
+    }
+}
+
+/// `name: running; health: starting, other: running; health: none`.
+fn docker_summary(dockers: &[(String, DockerState)]) -> String {
+    dockers
+        .iter()
+        .map(|(n, s)| format!("{n}: {}", docker_state_word(*s)))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// How a health gate ended.
+#[derive(Debug, PartialEq, Eq)]
+enum GateOutcome {
+    Healthy(String),
+    /// Docker says a restarted container is not running or unhealthy, or
+    /// `/health` answered a failure status over a verified connection.
+    Unhealthy(String),
+    /// Docker does not condemn the consumers and nothing confirmed them
+    /// either: the gate could not tell.
+    Blind(String),
+}
+
+/// What `rotate-all` does with a gate's verdict.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum GateAction {
+    /// Keep the rotation, report it applied.
+    Accept,
+    /// Restore the backup and restart the consumers.
+    Revert,
+    /// Keep the rotated certificates, touch nothing more, exit non-zero and
+    /// tell the operator how to confirm or go back. A gate that could not
+    /// see is no evidence against the new certificates.
+    KeepUnconfirmed,
+}
+
+/// The decision, pure: only an Unhealthy gate reverts. A blind one never does.
+fn gate_action(outcome: &GateOutcome) -> GateAction {
+    match outcome {
+        GateOutcome::Healthy(_) => GateAction::Accept,
+        GateOutcome::Unhealthy(_) => GateAction::Revert,
+        GateOutcome::Blind(_) => GateAction::KeepUnconfirmed,
+    }
+}
+
+/// Where the gateway is bound, as far as the configuration says.
+#[derive(Debug, PartialEq, Eq)]
+enum BindTarget {
+    /// A specific address (the tailnet IP, or a pinned one).
+    Address(String),
+    /// Loopback or every interface: the loopback address answers.
+    Local,
+    /// The configuration does not say, or says something that is not an
+    /// address; the reason.
+    Unknown(String),
+}
+
+/// One key out of `.env` exactly as `scripts/lib-bind-addr.sh`
+/// (`_bind_env_value`) reads it: the last line starting with the key
+/// (spaces allowed around `=`), everything after the first `=`, with spaces,
+/// tabs, carriage returns and double quotes deleted. No `export `, no
+/// inline comments and no single quotes are understood there, so none are
+/// here: a value the launcher cannot read is not an address.
+fn launcher_env_value(content: &str, key: &str) -> String {
+    let mut found = String::new();
+    for line in content.lines() {
+        let rest = line.trim_start_matches([' ', '\t']);
+        let Some(rest) = rest.strip_prefix(key) else { continue };
+        let rest = rest.trim_start_matches([' ', '\t']);
+        let Some(value) = rest.strip_prefix('=') else { continue };
+        found = value.chars().filter(|c| !matches!(c, ' ' | '\t' | '\r' | '"')).collect();
+    }
+    found
+}
+
+/// An IP literal (v4, or v6 with or without brackets): the launcher binds an
+/// address, so a host name or anything else is not one.
+fn ip_literal(s: &str) -> bool {
+    s.trim_matches(|c| c == '[' || c == ']').parse::<std::net::IpAddr>().is_ok()
+}
+
+/// The address the launcher (`scripts/lib-bind-addr.sh`) binds the gateway
+/// to, from `NOO_BIND_ADDR` (explicit, wins), else `NOO_BIND_MODE`, compared
+/// the way the launcher's `case` does (exact, lower case): `all` / `0.0.0.0`
+/// and `local` / `loopback` / `127.0.0.1` answer on loopback, `tailnet` is
+/// this node's tailnet IP, any other value is a literal address, and a value
+/// that is not an IP literal (a host name, a mode in the wrong case) is unknown. Pure: the settings and the tailnet
+/// IP come in as arguments.
+fn bind_target(addr: &str, mode: &str, tailnet_ip: Option<&str>) -> BindTarget {
+    let loopback_or_wildcard = |a: &str| {
+        let bare = a.trim_matches(|c| c == '[' || c == ']');
+        bare == "0.0.0.0" || bare == "::" || bare == "::1" || bare.starts_with("127.")
+    };
+    let addr = addr.trim();
+    if !addr.is_empty() {
+        return if loopback_or_wildcard(addr) {
+            BindTarget::Local
+        } else if ip_literal(addr) {
+            BindTarget::Address(addr.to_string())
+        } else {
+            BindTarget::Unknown(format!("NOO_BIND_ADDR={addr:?} is not an IP address"))
+        };
+    }
+    let mode = mode.trim();
+    match mode {
+        "" => BindTarget::Unknown("neither NOO_BIND_ADDR nor NOO_BIND_MODE is set".to_string()),
+        "all" | "0.0.0.0" | "local" | "loopback" | "127.0.0.1" => BindTarget::Local,
+        "tailnet" => match tailnet_ip.map(str::trim).filter(|ip| !ip.is_empty()) {
+            Some(ip) => BindTarget::Address(ip.to_string()),
+            None => BindTarget::Unknown(
+                "NOO_BIND_MODE=tailnet, but tailscale reports no address for this host".to_string(),
+            ),
+        },
+        _ if ip_literal(mode) => BindTarget::Address(mode.to_string()),
+        _ => BindTarget::Unknown(format!("NOO_BIND_MODE={mode:?} is neither a mode nor an IP address")),
+    }
+}
+
+/// The host part of an `http(s)://` URL (no brackets), or "".
+fn url_host(url: &str) -> String {
+    let rest = url.split_once("://").map_or(url, |(_, r)| r);
+    let auth = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let auth = auth.rsplit_once('@').map_or(auth, |(_, h)| h);
+    if let Some(v6) = auth.strip_prefix('[') {
+        return v6.split(']').next().unwrap_or("").to_string();
+    }
+    auth.split(':').next().unwrap_or("").to_string()
+}
+
+/// True when `url`'s host is this machine itself: the literal `localhost`, a
+/// loopback IP (v4 or v6), or its tailnet IP. A configured gateway URL can name another host or a
+/// tailscale-serve front, whose answer says nothing about this gateway.
+fn host_is_this_machine(url: &str, tailnet_ip: Option<&str>) -> bool {
+    let h = url_host(url);
+    if h.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    // A DNS name is never this machine, whatever it starts with
+    // (`127.0.0.1.example.com`): only an IP literal is compared.
+    let Ok(ip) = h.parse::<std::net::IpAddr>() else { return false };
+    ip.is_loopback()
+        || tailnet_ip
+            .and_then(|t| t.trim().parse::<std::net::IpAddr>().ok())
+            .is_some_and(|t| t == ip)
+}
+
+/// The URL the gateway's `/health` is probed at, and whether an answer from
+/// it counts as this gateway's. Pure.
+///
+/// A gateway bound to a specific address (a controller onboarded on a
+/// tailnet binds ONLY its tailnet IP) refuses loopback, so that address is
+/// probed. `Local` probes `127.0.0.1`, the address the launcher binds for
+/// `local` mode (the gateway certificate carries it as a SAN). When the bind
+/// is not known, the CLI's configured gateway URL (`CONTROLLER_URL` /
+/// `NOO_GATEWAY_URL`, an enrolled record) is probed instead, and counts only
+/// when its host is this machine; with none, there is no address and the
+/// caller says so.
+fn health_probe_url(
+    configured: &str,
+    source: &crate::envfile::GatewaySource,
+    target: &BindTarget,
+    port_offset: u32,
+    tailnet_ip: Option<&str>,
+) -> Result<(String, bool), String> {
+    let port = 8080 + port_offset;
+    match target {
+        BindTarget::Address(a) => {
+            let bare = a.trim_matches(|c| c == '[' || c == ']');
+            let host = if bare.contains(':') { format!("[{bare}]") } else { bare.to_string() };
+            Ok((format!("https://{host}:{port}/health"), true))
+        }
+        BindTarget::Local => Ok((format!("https://127.0.0.1:{port}/health"), true)),
+        BindTarget::Unknown(why) => {
+            if matches!(source, crate::envfile::GatewaySource::Default) {
+                Err(format!("{why}, and no gateway URL is configured"))
+            } else {
+                Ok((
+                    format!("{}/health", configured.trim_end_matches('/')),
+                    host_is_this_machine(configured, tailnet_ip),
+                ))
             }
         }
-        let gw_ok = if containers.iter().any(|c| c.ends_with("-gateway")) {
-            https_health_ok(&format!(
-                "https://localhost:{}/health",
-                8080 + crate::envfile::port_offset()
-            ))
-        } else {
-            true
-        };
-        if bad.is_empty() && gw_ok {
-            return (true, "all consumers healthy".into());
+    }
+}
+
+/// [`health_probe_url`] on this host's own settings.
+fn gateway_health_url() -> Result<(String, bool), String> {
+    let offset = crate::envfile::port_offset();
+    let (configured, source) = crate::envfile::gateway_url_source(&None);
+    let env_file = std::fs::read_to_string(crate::envfile::repo_root().join(".env")).unwrap_or_default();
+    // The launcher's order: the environment, then `.env`.
+    let setting = |key: &str| match std::env::var(key) {
+        Ok(v) if !v.trim().is_empty() => v,
+        _ => launcher_env_value(&env_file, key),
+    };
+    let addr = setting("NOO_BIND_ADDR");
+    let mode = setting("NOO_BIND_MODE");
+    let tailnet_ip = crate::tailnet_serve::tailnet_ip();
+    health_probe_url(
+        &configured,
+        &source,
+        &bind_target(&addr, &mode, tailnet_ip.as_deref()),
+        offset,
+        tailnet_ip.as_deref(),
+    )
+}
+
+/// The gateway's part of a gate's text: what the probe found and where.
+fn gw_note(gw: &GwHealth, url: &str, own: bool) -> String {
+    match gw {
+        GwHealth::NotApplicable => String::new(),
+        GwHealth::Ok if !own => format!(
+            "/health at {url} answered 200, but that address is not this machine's own, so it does not count"
+        ),
+        GwHealth::Ok => format!("/health at {url} answered 200"),
+        GwHealth::Answered(st) if !own => format!(
+            "/health at {url} answered HTTP {st}, but that address is not this machine's own, so it does not count"
+        ),
+        GwHealth::Answered(st) => format!("/health at {url} answered HTTP {st}"),
+        GwHealth::NothingAnswered(e) | GwHealth::NoTrust(e) => {
+            format!("the CLI could not reach /health at {url}: {e}")
         }
-        if Instant::now() >= deadline {
-            return (
-                false,
-                format!(
-                    "unhealthy after {timeout_secs}s: {bad:?}{}",
-                    if !gw_ok { " gateway /health failing" } else { "" }
-                ),
-            );
+        GwHealth::BadAnswer(e) => {
+            format!("/health at {url} answered, but this CLI could not verify the answer: {e}")
+        }
+        GwHealth::NoAddress(why) => format!("/health was not probed: no address to probe ({why})"),
+    }
+}
+
+/// The gate's decision. Pure, so the whole table is tested. Docker's own
+/// health is the authority for reverting; the CLI's HTTP probe can confirm,
+/// never condemn on a client-side failure.
+///
+/// - Healthy, as soon as it holds: no container is not-running or
+///   `unhealthy`, and either every container is running with a healthcheck
+///   that says `healthy` (or none), or `/health` answered 200 at an address
+///   that is this machine's own. (A container still `starting` is not
+///   healthy; `healthy` is stricter than "not unhealthy".)
+/// - Unhealthy, at the deadline: a container is not running or `unhealthy`,
+///   or `/health` answered a non-200 status over verified TLS at an address
+///   that is this machine's own.
+/// - Blind, at the deadline, for everything else: a container still
+///   `starting`; no address; no trust anchor; nothing answering; every
+///   client-side TLS failure (name mismatch, unknown issuer, protocol error).
+///
+/// `None` means keep polling.
+fn decide_gate(
+    timeout_secs: u64,
+    dockers: &[(String, DockerState)],
+    gw: &GwHealth,
+    own: bool,
+    url: &str,
+    at_deadline: bool,
+) -> Option<GateOutcome> {
+    let bad: Vec<String> = dockers
+        .iter()
+        .filter(|(_, s)| matches!(s, DockerState::NotRunning | DockerState::Unhealthy))
+        .map(|(n, s)| format!("{n} ({})", docker_state_word(*s)))
+        .collect();
+    let verified_failure = match gw {
+        GwHealth::Answered(st) if own => Some(*st),
+        _ => None,
+    };
+    let docker_ok = bad.is_empty()
+        && dockers.iter().all(|(_, s)| matches!(s, DockerState::Healthy | DockerState::NoCheck));
+    let probe_200 = own && matches!(gw, GwHealth::Ok);
+    if bad.is_empty() && verified_failure.is_none() && (docker_ok || probe_200) {
+        return Some(GateOutcome::Healthy("all consumers healthy".into()));
+    }
+    if !at_deadline {
+        return None;
+    }
+    let url = &mask_userinfo(url);
+    let note = gw_note(gw, url, own);
+    let tail = if note.is_empty() { String::new() } else { format!("; {note}") };
+    if !bad.is_empty() {
+        return Some(GateOutcome::Unhealthy(format!("unhealthy after {timeout_secs}s: {}{tail}", bad.join(", "))));
+    }
+    if let Some(st) = verified_failure {
+        return Some(GateOutcome::Unhealthy(format!(
+            "gateway /health at {url} answered HTTP {st} after {timeout_secs}s (docker reports {})",
+            docker_summary(dockers)
+        )));
+    }
+    let confirm = if note.is_empty() {
+        "no probe confirmed them".to_string()
+    } else {
+        format!("the CLI could not confirm: {note}")
+    };
+    Some(GateOutcome::Blind(format!(
+        "after {timeout_secs}s docker reports {}; {confirm}",
+        docker_summary(dockers)
+    )))
+}
+
+/// Wait for the restarted containers: poll docker's health and the gateway's
+/// `/health` (at the address it listens on, certificate verified) until
+/// [`decide_gate`] says it is healthy or the deadline passes.
+fn probe_health_gate(containers: &[String], timeout_secs: u64) -> GateOutcome {
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+    let has_gateway = containers.iter().any(|c| c.ends_with("-gateway"));
+    let target = if has_gateway { gateway_health_url() } else { Ok((String::new(), false)) };
+    let shown_url = target.clone().map(|(u, _)| u).unwrap_or_default();
+    let own = target.as_ref().is_ok_and(|(_, o)| *o);
+    loop {
+        let dockers: Vec<(String, DockerState)> = containers
+            .iter()
+            .map(|c| {
+                let out = Command::new("docker")
+                    .args([
+                        "inspect",
+                        "-f",
+                        "{{.State.Running}} {{if .State.Health}}{{.State.Health.Status}}{{end}}",
+                        c,
+                    ])
+                    .output();
+                let ran = out.ok().map(|o| (o.status.success(), String::from_utf8_lossy(&o.stdout).into_owned()));
+                (c.clone(), docker_state_of(ran.as_ref().map(|(ok, text)| (*ok, text.as_str()))))
+            })
+            .collect();
+        let gw = match (&target, has_gateway) {
+            (_, false) => GwHealth::NotApplicable,
+            (Ok((u, _)), true) => https_health_check(u),
+            (Err(why), true) => GwHealth::NoAddress(why.clone()),
+        };
+        if let Some(outcome) = decide_gate(timeout_secs, &dockers, &gw, own, &shown_url, Instant::now() >= deadline) {
+            return outcome;
         }
         std::thread::sleep(Duration::from_secs(5));
     }
 }
 
-/// GET with a 4s timeout, VERIFIED against the resolved trust anchor. The
-/// Python original passed `verify=False`; the gateway cert names `localhost`
-/// and `127.0.0.1` (`pki::issue_gateway_cert`) and this code runs on the
-/// controller, which holds the CA, so verification costs nothing and a probe
-/// that cannot tell WHO answered proves nothing about the rollout it gates.
-fn https_health_ok(url: &str) -> bool {
-    let Ok(agent) = crate::http::agent_for(url, 4) else {
-        return false;
-    };
-    match agent.get(url).call() {
-        Ok(resp) => resp.status().as_u16() == 200,
-        Err(_) => false,
+/// [`probe_health_gate`] as `(healthy, detail)`, for callers that only warn
+/// (the CA rotation reports `rotated_with_warnings` and never reverts).
+fn probe_health(containers: &[String], timeout_secs: u64) -> (bool, String) {
+    match probe_health_gate(containers, timeout_secs) {
+        GateOutcome::Healthy(d) => (true, d),
+        GateOutcome::Unhealthy(d) | GateOutcome::Blind(d) => (false, d),
     }
+}
+
+/// GET with a 4s timeout, VERIFIED against the resolved trust anchor. The
+/// Python original passed `verify=False`; the gateway cert names `localhost`,
+/// `127.0.0.1` and the address it was issued for (`pki::issue_gateway_cert`),
+/// and this code runs on the controller, which holds the CA, so verification
+/// costs nothing and a probe that cannot tell WHO answered proves nothing
+/// about the rollout it gates. A failure on this side (no anchor, name
+/// mismatch, unknown issuer) is reported as such and never as the gateway
+/// failing.
+fn https_health_check(url: &str) -> GwHealth {
+    let agent = match crate::http::agent_for(url, 4) {
+        Ok(a) => a,
+        Err(e) => return GwHealth::NoTrust(format!("no trust anchor to verify it with: {e}")),
+    };
+    // Never follow a redirect: an answer from somewhere else is not this
+    // gateway's. A 3xx comes back as a status and is "answered, not 200".
+    let call = agent.get(url).config().max_redirects(0).build().call();
+    gw_from_probe(match call {
+        Ok(resp) => Ok(resp.status().as_u16()),
+        Err(e) => {
+            let class = match crate::http::classify_send_error(&e) {
+                crate::http::SendFailure::SlowAnswer => "timed out after connecting",
+                crate::http::SendFailure::Unreachable => "connection failed",
+            };
+            Err(ProbeError { nothing_answered: crate::http::nothing_answered(&e), text: format!("{class}: {e}") })
+        }
+    })
+}
+
+/// A failed `/health` request, reduced to what the gate needs.
+#[derive(Debug, PartialEq, Eq, Clone)]
+struct ProbeError {
+    /// Nothing answered (refused, reset, unreachable, timed out), as against
+    /// something answering that this CLI could not accept (TLS, protocol).
+    nothing_answered: bool,
+    text: String,
+}
+
+/// A request's result as the gate's [`GwHealth`]. Pure: a status of 200 is
+/// Ok and any other status (a 3xx included) is Answered; a failure is
+/// NothingAnswered or BadAnswer, never Answered, so a client-side failure
+/// can not be mistaken for the gateway failing.
+fn gw_from_probe(r: Result<u16, ProbeError>) -> GwHealth {
+    match r {
+        Ok(200) => GwHealth::Ok,
+        Ok(st) => GwHealth::Answered(st),
+        Err(e) if e.nothing_answered => GwHealth::NothingAnswered(e.text),
+        Err(e) => GwHealth::BadAnswer(e.text),
+    }
+}
+
+/// `https://user:secret@host/x` as `https://***@host/x`: a configured URL
+/// may carry credentials and this text is printed.
+fn mask_userinfo(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else { return url.to_string() };
+    let auth_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    match rest[..auth_end].rfind('@') {
+        Some(at) => format!("{scheme}://***@{}", &rest[at + 1..]),
+        None => url.to_string(),
+    }
+}
+
+/// The copy-back the operator can run to go back to the backup: restore the
+/// files, re-sync `pki/public/` (`fix-modes` does), restart the consumers.
+/// `instance` is the named instance in use, "" for the default.
+fn copy_back_command(backup: &str, pki: &str, consumers: &[String], instance: &str) -> String {
+    let noo = if instance.is_empty() {
+        "noo".to_string()
+    } else {
+        format!("noo --instance {}", shquote(instance))
+    };
+    format!(
+        "cp -a {}/. {}/ && {noo} security pki fix-modes && docker restart {}",
+        shquote(backup),
+        shquote(pki),
+        consumers.iter().map(|c| shquote(c)).collect::<Vec<_>>().join(" ")
+    )
 }
 
 /// Copy every file under `src_root` to the same relative path under
@@ -2988,6 +3851,7 @@ pub fn pki_rotate_ca(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         }
     }
     to_restart.sort_by_key(|c| c.ends_with("-gateway"));
+    let to_restart = sidecar_first(&to_restart, &crate::envfile::container_prefix());
     for c in &to_restart {
         let _ = Command::new("docker").args(["restart", c]).output();
     }
@@ -3524,7 +4388,10 @@ pub(crate) fn prove_target(node: &str, registry: &[serde_json::Value]) -> Result
 /// is refused if another node claims it; the dial-back; the claim checked
 /// AGAIN (a registration may have raced the dial); the mint, for exactly the
 /// dialled address (plus the controller's own view of its tailnet IP); the
-/// delivery over the birth-key rail. A fresh key pair every time.
+/// delivery over the birth-key rail. A fresh key pair every time. A leaf that
+/// already covers the dialled address is still dialled back (i1310): a proven
+/// one answers "nothing to re-issue" (exit 0, `proven: true`), one that does
+/// not prove fails `not_proven`, so `--prove` never succeeds unproven.
 fn pki_push_node_prove(g: &Globals, node: &str, days: i64, yes: bool) -> Result<i32, Unhandled> {
     use crate::output::{fail, ExitCode};
     let ca = ClusterCa::new(pki_dir());
@@ -3558,20 +4425,15 @@ fn pki_push_node_prove(g: &Globals, node: &str, days: i64, yes: bool) -> Result<
             &format!("{}: {e}: there is no current leaf to prove with", leaf.display()),
             Some(&format!("noo cluster provision {node}"))),
     };
-    if ClusterCa::cert_names(&leaf).is_ok_and(|n| n.ips.iter().chain(n.dns.iter()).any(|a| a.eq_ignore_ascii_case(&host))) {
-        if g.json {
-            println!("{}", serde_json::json!({"ok": true, "node": node, "address": host, "changed": false}));
-        } else {
-            ui::close_done(&format!("{node}'s certificate already covers {host}: nothing to re-issue"));
-        }
-        return Ok(0);
-    }
+    let covered = ClusterCa::cert_names(&leaf).is_ok_and(|n| n.ips.iter().chain(n.dns.iter()).any(|a| a.eq_ignore_ascii_case(&host)));
     if !g.json {
         println!("{}", ui::phase("plan"));
-        println!("  {}", ui::muted(&format!("prove that {host}:{port} is served by {node}, then re-issue its certificate for {host}")));
+        let then = if covered { "its certificate already covers the address, so nothing is re-issued" } else { "then re-issue its certificate for it" };
+        println!("  {}", ui::muted(&format!("prove that {host}:{port} is served by {node}; {then}")));
     }
-    super::confirm_destructive(g, yes, "prove and re-key", node);
-    // (b) The dial-back, pinned to the node's own current leaf.
+    // (b) The dial-back, pinned to the node's own current leaf. It runs for
+    // a leaf that already covers the address too (i1310): only a proven one
+    // is "nothing to re-issue".
     let ca_pem = std::fs::read(ca.ca_cert_path()).unwrap_or_default();
     if let Err(why) = super::node_prove::prove_node_at(&ca_pem, &leaf_pem, &host, port, std::time::Duration::from_secs(10)) {
         // A leaf that has EXPIRED cannot prove (the chain check is at now):
@@ -3584,6 +4446,16 @@ fn pki_push_node_prove(g: &Globals, node: &str, days: i64, yes: bool) -> Result<
     if !g.json {
         println!("{}", ui::sub(&ui::status_line(Glyph::Ok, &format!("{host}:{port} answered with {node}'s own key"))));
     }
+    if covered {
+        if g.json {
+            println!("{}", serde_json::json!({"ok": true, "node": node, "address": host, "changed": false, "proven": true}));
+        } else {
+            ui::close_done(&format!("{node}'s certificate already covers {host}, and {host}:{port} answered with {node}'s own key: nothing to re-issue"));
+        }
+        return Ok(0);
+    }
+    // Asked only before a mint: the proof itself changes nothing.
+    super::confirm_destructive(g, yes, "re-key", node);
     // (c) The claim again, at mint time: a registration may have raced the dial.
     if let Some(other) = address_claimed_by_other(node, &host, &node_address_claims(&registry(), &local_leaf_ips)) {
         fail(g.json, ExitCode::Generic, "address_claimed",
@@ -4476,6 +5348,20 @@ pub fn pki_rotate_all(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         &format!("{} expiring certificate(s)", expiring.len()),
     );
 
+    // Preflight (reload mode): a Docker that cannot be asked is found out
+    // BEFORE anything changes, not after the certificates are already
+    // rotated and delivered. `--no-reload` needs no Docker answer.
+    if reload && docker_running_names().is_none() {
+        fail(
+            g.json,
+            ExitCode::Generic,
+            "docker_did_not_answer",
+            "`docker ps` did not answer within 15 s, so the consumers to restart cannot be found \
+             (running sandbox/worker replicas cannot be named without Docker): nothing was changed",
+            Some("aborting before rotation — nothing was changed; start Docker and re-run, or use --no-reload to rotate and restart by hand"),
+        );
+    }
+
     // Backup every expiring cert+key so a failed reload can revert.
     let now_ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -4519,7 +5405,6 @@ pub fn pki_rotate_all(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     }
 
     let rotated: Vec<&RotateResult> = results.iter().filter(|r| r.status == "rotated").collect();
-    let gateway_rotated = rotated.iter().any(|r| r.role == "gateway");
 
     // ── fu72 #2: DELIVER re-issued remote node certs ──
     // The old command stopped here: a remote node's cert was re-issued on
@@ -4607,18 +5492,80 @@ pub fn pki_rotate_all(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         return Ok(exit_for_deliveries(0));
     }
 
+    // The containers this rotation needs restarted: computed once, used by
+    // the reload path to restart them and by --no-reload to name them.
+    let running = docker_running_names();
+    let rotated_certs: Vec<(&str, &str)> = rotated.iter().map(|r| (r.name.as_str(), r.role)).collect();
+    let to_restart = restart_list(&rotated_certs, &hostname, running.as_deref(), crate::envfile::instanced);
+    let docker_answered = running.is_some();
+    // Door sidecars are reloaded in place; everything else restarts.
+    let plan = rotation_plan(&to_restart, &crate::envfile::container_prefix());
+    let reload_names: Vec<String> = plan.reload.iter().map(|d| d.sidecar.clone()).collect();
+    let local_node_rotated = rotated.iter().any(|r| {
+        r.role == "node"
+            && cert_node_name(&r.name).is_some_and(|n| n.eq_ignore_ascii_case(&hostname))
+    });
+    let local_agent_unit = local_node_rotated && systemd_unit_known("noo-node-agent");
+    let report = no_reload_report(&NoReloadInputs {
+        restart: &plan.restart,
+        reload: &reload_names,
+        docker_answered,
+        prefix: &crate::envfile::container_prefix(),
+        instance: &crate::envfile::instance(),
+        local_agent_unit,
+        am_root: unsafe { libc::geteuid() } == 0,
+        other_nodes_rotated: remote_rotated,
+    });
+
     if !reload {
         if g.json {
-            println!("{}", json_summary(&[], None, false));
+            println!("{}", with_would_reload(with_would_restart(json_summary(&[], None, false), &plan.restart, docker_answered), &reload_names));
             return Ok(exit_for_deliveries(0));
         } else {
-            if gateway_rotated {
-                ui::close_warned("the gateway certificate was rotated: restart the gateway for the new cert to take effect");
-                ui::guide(&[("noo stack restart", "picks up the rotated gateway certificate")]);
+            if let Some(w) = &report.warning {
+                ui::warned(w);
+            }
+            if !report.reload_commands.is_empty() {
+                ui::close_warned("the rotated certificates reach these door sidecars on a reload (their backend containers keep running and are not restarted):");
+                for c in &report.reload_commands {
+                    println!("  {c}");
+                }
+            }
+            if !report.commands.is_empty() {
+                ui::close_warned("the rotated certificates take effect only once these restart on this machine, in this order:");
+                for c in &report.commands {
+                    println!("  {c}");
+                }
+            }
+            for n in &report.notes {
+                println!("{}", ui::muted(n));
             }
             println!("{}", ui::note(&format!("backup kept at {}", backup_dir.display())));
         }
         return Ok(exit_for_deliveries(0));
+    }
+
+    // Docker must answer before anything restarts: an unknown running set is
+    // not an empty one (that read as "no running consumers", a silent no-op
+    // over a rotation whose consumers still hold the old certificates).
+    if !docker_answered {
+        if g.json {
+            println!("{}", with_restarted(json_summary(&[], None, false), &[]));
+        }
+        fail(
+            g.json,
+            ExitCode::Generic,
+            "docker_did_not_answer",
+            &format!(
+                "Docker stopped answering during the run: the certificates were rotated, but \
+                 `docker ps` did not answer within 15 s, so no consumer was restarted and none can be judged \
+                 (running sandbox/worker replicas cannot be named without Docker: restart any replica containers \
+                 of the services above too). Once Docker answers, run on this machine: {} (backup at {})",
+                report.reload_commands.iter().chain(&report.commands).cloned().collect::<Vec<_>>().join("; "),
+                backup_dir.display()
+            ),
+            None,
+        );
     }
 
     // ── Reload consumers: services first, gateway last ──
@@ -4629,10 +5576,6 @@ pub fn pki_rotate_all(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         println!("{}", ui::phase("reload"));
     }
     let mut reloaded_units: Vec<String> = Vec::new();
-    let local_node_rotated = rotated.iter().any(|r| {
-        r.role == "node"
-            && cert_node_name(&r.name).is_some_and(|n| n.eq_ignore_ascii_case(&hostname))
-    });
     if local_node_rotated && systemd_unit_known("noo-node-agent") {
         let _ = sync_self_agent_trust_plane(&ca, &hostname, g.json);
         if systemd_restart_unit("noo-node-agent") {
@@ -4645,30 +5588,9 @@ pub fn pki_rotate_all(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             ui::guide(&[("systemctl status noo-node-agent", "shows why the agent did not come back")]);
         }
     }
-    let running = running_containers();
-    let mut to_restart: Vec<String> = Vec::new();
-    for r in &rotated {
-        for c in cert_consumers(&r.name, r.role, &hostname) {
-            // cert_consumers speaks default-instance names; remap ONCE
-            // here so the running-set match, the restarts and the health
-            // probe all see this instance's real container names.
-            let c = crate::envfile::instanced(&c);
-            if running.contains(&c) && !to_restart.contains(&c) {
-                to_restart.push(c);
-            }
-        }
-        for c in replica_consumers(&r.name, &running) {
-            if !to_restart.contains(&c) {
-                to_restart.push(c);
-            }
-        }
-    }
-    // Suffix compare: instance prefixes vary (noo-gateway / noo-galaxy-gateway).
-    to_restart.sort_by_key(|c| c.ends_with("-gateway")); // stable: gateway last
-
     if to_restart.is_empty() {
         if g.json {
-            println!("{}", json_summary(&reloaded_units, None, false));
+            println!("{}", with_restarted(json_summary(&reloaded_units, None, false), &to_restart));
         } else if reloaded_units.is_empty() {
             println!("{}", ui::muted("no running consumers to reload"));
         }
@@ -4676,18 +5598,20 @@ pub fn pki_rotate_all(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     }
 
     if !g.json {
-        ui::step(&format!("reloading consumers: {}", to_restart.join(", ")));
+        ui::step(&format!(
+            "reloading consumers: {}",
+            plan.restart.iter().chain(&reload_names).cloned().collect::<Vec<_>>().join(", ")
+        ));
     }
-    for c in &to_restart {
-        let _ = Command::new("docker").args(["restart", c]).output();
-    }
+    let applied = apply_to_stack(&plan, g.json);
 
-    let (ok, detail) = probe_health(&to_restart, 150);
-    if ok {
+    let gate = probe_health_gate(&to_restart, 150);
+    let action = gate_action(&gate);
+    if let (GateAction::Accept, GateOutcome::Healthy(detail)) = (action, &gate) {
         let mut all_reloaded = reloaded_units.clone();
-        all_reloaded.extend(to_restart.iter().cloned());
+        all_reloaded.extend(applied.reloaded.iter().chain(&applied.restarted).cloned());
         if g.json {
-            println!("{}", json_summary(&all_reloaded, Some(true), false));
+            println!("{}", with_applied(json_summary(&all_reloaded, Some(true), false), &applied));
         } else {
             ui::close_done(&format!("rotation applied: {detail}"));
             if undelivered > 0 {
@@ -4700,23 +5624,90 @@ pub fn pki_rotate_all(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         return Ok(exit_for_deliveries(0));
     }
 
+    // ── Blind gate: keep the rotation, change nothing more ──
+    // Docker does not condemn the restarted consumers and nothing confirmed
+    // them either. That is no evidence against the new certificates, and a
+    // revert on it would undo a good rotation (and restart everything again).
+    // Node certificates already delivered stay new: they chain to the same CA.
+    if let (GateAction::KeepUnconfirmed, GateOutcome::Blind(detail)) = (action, &gate) {
+        let restore = copy_back_command(
+            &backup_dir.display().to_string(),
+            &ca.dir.display().to_string(),
+            &sidecar_first(&to_restart, &crate::envfile::container_prefix()),
+            &crate::envfile::instance(),
+        );
+        if g.json {
+            let mut all_reloaded = reloaded_units.clone();
+            all_reloaded.extend(applied.reloaded.iter().chain(&applied.restarted).cloned());
+            println!("{}", with_applied(json_summary(&all_reloaded, None, false), &applied));
+        }
+        fail(
+            g.json,
+            ExitCode::Generic,
+            "rotation_unconfirmed",
+            &format!(
+                "The certificates were rotated and the consumers restarted; {detail}. \
+                 Nothing was reverted, and node certificates already delivered stay new \
+                 (same CA). Confirm with `noo cluster verify --wait`. The backup is at {}; \
+                 to go back, run: {restore} (`fix-modes` re-syncs `pki/public/` to the \
+                 restored certificates)",
+                backup_dir.display()
+            ),
+            None,
+        );
+    }
+
     // ── Revert: restore backed-up certs, restart again ──
-    ui::close_failed(&format!("consumers unhealthy after rotation ({detail}): reverting"), None);
+    if let GateOutcome::Unhealthy(detail) | GateOutcome::Healthy(detail) = &gate {
+        ui::close_failed(&format!("consumers unhealthy after rotation ({detail}): reverting"), None);
+    }
     if let Err(e) = copy_tree(&backup_dir, &ca.dir) {
         fail(
             g.json,
             ExitCode::Generic,
             "revert_failed",
-            &format!("restore from backup failed: {e}"),
-            Some(&format!("original certs are at {}", backup_dir.display())),
+            &format!(
+                "restore from backup failed part-way: the restore is PARTIAL, so some certificates \
+                 are the new ones and some the old ({e}); the complete original certificates are at {}",
+                backup_dir.display()
+            ),
+            Some(&format!(
+                "copy them back: {}",
+                copy_back_command(
+                    &backup_dir.display().to_string(),
+                    &ca.dir.display().to_string(),
+                    &sidecar_first(&to_restart, &crate::envfile::container_prefix()),
+                    &crate::envfile::instance(),
+                )
+            )),
         );
     }
-    for c in &to_restart {
-        let _ = Command::new("docker").args(["restart", c]).output();
+    // `pki/public/` (the gateway's certificate-only view) mirrors the live
+    // certificates; issuing re-syncs it, restoring files does not.
+    let view = ca.sync_public_view();
+    if !g.json {
+        for e in &view.errors {
+            ui::warned(&format!("pki/public/ was not re-synced to the restored certificates: {e}"));
+        }
     }
-    let (ok2, detail2) = probe_health(&to_restart, 150);
-    if ok2 {
-        fail(
+    let applied2 = apply_to_stack(&plan, g.json);
+    let gate2 = probe_health_gate(&to_restart, 150);
+    if g.json {
+        // The same summary object as the other paths; a re-sync error is in
+        // it, not dropped.
+        let mut all_reloaded = reloaded_units.clone();
+        all_reloaded.extend(applied2.reloaded.iter().chain(&applied2.restarted).cloned());
+        let healthy2 = match &gate2 {
+            GateOutcome::Healthy(_) => Some(true),
+            GateOutcome::Unhealthy(_) => Some(false),
+            GateOutcome::Blind(_) => None,
+        };
+        let mut summary = with_applied(json_summary(&all_reloaded, healthy2, true), &applied2);
+        summary["public_view_errors"] = serde_json::json!(view.errors);
+        println!("{summary}");
+    }
+    match &gate2 {
+        GateOutcome::Healthy(_) => fail(
             g.json,
             ExitCode::Generic,
             "rotation_reverted",
@@ -4726,9 +5717,21 @@ pub fn pki_rotate_all(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                 backup_dir.display()
             ),
             None,
-        );
-    } else {
-        fail(
+        ),
+        // The restored certificates are in place; only the probe could not
+        // answer. That is not a failed revert, and not a recovery either.
+        GateOutcome::Blind(detail2) => fail(
+            g.json,
+            ExitCode::Generic,
+            "revert_unverified",
+            &format!(
+                "Reverted to previous certificates, but the gateway could not be verified \
+                 afterwards ({detail2}); check it by hand (`noo cluster verify`) — backup at {}",
+                backup_dir.display()
+            ),
+            None,
+        ),
+        GateOutcome::Unhealthy(detail2) => fail(
             g.json,
             ExitCode::Generic,
             "revert_unhealthy",
@@ -4738,7 +5741,7 @@ pub fn pki_rotate_all(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                 backup_dir.display()
             ),
             None,
-        );
+        ),
     }
 }
 
@@ -6431,6 +7434,523 @@ none /mnt/c/deeper tmpfs rw 0 0
         assert_eq!(&v[..2], &["noo-nats".to_string(), "noo-stunnel-nats".to_string()]);
     }
 
+    fn names(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    fn inputs<'a>(restart: &'a [String], prefix: &'a str, instance: &'a str) -> NoReloadInputs<'a> {
+        NoReloadInputs {
+            restart,
+            reload: &[],
+            docker_answered: true,
+            prefix,
+            instance,
+            local_agent_unit: false,
+            am_root: false,
+            other_nodes_rotated: false,
+        }
+    }
+
+    /// Every printed `noo ... stack restart` line names at least one service.
+    fn assert_no_bare_stack_restart(lines: &[String]) {
+        for l in lines.iter().filter(|l| l.contains("stack restart")) {
+            let after = l.split("stack restart").nth(1).unwrap_or("").trim();
+            assert!(!after.is_empty(), "a whole-stack restart was printed: {l}");
+            assert!(!after.starts_with('-'), "a flag, not a service: {l}");
+        }
+    }
+
+    #[test]
+    fn restart_list_puts_the_gateway_last_and_drops_what_is_not_running() {
+        // gateway rotated first, then nats; stunnel-nats is not running.
+        let rotated = [("gateway/gateway.crt", "gateway"), ("services/nats/service.crt", "service")];
+        let running = names(&["noo-gateway", "noo-nats", "noo-loki"]);
+        let got = restart_list(&rotated, "host1", Some(&running), str::to_string);
+        assert_eq!(got, names(&["noo-nats", "noo-gateway"]));
+    }
+
+    #[test]
+    fn restart_list_includes_replicas_and_removes_duplicates() {
+        let rotated = [
+            ("services/sandbox/service.crt", "service"),
+            ("services/sandbox/service.crt", "service"),
+            ("gateway/gateway.crt", "gateway"),
+        ];
+        let running = names(&["noo-sandbox", "noo-stunnel-sandbox", "noomesh-sandbox-extra-1", "noo-gateway"]);
+        let got = restart_list(&rotated, "host1", Some(&running), str::to_string);
+        assert_eq!(got, names(&["noo-sandbox", "noo-stunnel-sandbox", "noomesh-sandbox-extra-1", "noo-gateway"]));
+    }
+
+    #[test]
+    fn restart_list_remaps_to_the_instance_and_is_empty_when_nothing_runs() {
+        let rotated = [("gateway/gateway.crt", "gateway")];
+        let remap = |c: &str| c.replacen("noo-", "noo-galaxy-", 1);
+        let running = names(&["noo-galaxy-gateway"]);
+        assert_eq!(restart_list(&rotated, "host1", Some(&running), remap), names(&["noo-galaxy-gateway"]));
+        assert!(restart_list(&rotated, "host1", Some(&names(&["noo-nats"])), str::to_string).is_empty());
+        assert!(restart_list(&[("ca.crt", "ca")], "host1", Some(&names(&["noo-gateway"])), str::to_string).is_empty());
+    }
+
+    /// Docker not answering is not "nothing is running": every consumer is
+    /// named, running or not, gateway last.
+    #[test]
+    fn restart_list_without_an_answer_names_every_consumer() {
+        let rotated = [("gateway/gateway.crt", "gateway"), ("services/nats/service.crt", "service")];
+        let got = restart_list(&rotated, "host1", None, str::to_string);
+        assert_eq!(got, names(&["noo-nats", "noo-stunnel-nats", "noo-gateway"]));
+        // An answered empty list is a different thing: nothing to restart.
+        assert!(restart_list(&rotated, "host1", Some(&[]), str::to_string).is_empty());
+    }
+
+    #[test]
+    fn no_reload_names_exactly_the_services_gateway_last() {
+        let restart = names(&["noo-stunnel-nats", "noo-nats", "noo-gateway"]);
+        let r = no_reload_report(&inputs(&restart, "noo", ""));
+        assert_eq!(r.commands, names(&["noo stack restart stunnel-nats nats", "noo stack restart gateway"]));
+        assert_eq!(r.notes, names(&[NOTHING_ELSE_TO_RESTART]));
+        assert_eq!(r.warning, None);
+        assert_no_bare_stack_restart(&r.commands);
+    }
+
+    #[test]
+    fn no_reload_maps_instance_names_and_falls_back_to_docker_for_replicas() {
+        let restart = names(&["noo-galaxy-sandbox", "noomesh-sandbox-extra-1", "noo-galaxy-gateway"]);
+        let r = no_reload_report(&inputs(&restart, "noo-galaxy", "galaxy"));
+        assert_eq!(
+            r.commands,
+            names(&[
+                "noo --instance galaxy stack restart sandbox",
+                "docker restart noomesh-sandbox-extra-1",
+                "noo --instance galaxy stack restart gateway",
+            ])
+        );
+        assert_no_bare_stack_restart(&r.commands);
+        // A container outside the prefix has no service name either.
+        let other = names(&["other-thing"]);
+        assert_eq!(no_reload_report(&inputs(&other, "noo", "")).commands, names(&["docker restart other-thing"]));
+    }
+
+    #[test]
+    fn no_reload_with_nothing_to_restart_says_so_and_prints_no_command() {
+        let r = no_reload_report(&inputs(&[], "noo", ""));
+        assert!(r.commands.is_empty());
+        assert_eq!(r.notes, names(&[NO_RESTART_NEEDED]));
+        assert!(NO_RESTART_NEEDED.contains("no restart is needed") && NO_RESTART_NEEDED.contains("on this machine"));
+    }
+
+    /// Docker did not answer: a warning, the full follow-up, never the
+    /// "no restart is needed" line (even when the list is empty).
+    #[test]
+    fn no_reload_when_docker_did_not_answer_never_says_no_restart_is_needed() {
+        let restart = names(&["noo-nats", "noo-stunnel-nats", "noo-gateway"]);
+        let mut p = inputs(&restart, "noo", "");
+        p.docker_answered = false;
+        let r = no_reload_report(&p);
+        assert_eq!(r.warning.as_deref(), Some(DOCKER_DID_NOT_ANSWER));
+        assert_eq!(r.commands, names(&["noo stack restart nats stunnel-nats", "noo stack restart gateway"]));
+        assert!(r.notes.iter().all(|n| n != NO_RESTART_NEEDED));
+        let empty = no_reload_report(&NoReloadInputs { restart: &[], docker_answered: false, ..p });
+        assert!(empty.warning.is_some());
+        assert!(empty.notes.iter().all(|n| !n.contains("no restart is needed")), "{:?}", empty.notes);
+        assert_eq!(empty.notes, names(&[NO_CONSUMERS]));
+    }
+
+    /// The controller's own agent as a HOST unit is part of the follow-up,
+    /// first (the reload path restarts it first), as the command the reload
+    /// path runs; an empty container list no longer reads "no restart".
+    #[test]
+    fn no_reload_includes_the_local_agent_unit_and_scopes_to_this_machine() {
+        let mut p = inputs(&[], "noo", "");
+        p.local_agent_unit = true;
+        let r = no_reload_report(&p);
+        assert_eq!(r.commands, names(&["sudo systemctl restart noo-node-agent"]));
+        assert!(r.notes.iter().all(|n| n != NO_RESTART_NEEDED));
+        assert!(r.notes.contains(&AGENT_COPY_NOTE.to_string()));
+        p.am_root = true;
+        assert_eq!(no_reload_report(&p).commands, names(&["systemctl restart noo-node-agent"]));
+        let restart = names(&["noo-nats", "noo-gateway"]);
+        let mut q = inputs(&restart, "noo", "");
+        q.local_agent_unit = true;
+        let r = no_reload_report(&q);
+        assert_eq!(r.commands.first().map(String::as_str), Some("sudo systemctl restart noo-node-agent"));
+        assert_eq!(r.commands.last().map(String::as_str), Some("noo stack restart gateway"));
+        assert!(r.notes.iter().all(|n| n.starts_with("on this machine") || n.starts_with("the agent")));
+    }
+
+    #[test]
+    fn no_reload_says_how_other_machines_certificates_take_effect() {
+        let mut p = inputs(&[], "noo", "");
+        assert!(no_reload_report(&p).notes.iter().all(|n| n != OTHER_NODES_NOTE));
+        p.other_nodes_rotated = true;
+        let r = no_reload_report(&p);
+        assert!(r.notes.contains(&OTHER_NODES_NOTE.to_string()));
+        assert!(OTHER_NODES_NOTE.contains("pull rail") && OTHER_NODES_NOTE.contains("--no-deliver"));
+    }
+
+    #[test]
+    fn rotate_all_json_names_what_would_restart_and_what_restarted() {
+        let base = serde_json::json!({ "reloaded": [], "healthy": null });
+        let list = names(&["noo-nats", "noo-gateway"]);
+        let would = with_would_restart(base.clone(), &list, true);
+        assert_eq!(would["would_restart"], serde_json::json!(["noo-nats", "noo-gateway"]));
+        assert_eq!(would["docker_answered"], serde_json::json!(true));
+        assert!(would.get("restarted").is_none());
+        assert_eq!(would["healthy"], serde_json::Value::Null); // existing fields kept
+        assert_eq!(with_would_restart(base.clone(), &list, false)["docker_answered"], serde_json::json!(false));
+        let did = with_restarted(base, &list);
+        assert_eq!(did["restarted"], serde_json::json!(["noo-nats", "noo-gateway"]));
+        assert!(did.get("would_restart").is_none());
+        assert_eq!(with_would_restart(serde_json::json!({}), &[], true)["would_restart"], serde_json::json!([]));
+    }
+
+    /// The loops restart exactly the list, in order: no filtering between.
+    #[test]
+    fn restart_each_visits_exactly_the_list_in_order() {
+        let list = names(&["noo-nats", "noo-stunnel-nats", "noo-gateway"]);
+        let mut seen: Vec<String> = Vec::new();
+        restart_each(&list, |c| seen.push(c.to_string()));
+        assert_eq!(seen, list);
+        restart_each(&[], |c| panic!("restarted {c} from an empty list"));
+    }
+
+    // ── door sidecars: reload in place ──────────────────────────────────
+
+    /// `stunnel-*` service keys of the shipped compose, and the services that
+    /// join one's network namespace.
+    fn compose_stunnel_services(compose: &str) -> Vec<String> {
+        compose
+            .lines()
+            .filter_map(|l| l.strip_prefix("  stunnel-")?.strip_suffix(':'))
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn compose_namespace_doors(compose: &str) -> Vec<String> {
+        compose
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("network_mode: \"service:stunnel-")?.strip_suffix('"'))
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// The door list is the compose file's: every `stunnel-*` service there is
+    /// a door a backend shares the namespace of, and each is classified.
+    #[test]
+    fn door_sidecars_are_pinned_to_the_shipped_compose() {
+        let compose = include_str!("../../../docker-compose.cluster.yml");
+        let mut services = compose_stunnel_services(compose);
+        let mut sharing = compose_namespace_doors(compose);
+        services.sort();
+        sharing.sort();
+        sharing.dedup();
+        let mut classified: Vec<String> = DOOR_SIDECARS.iter().map(|d| (*d).to_string()).collect();
+        classified.sort();
+        assert_eq!(services, sharing, "a stunnel-* service in compose has no backend in its namespace (or the reverse): classify it");
+        assert_eq!(services, classified, "DOOR_SIDECARS drifted from docker-compose.cluster.yml: a new stunnel-* door must be classified here");
+        for door in DOOR_SIDECARS {
+            let backend = compose_service_block_of(compose, door).unwrap_or_else(|| panic!("no compose service {door}"));
+            assert!(backend.contains(&format!("network_mode: \"service:stunnel-{door}\"")), "{door}");
+            assert!(backend.contains("restart: true"), "{door} does not restart with its sidecar");
+            let sidecar = compose_service_block_of(compose, &format!("stunnel-{door}")).expect("sidecar");
+            assert!(sidecar.contains(&format!("/tls/services/{}:ro", if door == "vllm-secondary" { "vllm" } else { door })), "{door} sidecar mounts its leaf");
+        }
+    }
+
+    /// A service's block of the compose text (key line to the next key).
+    fn compose_service_block_of(compose: &str, name: &str) -> Option<String> {
+        let mut out = String::new();
+        let mut inside = false;
+        for line in compose.lines() {
+            if line.starts_with("  ") && !line.starts_with("   ") && line.trim_end().ends_with(':') && !line.trim().starts_with('#') {
+                if inside {
+                    break;
+                }
+                inside = line.trim() == format!("{name}:");
+                continue;
+            }
+            if inside {
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+        inside.then_some(out)
+    }
+
+    #[test]
+    fn the_plan_reloads_door_sidecars_and_restarts_the_rest() {
+        let c = names(&["noo-ollama", "noo-stunnel-ollama", "noo-nats", "noo-stunnel-nats", "noo-gateway"]);
+        let plan = rotation_plan(&c, "noo");
+        assert_eq!(plan.reload, vec![DoorReload { sidecar: "noo-stunnel-ollama".into(), backend: Some("noo-ollama".into()) }]);
+        assert_eq!(plan.restart, names(&["noo-nats", "noo-stunnel-nats", "noo-gateway"]), "the backend is not restarted, nats is");
+        // A backend without its sidecar running is restarted as before.
+        let lone = rotation_plan(&names(&["noo-ollama", "noo-gateway"]), "noo");
+        assert!(lone.reload.is_empty());
+        assert_eq!(lone.restart, names(&["noo-ollama", "noo-gateway"]));
+        // Instance prefixes classify too; a sidecar without its backend running reloads alone.
+        let inst = rotation_plan(&names(&["noo-galaxy-stunnel-vllm-secondary"]), "noo-galaxy");
+        assert_eq!(inst.reload, vec![DoorReload { sidecar: "noo-galaxy-stunnel-vllm-secondary".into(), backend: None }]);
+        assert!(inst.restart.is_empty());
+        // A stunnel that is not a door (an unclassified name) restarts.
+        assert_eq!(rotation_plan(&names(&["noo-stunnel-nats"]), "noo").restart, names(&["noo-stunnel-nats"]));
+    }
+
+    const LOG_OK: &str = "2026.11.26 10:00:01 LOG5[ui]: Reading configuration from file /tmp/stunnel.conf\n2026.11.26 10:00:01 LOG5[ui]: Configuration successful\n";
+    const LOG_FAILED: &str = "2026.11.26 10:00:01 LOG5[ui]: Reading configuration from file /tmp/stunnel.conf\n2026.11.26 10:00:01 LOG3[ui]: SSL_CTX_use_PrivateKey_file: key values mismatch\n2026.11.26 10:00:01 LOG3[ui]: Configuration failed\n2026.11.26 10:00:01 LOG3[ui]: Failed to reload configuration\n";
+    const LOG_QUIET: &str = "2026.11.26 10:00:05 LOG6[7]: s_connect: connected 127.0.0.1:8000\n";
+
+    #[test]
+    fn the_reload_log_parser_reads_success_failure_and_no_evidence() {
+        assert_eq!(parse_reload_log(LOG_OK), ReloadOutcome::Reloaded);
+        assert_eq!(parse_reload_log(LOG_FAILED), ReloadOutcome::Failed);
+        assert_eq!(parse_reload_log(LOG_QUIET), ReloadOutcome::Unknown);
+        assert_eq!(parse_reload_log(""), ReloadOutcome::Unknown);
+        // A failure anywhere wins: never report applied beside a failure line.
+        assert_eq!(parse_reload_log(&format!("{LOG_OK}{LOG_FAILED}")), ReloadOutcome::Failed);
+        assert_eq!(parse_reload_log("LOG3[ui]: FAILED TO RELOAD"), ReloadOutcome::Failed);
+        assert_eq!(parse_reload_log("LOG3[ui]: Reloading configuration failed"), ReloadOutcome::Failed);
+    }
+
+    /// reload ok: no backend restart. failed or unknown: the backend then the sidecar.
+    #[test]
+    fn the_decision_table_falls_back_unless_the_reload_is_verified() {
+        let door = DoorReload { sidecar: "noo-stunnel-ollama".into(), backend: Some("noo-ollama".into()) };
+        assert!(door_fallback(&door, ReloadOutcome::Reloaded).is_empty());
+        for bad in [ReloadOutcome::Failed, ReloadOutcome::Unknown] {
+            assert_eq!(door_fallback(&door, bad), names(&["noo-stunnel-ollama", "noo-ollama"]), "{bad:?}");
+        }
+        let alone = DoorReload { sidecar: "noo-stunnel-ollama".into(), backend: None };
+        assert_eq!(door_fallback(&alone, ReloadOutcome::Unknown), names(&["noo-stunnel-ollama"]));
+    }
+
+    /// For every door, whichever path restarts the pair, the sidecar goes first.
+    #[test]
+    fn every_door_pair_restarts_sidecar_before_backend() {
+        for door in DOOR_SIDECARS {
+            let (sidecar, backend) = (format!("noo-stunnel-{door}"), format!("noo-{door}"));
+            // fallback and revert fallback
+            let d = DoorReload { sidecar: sidecar.clone(), backend: Some(backend.clone()) };
+            assert_eq!(door_fallback(&d, ReloadOutcome::Failed), vec![sidecar.clone(), backend.clone()], "{door}");
+            // the copy-back list, from the legacy backend-first consumer order
+            let legacy = vec![backend.clone(), sidecar.clone(), "noo-gateway".to_string()];
+            assert_eq!(sidecar_first(&legacy, "noo"), vec![sidecar.clone(), backend.clone(), "noo-gateway".to_string()], "{door}");
+            let cmd = copy_back_command("/b", "/p", &sidecar_first(&legacy, "noo"), "");
+            assert!(cmd.ends_with(&format!("docker restart {sidecar} {backend} noo-gateway")), "{cmd}");
+        }
+        // a backend whose sidecar is not running is untouched; instances work
+        assert_eq!(sidecar_first(&names(&["noo-ollama", "noo-nats"]), "noo"), names(&["noo-ollama", "noo-nats"]));
+        assert_eq!(
+            sidecar_first(&names(&["noo-galaxy-vllm", "noo-galaxy-stunnel-vllm"]), "noo-galaxy"),
+            names(&["noo-galaxy-stunnel-vllm", "noo-galaxy-vllm"])
+        );
+    }
+
+    /// The vllm leaf is mounted by both vllm doors: a vllm rotation reaches the secondary too.
+    #[test]
+    fn a_vllm_rotation_reaches_the_secondary_door() {
+        let c = cert_consumers("services/vllm/service.crt", "service", "host1");
+        assert_eq!(c, names(&["noo-vllm", "noo-stunnel-vllm", "noo-stunnel-vllm-secondary", "noo-vllm-secondary"]));
+        let plan = rotation_plan(&sidecar_first(&c, "noo"), "noo");
+        assert_eq!(plan.reload.len(), 2);
+        assert_eq!(plan.reload[1], DoorReload { sidecar: "noo-stunnel-vllm-secondary".into(), backend: Some("noo-vllm-secondary".into()) });
+        assert!(plan.restart.is_empty());
+        let running = names(&["noo-stunnel-vllm-secondary", "noo-gateway"]);
+        assert_eq!(restart_list(&[("services/vllm/service.crt", "service")], "host1", Some(&running), str::to_string), names(&["noo-stunnel-vllm-secondary"]));
+    }
+
+    #[test]
+    fn the_gate_sees_the_full_list_and_the_log_window_opens_before_the_hup() {
+        let src = include_str!("security_local.rs");
+        let body = crate::test_src::fn_body(src, "pub fn pki_rotate_all(");
+        assert_eq!(body.matches("probe_health_gate(&to_restart, 150)").count(), 2, "both gates judge every consumer, reloaded sidecars and backends included");
+        assert!(!body.contains("probe_health_gate(&plan"));
+        let r = crate::test_src::fn_body(src, "fn reload_door_sidecar(");
+        assert!(r.find("let since").unwrap() < r.find("\"kill\"").unwrap());
+    }
+
+    /// `pki_rotate_ca` orders its restart list sidecar-first after the
+    /// gateway-last sort and before the restart loop.
+    #[test]
+    fn rotate_ca_orders_door_pairs_sidecar_first() {
+        let body = crate::test_src::fn_body(include_str!("security_local.rs"), "pub fn pki_rotate_ca(");
+        let sort = body.find("to_restart.sort_by_key(|c| c.ends_with(\"-gateway\"))").expect("no gateway-last sort");
+        let order = body.find("sidecar_first(&to_restart").expect("rotate-ca does not order door pairs");
+        let each = body.find("for c in &to_restart {").expect("no restart loop");
+        assert!(sort < order && order < each, "sort, then sidecar_first, then restart");
+    }
+
+    #[test]
+    fn apply_consumers_never_restarts_a_reloaded_doors_backend() {
+        let plan = rotation_plan(&names(&["noo-ollama", "noo-stunnel-ollama", "noo-vllm", "noo-stunnel-vllm", "noo-nats", "noo-gateway"]), "noo");
+        let mut hup: Vec<String> = Vec::new();
+        let mut restarted: Vec<String> = Vec::new();
+        let done = apply_consumers(
+            &plan,
+            |c| {
+                hup.push(c.to_string());
+                if c == "noo-stunnel-vllm" { ReloadOutcome::Unknown } else { ReloadOutcome::Reloaded }
+            },
+            |c| restarted.push(c.to_string()),
+        );
+        assert_eq!(hup, names(&["noo-stunnel-ollama", "noo-stunnel-vllm"]));
+        // ollama reloaded: its backend stayed. vllm unverified: sidecar, backend, then the rest, gateway last.
+        assert_eq!(restarted, names(&["noo-stunnel-vllm", "noo-vllm", "noo-nats", "noo-gateway"]));
+        assert!(!restarted.contains(&"noo-ollama".to_string()) && !restarted.contains(&"noo-stunnel-ollama".to_string()));
+        assert_eq!(done.reloaded, names(&["noo-stunnel-ollama"]));
+        assert_eq!(done.restarted, restarted);
+        assert_eq!(done.fell_back, vec![("noo-stunnel-vllm".to_string(), ReloadOutcome::Unknown)]);
+        let failed = apply_consumers(&plan, |_| ReloadOutcome::Failed, |_| {});
+        assert!(failed.reloaded.is_empty(), "a failed reload is never reported as reloaded");
+        assert_eq!(failed.fell_back.len(), 2);
+    }
+
+    #[test]
+    fn the_outcome_lines_say_what_happened() {
+        assert!(reload_outcome_line("s", ReloadOutcome::Reloaded).contains("not restarted"));
+        assert!(reload_outcome_line("s", ReloadOutcome::Failed).contains("did NOT reload"));
+        let u = reload_outcome_line("s", ReloadOutcome::Unknown);
+        assert!(u.contains("unconfirmed") && u.contains("restarted it, then its backend"), "{u}");
+    }
+
+    #[test]
+    fn no_reload_names_the_hup_and_the_check_and_json_lists_would_reload() {
+        let reload = names(&["noo-stunnel-ollama"]);
+        let restart = names(&["noo-nats", "noo-gateway"]);
+        let mut p = inputs(&restart, "noo", "");
+        p.reload = &reload;
+        let r = no_reload_report(&p);
+        assert_eq!(r.reload_commands, names(&["docker kill -s HUP noo-stunnel-ollama", "docker logs --since 1m noo-stunnel-ollama"]));
+        assert_eq!(r.commands, names(&["noo stack restart nats", "noo stack restart gateway"]));
+        assert!(r.notes.contains(&RELOAD_CHECK_NOTE.to_string()));
+        assert!(RELOAD_CHECK_NOTE.contains("backend does not need restarting"));
+        // Only door sidecars: nothing else to restart, and it says so truthfully.
+        let only = no_reload_report(&NoReloadInputs { restart: &[], ..p });
+        assert!(only.commands.is_empty());
+        assert_eq!(only.notes, names(&[RELOAD_ONLY_NOTE, RELOAD_CHECK_NOTE]));
+        let j = with_would_reload(with_would_restart(serde_json::json!({}), &restart, true), &reload);
+        assert_eq!(j["would_reload"], serde_json::json!(["noo-stunnel-ollama"]));
+        assert_eq!(j["would_restart"], serde_json::json!(["noo-nats", "noo-gateway"]));
+        let done = Applied { reloaded: reload.clone(), restarted: restart.clone(), fell_back: vec![("noo-stunnel-vllm".into(), ReloadOutcome::Failed)] };
+        let j = with_applied(serde_json::json!({}), &done);
+        assert_eq!(j["reloaded_in_place"], serde_json::json!(["noo-stunnel-ollama"]));
+        assert_eq!(j["restarted"], serde_json::json!(["noo-nats", "noo-gateway"]));
+        assert_eq!(j["reload_fallbacks"], serde_json::json!([{ "container": "noo-stunnel-vllm", "outcome": "failed" }]));
+    }
+
+    /// Both docker calls of a reload are bounded, the signal goes before the
+    /// log read, and no unbounded `Command` is used.
+    #[test]
+    fn the_reload_sends_hup_then_reads_the_log_through_the_bounded_helper() {
+        let src = include_str!("security_local.rs");
+        let body = crate::test_src::fn_body(src, "fn reload_door_sidecar(");
+        assert_eq!(body.matches("crate::bounded::docker(").count(), 2);
+        let kill = body.find("&[\"kill\", \"-s\", \"HUP\", container]").expect("no HUP");
+        let logs = body.find("&[\"logs\", \"--since\", &since, container]").expect("no log read");
+        assert!(kill < logs, "the log is read after the signal");
+        assert!(body.find("let since").unwrap() < kill, "the log window starts before the signal");
+        assert!(!body.contains("Command::new"), "docker only through the bounded helper");
+        assert!(body.contains("parse_reload_log(") && body.contains("RELOAD_WAIT"));
+        assert!(body.contains("return ReloadOutcome::Failed") && body.trim_end().contains("ReloadOutcome::Unknown"));
+    }
+
+    /// The HUP goes out only after the service's files are written (the
+    /// rotation, then on a revert the restore and the public-view re-sync),
+    /// and a door's backend is never passed to a restart on the success path.
+    #[test]
+    fn the_hup_follows_the_files_and_the_backend_is_never_restarted_on_success() {
+        let src = include_str!("security_local.rs");
+        let body = crate::test_src::fn_body(src, "pub fn pki_rotate_all(");
+        let first = body.find("apply_to_stack(&plan,").expect("no apply");
+        assert!(body.find("rotate_all_expiring(").unwrap() < first, "rotate, then reload");
+        let second = body[first + 1..].find("apply_to_stack(&plan,").expect("no revert apply") + first + 1;
+        let restore = body.find("copy_tree(&backup_dir").unwrap();
+        let resync = body.find("sync_public_view()").unwrap();
+        assert!(restore < resync && resync < second, "restore, re-sync, then reload on a revert");
+        assert!(first < restore, "the first reload is the forward one");
+        let apply = crate::test_src::fn_body(src, "fn apply_consumers(");
+        assert!(!apply.contains(".backend"), "only door_fallback names a backend");
+        assert_eq!(apply.matches("restart_each(").count(), 2);
+        assert!(apply.contains("restart_each(&plan.restart, &mut restart)"));
+        assert!(apply.contains("door_fallback(door, outcome)"));
+        let fallback = crate::test_src::fn_body(src, "fn door_fallback(");
+        assert!(fallback.find("Reloaded").unwrap() < fallback.find("backend").unwrap(), "a verified reload returns before any backend is named");
+        let apply_stack = crate::test_src::fn_body(src, "fn apply_to_stack(");
+        assert!(apply_stack.contains("reload_door_sidecar(c)") && apply_stack.contains("docker_restart"));
+    }
+
+    #[test]
+    fn rotate_all_computes_the_list_once_and_never_says_bare_stack_restart() {
+        let body = crate::test_src::fn_body(include_str!("security_local.rs"), "pub fn pki_rotate_all(");
+        assert_eq!(body.matches("restart_list(").count(), 1, "one list for both paths");
+        let list_at = body.find("restart_list(").unwrap();
+        let branch_at = body.find("if !reload {").expect("no --no-reload branch");
+        assert!(list_at < branch_at, "the list is computed before the --no-reload branch");
+        assert!(body.contains("no_reload_report("), "the no-reload branch names the services");
+        assert!(body.contains("with_would_restart("));
+        assert!(!body.contains("\"noo stack restart\""), "the bare whole-stack restart is gone");
+        // Both restart loops (reload, revert) walk to_restart itself, and
+        // nothing narrows it after it is made.
+        // (the plan splits it once into reload and restart; both loops apply the plan).
+        assert_eq!(body.matches("apply_to_stack(&plan,").count(), 2);
+        assert_eq!(body.matches("rotation_plan(&to_restart,").count(), 1);
+        assert!(!body.contains("restart_each("), "rotate-all restarts only through apply_to_stack");
+        for narrowing in ["to_restart.retain", "to_restart.truncate", "to_restart.pop", "to_restart.remove", "to_restart.clear", "plan.restart.retain", "plan.restart.remove"] {
+            assert!(!body.contains(narrowing), "{narrowing}");
+        }
+        // Docker must answer before the first restart (the unit or a container).
+        let ask = body.find("if !docker_answered").expect("no could-not-ask refusal");
+        assert!(ask < body.find("systemd_restart_unit(").unwrap());
+        assert!(ask < body.find("apply_to_stack(").unwrap());
+        // `restarted` is emitted on success, blind, revert and the late refusal.
+        let at = |needle: &str| body.find(needle).unwrap_or_else(|| panic!("missing {needle}"));
+        let success = at("with_applied(json_summary(&all_reloaded, Some(true)");
+        let blind = at("with_applied(json_summary(&all_reloaded, None");
+        let revert = at("with_applied(json_summary(&all_reloaded, healthy2, true)");
+        let late = at("with_restarted(json_summary(&[], None, false), &[])");
+        let late_fail = body[late..].find("\"docker_did_not_answer\"").expect("late refusal has no id") + late;
+        assert!(ask < late && late_fail < at("systemd_restart_unit("), "the late refusal precedes every restart");
+        assert!(success > ask && blind > success && revert > blind, "success, blind, revert follow the refusal in order");
+    }
+
+    /// The preflight asks Docker before any backup or rotation, and both
+    /// refusals leave through `fail` (non-zero), never a quiet return.
+    #[test]
+    fn rotate_all_asks_docker_before_changing_anything() {
+        let body = crate::test_src::fn_body(include_str!("security_local.rs"), "pub fn pki_rotate_all(");
+        let pre = body.find("reload && docker_running_names().is_none()").expect("no preflight");
+        assert!(pre > body.find("confirm_destructive(").unwrap(), "after the confirmation");
+        assert!(pre < body.find("backup_dir").unwrap(), "before the backup directory exists");
+        assert!(pre < body.find("create_dir_all").unwrap());
+        assert!(pre < body.find("rotate_all_expiring(").unwrap(), "before the rotation");
+        assert!(pre < body.find("deliver_node_certs(").unwrap(), "before any delivery");
+        // The preflight's failure path is a `fail(` with the id, in its own block.
+        let fail_at = body[pre..].find("fail(").expect("preflight does not fail") + pre;
+        let id_at = body[pre..].find("\"docker_did_not_answer\"").unwrap() + pre;
+        assert!(fail_at < id_at && id_at < body.find("backup_dir").unwrap());
+        assert!(body[pre..id_at].matches("fail(").count() == 1);
+        // The late refusal is `fail(` too, and says so truthfully.
+        let late = body.find("if !docker_answered").expect("no late refusal");
+        let late_fail = body[late..].find("fail(").expect("late refusal does not fail") + late;
+        assert!(body[late..late_fail].find("return").is_none(), "no quiet return before fail");
+        assert!(body[late_fail..].contains("the certificates were rotated"));
+        // docker_answered is the real answer at the call site, never a literal.
+        assert!(body.contains("let docker_answered = running.is_some();"));
+        assert!(!body.contains("docker_answered = true") && !body.contains("docker_answered: true"));
+        assert!(body.contains("with_would_restart(json_summary(&[], None, false), &plan.restart, docker_answered)"));
+    }
+
+    #[test]
+    fn both_could_not_ask_messages_say_what_docker_could_not_answer() {
+        assert_eq!(DOCKER_PS_SECS, 15);
+        let m = DOCKER_DID_NOT_ANSWER;
+        assert!(m.contains("`docker ps` did not answer within 15 s"), "{m}");
+        assert!(m.contains("replica containers"), "{m}");
+        let src = include_str!("security_local.rs");
+        let body = crate::test_src::fn_body(src, "pub fn pki_rotate_all(");
+        assert_eq!(body.matches("did not answer within 15 s").count(), 2, "preflight and late refusal");
+        assert_eq!(body.matches("replicas cannot be named without Docker").count(), 2);
+        assert!(body.contains("nothing was changed"));
+    }
+
     // ── trust-ca command construction ───────────────────────────────────
 
     #[test]
@@ -6864,6 +8384,28 @@ mod address_claim_tests {
         assert!(body[mint..].contains("&host"), "the mint names the dialled address");
     }
 
+    /// i1310: a leaf that already covers the address is dialled back too.
+    /// "Nothing to re-issue" comes only AFTER the proof (a refactor that
+    /// returns before it makes `--prove` succeed unproven), says it proved
+    /// (`proven: true`), and the confirm is asked only before a mint.
+    #[test]
+    fn a_covered_address_is_proven_before_nothing_to_reissue() {
+        let code = include_str!("security_local.rs");
+        let body = crate::test_src::fn_body(code, "fn pki_push_node_prove(");
+        let prove = body.find("node_prove::prove_node_at(").expect("the dial-back");
+        // The covered answer's own branch (a block, not an inline condition).
+        let covered = body.find("if covered {\n").expect("the covered branch");
+        let confirm = body.find("confirm_destructive(").expect("the confirm");
+        let mint = body.find("issue_node_cert(").expect("the mint");
+        assert!(prove < covered, "the covered answer comes after the dial-back");
+        assert!(covered < confirm && confirm < mint, "the confirm comes after the covered answer and before the mint");
+        let branch = &body[covered..confirm];
+        assert!(branch.contains("\"proven\": true") && branch.contains("\"changed\": false"), "{branch}");
+        assert!(branch.contains("nothing to re-issue") && branch.contains("return Ok(0)"), "{branch}");
+        assert!(!body[..prove].contains("return Ok(0)"), "nothing returns success before the dial-back");
+        assert!(!body[prove..covered].contains("covered"), "a failed proof fails whether or not the leaf covers the address");
+    }
+
     /// The seam with node-pin (#1518), agreed in both PR bodies: `--prove`
     /// dispatches to pki_push_node_prove and RETURNS before the plain
     /// per-node loop, so node-pin's vetted-address check (inside that loop)
@@ -6956,5 +8498,370 @@ mod push_vetting_tests {
         let vet = body.find("vetted_push_address(name, host, enrolled.as_deref(), &ts_ip, &local_leaf_ips(name))").expect("the vetting");
         let mint = body.find("ca.issue_node_cert(name, host,").expect("the mint");
         assert!(vet < mint);
+    }
+}
+
+/// The health gate behind `pki rotate-all` and the CA rotation: where it
+/// probes, what decides a revert, and what it says when it cannot tell.
+#[cfg(test)]
+mod rotate_gate_tests {
+    use super::{
+        bind_target, decide_gate, docker_summary, gate_action, health_probe_url, host_is_this_machine,
+        launcher_env_value, parse_docker_state, BindTarget, DockerState, GateAction, GateOutcome, GwHealth,
+        copy_back_command, docker_state_of, gw_from_probe, mask_userinfo, ProbeError,
+    };
+    use crate::envfile::GatewaySource;
+
+    fn url_of(configured: &str, source: &GatewaySource, t: &BindTarget, offset: u32) -> String {
+        health_probe_url(configured, source, t, offset, None).unwrap().0
+    }
+
+    /// A controller onboarded on a tailnet binds its gateway to the tailnet
+    /// IP only; loopback refuses there. The probe goes to the address the
+    /// gateway listens on, on the instance's port.
+    #[test]
+    fn the_probe_url_is_the_bound_address_not_localhost() {
+        let t = bind_target("", "tailnet", Some("100.64.0.7"));
+        assert_eq!(t, BindTarget::Address("100.64.0.7".into()));
+        assert_eq!(
+            health_probe_url("https://localhost:8080", &GatewaySource::Default, &t, 0, None).unwrap(),
+            ("https://100.64.0.7:8080/health".to_string(), true)
+        );
+        // An instance port offset moves the port with it.
+        assert_eq!(
+            url_of("https://localhost:9080", &GatewaySource::Default, &t, 1000),
+            "https://100.64.0.7:9080/health"
+        );
+        // An explicit NOO_BIND_ADDR wins over the mode (the launcher's order).
+        let pinned = bind_target("100.64.0.9", "local", None);
+        assert_eq!(url_of("", &GatewaySource::Default, &pinned, 0), "https://100.64.0.9:8080/health");
+        // An IPv6 address is bracketed.
+        let v6 = bind_target("fd7a::1", "", None);
+        assert_eq!(url_of("", &GatewaySource::Default, &v6, 0), "https://[fd7a::1]:8080/health");
+    }
+
+    /// `local` / `all` probe the host the launcher binds for local mode,
+    /// 127.0.0.1 (the gateway certificate carries it as a SAN).
+    #[test]
+    fn local_probes_the_loopback_the_launcher_binds() {
+        for (addr, mode) in [
+            ("", "local"),
+            ("", "loopback"),
+            ("", "all"),
+            ("", "0.0.0.0"),
+            ("", "127.0.0.1"),
+            ("0.0.0.0", ""),
+            ("127.0.0.1", "tailnet"),
+        ] {
+            let t = bind_target(addr, mode, Some("100.64.0.7"));
+            assert_eq!(t, BindTarget::Local, "{addr:?} {mode:?}");
+            assert_eq!(
+                health_probe_url("https://100.64.0.7:8080", &GatewaySource::Default, &t, 0, None).unwrap(),
+                ("https://127.0.0.1:8080/health".to_string(), true)
+            );
+        }
+    }
+
+    /// The launcher compares modes exactly, in lower case; a value that is
+    /// not plausibly an address is unknown, never something to dial.
+    #[test]
+    fn a_value_that_is_not_an_address_is_unknown() {
+        for (addr, mode) in [
+            ("", "Tailnet"),
+            ("", "node-a.example.ts.net"),
+            ("node-a.example.ts.net", ""),
+            ("", "'100.64.0.7'"),
+            ("", "tailnet # on"),
+            ("", "100.64.0.7 extra"),
+            ("'100.64.0.7'", ""),
+            ("100.64.0.7;rm", ""),
+        ] {
+            assert!(matches!(bind_target(addr, mode, Some("100.64.0.7")), BindTarget::Unknown(_)), "{addr:?} {mode:?}");
+        }
+        // A literal address in NOO_BIND_MODE is an address (the launcher's `*` arm).
+        assert_eq!(bind_target("", "100.64.0.7", None), BindTarget::Address("100.64.0.7".into()));
+    }
+
+    /// `.env` is read as the launcher's `_bind_env_value` reads it: spaces
+    /// and double quotes deleted, spaces around `=` allowed, the last line
+    /// wins; `export ` and inline comments are NOT understood (so they
+    /// never become an address).
+    #[test]
+    fn the_env_file_is_read_as_the_launcher_reads_it() {
+        let env = "NOO_BIND_MODE=local\n  NOO_BIND_MODE = \"tailnet\" \r\nNOO_BIND_ADDR=\"100.64.0.7\"\nNOO_BIND_ADDRESS=1.2.3.4\n";
+        assert_eq!(launcher_env_value(env, "NOO_BIND_MODE"), "tailnet");
+        assert_eq!(launcher_env_value(env, "NOO_BIND_ADDR"), "100.64.0.7");
+        assert_eq!(launcher_env_value(env, "NOO_BIND_PORT"), "");
+        assert_eq!(launcher_env_value("export NOO_BIND_MODE=tailnet\n", "NOO_BIND_MODE"), "");
+        let commented = launcher_env_value("NOO_BIND_MODE=tailnet # note\n", "NOO_BIND_MODE");
+        assert!(matches!(bind_target("", &commented, Some("100.64.0.7")), BindTarget::Unknown(_)), "{commented}");
+        let quoted = launcher_env_value("NOO_BIND_MODE=\"tailnet\"\n", "NOO_BIND_MODE");
+        assert_eq!(bind_target("", &quoted, Some("100.64.0.7")), BindTarget::Address("100.64.0.7".into()));
+    }
+
+    /// No bind known: the configured URL is the fallback and counts only
+    /// when its host is this machine; with none, there is no address.
+    #[test]
+    fn an_unknown_bind_uses_the_configured_url_only_as_a_fallback() {
+        let none = bind_target("", "", None);
+        assert!(matches!(none, BindTarget::Unknown(_)));
+        assert_eq!(
+            health_probe_url("https://ctrl.example.ts.net/", &GatewaySource::Env("NOO_GATEWAY_URL"), &none, 0, Some("100.64.0.7"))
+                .unwrap(),
+            ("https://ctrl.example.ts.net/health".to_string(), false),
+            "another host, or a serve front: its answer is not this gateway's"
+        );
+        assert_eq!(
+            health_probe_url("https://100.64.0.7:8080", &GatewaySource::Env("CONTROLLER_URL"), &none, 0, Some("100.64.0.7"))
+                .unwrap(),
+            ("https://100.64.0.7:8080/health".to_string(), true)
+        );
+        let err = health_probe_url("https://localhost:8080", &GatewaySource::Default, &none, 0, None).unwrap_err();
+        assert!(err.contains("NOO_BIND_MODE") && err.contains("no gateway URL"), "{err}");
+        assert!(matches!(bind_target("", "tailnet", None), BindTarget::Unknown(_)));
+        assert!(matches!(bind_target("", "tailnet", Some("  ")), BindTarget::Unknown(_)));
+    }
+
+    #[test]
+    fn this_machine_is_loopback_or_its_tailnet_address() {
+        let ts = Some("100.64.0.7");
+        for u in ["https://localhost:8080", "https://LOCALHOST", "https://127.0.0.1:8080/x", "https://127.0.0.2", "https://[::1]:8080", "https://100.64.0.7"] {
+            assert!(host_is_this_machine(u, ts), "{u}");
+        }
+        for u in ["https://ctrl.example.ts.net", "https://100.64.0.8:8080", "https://user@other:8080/", "https://100.64.0.7.evil.example",
+            "https://127.0.0.1.example.com", "https://127.example.com", "https://localhost.example.com", "https://127.0.0.1.nip.io:8080"] {
+            assert!(!host_is_this_machine(u, ts), "{u}");
+        }
+        assert!(!host_is_this_machine("https://100.64.0.7", None));
+    }
+
+    #[test]
+    fn docker_output_parses_whole_words() {
+        assert_eq!(parse_docker_state("true healthy"), DockerState::Healthy);
+        assert_eq!(parse_docker_state("true unhealthy"), DockerState::Unhealthy);
+        assert_eq!(parse_docker_state("true starting"), DockerState::Starting);
+        assert_eq!(parse_docker_state("true"), DockerState::NoCheck);
+        assert_eq!(parse_docker_state("true "), DockerState::NoCheck);
+        assert_eq!(parse_docker_state("false healthy"), DockerState::NotRunning);
+        // A failed or empty inspect says nothing: never "not running".
+        assert_eq!(parse_docker_state(""), DockerState::Unknown);
+        assert_eq!(parse_docker_state("Error: No such object"), DockerState::Unknown);
+        assert_eq!(parse_docker_state("false"), DockerState::NotRunning);
+        assert_eq!(parse_docker_state("true mystery"), DockerState::Starting);
+    }
+
+    const URL: &str = "https://100.64.0.7:8080/health";
+    use DockerState::{
+        Healthy as H, NoCheck as N, NotRunning as NR, Starting as S, Unhealthy as U, Unknown as K,
+    };
+
+    fn run(states: &[DockerState], gw: GwHealth, own: bool, deadline: bool) -> Option<GateOutcome> {
+        let d: Vec<(String, DockerState)> =
+            states.iter().enumerate().map(|(i, s)| (format!("noo-c{i}"), *s)).collect();
+        decide_gate(150, &d, &gw, own, URL, deadline)
+    }
+    fn kind(o: Option<GateOutcome>) -> &'static str {
+        match o {
+            None => "poll",
+            Some(GateOutcome::Healthy(_)) => "healthy",
+            Some(GateOutcome::Unhealthy(_)) => "unhealthy",
+            Some(GateOutcome::Blind(_)) => "blind",
+        }
+    }
+
+    /// Healthy: every container running with `healthy` (or no healthcheck),
+    /// or a 200 from this machine's own address with nothing condemned.
+    #[test]
+    fn healthy_by_docker_or_by_a_200() {
+        let nope = || GwHealth::NothingAnswered("refused".into());
+        assert_eq!(kind(run(&[H, N], nope(), true, false)), "healthy", "docker alone, probe blind");
+        assert_eq!(kind(run(&[H], GwHealth::NotApplicable, false, false)), "healthy");
+        assert_eq!(kind(run(&[S], GwHealth::Ok, true, false)), "healthy", "200 while starting");
+        assert_eq!(kind(run(&[H], GwHealth::BadAnswer("name mismatch".into()), true, false)), "healthy");
+        // `starting` is not healthy, and a 200 from another host does not make it so.
+        assert_eq!(kind(run(&[S], nope(), true, false)), "poll");
+        assert_eq!(kind(run(&[S], GwHealth::Ok, false, false)), "poll");
+        // A 200 never outvotes a container docker condemns.
+        assert_eq!(kind(run(&[U, H], GwHealth::Ok, true, false)), "poll");
+    }
+
+    /// Revert only for: a container not running, a container docker calls
+    /// unhealthy, or a verified non-200 from this machine's own address.
+    #[test]
+    fn only_dockers_word_or_a_verified_non_200_reverts() {
+        let nope = || GwHealth::NothingAnswered("refused".into());
+        assert_eq!(kind(run(&[NR], GwHealth::Ok, true, true)), "unhealthy");
+        assert_eq!(kind(run(&[H, U], GwHealth::Ok, true, true)), "unhealthy");
+        assert_eq!(kind(run(&[NR], nope(), false, true)), "unhealthy");
+        assert_eq!(kind(run(&[H], GwHealth::Answered(503), true, true)), "unhealthy");
+        assert_eq!(kind(run(&[S], GwHealth::Answered(503), true, true)), "unhealthy");
+        // ... but it waits for the deadline: a container may still come up.
+        assert_eq!(kind(run(&[NR], nope(), true, false)), "poll");
+        assert_eq!(kind(run(&[H], GwHealth::Answered(503), true, false)), "poll");
+        // A non-200 from an address that is not this machine's is not evidence.
+        assert_eq!(kind(run(&[H], GwHealth::Answered(503), false, true)), "healthy");
+        assert_eq!(kind(run(&[S], GwHealth::Answered(503), false, true)), "blind");
+    }
+
+    /// Everything the CLI's own side can get wrong is Blind at the deadline,
+    /// never a revert: a cert issued on another address then a tailnet bind
+    /// (name mismatch), a stale anchor (unknown issuer), no anchor, no
+    /// address, nothing answering, a container still `starting`.
+    #[test]
+    fn a_client_side_failure_is_blind_never_a_revert() {
+        for gw in [
+            GwHealth::BadAnswer("invalid peer certificate: NotValidForName".into()),
+            GwHealth::BadAnswer("invalid peer certificate: UnknownIssuer".into()),
+            GwHealth::BadAnswer("protocol".into()),
+            GwHealth::NoTrust("no anchor".into()),
+            GwHealth::NoAddress("no bind".into()),
+            GwHealth::NothingAnswered("connection failed: refused".into()),
+            GwHealth::NothingAnswered("timed out".into()),
+        ] {
+            for own in [true, false] {
+                let o = run(&[S], gw.clone(), own, true);
+                assert_eq!(kind(o), "blind", "{gw:?} own={own}");
+            }
+            // A NoAddress gate keeps polling docker: it can still turn healthy by docker alone.
+            assert_eq!(kind(run(&[S], gw.clone(), true, false)), "poll", "{gw:?}");
+            assert_eq!(kind(run(&[H], gw.clone(), true, false)), "healthy", "{gw:?}");
+        }
+        // Gateway-less restart set, one container still starting at the deadline.
+        assert_eq!(kind(run(&[S], GwHealth::NotApplicable, false, true)), "blind");
+    }
+
+    /// The decision, state to action: only Unhealthy reverts; a blind gate
+    /// never does.
+    #[test]
+    fn blind_never_reverts() {
+        assert_eq!(gate_action(&GateOutcome::Healthy(String::new())), GateAction::Accept);
+        assert_eq!(gate_action(&GateOutcome::Unhealthy(String::new())), GateAction::Revert);
+        assert_eq!(gate_action(&GateOutcome::Blind(String::new())), GateAction::KeepUnconfirmed);
+        for gw in [
+            GwHealth::NothingAnswered("refused".into()),
+            GwHealth::BadAnswer("name mismatch".into()),
+            GwHealth::NoTrust("x".into()),
+            GwHealth::NoAddress("x".into()),
+        ] {
+            let o = run(&[S, H, N], gw.clone(), true, true).unwrap();
+            assert_ne!(gate_action(&o), GateAction::Revert, "{gw:?} -> {o:?}");
+        }
+    }
+
+    /// The text says what docker reported, truthfully (`starting` is not
+    /// "healthy"), and names the URL probed and the error.
+    #[test]
+    fn the_gate_text_is_truthful_and_names_the_url() {
+        match run(&[S, H], GwHealth::NothingAnswered("connection failed: refused".into()), true, true) {
+            Some(GateOutcome::Blind(t)) => {
+                assert!(t.contains("noo-c0: running; health: starting"), "{t}");
+                assert!(t.contains("noo-c1: running; health: healthy"), "{t}");
+                assert!(t.contains(URL) && t.contains("could not reach /health"), "{t}");
+                assert!(t.contains("connection failed: refused"), "{t}");
+            }
+            other => panic!("{other:?}"),
+        }
+        match run(&[S], GwHealth::NoAddress("no bind".into()), true, true) {
+            Some(GateOutcome::Blind(t)) => assert!(t.contains("no address to probe") && t.contains("no bind"), "{t}"),
+            other => panic!("{other:?}"),
+        }
+        match run(&[U], GwHealth::NothingAnswered("x".into()), true, true) {
+            Some(GateOutcome::Unhealthy(t)) => assert!(t.contains("noo-c0 (running; health: unhealthy)") && t.contains(URL), "{t}"),
+            other => panic!("{other:?}"),
+        }
+        match run(&[H], GwHealth::Answered(503), true, true) {
+            Some(GateOutcome::Unhealthy(t)) => assert!(t.contains(URL) && t.contains("503"), "{t}"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            docker_summary(&[("a".to_string(), NR), ("b".to_string(), N)]),
+            "a: not running, b: running; health: none"
+        );
+    }
+
+    /// A failed `docker inspect` (docker missing, a daemon hiccup, an unknown
+    /// name) is Unknown: neither healthy nor bad. Alone it ends Blind; it
+    /// never reverts, and it does not hide a container docker condemns.
+    #[test]
+    fn a_failed_inspect_is_blind_and_never_a_revert() {
+        let nope = || GwHealth::NothingAnswered("refused".into());
+        assert_eq!(kind(run(&[K], nope(), true, true)), "blind");
+        assert_eq!(kind(run(&[K, H], nope(), true, true)), "blind");
+        assert_eq!(kind(run(&[K], GwHealth::NotApplicable, false, true)), "blind");
+        assert_eq!(kind(run(&[K], nope(), true, false)), "poll");
+        // One inspect failed, another explicitly unhealthy: docker's word stands.
+        assert_eq!(kind(run(&[K, U], nope(), true, true)), "unhealthy");
+        assert_eq!(kind(run(&[K, NR], nope(), true, true)), "unhealthy");
+        // The text says docker could not be asked.
+        match run(&[K], nope(), true, true) {
+            Some(GateOutcome::Blind(t)) => assert!(t.contains("docker inspect gave no answer"), "{t}"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// The probe's result, as a pure function over error kinds: a status is
+    /// Ok (200) or Answered (anything else, a 3xx included, never followed);
+    /// a failure is NothingAnswered or BadAnswer, never Answered.
+    #[test]
+    fn the_probe_classification() {
+        let e = |nothing_answered: bool| ProbeError { nothing_answered, text: "boom".into() };
+        assert_eq!(gw_from_probe(Ok(200)), GwHealth::Ok);
+        assert_eq!(gw_from_probe(Ok(503)), GwHealth::Answered(503));
+        assert_eq!(gw_from_probe(Ok(302)), GwHealth::Answered(302));
+        assert_eq!(gw_from_probe(Err(e(true))), GwHealth::NothingAnswered("boom".into()));
+        assert_eq!(gw_from_probe(Err(e(false))), GwHealth::BadAnswer("boom".into()));
+    }
+
+    #[test]
+    fn userinfo_is_masked_before_a_url_is_printed() {
+        assert_eq!(mask_userinfo("https://user:secret@host:8080/health"), "https://***@host:8080/health");
+        assert_eq!(mask_userinfo("https://host:8080/a@b"), "https://host:8080/a@b");
+        assert_eq!(mask_userinfo("https://host/health"), "https://host/health");
+        match run(&[S], GwHealth::NothingAnswered("x".into()), true, true) {
+            Some(GateOutcome::Blind(t)) => assert!(!t.contains("secret"), "{t}"),
+            other => panic!("{other:?}"),
+        }
+        let d = vec![("noo-c0".to_string(), S)];
+        let t = decide_gate(150, &d, &GwHealth::NothingAnswered("x".into()), false, "https://u:secret@h/health", true);
+        match t {
+            Some(GateOutcome::Blind(t)) => assert!(t.contains("https://***@h/health") && !t.contains("secret"), "{t}"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// The printed copy-back quotes its paths, re-syncs `pki/public/`
+    /// (`fix-modes`) before the restart, and carries the instance in use.
+    #[test]
+    fn the_copy_back_is_quoted_ordered_and_names_the_instance() {
+        let c = vec!["noo-gateway".to_string(), "noo-loki".to_string()];
+        let default = copy_back_command("/home/u/.noo/pki/.rotate-backup-1", "/home/u/.noo/pki", &c, "");
+        assert_eq!(
+            default,
+            "cp -a /home/u/.noo/pki/.rotate-backup-1/. /home/u/.noo/pki/ && noo security pki fix-modes && docker restart noo-gateway noo-loki"
+        );
+        let spaced = copy_back_command("/a b/backup", "/a b/pki", &c, "galaxy");
+        assert!(spaced.starts_with("cp -a '/a b/backup'/. '/a b/pki'/ && noo --instance galaxy security pki fix-modes"), "{spaced}");
+        assert!(spaced.find("fix-modes").unwrap() < spaced.find("docker restart").unwrap());
+    }
+
+    /// The mapping from a `docker inspect` run to a state, the code the gate
+    /// loop calls: a spawn error, a non-zero exit, empty or unparseable
+    /// output is Unknown (never a revert); only an explicit `false` is
+    /// not running.
+    #[test]
+    fn an_inspect_run_maps_to_a_state() {
+        assert_eq!(docker_state_of(None), DockerState::Unknown, "spawn error");
+        assert_eq!(docker_state_of(Some((false, "true healthy"))), DockerState::Unknown, "non-zero exit");
+        assert_eq!(docker_state_of(Some((false, ""))), DockerState::Unknown);
+        assert_eq!(docker_state_of(Some((true, ""))), DockerState::Unknown, "empty stdout");
+        assert_eq!(docker_state_of(Some((true, "  \n"))), DockerState::Unknown);
+        assert_eq!(docker_state_of(Some((true, "Error: No such object"))), DockerState::Unknown, "unparseable");
+        assert_eq!(docker_state_of(Some((true, "false"))), DockerState::NotRunning);
+        assert_eq!(docker_state_of(Some((true, "false unhealthy\n"))), DockerState::NotRunning);
+        assert_eq!(docker_state_of(Some((true, "true healthy\n"))), DockerState::Healthy);
+        assert_eq!(docker_state_of(Some((true, "true starting"))), DockerState::Starting);
+        assert_eq!(docker_state_of(Some((true, "true unhealthy"))), DockerState::Unhealthy);
+        assert_eq!(docker_state_of(Some((true, "true "))), DockerState::NoCheck);
+        assert_eq!(docker_state_of(Some((true, "true"))), DockerState::NoCheck);
     }
 }

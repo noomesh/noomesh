@@ -44,7 +44,7 @@ use anyhow::{anyhow, Result};
 use futures::StreamExt;
 use serde_json::json;
 
-use crate::coordinator::{self, ResolvedBackend, RemoteRuntime};
+use crate::coordinator::{self, turn_cancel, ResolvedBackend, RemoteRuntime};
 use crate::websocket::{NatsTurnSink, TurnSink, HARNESS_RESULT_EVENT};
 
 fn env(name: &str) -> Result<String> {
@@ -305,6 +305,7 @@ pub async fn run() -> Result<()> {
     let placement = read_placement(&model_url, &client).await;
     let profile = profile_of(&placement);
     install_chat_contexts(&placement, "start");
+    install_chat_windows(&placement, "start");
     match &profile {
         Some(p) => tracing::info!(
             tier = ?p.tier, first_byte_secs = ?p.first_byte_secs, stream_idle_secs = ?p.stream_idle_secs,
@@ -394,6 +395,7 @@ pub async fn run() -> Result<()> {
                 tick.tick().await;
                 let placement = read_placement(&model_url, &client).await;
                 install_chat_contexts(&placement, "re-read");
+                install_chat_windows(&placement, "re-read");
                 let (mode, source) =
                     thinking_after_read(std::env::var(coordinator::thinking::THINKING_ENV).ok(), &placement);
                 if source == "unreachable" {
@@ -444,6 +446,9 @@ pub async fn run() -> Result<()> {
     let mut tasks = nats.queue_subscribe(crate::tasks::task_subject(&node), "harness".to_string()).await?;
     let drain = drain_bound(&|k| std::env::var(k).ok());
     let mut stop = stop_signal();
+    // The turns this harness runs, by the gateway's turn id, so a cancel can
+    // abort the one it names.
+    let running_turns: Arc<turn_cancel::TurnRegistry> = Arc::default();
     // The tasks this harness holds right now, by id: a hand-back of a task
     // that is already here (the gateway hands a node's unfinished tasks
     // back on every `harness.ready`) is acknowledged as taken and never
@@ -570,12 +575,16 @@ pub async fn run() -> Result<()> {
             _ = stop.changed() => { stopping = true; break }
             m = turns.next() => match m { Some(m) => m, None => break },
         };
-        let req: coordinator::TurnRequest = match serde_json::from_slice(&msg.payload) {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::warn!(error = %e, "harness: unreadable turn request");
+        let req: coordinator::TurnRequest = match turn_cancel::handle_inbound(&running_turns, &msg.payload) {
+            turn_cancel::Handled::Turn(r) => *r,
+            // The gateway abandoned a turn and it was still here: it is being
+            // stopped (a driver turn kills its CLI group and cleans up, then
+            // its slot is released the way a finished turn's is).
+            turn_cancel::Handled::Cancelled(id) => {
+                tracing::info!(turn = %id, "harness: the gateway abandoned this turn; cancelling it and releasing its slot");
                 continue;
             }
+            turn_cancel::Handled::Ignored => continue,
         };
         if !crate::harness::egress_selftest::serving() {
             // Fail closed: the hold's latest check is not held. Busy: the gateway
@@ -605,8 +614,7 @@ pub async fn run() -> Result<()> {
         let pinned = pinned.clone();
         let node = node.clone();
         let driver = driver.clone();
-        tokio::spawn(async move {
-            let _permit = permit;
+        turn_cancel::spawn_tracked(&running_turns, req.turn_id.clone(), driver.is_some(), permit, async move {
             // Our OWN node id on the subject — the grant is written against it.
             let sink = NatsTurnSink::new(nats.clone(), &node, &req.conversation_id);
             let outcome = match driver.as_deref() {
@@ -833,6 +841,20 @@ fn install_chat_contexts(placement: &Result<Option<serde_json::Value>>, when: &s
     let shown = table.as_ref().map(|t| format!("{t:?}")).unwrap_or_else(|| "none".into());
     if crate::harness::profile::set_chat_contexts(table) {
         tracing::info!("harness: decided chat contexts={shown} ({when})");
+    }
+}
+
+/// The agent's engine windows (`chat_windows`, vLLM and llama.cpp chat
+/// models) from a placement read, installed for the loop
+/// ([`crate::harness::profile::chat_window_for`]). Held like
+/// [`install_chat_contexts`]: unreachable leaves the table, a read without
+/// the key (an older agent) clears it.
+fn install_chat_windows(placement: &Result<Option<serde_json::Value>>, when: &str) {
+    let Ok(read) = placement else { return };
+    let table = read.as_ref().and_then(crate::harness::profile::chat_windows_of);
+    let shown = table.as_ref().map(|t| format!("{t:?}")).unwrap_or_else(|| "none".into());
+    if crate::harness::profile::set_chat_windows(table) {
+        tracing::info!("harness: engine chat windows={shown} ({when})");
     }
 }
 

@@ -370,11 +370,32 @@ def test_hostd_keeps_the_loaders_stderr() -> None:
     assert "load_secrets >/dev/null 2>&1" not in go, "the refusal reason (not tmpfs, chown failed) would be discarded"
 
 
+def _sprintf_boot(template: str, lib: str) -> str:
+    """Render boot.go's Sprintf template the way Go does: the first verb is the
+    quoted lib path, the %d verbs are the script's time bounds (production
+    values, short enough for these fakes, which answer at once), %% is a
+    literal percent sign."""
+    nums = iter(["20", "15", "180", "150", "600", "15", "1440"])
+    out = []
+    for m in re.finditer(r"%(%|s|d)|[^%]+|%", template):
+        t = m.group(0)
+        if t == "%%":
+            out.append("%")
+        elif t == "%s":
+            out.append(f"'{lib}'")
+        elif t == "%d":
+            out.append(next(nums))
+        else:
+            out.append(t)
+    assert next(nums, None) is None, "bootRestoreScript has fewer %d bounds than the test supplies"
+    return "".join(out)
+
+
 def _boot_script() -> str:
     go = (ROOT / "node-agent-go/internal/hostd/boot.go").read_text()
     m = re.search(r"const bootRestoreScript = `(.*?)`\n", go, re.S)
     assert m, "bootRestoreScript not found"
-    return m.group(1).replace("%s", f"'{LIB}'")
+    return _sprintf_boot(m.group(1), str(LIB))
 
 
 def _boot_run(

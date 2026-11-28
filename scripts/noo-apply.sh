@@ -1732,6 +1732,10 @@ AP_DENY_TREES="/etc /usr /boot /root /var/lib/docker /bin /sbin /lib /lib32 /lib
 # Denied as the path itself or anything above it; BELOW is allowed (a data
 # root under /home is a real layout, and ProtectHome needs it listed).
 AP_DENY_EXACT="/home"
+# The read-only `systemctl show` checks of agent_protect_rereport are bounded
+# (seconds), as this script bounds its other probes with `timeout`, which it
+# assumes exists. A test sets it shorter after sourcing the block.
+AP_SHOW_TIMEOUT=10
 AP_CHANGED=0
 AP_BAD_KEY=""
 AP_PATHS=""
@@ -1868,6 +1872,42 @@ agent_protect_apply() {
     systemctl daemon-reload 2>/dev/null || true
     need_restart=1
     applied="$applied agent-protect=$_ap_cnt"
+}
+
+# agent_protect_rereport ENV — REPORT ONLY, for a bundle that carries no
+# agent-env (a certificate or single-kind push). The applied line of such a
+# bundle replaces the node's one status row, so without this the hold the node
+# has reads as unknown to `noo cluster verify`. Render what the INSTALLED env
+# calls for, with the same renderer as agent_protect_apply, and say
+# `agent-protect=unchanged:N` ONLY when the installed drop-in is exactly that
+# (bytes, mode 644, owner) AND systemd has it loaded: `systemctl show` says
+# the unit needs no daemon-reload and ProtectSystem is what the drop-in sets
+# (each call bounded by `timeout $AP_SHOW_TIMEOUT`; a timeout reads as no).
+# Anything else (no systemd or systemctl, env or drop-in missing or unreadable,
+# a bad value, any difference, any other answer) says NOTHING: never a claim
+# of a hold that is not proved. It writes no file, installs nothing, runs no
+# systemctl verb but `show`, and never asks for a restart. A data directory
+# created after the drop-in was rendered makes it differ (a bare path becomes
+# listed with `-` or the reverse), so the tag is then withheld until the next
+# full bundle.
+agent_protect_rereport() {
+    [ -d "${AP_SYSTEMD_DIR:-/run/systemd/system}" ] || return 0
+    [ -f "$1" ] && [ -r "$1" ] || return 0
+    [ -f "$AGENT_DROPIN" ] && [ -r "$AGENT_DROPIN" ] || return 0
+    command -v systemctl >/dev/null 2>&1 || return 0
+    ap_collect "$1" || return 0
+    if [ -n "$AP_STAT_OWNER" ]; then
+        [ "$(stat -c '%a %U:%G' "$AGENT_DROPIN" 2>/dev/null)" = "644 $AP_STAT_OWNER" ] || return 0
+    fi
+    _ar_want="$(ap_render; printf x)" || return 0
+    _ar_have="$(cat -- "$AGENT_DROPIN"; printf x)" || return 0
+    [ "$_ar_want" = "$_ar_have" ] || return 0
+    _ar_ps="$(printf '%s\n' "$_ar_want" | sed -n 's/^ProtectSystem=//p' | head -1)"
+    [ -n "$_ar_ps" ] || return 0
+    [ "$(timeout "$AP_SHOW_TIMEOUT" systemctl show -p NeedDaemonReload --value noo-node-agent.service 2>/dev/null)" = "no" ] || return 0
+    [ "$(timeout "$AP_SHOW_TIMEOUT" systemctl show -p ProtectSystem --value noo-node-agent.service 2>/dev/null)" = "$_ar_ps" ] || return 0
+    _ar_cnt="$(printf '%s\n' "$AP_PATHS" | grep -c .)" || return 0
+    applied="$applied agent-protect=unchanged:$_ar_cnt"
 }
 
 # agent_protect_remove — teardown: the drop-in, and its directory if empty.
@@ -3477,6 +3517,11 @@ if [ -f /etc/noo-harness.env ] && id -u noo-harness >/dev/null 2>&1; then
 fi
 # Every install above succeeded: raise the release floor to what §1c verified.
 release_floor_write "$RELEASE_OK_VERSION" "$RELEASE_OK_STACK"
+# A bundle with no agent-env: say whether the node's installed protection
+# matches its agent config and is loaded (agent_protect_rereport). Here, after
+# the empty-bundle refusal, so the tag is only ever added to a bundle that
+# applied something. Report only; nothing is written.
+[ -f "$WORK/files/agent-env" ] || agent_protect_rereport /etc/noo-node-agent.env
 logger -t noo-apply "applied:$applied (node=$NODE_ID, verified-by=$SIG_VIA)" 2>/dev/null || true
 echo "applied:$applied"
 echo "verified-by: $SIG_VIA"

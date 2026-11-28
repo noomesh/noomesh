@@ -44,7 +44,11 @@ NOT_THIS_INSTALL = {"test-rotation-rehearsal.sh"}
 # held to building that list from lib-compose first by
 # test_callers_of_the_addon_stop_helpers_build_the_list_first below.
 # lib-start-inputs.sh fingerprints the config the launcher's next `up` renders.
-CALLERS_LIST = {"lib-bind-sources.sh", "lib-addons.sh", "lib-start-inputs.sh"}
+# lib-stuck-container.sh runs `docker compose` with the caller's $COMPOSE_FILES
+# and $PROFILE_ARGS (or the `compose ...` arguments its caller passes): it
+# probes and stages the launcher's own stack, and asks lib-compose.sh's
+# `_compose_project_name` for the project only when the launcher has loaded it.
+CALLERS_LIST = {"lib-bind-sources.sh", "lib-addons.sh", "lib-start-inputs.sh", "lib-stuck-container.sh"}
 ADDON_STOP_HELPERS = ("addons_stop_disabled", "addon_own_services")
 
 # A `docker compose … -f <literal docker-compose.*.yml>` on a live line.

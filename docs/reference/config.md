@@ -205,6 +205,8 @@ writes the values that match the deployed profile.
 | `max_session_messages` | `20` | |
 | `max_context_tokens` | unset (12288 = 16K minus the 4K reserve) | input budget |
 
+The retrieved-context block (knowledge base, memory, other channels, recall) is held to this budget as well: it takes what is left after the system prompt, the tool list, your question and recent history, and on a window with an input budget under 8,192 tokens at most 40% of it. A block that fits is sent unchanged. On a small window the lowest-priority material is left out first (video recall, other channels, companion devices, runtime skills, memory, cluster nodes, conversation recall, your facts, then the knowledge base), item by item from the end of each section; a cut knowledge-base section keeps only its first source, and only while its first passage is whole. When too little room remains the block is left out and the question is sent alone. The gateway log line `retrieved_data_budgeted` gives the token counts before and after.
+
 ### `heartbeat` — cron scheduler (gateway)
 
 | Key | Env | Default | Purpose |

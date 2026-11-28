@@ -106,7 +106,8 @@ id in a subject has `.`, `*`, `>` and spaces replaced by `_`.
 `TurnRequest` fields: `conversation_id`, `prompt`, `channel`,
 `max_iterations`, `model` (optional), `user`, `enable_thinking` (default
 false), `role_prompt` (optional), `stream` (default false: send only the
-result), `token`.
+result), `token`, `turn_id` (optional; from 0.6.31, one random UUID per
+dispatch, used only to cancel the turn, see **Cancel** below).
 
 `TaskRequest` fields: `task_id`, `objective`, `conversation_id`,
 `thread_id`, `channel`, `user`, `model` (optional), `loops_done`,
@@ -118,6 +119,62 @@ a turn's ack also names the harness `kind` (from 0.6.13), which the
 gateway passes to the console as a `harness_dispatched` event so the person
 sees which node and kind are answering. The gateway waits 3 seconds. No ack, a reply that is not `ack: true`, or
 no responder means the work was not taken, and the gateway runs it itself.
+
+**Cancel (from 0.6.31).** A turn the gateway stops waiting for (the
+console tab closed, the HTTP client disconnected, the person's session was
+revoked, or the turn deadline passed) is also stopped on the node, so it no
+longer holds a slot or publishes events nobody reads. The gateway publishes
+one plain message, no reply expected, on the turn's own subject
+`harness.run.<node>`:
+
+```json
+{"kind": "cancel", "turn_id": "<the turn_id of the TurnRequest>"}
+```
+
+A harness keeps its running turns by `turn_id`. On a cancel for a turn it
+holds:
+
+- a turn run by a vendor CLI (the driver) is signalled. The harness kills
+  the CLI's whole process group (the CLI and every tool subprocess it
+  started, by the same kill the turn deadline uses), then runs the turn's
+  usual end-of-turn cleanup: the minted door key is revoked, the key file,
+  system prompt and per-turn workspace are removed, the usage the turn
+  already consumed is reported, and the wire translator is shut down. The
+  turn saves no answer and sends no result. The key file, system prompt
+  and codex config are removed first (no network needed); then the calls
+  to the gateway each get at most 4 s (the key revoke, then the usage
+  report) and a call that times out is logged and skipped, so the whole
+  cleanup fits inside the grace. If the turn has not ended 15 s after the
+  signal it is aborted outright, and the harness logs an error naming the
+  turn;
+- a turn run by the harness's own loop is aborted at once, which drops its
+  model request so the backend stops.
+
+Either way the turn's concurrency slot is released the way a finished
+turn's is, and one line is logged. A `turn_id` it does not hold (the turn
+already ended, a second cancel, another node's turn) is ignored. A cancel
+names exactly one turn; the id is random per dispatch and is only ever sent
+on that node's `harness.run.<node>` subject, which only the gateway
+publishes to. A turn that ends with a result or an error is never cancelled
+afterwards.
+
+A cancel is a plain publish with no retry. One sent while the harness is
+restarting or draining (it has dropped its subscription) is missed, and
+the turn then runs to its deadline, as it did before this existed.
+
+Mixed versions need no setting and no new bus grant: the cancel rides the
+subject every harness already subscribes to and the gateway already
+publishes to.
+
+- New gateway, older harness: the older harness reads every payload on the
+  subject as a `TurnRequest`; a cancel has none of its required fields, so it
+  is logged as unreadable and dropped. It is never taken as a turn. The
+  turn runs on until it ends or reaches its deadline, as before.
+- Older gateway, new harness: the request has no `turn_id`, so the turn is
+  not cancellable and nothing sends a cancel. Behaviour is as before.
+
+A foreign runner that implements its own `harness.run.<node>` subscription
+should treat a payload whose `kind` is `cancel` as above, not as a turn.
 
 **At capacity.** A harness at its `NOO_HARNESS_MAX_TURNS` limit replies
 `{"ack": false, "busy": true, "node": "<id>", "running": n, "capacity": N}`
@@ -499,6 +556,29 @@ model's calls. The harness fits its own loop's turns to it, so a task on the
 node runs in the same window as a console turn on that model, and its
 translator stamps it on an Ollama-bound body a CLI sent without one. It is
 absent when nothing is decided or the agent is older; the loop then keeps
+the global `VLLM_MAX_MODEL_LEN` window.
+
+`chat_windows` is the same for a vLLM or llama.cpp chat model: the engine's
+own window per model as placed (`VLLM_MAX_MODEL_LEN`, or llama.cpp's `N_CTX`
+shared by its parallel slots, else the node's profile context, capped by the
+model's own ceiling), as the controller reads it for the chats it runs
+itself (desired-config `chat_windows`; a model placed twice keeps the smaller
+window). The agent stamps nothing with it. It is the controller's desired
+state, not a live reading of the engine: it changes when the placement does
+and reaches the harness on its one-minute re-read. Keys are exact model
+names as placed, and the value is never larger than the gateway's own fit
+for that model.
+
+The shipped harness is pinned to the model `auto` (the node's inference
+proxy substitutes the model of the backend it picks). So the agent also
+states, under `auto` in `chat_windows` and under `auto:latest` in
+`chat_contexts`, the SMALLEST window across the node's running chat
+placements (an engine window or an Ollama decided context); the proxy picks
+one backend per request and the harness cannot see which, so the smallest
+cannot overflow. The harness looks its window up by its pin as given, so a
+4096-token llama.cpp placement gets a prompt budget inside 4096 rather than
+the global window. Each key is absent when its own table is empty or the
+agent is older; zero or implausibly large values are ignored; the loop then keeps
 the global `VLLM_MAX_MODEL_LEN` window.
 
 `noo-gateway harness probe --kind <kind>` runs steps 1, 3, 4 and 5 once,

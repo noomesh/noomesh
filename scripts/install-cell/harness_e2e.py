@@ -173,6 +173,11 @@ def self_record(node: str) -> dict | None:
 # HTTP status), by the reason's class and errno only (no values).
 ATTEMPTS: list[dict] = []
 
+# A body this large is read after the gateway has authenticated the request, so
+# a refused login shows as a lost upload; _RESET_REFRESHED: refreshed once on it.
+LARGE_BODY = 1 << 20
+_RESET_REFRESHED = False
+
 
 def http(method: str, path: str, body: bytes | None = None, ctype: str = "application/json", timeout: float = 120):
     for attempt in (1, 2):
@@ -207,6 +212,22 @@ def _http(method: str, path: str, body: bytes | None = None, ctype: str = "appli
             except urllib.error.HTTPError as e2:
                 return e2.code, e2.read()
         return e.code, e.read()
+    except urllib.error.URLError:
+        # A 401 on a LARGE upload arrives as a TLS EOF, not as a status: the
+        # gateway refuses on authentication before reading the body and
+        # closes while the client is still sending (i1392). So a connection
+        # reset on a large body may be an expired login: refresh ONCE for
+        # the whole run and retry once. Never a loop; the token is not logged.
+        global _RESET_REFRESHED
+        if body is None or len(body) < LARGE_BODY or _RESET_REFRESHED:
+            raise
+        _RESET_REFRESHED = True
+        if not ws_chat.refresh_via_cli():
+            raise
+        try:
+            return once()
+        except urllib.error.HTTPError as e3:
+            return e3.code, e3.read()
 
 
 def release_repo() -> str:
@@ -351,6 +372,9 @@ def collect(ev: list[str], tmp: str, E: dict) -> None:
                  "-in", tar_path, "-out", blob, bpath])
     if rc != 0:
         return stop("FAIL", "openssl could not encrypt the bundle to the birth certificate")
+    # One small authenticated request first: an expired login is refreshed
+    # through the 401 path, so the large POST below starts with a live one.
+    http("GET", f"/api/cluster/provision-bundle/{node}/status", timeout=30)
     st, body = http("POST", f"/api/cluster/provision-bundle/{node}", open(blob, "rb").read(), "application/octet-stream", 600)
     ev.append(f"staged: HTTP {st} ({len(files)} kinds, {os.path.getsize(blob)} bytes)")
     if st // 100 != 2:

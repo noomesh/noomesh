@@ -68,6 +68,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/api/v1/docs/purge", post(docs_purge))
         .route("/api/v1/docs/held", get(docs_held))
         .route("/api/v1/docs/{doc_id}", get(doc_detail))
+        .route("/api/v1/docs/{doc_id}/pages/{page_no}", get(doc_page))
         // Manual trigger for the watched_folders + watched_drives ingest loops.
         // ?source=folders|drives|all (default all). Synchronous — returns the
         // ScanResult so the caller can immediately see what was ingested.
@@ -1010,6 +1011,74 @@ async fn doc_detail(
         Ok(None) => Err(AppError::NotFound(format!("no document {id}"))),
         Err(e) if missing_table(&e) => Err(AppError::NotFound(format!("no document {id}"))),
         Err(e) => Err(AppError::Internal(format!("cannot read document: {e}"))),
+    }
+}
+
+/// The most characters one page read returns. A longer page is cut on a
+/// character boundary and says `truncated: true`.
+const DOC_PAGE_MAX_CHARS: usize = 20_000;
+
+/// Cut `text` to [`DOC_PAGE_MAX_CHARS`] characters (never inside a
+/// multi-byte character). The flag is whether anything was dropped.
+fn cap_page_text(text: &str) -> (String, bool) {
+    match text.char_indices().nth(DOC_PAGE_MAX_CHARS) {
+        Some((at, _)) => (text[..at].to_string(), true),
+        None => (text.to_string(), false),
+    }
+}
+
+/// The page answer from what the query found. `row` is `None` when the
+/// document is missing OR not readable: the same 404 as [`doc_detail`], with
+/// no count. Only once the document is readable does an absent page say how
+/// many pages exist.
+fn doc_page_outcome(id: &str, page_no: i32, row: Option<scope::DocPageRow>) -> Result<Value, AppError> {
+    let Some((title, page_count, found, text, real_len)) = row else {
+        return Err(AppError::NotFound(format!("no document {id}")));
+    };
+    if !found {
+        return Err(AppError::NotFound(format!("document {id} has no page {page_no} (it has {page_count} pages, numbered from 1)")));
+    }
+    let (text, truncated) = cap_page_text(text.as_deref().unwrap_or(""));
+    // The page's real length; the shown length only when the query gave none.
+    let char_count = real_len.map_or_else(|| i64::try_from(text.chars().count()).unwrap_or(i64::MAX), i64::from);
+    Ok(json!({
+        "doc_id": id,
+        "page_no": page_no,
+        "page_count": page_count,
+        "title": title,
+        "char_count": char_count,
+        "text": text,
+        "truncated": truncated,
+    }))
+}
+
+/// GET /api/v1/docs/{doc_id}/pages/{page_no} — the full text of ONE page,
+/// read-only. Pages are numbered from 1, as stored. The audience is the one
+/// `GET /api/v1/docs/{doc_id}` applies: a missing document and one the caller
+/// may not read both answer `404 no document <id>`; the page count is told
+/// only for a readable document whose page is out of range (also 404). A page
+/// is cut to 20,000 characters with `truncated: true`; `char_count` is the page's real length.
+/// A page outside 1..=page_count is a 404 that names the page count. `400` when the
+/// document id is not a UUID or the page is not a whole number.
+async fn doc_page(
+    State(state): State<Arc<AppState>>,
+    ctx: Option<axum::Extension<crate::auth::RequesterCtx>>,
+    Path((doc_id, page_no)): Path<(String, String)>,
+) -> AppResult {
+    let id = uuid::Uuid::parse_str(doc_id.trim())
+        .map_err(|_| AppError::BadRequest(format!("'{doc_id}' is not a document id")))?
+        .to_string();
+    let page: i32 = page_no
+        .trim()
+        .parse()
+        .map_err(|_| AppError::BadRequest(format!("'{page_no}' is not a page number")))?;
+    let aud = scope::resolve(&state, &ctx).await?;
+    // One more than shown: the extra character is how the cut is noticed.
+    let fetch = i32::try_from(DOC_PAGE_MAX_CHARS + 1).unwrap_or(i32::MAX);
+    match state.memory().kb_doc_page(&aud, &id, page, fetch).await {
+        Ok(row) => doc_page_outcome(&id, page, row).map(Json),
+        Err(e) if missing_table(&e) => Err(AppError::NotFound(format!("no document {id}"))),
+        Err(e) => Err(AppError::Internal(format!("cannot read document page: {e}"))),
     }
 }
 
@@ -2659,5 +2728,79 @@ mod graph_audience_tests {
     fn the_marker_spelling_is_pinned() {
         // the worker's spelling is pinned by tests/test_graph_audience_worker.py
         assert_eq!(scope::AUDIENCE_KEY, AUDIENCE_KEY_FOR_TEST);
+    }
+}
+
+#[cfg(test)]
+mod doc_page_tests {
+    use super::*;
+
+    fn found(text: Option<&str>) -> Option<scope::DocPageRow> {
+        Some((Some("T".into()), 5, true, text.map(String::from), text.map(|t| i32::try_from(t.chars().count()).unwrap_or(i32::MAX))))
+    }
+
+    #[test]
+    fn a_long_page_is_cut_on_a_character_boundary() {
+        // Two-byte characters: a byte cut at 20,000 would land mid-character.
+        let long = "é".repeat(DOC_PAGE_MAX_CHARS + 7);
+        let (t, cut) = cap_page_text(&long);
+        assert!(cut);
+        assert_eq!(t.chars().count(), DOC_PAGE_MAX_CHARS);
+        assert_eq!(t.len(), DOC_PAGE_MAX_CHARS * 2);
+        let (t, cut) = cap_page_text(&"é".repeat(DOC_PAGE_MAX_CHARS));
+        assert!(!cut, "exactly the cap is not truncated");
+        assert_eq!(t.chars().count(), DOC_PAGE_MAX_CHARS);
+        assert_eq!(cap_page_text(""), (String::new(), false));
+    }
+
+    #[test]
+    fn the_page_answer_has_the_documented_shape() {
+        let v = doc_page_outcome("id1", 2, found(Some("héllo"))).unwrap();
+        assert_eq!(
+            v,
+            json!({"doc_id": "id1", "page_no": 2, "page_count": 5, "title": "T",
+                   "char_count": 5, "text": "héllo", "truncated": false})
+        );
+        let v = doc_page_outcome("id1", 1, found(None)).unwrap();
+        assert_eq!(v["text"], "");
+        assert_eq!(v["char_count"], 0);
+    }
+
+    #[test]
+    fn a_long_page_says_it_was_truncated() {
+        let v = doc_page_outcome("id1", 1, found(Some(&"x".repeat(DOC_PAGE_MAX_CHARS + 1)))).unwrap();
+        assert_eq!(v["truncated"], true);
+        assert_eq!(v["char_count"], DOC_PAGE_MAX_CHARS + 1, "char_count is the real length, not the shown one");
+        assert_eq!(v["text"].as_str().unwrap().chars().count(), DOC_PAGE_MAX_CHARS);
+    }
+
+    #[test]
+    fn char_count_is_the_real_length_when_the_query_reports_one() {
+        let row = Some((Some("T".into()), 2, true, Some("x".repeat(DOC_PAGE_MAX_CHARS + 1)), Some(123_456)));
+        let v = doc_page_outcome("id1", 1, row).unwrap();
+        assert_eq!(v["char_count"], 123_456);
+        assert_eq!(v["truncated"], true);
+    }
+
+    #[test]
+    fn missing_and_unreadable_are_one_answer_and_only_a_readable_document_gives_a_count() {
+        // The query returns None for both a missing and an unreadable document.
+        let Err(AppError::NotFound(m)) = doc_page_outcome("id1", 1, None) else { panic!("expected 404") };
+        assert_eq!(m, "no document id1");
+        assert!(!m.contains('5'), "no count without visibility");
+        let Err(AppError::NotFound(m)) = doc_page_outcome("id1", 9, Some((None, 5, false, None, None))) else {
+            panic!("expected 404")
+        };
+        assert!(m.contains("no page 9") && m.contains("5 pages"), "{m}");
+    }
+
+    #[test]
+    fn the_page_route_uses_the_document_views_literal_path_and_audience() {
+        let own = crate::test_src::own_code(include_str!("knowledge.rs"));
+        assert!(own.contains(".route(\"/api/v1/docs/{doc_id}/pages/{page_no}\", get(doc_page))"));
+        let body = crate::test_src::fn_body(&own, "async fn doc_page(");
+        assert!(body.contains("scope::resolve(&state, &ctx)"), "same audience resolution as doc_detail");
+        assert!(body.contains("BadRequest") && body.contains("is not a page number"));
+        assert!(!body.contains("audit") && !body.contains("record_"), "a read writes nothing");
     }
 }

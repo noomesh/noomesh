@@ -78,6 +78,15 @@ _drm_env() {  # <KEY>: environment first, else the last KEY= line in ./.env
     printf '%s' "$_v"
 }
 
+# One normal form for a data root, used by the evaluator AND the writer: every
+# trailing slash stripped (so /x, /x/ and /x// are the same root; / and // are
+# empty). Portable: no sed, no ${v//p/r}.
+_drm_norm_root() {  # <path>
+    local _r="$1"
+    while [ "${_r%/}" != "$_r" ]; do _r="${_r%/}"; done
+    printf '%s' "$_r"
+}
+
 _drm_record_file() { printf '%s' "${NOO_DATA_ROOT_ID_FILE:-$DRM_RECORD_FILE_DEFAULT}"; }
 _drm_refused_file() { printf '%s' "${NOO_DATA_ROOT_REFUSED_FILE:-$DRM_REFUSED_FILE_DEFAULT}"; }
 
@@ -121,15 +130,14 @@ _drm_field() {  # <FIELD> <path>
 # DRM_NOW_* identity. Never writes, never creates, never stops anything.
 _drm_evaluate() {
     DRM_VERDICT="ok"; DRM_MSG=""; DRM_KIND=""; DRM_UUID_NOTE=""; DRM_PG_NOTE=""
-    DRM_NOW_UUID=""; DRM_NOW_SOURCE=""; DRM_NOW_TARGET=""; DRM_NOW_FSTYPE=""; DRM_PG_INIT_NOW=""
+    DRM_NOW_UUID=""; DRM_NOW_SOURCE=""; DRM_NOW_TARGET=""; DRM_NOW_FSTYPE=""; DRM_PG_INIT_NOW=""; DRM_HEAL=""
     local root rec rec_root kind e
-    root="$(_drm_env NOO_DATA_ROOT)"
-    root="${root%/}"
+    root="$(_drm_norm_root "$(_drm_env NOO_DATA_ROOT)")"
     if [ -z "$root" ]; then
         DRM_VERDICT="skip"; DRM_MSG="NOO_DATA_ROOT is not set (the launcher says so itself)"; return 0
     fi
     rec="$(_drm_record_file)"
-    rec_root="$(_drm_get data_root "$rec")"
+    rec_root="$(_drm_norm_root "$(_drm_get data_root "$rec")")"
     kind="$(_drm_get id_kind "$rec")"
 
     if ! command -v findmnt >/dev/null 2>&1; then
@@ -176,7 +184,27 @@ _drm_evaluate() {
     fi
 
     local bad=""
-    if [ "$rec_root" != "$root" ]; then
+    local _ident=""
+    if [ -z "$rec_root" ]; then
+        # A record without a data root is healed only on a NON-EMPTY recorded
+        # identity: "" == "" must never count as a match.
+        case "$kind" in
+            uuid) _ident="$(_drm_get uuid "$rec")" ;;
+            mount) _ident="$(_drm_get source "$rec")$(_drm_get target "$rec")" ;;
+        esac
+    fi
+    if [ -z "$rec_root" ] && [ -z "$_ident" ]; then
+        # No data root and no usable filesystem identity: nothing to compare.
+        DRM_VERDICT="refuse"; DRM_KIND="damaged"
+        DRM_MSG="the record $rec holds no data_root and no usable filesystem identity (the file is damaged), so the filesystem under $root cannot be compared with anything"
+        _drm_explain "$root" "$rec" "$rec_root" "$kind"; return 0
+    fi
+    # A record that names a filesystem but not the data root it was taken for
+    # is not trusted for the root, only for the filesystem: the identity
+    # comparison below still runs and refuses any other filesystem; the data
+    # root is written back only if it matches (DRM_HEAL, in _drm_run).
+    [ -z "$rec_root" ] && DRM_HEAL="1"
+    if [ -n "$rec_root" ] && [ "$rec_root" != "$root" ]; then
         bad="the recorded data root is ${rec_root:-<none>}, this launch uses $root"
     elif [ "$kind" = "uuid" ]; then
         local want; want="$(_drm_get uuid "$rec")"
@@ -276,7 +304,7 @@ _drm_explain() {  # <root> <rec> <rec_root> <kind>
     local found="not mounted anywhere we could read"
     if [ -n "$DRM_NOW_SOURCE$DRM_NOW_TARGET$DRM_NOW_UUID" ]; then
         found="$(_drm_describe_now)"
-        if [ "$DRM_NOW_TARGET" = "/" ]; then found="$found: the ROOT filesystem — the data disk is not mounted"; fi
+        if [ "$DRM_NOW_TARGET" = "/" ] && [ "$(_drm_get target "$2")" != "/" ]; then found="$found: the ROOT filesystem — the data disk is not mounted"; fi
     fi
     DRM_EXPECTED="$exp"; DRM_FOUND="$found"
 }
@@ -290,6 +318,13 @@ _drm_refusal_text() {
 "  Nothing was created, changed or started. Retrying will not help: findmnt will not appear until it is installed." \
 "  fix:      $DRM_FINDMNT_FIX, then noo stack start" \
 "            (NOO_DATA_ROOT_RERECORD=1 does not apply: without findmnt there is nothing to record)"
+        return 0
+    fi
+    if [ "$DRM_KIND" = "damaged" ]; then
+        printf '%s\n' \
+"REFUSED: not starting — $DRM_MSG." \
+"  The launch was refused and the data root was not created or modified. This is a damaged record, not a missing disk." \
+"  repair:   NOO_DATA_ROOT_RERECORD=1 noo stack start   (re-records the filesystem under ${root:-<data root>} once; check it first with: findmnt -T ${root:-<data root>})"
         return 0
     fi
     if [ "$DRM_KIND" = "uuid_unreadable" ]; then
@@ -315,7 +350,12 @@ _drm_refusal_text() {
 }
 
 _drm_write_record() {  # writes the record from DRM_NOW_*; keeps an existing initialised marker
-    local rec tmp init kind uuid
+    local rec tmp init kind uuid root
+    root="$(_drm_norm_root "$(_drm_env NOO_DATA_ROOT)")"
+    if [ -z "$root" ]; then
+        echo "NOTE: not writing $(_drm_record_file): NOO_DATA_ROOT is empty or only slashes, and a record without a data root would refuse every later launch" >&2
+        return 1
+    fi
     rec="$(_drm_record_file)"
     init="$(_drm_get postgres_initialised "$rec")"
     [ -z "$init" ] && [ -n "$DRM_PG_INIT_NOW" ] && init="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -329,7 +369,7 @@ _drm_write_record() {  # writes the record from DRM_NOW_*; keeps an existing ini
     {
         echo "# written by scripts/lib-data-root-mount.sh — the filesystem the data root lives on."
         echo "# launchers and hostd refuse to start the stack when it is not mounted here."
-        echo "data_root=$(_drm_env NOO_DATA_ROOT | sed 's:/*$::')"
+        echo "data_root=$root"
         echo "id_kind=$kind"
         echo "uuid=$uuid"
         echo "source=$DRM_NOW_SOURCE"
@@ -372,7 +412,13 @@ _drm_run() {
             [ -n "$DRM_PG_NOTE" ] && echo "NOTE: $DRM_PG_NOTE." >&2
             # ok: remember that postgres has been initialised here, so a
             # later empty data dir is refused rather than re-initialised.
-            if [ -n "$DRM_PG_INIT_NOW" ] && [ -z "$(_drm_get postgres_initialised "$(_drm_record_file)")" ]; then
+            if [ -n "$DRM_HEAL" ]; then
+                # The record named this very filesystem but no data root:
+                # write the data root back (identity unchanged, it matched).
+                if _drm_write_record; then
+                    echo "NOTE: $(_drm_record_file) named this filesystem but no data root; wrote the data root back ($(_drm_describe_now))." >&2
+                fi
+            elif [ -n "$DRM_PG_INIT_NOW" ] && [ -z "$(_drm_get postgres_initialised "$(_drm_record_file)")" ]; then
                 _drm_write_record || true
             fi
             return 0 ;;

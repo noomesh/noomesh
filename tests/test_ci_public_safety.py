@@ -230,7 +230,7 @@ def test_e_the_public_release_workflow_is_core_only():
     no add-on repo name, no add-on image, and the app token reads only the open
     library. The add-ons release from their own repos with their own lock."""
     if not (WORKFLOWS_DIR / "images-release.yml").exists():
-        pytest.skip("images-release.yml not present")
+        pytest.skip("not in this tree: images-release.yml is not present")
     doc = _load("images-release.yml")
     assert set(doc["jobs"]) == {"release-line", "static-ffmpeg", "deps-core", "deps-base", "images", "lock", "addon-dispatch"}, sorted(doc["jobs"])
     text = (WORKFLOWS_DIR / "images-release.yml").read_text()
@@ -273,7 +273,7 @@ def test_e_the_llamacpp_leg_is_a_plain_core_entry_with_the_shipped_dockerfile():
     core image, with no repository-variable gate and no skip step. A missing
     Dockerfile therefore fails the build instead of dropping a lock row."""
     if not (WORKFLOWS_DIR / "images-release.yml").exists():
-        pytest.skip("images-release.yml not present")
+        pytest.skip("not in this tree: images-release.yml is not present")
     doc = _load("images-release.yml")
     job = doc["jobs"]["images"]
     text = json.dumps(job["steps"])

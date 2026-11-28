@@ -403,9 +403,9 @@ jobs:
   # The only Python job: it needs no token. The trellion library
   # (and trellion-protocols, which it pins) is installed from its PUBLIC
   # location once the TRELLION_PUBLIC switch (top of this file) is 'true'; until then the
-  # tests that import trellion are ignored/deselected (the `needs_trellion`
-  # lists below) and the rest runs. The first run after both repositories go
-  # public therefore starts running those tests with no workflow change. The
+  # tests that import trellion are left out by tests/_public_tree.py (the
+  # conftest hook both this job and the mutants python lane read) and the rest
+  # runs. The first run after both repositories go public therefore starts running those tests with no workflow change. The
   # tests that need the licensed add-ons' code live in the add-on repositories.
   #
   # The REQUIRED context `test-core` (this job's id; no `name:`, so the
@@ -544,41 +544,16 @@ jobs:
         # A path that does not exist, so nothing mistakes a stray directory for
         # a sibling checkout.
         PAI_TRELLION_CHECKOUT: ${{ github.workspace }}/_no_sibling_checkout
+        # The run fails if the suite shrinks or over-skips (tests/_public_tree.py).
+        NOO_SUITE_BOUNDS: "1"
       run: |
         # Skips are expected here (no sibling checkouts, no bubblewrap).
         export NOO_STRICT_SKIPS=0
-        # Only while trellion is not public: tests that import it.
-        needs_trellion=(
-          # Import the trellion package at collection time.
-          --ignore=tests/test_agent_messaging_client.py
-          --ignore=tests/test_backend_profiles.py
-          --ignore=tests/test_evidence.py
-          --ignore=tests/test_memory_shim_providers.py
-          --ignore=tests/test_parallel_collab.py
-          --ignore=tests/test_rag_orchestrator.py
-          --ignore=tests/test_rag_verifier.py
-          --ignore=tests/test_workflow.py
-          # Need the trellion package (installed by the [trellion] extra).
-          --deselect=tests/test_persona_scoping.py
-          --deselect=tests/test_walks_worker.py
-          --deselect=tests/test_snapshot_audience.py
-        )
-        args=(
-          # Read release/image workflows, private docs or sibling checkouts that
-          # are not part of this tree.
-          --deselect=tests/test_dist_mode.py
-          --deselect=tests/test_release_lock_retries_the_network.py
-          --deselect=tests/test_hygiene_defaults.py
-          --deselect=tests/test_ci_scope_declarations.py::test_the_console_artifact_tag_matches_what_the_gateway_pulls
-          --deselect=tests/test_ci_scope_declarations.py::test_the_llamacpp_image_reads_nothing_else_from_the_tree
-          --deselect=tests/test_hub_mirror.py::test_every_mirrored_from_is_in_the_inventory_and_one_prefix_is_declared
-          --deselect=tests/test_hub_mirror.py::test_rust_jobs_and_image_builds_use_the_mirror
-          --deselect=tests/test_noo_gateway_client_package.py::test_the_images_install_it
-          --deselect=tests/test_pro_build_cfg_excluded_from_oss.py::test_cfg_gated_pro_files_are_excluded_from_the_oss_sync
-          --deselect=tests/test_release_images_are_pinned_in_compose.py::test_every_released_compose_service_uses_the_release_pin
-          --deselect=tests/test_workflow_release_line_fetch.py::test_the_guards_exist_where_expected
-        )
-        if [ "$TRELLION_PUBLIC" != "true" ]; then args+=("${needs_trellion[@]}"); fi
+        # Nothing is left out by flags here. Tests whose input is not in this
+        # tree skip themselves ("not in this tree:" reasons, counted and named
+        # in the summary); the tests that import trellion are left out by
+        # tests/_public_tree.py while TRELLION_PUBLIC is not true. The mutants
+        # python lane reads the same hooks, so the two cannot drift.
         # Parallel: test-core set the wall time of every PR and merge-queue
         # run serially (992 s for 4,168 tests, run 42855148772; build-speed
         # review 2026-11-11). worksteal balances the very uneven durations
@@ -587,7 +562,7 @@ jobs:
         # produced once a night on dev (coverage-nightly.yml, which runs THIS
         # step verbatim with PYTEST_ADDOPTS=--cov…), not on every PR and
         # queue run (operator, 2026-11-11).
-        pytest tests/ -v -n auto --dist worksteal --durations=50 --durations-min=1 "${args[@]}"
+        pytest tests/ -v -n auto --dist worksteal --durations=50 --durations-min=1
 
     # The sandbox jail as it runs in a container (ctrl, 0.6.13): Docker
     # masks paths under every container's /proc, the kernel then refuses a

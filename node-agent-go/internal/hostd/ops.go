@@ -72,6 +72,9 @@ type Engine struct {
 	// one); its state rides the heartbeat. See journal_follow.go.
 	journalMu sync.Mutex
 	journal   *journalFollower
+
+	// fetch is the Mac fetch job's re-arm state (fetch_rearm.go).
+	fetch fetchRearm
 }
 
 func (e *Engine) logf(format string, args ...any) {

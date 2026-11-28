@@ -599,6 +599,95 @@ where
     }
 }
 
+/// How a console turn ended, from the socket's side.
+#[derive(Debug, PartialEq, Eq)]
+pub enum TurnEnd<T> {
+    /// The turn ran to its end.
+    Done(T),
+    /// The session was revoked first; the turn was dropped.
+    Revoked,
+    /// The client went away (a `Close`, the stream ended or failed, or a
+    /// keepalive could not be sent); the turn was dropped and nothing more
+    /// is to be written to this socket.
+    ClientGone,
+}
+
+/// Most inbound messages held while a turn runs. Past it the socket is not
+/// read until the turn ends, which is the backpressure it had before.
+pub const TURN_HELD_MAX: usize = 16;
+
+/// Most bytes held while a turn runs, on top of [`TURN_HELD_MAX`]. Once the
+/// held messages total this much the socket is not read until the turn ends,
+/// so a `Close` queued behind them is seen when the turn ends.
+pub const TURN_HELD_MAX_BYTES: usize = 1024 * 1024;
+
+/// What the console loop does with an inbound message that arrives mid-turn.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Inbound {
+    /// The client is leaving.
+    Close,
+    /// Nothing to act on (a ping or pong): discarded, as the main loop does.
+    Ignore,
+    /// A message the main loop acts on after the turn; its size in bytes.
+    Hold(usize),
+}
+
+/// [`run_turn_with_keepalive`] that also reads the client while the turn
+/// runs. Dropping `run` cancels the turn (its model call included), which is
+/// what the HTTP chat route's `AbortTurnOnDrop` does to its spawned task: a
+/// client that has left must not keep a model slot busy. A message that is
+/// not a close is classified by `classify`: a ping or pong is discarded (it
+/// would only fill the hold), anything else is pushed on `held`, in arrival
+/// order, for the caller to handle after the turn; none of those is dropped.
+/// `keepalive` returns false when the frame could not be queued (the client
+/// is gone).
+pub async fn run_turn_watching_client<T, K, KF, S, M, E>(
+    run: impl std::future::Future<Output = T>,
+    revoked: impl std::future::Future<Output = ()>,
+    every: std::time::Duration,
+    mut keepalive: K,
+    inbound: &mut S,
+    classify: impl Fn(&M) -> Inbound,
+    held: &mut std::collections::VecDeque<M>,
+) -> TurnEnd<T>
+where
+    K: FnMut() -> KF,
+    KF: std::future::Future<Output = bool>,
+    S: futures::Stream<Item = Result<M, E>> + Unpin,
+{
+    use futures::StreamExt;
+    tokio::pin!(run);
+    tokio::pin!(revoked);
+    let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut held_bytes = 0usize;
+    loop {
+        // Same order as `run_turn_with_keepalive`: revoke, then the turn's
+        // result, then the client, then the tick.
+        tokio::select! {
+            biased;
+            _ = &mut revoked => return TurnEnd::Revoked,
+            r = &mut run => return TurnEnd::Done(r),
+            item = inbound.next(), if held.len() < TURN_HELD_MAX && held_bytes < TURN_HELD_MAX_BYTES => match item {
+                Some(Ok(m)) => match classify(&m) {
+                    Inbound::Close => return TurnEnd::ClientGone,
+                    Inbound::Ignore => {}
+                    Inbound::Hold(n) => {
+                        held_bytes = held_bytes.saturating_add(n);
+                        held.push_back(m);
+                    }
+                },
+                Some(Err(_)) | None => return TurnEnd::ClientGone,
+            },
+            _ = tick.tick() => {
+                if !keepalive().await {
+                    return TurnEnd::ClientGone;
+                }
+            }
+        }
+    }
+}
+
 pub async fn send_json(socket: &mut WebSocket, value: &Value) -> bool {
     let text = match serde_json::to_string(value) {
         Ok(t) => t,
@@ -704,6 +793,241 @@ mod session_tests {
         let run = std::future::ready(7u32);
         let revoked = std::future::ready(());
         assert_eq!(run_turn_with_keepalive(run, revoked, TURN_KEEPALIVE, || async {}).await, None);
+    }
+
+    /// Sets its flag when dropped: the turn future was cancelled.
+    struct DropFlag(std::sync::Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    type Item = Result<&'static str, ()>;
+
+    /// A turn that would run for an hour of simulated time unless dropped.
+    async fn hour_long_turn(flag: DropFlag) -> u32 {
+        let _held = flag;
+        tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+        1
+    }
+
+    /// "close" closes, "ping" is ignored, anything else is held (1 byte each
+    /// unless it is "big", which is the byte cap).
+    fn is_close(m: &&'static str) -> Inbound {
+        match *m {
+            "close" => Inbound::Close,
+            "ping" => Inbound::Ignore,
+            "big" => Inbound::Hold(TURN_HELD_MAX_BYTES),
+            _ => Inbound::Hold(1),
+        }
+    }
+
+    /// One inbound item after `secs`, then a socket that stays open.
+    fn after(secs: u64, item: Item) -> std::pin::Pin<Box<dyn futures::Stream<Item = Item> + Send>> {
+        use futures::StreamExt;
+        Box::pin(
+            futures::stream::once(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+                item
+            })
+            .chain(futures::stream::pending()),
+        )
+    }
+
+    /// i1379: a client that closes mid-turn drops the turn at once.
+    #[tokio::test(start_paused = true)]
+    async fn a_client_close_mid_turn_drops_the_turn() {
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut inbound = after(5, Ok("close"));
+        let mut held = std::collections::VecDeque::new();
+        let start = tokio::time::Instant::now();
+        let end = run_turn_watching_client(
+            hour_long_turn(DropFlag(dropped.clone())),
+            std::future::pending(),
+            TURN_KEEPALIVE,
+            || async { true },
+            &mut inbound,
+            is_close,
+            &mut held,
+        )
+        .await;
+        assert_eq!(end, TurnEnd::ClientGone);
+        assert!(dropped.load(std::sync::atomic::Ordering::SeqCst), "the turn future was not dropped");
+        assert_eq!(start.elapsed(), std::time::Duration::from_secs(5), "dropped when the close arrived, not later");
+        assert!(held.is_empty(), "the close is not held for the loop to write to");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_keepalive_mid_turn_drops_the_turn() {
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut inbound = after(100_000, Ok("late"));
+        let mut held = std::collections::VecDeque::new();
+        let start = tokio::time::Instant::now();
+        let end = run_turn_watching_client(
+            hour_long_turn(DropFlag(dropped.clone())),
+            std::future::pending(),
+            TURN_KEEPALIVE,
+            || async { false },
+            &mut inbound,
+            is_close,
+            &mut held,
+        )
+        .await;
+        assert_eq!(end, TurnEnd::ClientGone);
+        assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(start.elapsed(), TURN_KEEPALIVE, "ended at the first keepalive that could not be sent");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stream_that_ends_or_fails_mid_turn_drops_the_turn() {
+        for ended in [after_end(), after_err()] {
+            let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let mut inbound = ended;
+            let mut held = std::collections::VecDeque::new();
+            let end = run_turn_watching_client(
+                hour_long_turn(DropFlag(dropped.clone())),
+                std::future::pending(),
+                TURN_KEEPALIVE,
+                || async { true },
+                &mut inbound,
+                is_close,
+                &mut held,
+            )
+            .await;
+            assert_eq!(end, TurnEnd::ClientGone);
+            assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+        }
+    }
+
+    fn after_end() -> std::pin::Pin<Box<dyn futures::Stream<Item = Item> + Send>> {
+        Box::pin(futures::stream::empty())
+    }
+
+    fn after_err() -> std::pin::Pin<Box<dyn futures::Stream<Item = Item> + Send>> {
+        Box::pin(futures::stream::iter(vec![Err(())]))
+    }
+
+    /// A client that stays: same result, same keepalive cadence, nothing held.
+    #[tokio::test(start_paused = true)]
+    async fn a_client_that_stays_gets_the_turn_and_the_keepalives_as_before() {
+        let n = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c = n.clone();
+        let run = async {
+            tokio::time::sleep(std::time::Duration::from_secs(70)).await;
+            42
+        };
+        let mut inbound = after(100_000, Ok("late"));
+        let mut held = std::collections::VecDeque::new();
+        let end = run_turn_watching_client(
+            run,
+            std::future::pending(),
+            TURN_KEEPALIVE,
+            move || {
+                c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async { true }
+            },
+            &mut inbound,
+            is_close,
+            &mut held,
+        )
+        .await;
+        assert_eq!(end, TurnEnd::Done(42));
+        assert_eq!(n.load(std::sync::atomic::Ordering::SeqCst), 2, "keepalives at 30 s and 60 s, none before");
+        assert!(held.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_revoke_still_ends_the_turn_while_the_client_is_watched() {
+        let mut inbound = after(100_000, Ok("late"));
+        let mut held = std::collections::VecDeque::new();
+        let end = run_turn_watching_client(
+            std::future::pending::<u32>(),
+            tokio::time::sleep(std::time::Duration::from_secs(5)),
+            TURN_KEEPALIVE,
+            || async { true },
+            &mut inbound,
+            is_close,
+            &mut held,
+        )
+        .await;
+        assert_eq!(end, TurnEnd::Revoked);
+    }
+
+    /// A message that is not a close, sent while a turn runs, is kept in
+    /// order for the loop to handle after it; the turn is unaffected.
+    #[tokio::test(start_paused = true)]
+    async fn a_message_sent_mid_turn_is_held_not_lost() {
+        use futures::StreamExt;
+        let run = async {
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            5
+        };
+        let mut inbound = futures::stream::iter(vec![Ok::<_, ()>("first"), Ok("second")]).chain(futures::stream::pending());
+        let mut held = std::collections::VecDeque::new();
+        let end = run_turn_watching_client(run, std::future::pending(), TURN_KEEPALIVE, || async { true }, &mut inbound, is_close, &mut held).await;
+        assert_eq!(end, TurnEnd::Done(5));
+        assert_eq!(held.into_iter().collect::<Vec<_>>(), vec!["first", "second"]);
+    }
+
+    /// At most TURN_HELD_MAX messages are held; the rest wait in the socket.
+    #[tokio::test(start_paused = true)]
+    async fn the_hold_is_bounded_and_the_rest_waits_in_the_socket() {
+        use futures::StreamExt;
+        let run = async {
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            5
+        };
+        let msgs: Vec<Item> = vec![Ok("m"); TURN_HELD_MAX + 4];
+        let mut inbound = futures::stream::iter(msgs).chain(futures::stream::pending());
+        let mut held = std::collections::VecDeque::new();
+        let end = run_turn_watching_client(run, std::future::pending(), TURN_KEEPALIVE, || async { true }, &mut inbound, is_close, &mut held).await;
+        assert_eq!(end, TurnEnd::Done(5));
+        assert_eq!(held.len(), TURN_HELD_MAX);
+        assert_eq!(inbound.next().await, Some(Ok("m")), "the rest was not read");
+    }
+
+    /// Pings are discarded, not held: they cannot fill the hold, so a later
+    /// close is still seen.
+    #[tokio::test(start_paused = true)]
+    async fn pings_mid_turn_are_not_held_and_a_later_close_is_seen() {
+        use futures::StreamExt;
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut items: Vec<Item> = vec![Ok("ping"); 100];
+        items.push(Ok("close"));
+        let mut inbound = futures::stream::iter(items).chain(futures::stream::pending());
+        let mut held = std::collections::VecDeque::new();
+        let end = run_turn_watching_client(
+            hour_long_turn(DropFlag(dropped.clone())),
+            std::future::pending(),
+            TURN_KEEPALIVE,
+            || async { true },
+            &mut inbound,
+            is_close,
+            &mut held,
+        )
+        .await;
+        assert_eq!(end, TurnEnd::ClientGone);
+        assert!(held.is_empty(), "pings were held");
+        assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    /// Past the byte cap the socket is not read: the close behind it is seen
+    /// when the turn ends.
+    #[tokio::test(start_paused = true)]
+    async fn the_hold_is_bounded_by_bytes_too() {
+        use futures::StreamExt;
+        let run = async {
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            5
+        };
+        let items: Vec<Item> = vec![Ok("big"), Ok("after"), Ok("close")];
+        let mut inbound = futures::stream::iter(items).chain(futures::stream::pending());
+        let mut held = std::collections::VecDeque::new();
+        let end = run_turn_watching_client(run, std::future::pending(), TURN_KEEPALIVE, || async { true }, &mut inbound, is_close, &mut held).await;
+        assert_eq!(end, TurnEnd::Done(5), "the close behind a full hold was not read");
+        assert_eq!(held.into_iter().collect::<Vec<_>>(), vec!["big"]);
+        assert_eq!(inbound.next().await, Some(Ok("after")));
     }
 
     #[tokio::test(start_paused = true)]

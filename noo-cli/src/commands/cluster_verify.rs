@@ -348,6 +348,13 @@ pub(crate) fn stack_tag_from_gateway(fleet: &Value) -> String {
 pub(crate) const ROLL_SETTLE_SECS: i64 = 600;
 /// The record field verify adds while a roll is settling: seconds since it.
 const ROLLED_AGO_KEY: &str = "rolled_secs_ago";
+/// The record field verify adds from the gateway's `/metrics`: seconds since
+/// the gateway started. Rows that judge a poll the node makes of the
+/// controller read it, because a controller outage stops every poll.
+const GATEWAY_UPTIME_KEY: &str = "gateway_uptime_secs";
+/// The record field verify adds from `/api/cluster/provision-bundle/<node>/status`:
+/// its `staged_at` and `fetched_at` stamps (absent when no bundle is staged).
+const BUNDLE_STATUS_KEY: &str = "bundle_status";
 /// The rows an agent or gateway restart turns red for a minute or two.
 const SETTLING_ROWS: [&str; 4] = ["online", "bus", "hostd", "version"];
 
@@ -641,6 +648,8 @@ pub(crate) fn node_checks(n: &Value, controller_tag: &str, cli_version: &str, no
     } }
     out.extend(model_stores_check(id, n));
     out.extend(backend_starts_check(id, n));
+    out.extend(reconcile_refusals_check(id, n));
+    out.extend(bundle_fetch_check(id, n, now_unix));
     out.extend(node_local_check(id, n));
     out.extend(backend_caps_check(id, n));
     out.extend(agent_address_check(id, n));
@@ -689,6 +698,184 @@ pub(crate) fn backend_starts_check(id: &str, n: &Value) -> Option<Check> {
         }
     }
     Some(fail(NAME, format!("{id}: {}", parts.join(" | ")), remedies.join("; ")))
+}
+
+/// The refusal scopes another row already shows: `backend_start` and
+/// `placement` (`backend starts`), `backend_tls` and `backend_door` (`backend
+/// doors`), `model_cache_url` (the controller's `model cache` row). A scope
+/// listed here is never repeated by the `reconcile refusals` row; a test pins
+/// the list against the filters those rows read.
+pub(crate) const OWNED_REFUSAL_SCOPES: [&str; 5] =
+    ["backend_start", "placement", "backend_tls", "backend_door", "model_cache_url"];
+
+/// The longest refusal reason the `reconcile refusals` row prints whole.
+const REFUSAL_REASON_MAX_CHARS: usize = 160;
+
+/// The `reconcile refusals` row: every refusal the node reports whose scope
+/// no other row owns ([`OWNED_REFUSAL_SCOPES`]), such as a tuning env key, a
+/// models dir or a helper image the node would not take. WARN, one
+/// `scope=target: reason (since …)` per refusal; the reason names its own
+/// fix, and `noo cluster show <node>` has the whole record. No row when there
+/// are none.
+pub(crate) fn reconcile_refusals_check(id: &str, n: &Value) -> Option<Check> {
+    const NAME: &str = "reconcile refusals";
+    let rest: Vec<&Value> = n["reconcile_refusals"].as_array()
+        .map(|rs| rs.iter().filter(|r| !r["scope"].as_str().is_some_and(|s| OWNED_REFUSAL_SCOPES.contains(&s))).collect())
+        .unwrap_or_default();
+    if rest.is_empty() {
+        return None;
+    }
+    let mut remedies: Vec<String> = Vec::new();
+    let parts: Vec<String> = rest.iter().map(|r| {
+        let scope = r["scope"].as_str().unwrap_or("?");
+        let reason = r["reason"].as_str().unwrap_or("no reason reported");
+        let reason = if scope == OLLAMA_ENV_SCOPE {
+            ollama_env_detail(reason)
+        } else if reason.chars().count() > REFUSAL_REASON_MAX_CHARS {
+            format!("{}…", reason.chars().take(REFUSAL_REASON_MAX_CHARS).collect::<String>())
+        } else {
+            reason.to_string()
+        };
+        let remedy = if scope == OLLAMA_ENV_SCOPE {
+            format!("on {id}: noo enroll --resume   # asks for the Mac's admin password")
+        } else {
+            format!("noo cluster show {id}   # the reason names its own fix")
+        };
+        if !remedies.contains(&remedy) {
+            remedies.push(remedy);
+        }
+        let since = r["since"].as_str().map(|s| format!(" (since {s})")).unwrap_or_default();
+        format!("{scope}={}: {reason}{since}", r["target"].as_str().unwrap_or("?"))
+    }).collect();
+    Some(warn(NAME, format!("{id}: {}", parts.join(" | ")), Some(remedies.join("; "))))
+}
+
+/// The refusal scope the Mac agent records when the native Ollama is a root
+/// boot service lacking the settings noomesh wants.
+const OLLAMA_ENV_SCOPE: &str = "ollama_env";
+
+/// The most missing settings the `ollama_env` detail names; the agent's key
+/// set is closed and small (six), so this is every one of them.
+const OLLAMA_ENV_KEYS_SHOWN: usize = 8;
+
+/// The detail an `ollama_env` refusal shows: what is wrong in plain words,
+/// short enough to print whole. The agent's reason names the missing keys
+/// after " lacks " and ends that list at the first colon (the same in the old
+/// and the new wording); the fix is the row's remedy, so the reason's command
+/// text is never printed (or cut off) here. More keys than shown: "N settings".
+fn ollama_env_detail(reason: &str) -> String {
+    let keys: Option<Vec<&str>> = reason.split_once(" lacks ")
+        .and_then(|(_, rest)| rest.split_once(':'))
+        .map(|(k, _)| k.split(',').map(str::trim).filter(|k| !k.is_empty()).collect::<Vec<_>>())
+        .filter(|k| !k.is_empty() && k.iter().all(|k| k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')));
+    match keys {
+        Some(k) if k.len() <= OLLAMA_ENV_KEYS_SHOWN => format!("settings missing on the node's native Ollama ({}); the node cannot write them itself", k.join(", ")),
+        Some(k) => format!("{} settings missing on the node's native Ollama (starting {}); the node cannot write them itself", k.len(), k[..3].join(", ")),
+        None => "settings missing on the node's native Ollama; the node cannot write them itself".to_string(),
+    }
+}
+
+/// A node whose last fetch receipt is older than this is late.
+const BUNDLE_FETCH_WARN_SECS: i64 = 900;
+/// Older than this, with receipts expected, its fetcher has stopped.
+const BUNDLE_FETCH_FAIL_SECS: i64 = 3600;
+/// For this long after the gateway started, no node's receipt is judged: a
+/// controller outage stops every poll, so the silence says nothing yet.
+const BUNDLE_FETCH_GATEWAY_GRACE_SECS: i64 = 900;
+/// A stamp this far ahead of this machine's clock is clock skew, said as such.
+const BUNDLE_FETCH_CLOCK_SKEW_SECS: i64 = 60;
+/// The first release whose fetchers send a receipt on every poll, a 304 too
+/// (commits c93f41ec and 01a351c3, first in noo-cli-v0.6.24); before it
+/// `fetched_at` moved only when a new bundle was collected, so a node
+/// polling normally on an older agent looks silent.
+const BUNDLE_RECEIPT_MIN_VERSION: (u64, u64, u64) = (0, 6, 24);
+
+/// `v0.6.30`, `0.6.0-rc.1`, `v0.2.70` → major, minor, patch.
+fn version_triple(v: &str) -> Option<(u64, u64, u64)> {
+    let mut parts = v.trim_start_matches('v').split('.').map(|p| p.split(['-', '+']).next().unwrap_or("").parse::<u64>().ok());
+    Some((parts.next()??, parts.next()??, parts.next()??))
+}
+
+/// Whether the `bundle fetch` row judges this node at all, and so whether
+/// verify reads its bundle status: not the controller's own node, and only a
+/// node that is online with a heartbeat inside [`HEARTBEAT_MAX_AGE_SECS`]
+/// (the `online` row speaks for the rest).
+fn bundle_row_applies(n: &Value, now: i64) -> bool {
+    n["self_node"].as_bool() != Some(true)
+        && n["status"].as_str() == Some("online")
+        && n["last_heartbeat"].as_str().and_then(parse_rfc3339_unix).is_some_and(|t| now - t <= HEARTBEAT_MAX_AGE_SECS)
+}
+
+/// The `bundle fetch` row: when the controller last got a fetch receipt from
+/// the node's fetcher. The receipt is the node's signed, best-effort note
+/// that it collected (or confirmed) its bundle, sent on every poll, a 304
+/// too; a restage clears it, so the age is `fetched_at`, else `staged_at`.
+/// OK under 15 minutes. Past that a WARN; past an hour a FAIL only when the
+/// node has sent a receipt since this bundle was staged and its agent is one
+/// that sends them on every poll: a node that never receipts (an agent too
+/// old, or a node that is pushed to rather than polling) is a WARN, never a
+/// FAIL. No row when [`bundle_row_applies`] is false or the controller has
+/// no bundle for the node; a status read that failed is a WARN. Not judged
+/// for the first 15 minutes after the gateway started. A stamp ahead of this
+/// machine's clock is said as clocks that disagree, not clamped.
+pub(crate) fn bundle_fetch_check(id: &str, n: &Value, now: i64) -> Option<Check> {
+    const NAME: &str = "bundle fetch";
+    if !bundle_row_applies(n, now) {
+        return None;
+    }
+    let st = n.get(BUNDLE_STATUS_KEY).filter(|v| v.is_object())?;
+    if st["unreadable"].as_bool() == Some(true) {
+        return Some(warn(NAME, "could not read the bundle status: the controller did not answer in time, so the node's fetcher was not judged",
+            Some(format!("noo cluster verify {id}   # asks again"))));
+    }
+    let stamp = |k: &str| st[k].as_str().and_then(parse_rfc3339_unix);
+    let (since, polled) = match stamp("fetched_at") {
+        Some(t) => (t, true),
+        None => (stamp("staged_at")?, false),
+    };
+    if let Some(up) = n[GATEWAY_UPTIME_KEY].as_i64().filter(|u| (0..BUNDLE_FETCH_GATEWAY_GRACE_SECS).contains(u)) {
+        return Some(ok(NAME, format!("the controller started {} ago; a controller outage stops every poll, so nothing is judged yet", compact_secs(up))));
+    }
+    let age = now - since;
+    if age < -BUNDLE_FETCH_CLOCK_SKEW_SECS {
+        return Some(warn(NAME, format!(
+            "the clocks disagree: the controller stamped this node's {} {}s ahead of this machine's clock, so its age cannot be judged",
+            if polled { "last fetch receipt" } else { "staged bundle" }, -age),
+            Some("check time sync on the controller and on this machine".into())));
+    }
+    let age = age.max(0);
+    let when = compact_secs(age);
+    let seen = if polled { format!("last fetch receipt {when} ago") } else { format!("no fetch receipt since the bundle was staged {when} ago") };
+    if age < BUNDLE_FETCH_WARN_SECS {
+        return Some(ok(NAME, seen));
+    }
+    let remedy = match n["hostd"]["host"]["os"].as_str() {
+        Some("darwin") => bundle_fetch_remedy_mac(id),
+        Some("linux") => bundle_fetch_remedy_linux(id),
+        _ => format!("{}; {}", bundle_fetch_remedy_linux(id), bundle_fetch_remedy_mac(id)),
+    };
+    let sends_receipts = n["app_version"].as_str()
+        .and_then(agent_version_tag)
+        .and_then(|(_, v)| version_triple(&v))
+        .is_some_and(|v| v >= BUNDLE_RECEIPT_MIN_VERSION);
+    if age >= BUNDLE_FETCH_FAIL_SECS && polled && sends_receipts {
+        return Some(fail(NAME, format!(
+            "this node's fetcher has not asked the controller for its bundle for {when}: pushes and upgrades will not reach it ({seen})"), remedy));
+    }
+    let why = if age >= BUNDLE_FETCH_FAIL_SECS {
+        "this node's agent does not send a receipt, or its receipt is failing"
+    } else {
+        "its fetcher polls every few minutes"
+    };
+    Some(warn(NAME, format!("{seen}: {why}"), Some(remedy)))
+}
+
+fn bundle_fetch_remedy_linux(id: &str) -> String {
+    format!("on {id} (Linux): systemctl status noo-fetch.timer")
+}
+
+fn bundle_fetch_remedy_mac(id: &str) -> String {
+    format!("on {id} (Mac): sudo launchctl print system/net.noomesh.fetch; noo enroll --resume")
 }
 
 /// The agent's image-pull refusal for disk space: its typed NoSpaceError
@@ -1101,6 +1288,13 @@ pub(crate) fn ollama_models_check(id: &str, n: &Value) -> Option<Check> {
 /// is said as the exposure it is, a WARN naming the runtime, never as an
 /// agent too old to report with an upgrade that cannot change it.
 pub(crate) fn harness_egress_check(id: &str, n: &Value) -> Option<Check> {
+    /// A harness check this soon after the gateway started ran while it could
+    /// not yet answer.
+    const HARNESS_RECHECK_GRACE_SECS: i64 = 120;
+    /// Past this uptime the gateway has had time to be asked again: a check
+    /// loop that stopped shows as uptime and check age growing together, and
+    /// that is a FAIL, never a wait.
+    const HARNESS_STARTING_MAX_UPTIME_SECS: i64 = 300;
     const NAME: &str = "harness egress";
     if n["self_node"].as_bool() == Some(true) {
         return None;
@@ -1131,8 +1325,19 @@ pub(crate) fn harness_egress_check(id: &str, n: &Value) -> Option<Check> {
         Some("enforced") if stale.is_empty() => ok(NAME, format!(
             "held off the internet{age}: deny {}, unit resolver; the harness's own check from inside the unit: lookup {}, connect {}",
             e["ip_deny"].as_str().unwrap_or("?"), e["lookup"].as_str().unwrap_or("?"), e["connect"].as_str().unwrap_or("?"))),
-        Some("stale") => fail(NAME, format!("{reason}; the harness takes no work it cannot reach the gateway for"),
-            format!("noo cluster provision {id}   # re-renders the hosts file and the allow list from the controller's current address")),
+        // A gateway that has just started could not answer the harness's last
+        // self-test (it re-checks every 60 s): the check ran while the
+        // controller was down, so the verdict waits for the next one.
+        Some("stale") => match (n[GATEWAY_UPTIME_KEY].as_i64(), e["checked_age_secs"].as_i64()) {
+            (Some(up), Some(checked)) if up < HARNESS_STARTING_MAX_UPTIME_SECS && up - checked < HARNESS_RECHECK_GRACE_SECS => Check {
+                name: NAME,
+                verdict: Verdict::Starting,
+                detail: format!("the controller started {up}s ago; the harness's last check ({checked}s ago) ran while it was down; the harness re-checks every 60 s"),
+                remedy: Some("noo cluster verify --wait".into()),
+            }.checked(),
+            _ => fail(NAME, format!("{reason}; the harness takes no work it cannot reach the gateway for"),
+                format!("noo cluster provision {id}   # re-renders the hosts file and the allow list from the controller's current address")),
+        },
         Some("enforced") => fail(NAME, format!(
             "held off the internet, but {} changed address since the harness's hosts file was rendered: the harness cannot reach its controller (it never falls back to real DNS)",
             stale.join(", ")), format!("noo cluster provision {id}   # re-renders the hosts file and the allowlist")),
@@ -2862,13 +3067,47 @@ pub(crate) fn data_root_missing_remedy(id: &str, root: &str, meant: Option<&str>
     }
 }
 
+/// Seconds since the gateway started, from its `/metrics` text. A start time
+/// ahead of this machine's clock (skew) is no uptime at all, never a
+/// negative one.
+fn uptime_from_metrics(metrics: Option<&str>, now: i64) -> Option<i64> {
+    metrics.map(parse_legacy_lane_metrics).and_then(|m| m.start_unix).map(|start| now - start).filter(|up| *up >= 0)
+}
+
+/// The bundle status of one node for the `bundle fetch` row: its stamps, or
+/// `unreadable` when the controller did not answer (a timeout is a WARN row,
+/// not silence). `None` when no bundle is staged (404).
+fn read_bundle_status(g: &Globals, id: &str) -> Option<Value> {
+    let unreadable = || Some(serde_json::json!({"unreadable": true}));
+    match crate::http::get_raw_opt(g, &format!("/api/cluster/provision-bundle/{}/status", crate::commands::urlencode(id)), true, 10) {
+        Some((404, _)) => None,
+        Some((status, text)) if (200..300).contains(&status) => match serde_json::from_str::<Value>(&text) {
+            Ok(st) if st.is_object() => Some(serde_json::json!({"staged_at": st["staged_at"], "fetched_at": st["fetched_at"]})),
+            _ => unreadable(),
+        },
+        _ => unreadable(),
+    }
+}
+
+/// The gateway's `/metrics` text, when it answers 2xx.
+fn read_gateway_metrics(g: &Globals) -> Option<String> {
+    crate::http::get_raw_opt(g, "/metrics", true, 10)
+        .filter(|(status, _)| (200..300).contains(status))
+        .map(|(_, text)| text)
+}
+
 /// The node record plus the gateway's answer on the harness (and the
 /// declared data root), for node_checks.
-fn with_harness_wanted(g: &Globals, n: &Value) -> Value {
+fn with_harness_wanted(g: &Globals, n: &Value, gateway_uptime: Option<i64>) -> Value {
     let mut n = n.clone();
     let id = n["id"].as_str().unwrap_or_default().to_string();
     let desired = get_json_opt(g, &format!("/api/cluster/nodes/{}/desired-config", crate::commands::urlencode(&id)), true, 10);
     let wanted = desired.as_ref().and_then(harness_wanted_in);
+    // The `bundle fetch` row: when the node's fetcher last asked for its bundle.
+    // Read only for a node the row judges (never the controller's own node or
+    // one that is offline): on a cold gateway the status route hashes the
+    // staged blob once per node.
+    let bundle = if bundle_row_applies(&n, now_unix()) { read_bundle_status(g, &id) } else { None };
     let declared = desired.as_ref()
         .and_then(|d| d["node"]["data_root"].as_str())
         .filter(|s| s.starts_with('/') && s.len() > 1)
@@ -2950,6 +3189,12 @@ fn with_harness_wanted(g: &Globals, n: &Value) -> Value {
         }
         if let Some(w) = wanted {
             obj.insert("harness_wanted".into(), Value::Bool(w));
+        }
+        if let Some(b) = bundle {
+            obj.insert(BUNDLE_STATUS_KEY.into(), b);
+        }
+        if let Some(up) = gateway_uptime {
+            obj.insert(GATEWAY_UPTIME_KEY.into(), up.into());
         }
         if let Some(d) = declared {
             obj.insert("declared_data_root".into(), Value::String(d));
@@ -8432,11 +8677,13 @@ pub(crate) fn tailnet_merge_missing(j: &Value) -> Option<Vec<String>> {
     Some(out)
 }
 
-/// The `add-on containers` row for one enabled add-on (i509): its declared
-/// containers (`x-noo-addon: containers`) that are not running, or why they
-/// could not be read. Down is a FAIL naming `noo stack restart <addon>`: after
-/// a reboot, nothing else says that an add-on did not come back. A container
-/// the launcher HOLDS (`addon_after_boot::split_containers`, the launcher's
+/// The `add-on containers` row for one enabled add-on (i509): the containers
+/// it declares (`x-noo-addon: containers`) or its compose file starts (every
+/// service without `profiles:`) that are not running or are unhealthy, or
+/// why they could not be read. Not running is a FAIL naming `noo stack start`,
+/// unhealthy a FAIL naming `noo stack restart <addon>`: after a reboot,
+/// nothing else says that an add-on did not come back. A container the
+/// launcher HOLDS (`addon_after_boot::judge_containers`, the launcher's
 /// own rule) is not expected to run: a note on an OK row, never a FAIL. An
 /// add-on whose overlay declares no containers (no `x-noo-addon` block) is a
 /// WARN: a row red forever for what the operator cannot fix trains people to
@@ -8445,16 +8692,41 @@ pub(crate) fn addon_containers_row(addon: &str, state: Result<crate::commands::a
     const ROW: &str = "add-on containers";
     let restart = format!("noo stack restart {addon}");
     match state {
+        Ok(c) if c.docker_timeout.is_some() => warn(
+            ROW,
+            format!("{addon}: Docker did not answer for {addon} ({}); its containers were not checked", c.docker_timeout.as_deref().unwrap_or("timed out")),
+            Some("noo doctor".to_string()),
+        ),
         Ok(c) if c.undeclared => warn(ROW, format!("{addon}: declares no containers, so they aren't checked"), None),
-        Ok(c) if c.down.is_empty() => {
+        Ok(c) if c.down.is_empty() && c.unhealthy.is_empty() => {
             let held: Vec<String> = c.held.iter().map(|(h, why)| format!("held: {h} ({why})")).collect();
             if held.is_empty() {
-                ok(ROW, format!("{addon}: every declared container is running"))
+                ok(ROW, format!("{addon}: every container the add-on declares or its compose file starts is running"))
             } else {
                 ok(ROW, format!("{addon}: every container that should run is running; {}", held.join("; ")))
             }
         }
-        Ok(c) => fail(ROW, format!("{addon}: not running: {}", c.down.join(", ")), restart),
+        Ok(c) => {
+            let mut why: Vec<String> = Vec::new();
+            let mut remedy: Vec<String> = Vec::new();
+            if !c.down.is_empty() {
+                why.push(format!("not running: {}", c.down.join(", ")));
+                if !c.exited_clean.is_empty() {
+                    why.push(format!(
+                        "{} exited 0: if it is meant to finish, declare it a one-shot (`restart: \"no\"` in the overlay)",
+                        c.exited_clean.join(", ")
+                    ));
+                }
+                remedy.push("noo stack start".to_string());
+            }
+            if !c.unhealthy.is_empty() {
+                why.push(format!("unhealthy: {}", c.unhealthy.join(", ")));
+                remedy.push(restart.clone());
+            }
+            let first = c.down.first().or(c.unhealthy.first()).map(String::as_str).unwrap_or("<service>");
+            remedy.push(format!("noo stack logs {first}"));
+            fail(ROW, format!("{addon}: {}", why.join("; ")), remedy.join("; "))
+        }
         Err(e) => fail(ROW, format!("{addon}: whether its containers run could not be read ({e})"), restart),
     }
 }
@@ -9537,6 +9809,10 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     // The fleet as the gateway listed it, when the node half read it: which
     // machine is the controller is decided from it.
     let mut fleet_seen: Option<Value> = None;
+    // The gateway's `/metrics`, read once before the node loop (its start time
+    // is the uptime the `bundle fetch` and `harness egress` rows judge by) and
+    // reused by the controller half.
+    let mut gateway_metrics: Option<Option<String>> = None;
 
     if want_nodes || nodes.is_empty() {
         // Best-effort read: this verb is also run from `onboard`'s last step
@@ -9605,6 +9881,7 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         let tag = if here == Vantage::Controller { controller_stack_tag() } else { stack_tag_from_gateway(&body) };
         let now = now_unix();
         let roll = crate::commands::upgrade::last_roll();
+        let gateway_uptime = uptime_from_metrics(gateway_metrics.insert(read_gateway_metrics(g)).as_deref(), now);
         // The tally closes the text and fills `summary` under --json alike.
         tally.context = format!(" — {} node(s) on {tag}", selected.len());
         if g.json {
@@ -9617,7 +9894,7 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         // tunnel probes) are independent of every other node's: run them
         // side by side, then judge and print in the listed order.
         let reads_from = Instant::now();
-        let enriched = par_map(&selected, |n| with_harness_wanted(g, n));
+        let enriched = par_map(&selected, |n| with_harness_wanted(g, n, gateway_uptime));
         laps.push((format!("node reads ({} node(s), side by side)", selected.len()), reads_from.elapsed()));
         let mut sections: Vec<(String, Vec<Check>)> = Vec::new();
         for (n, wanted) in selected.iter().zip(&enriched) {
@@ -10230,9 +10507,7 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         // online node (its own gauge, read as text — `/metrics` is
         // Operator+ since an earlier release, which is what this verb runs as),
         // and that the read door refuses a caller with no credential.
-        let metrics = crate::http::get_raw_opt(g, "/metrics", true, 10)
-            .filter(|(status, _)| (200..300).contains(status))
-            .map(|(_, text)| text);
+        let metrics = gateway_metrics.take().unwrap_or_else(|| read_gateway_metrics(g));
         let now = now_unix();
         let roster: Vec<(String, bool)> = fleet
             .iter()
@@ -11067,7 +11342,7 @@ pub(crate) fn verify_node_after_apply(g: &Globals, node: &str) -> bool {
         ui::say(&ui::status_line(Glyph::Warn, &format!(
             "{node}: no heartbeat from the new build within {POST_APPLY_WAIT_SECS}s — judging the last record it sent; `noo cluster verify {node}` re-checks")));
     }
-    let checks = node_checks(&with_harness_wanted(g, &n), &controller_stack_tag(), env!("CARGO_PKG_VERSION"), now_unix(), signing_adopted_for(node));
+    let checks = node_checks(&with_harness_wanted(g, &n, uptime_from_metrics(read_gateway_metrics(g).as_deref(), now_unix())), &controller_stack_tag(), env!("CARGO_PKG_VERSION"), now_unix(), signing_adopted_for(node));
     // A `starting` row is not a pass: the caller's note
     // says the invariant does not hold YET, and `cluster verify` re-checks.
     // Under --quiet/--json the table stays off stdout (the caller's JSON
@@ -11134,30 +11409,65 @@ mod tests {
     /// i509 step 5: an enabled add-on that is down FAILS, naming it and the
     /// restart; one that runs passes; an unreadable state is not a pass.
     #[test]
-    fn an_enabled_add_on_whose_containers_are_down_fails_and_names_the_restart() {
-        use crate::commands::addon_after_boot::split_containers;
-        let declared = vec!["noo-rhaddon".to_string(), "noo-rhaddon-worker".to_string(), "noo-rhaddon-gpu".to_string()];
-        let all: Vec<String> = declared[..2].to_vec();
+    fn an_enabled_add_on_whose_containers_are_down_fails_and_names_the_start() {
+        use crate::commands::addon_after_boot::Containers;
         let gpu = vec![("noo-rhaddon-gpu".to_string(), "asks for a GPU".to_string())];
-        let up = super::addon_containers_row("rhaddon", Ok(split_containers(&declared[..2], &all, &[])));
+        let up = super::addon_containers_row("rhaddon", Ok(Containers::default()));
         assert_eq!((up.name, up.verdict), ("add-on containers", super::Verdict::Ok), "{up:?}");
-        assert!(up.detail.starts_with("rhaddon: "), "{up:?}");
-        let down = super::addon_containers_row("rhaddon", Ok(split_containers(&declared[..2], &[], &[])));
+        assert!(up.detail.starts_with("rhaddon: ") && up.detail.contains("declares or its compose file starts is running"), "{up:?}");
+        let down = super::addon_containers_row("rhaddon", Ok(Containers { down: vec!["noo-rhaddon".into(), "noo-rhaddon-worker".into()], ..Default::default() }));
         assert_eq!(down.verdict, super::Verdict::Fail, "{down:?}");
-        assert!(down.detail.contains("rhaddon") && down.detail.contains("noo-rhaddon, noo-rhaddon-worker"), "{down:?}");
-        assert_eq!(down.remedy.as_deref(), Some("noo stack restart rhaddon"));
+        assert!(down.detail.contains("rhaddon") && down.detail.contains("not running: noo-rhaddon, noo-rhaddon-worker"), "{down:?}");
+        let remedy = down.remedy.as_deref().unwrap();
+        assert!(remedy.contains("noo stack start") && remedy.contains("noo stack logs noo-rhaddon"), "{down:?}");
+        let hung = super::addon_containers_row("rhaddon", Ok(Containers { docker_timeout: Some("docker ps after 20s".into()), ..Default::default() }));
+        assert_eq!(hung.verdict, super::Verdict::Warn, "a hang is never a pass and never a hang: {hung:?}");
+        assert!(hung.detail.contains("Docker did not answer for rhaddon"), "{hung:?}");
+        let quiet = super::addon_containers_row("rhaddon", Ok(Containers { down: vec!["quiet".into()], exited_clean: vec!["quiet".into()], ..Default::default() }));
+        assert!(quiet.detail.contains("quiet exited 0") && quiet.detail.contains("one-shot"), "{quiet:?}");
         let unknown = super::addon_containers_row("rhaddon", Err("docker is not answering".into()));
         assert_eq!(unknown.verdict, super::Verdict::Fail, "an unreadable state is never a pass: {unknown:?}");
         assert!(unknown.detail.contains("docker is not answering"), "{unknown:?}");
         assert_eq!(unknown.remedy.as_deref(), Some("noo stack restart rhaddon"));
         // A held container is a note, not a FAIL (the launcher never starts it).
-        let held = super::addon_containers_row("rhaddon", Ok(split_containers(&declared, &all, &gpu)));
+        let held = super::addon_containers_row("rhaddon", Ok(Containers { held: gpu.clone(), ..Default::default() }));
         assert_eq!(held.verdict, super::Verdict::Ok, "a held container is not a FAIL: {held:?}");
         assert!(held.detail.contains("held: noo-rhaddon-gpu (asks for a GPU)"), "{held:?}");
         // Held plus another one down: a FAIL that names only the down one.
-        let both = super::addon_containers_row("rhaddon", Ok(split_containers(&declared, &["noo-rhaddon".to_string()], &gpu)));
+        let both = super::addon_containers_row("rhaddon", Ok(Containers { down: vec!["noo-rhaddon-worker".into()], held: gpu, ..Default::default() }));
         assert_eq!(both.verdict, super::Verdict::Fail, "{both:?}");
         assert!(both.detail.contains("not running: noo-rhaddon-worker") && !both.detail.contains("noo-rhaddon-gpu"), "{both:?}");
+    }
+
+    /// 0.6.30 live fleet: after a reboot one service of an add-on was Exited
+    /// (127) and another Up (unhealthy), and the row said every declared
+    /// container ran. The expected set is the declared names plus every
+    /// non-profiled compose service, and health is read.
+    #[test]
+    fn an_exited_service_outside_the_declared_list_and_an_unhealthy_one_fail() {
+        use crate::commands::addon_after_boot::{judge_containers, Seen};
+        let overlay = "services:\n  web:\n    container_name: noo-rhaddon\n    image: x\n  worker:\n    container_name: noo-rhaddon-worker\n    image: x\n  debug:\n    container_name: noo-rhaddon-debug\n    image: x\n    profiles: [debug]\n  routes:\n    image: x\n    restart: \"no\"\n";
+        let decl = vec!["noo-rhaddon".to_string()];
+        let seen = |n: &str, svc: &str, st: &str, code: i32, h: &str| Seen { name: n.into(), project: "p".into(), service: svc.into(), state: st.into(), exit_code: code, health: h.into() };
+        let judge = |s: &[Seen]| super::addon_containers_row("rhaddon", judge_containers(&decl, overlay, "p", s, &[], &[]));
+        // Healthy; the profiled service is absent and the finished one-shot exited 0.
+        let ok = judge(&[
+            seen("noo-rhaddon", "web", "running", 0, "healthy"),
+            seen("noo-rhaddon-worker", "worker", "running", 0, "starting"),
+            seen("acme-routes-1", "routes", "exited", 0, ""),
+        ]);
+        assert_eq!(ok.verdict, super::Verdict::Ok, "a profiled service, a completed one-shot and `starting` are fine: {ok:?}");
+        // The undeclared service exited 127: FAIL naming it.
+        let down = judge(&[seen("noo-rhaddon", "web", "running", 0, "healthy"), seen("noo-rhaddon-worker", "worker", "exited", 127, "")]);
+        assert_eq!(down.verdict, super::Verdict::Fail, "{down:?}");
+        assert!(down.detail.contains("not running: noo-rhaddon-worker"), "{down:?}");
+        assert!(down.remedy.as_deref().unwrap().contains("noo stack start"), "{down:?}");
+        // Up but unhealthy: FAIL naming it and the restart.
+        let sick = judge(&[seen("noo-rhaddon", "web", "running", 0, "unhealthy"), seen("noo-rhaddon-worker", "worker", "running", 0, "")]);
+        assert_eq!(sick.verdict, super::Verdict::Fail, "{sick:?}");
+        assert!(sick.detail.contains("unhealthy: noo-rhaddon") && !sick.detail.contains("not running"), "{sick:?}");
+        let remedy = sick.remedy.as_deref().unwrap();
+        assert!(remedy.contains("noo stack restart rhaddon") && remedy.contains("noo stack logs noo-rhaddon"), "{sick:?}");
     }
 
     /// The `model classes` row: declared candidates must be
@@ -12012,7 +12322,7 @@ mod tests {
     fn the_wait_loop_uses_the_tested_predicate() {
         let own = crate::test_src::own_code(include_str!("cluster_verify/warmup.rs"));
         let body = crate::test_src::fn_body(&own, "pub(crate) fn wait_for_node_warmup(");
-        assert!(body.contains(".any(|n| node_still_starting(n, now))"), "{body}");
+        assert!(body.contains("node_still_starting(&n, now)") && body.contains("super::GATEWAY_UPTIME_KEY"), "{body}");
     }
 
     // ── i276: what a fresh one-box install must not FAIL on ───────────
@@ -17746,7 +18056,7 @@ mod speed_tests {
     fn independent_reads_stay_side_by_side() {
         let own = crate::test_src::own_code(include_str!("cluster_verify.rs"));
         let run = crate::test_src::fn_body(&own, "pub fn cluster_verify(");
-        assert!(run.contains("par_map(&selected, |n| with_harness_wanted(g, n))"), "node reads run side by side");
+        assert!(run.contains("par_map(&selected, |n| with_harness_wanted(g, n, gateway_uptime))"), "node reads run side by side");
         assert!(run.contains("par_map(&reads, |w| self_json(g, w))"), "the security/doctor verbs run side by side");
         assert!(run.contains("par_map(&fit_ids,"), "the per-node fit reads run side by side");
         assert!(run.contains("par_map(&bundle_ids,"), "the per-node apply reports run side by side");
@@ -20195,5 +20505,366 @@ mod reranker_row_tests {
     fn the_controller_checks_read_the_gateways_capabilities() {
         let own = crate::test_src::own_code(include_str!("cluster_verify.rs"));
         assert!(own.contains(r#"checks.push(reranker_check(get_json_opt(g, "/api/external/capabilities", true, 15).as_ref()));"#));
+    }
+}
+
+#[cfg(test)]
+mod bundle_fetch_and_refusal_rows_tests {
+    use super::*;
+    use serde_json::json;
+
+    const NOW: i64 = 1_800_000_000;
+
+    /// unix → `YYYY-MM-DDTHH:MM:SSZ`, the shape the gateway writes.
+    fn stamp(t: i64) -> String {
+        let (days, secs) = (t.div_euclid(86_400), t.rem_euclid(86_400));
+        let z = days + 719_468;
+        let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+        let doe = z - era * 146_097;
+        let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+        let y = yoe + era * 400;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = doy - (153 * mp + 2) / 5 + 1;
+        let m = if mp < 10 { mp + 3 } else { mp - 9 };
+        let y = if m <= 2 { y + 1 } else { y };
+        format!("{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z", secs / 3600, (secs % 3600) / 60, secs % 60)
+    }
+
+    /// An online node that last asked `fetched_ago` seconds ago.
+    fn polling(fetched_ago: i64) -> Value {
+        json!({"id": "node-a", "status": "online", "last_heartbeat": stamp(NOW - 20), "app_version": "stack-v0.6.30+abc",
+               "hostd": {"host": {"os": "linux"}},
+               BUNDLE_STATUS_KEY: {"staged_at": stamp(NOW - 86_400), "fetched_at": stamp(NOW - fetched_ago)}})
+    }
+
+    fn row(n: &Value) -> Option<Check> {
+        bundle_fetch_check("node-a", n, NOW)
+    }
+
+    #[test]
+    fn a_recent_poll_is_ok_and_says_when() {
+        let c = row(&polling(120)).unwrap();
+        assert_eq!(c.verdict, Verdict::Ok);
+        assert_eq!(c.detail, "last fetch receipt 2m ago");
+    }
+
+    #[test]
+    fn a_late_poll_warns_and_a_stopped_fetcher_fails_with_the_remedy() {
+        let w = row(&polling(20 * 60)).unwrap();
+        assert_eq!(w.verdict, Verdict::Warn);
+        let remedy = w.remedy.as_deref().unwrap();
+        assert!(remedy.contains("systemctl status noo-fetch.timer") && !remedy.contains("launchctl"), "{remedy}");
+        assert_eq!(row(&polling(BUNDLE_FETCH_WARN_SECS - 1)).unwrap().verdict, Verdict::Ok);
+        assert_eq!(row(&polling(BUNDLE_FETCH_WARN_SECS)).unwrap().verdict, Verdict::Warn);
+        assert_eq!(row(&polling(BUNDLE_FETCH_FAIL_SECS - 1)).unwrap().verdict, Verdict::Warn);
+        let f = row(&polling(BUNDLE_FETCH_FAIL_SECS)).unwrap();
+        assert_eq!(f.verdict, Verdict::Fail);
+        assert!(f.detail.contains("has not asked the controller for its bundle for 60m: pushes and upgrades will not reach it"), "{}", f.detail);
+        assert!(f.detail.contains("last fetch receipt 60m ago"), "{}", f.detail);
+    }
+
+    #[test]
+    fn an_agent_that_sends_no_receipt_is_never_failed_for_it() {
+        let mut old = polling(7200);
+        old["app_version"] = "stack-v0.2.70+abc".into();
+        let c = row(&old).unwrap();
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.contains("this node's agent does not send a receipt, or its receipt is failing"), "{}", c.detail);
+        let mut unknown = polling(7200);
+        unknown.as_object_mut().unwrap().remove("app_version");
+        assert_eq!(row(&unknown).unwrap().verdict, Verdict::Warn);
+        assert_eq!(version_triple("v0.6.30"), Some((0, 6, 30)));
+        assert_eq!(version_triple("0.6.0-rc.1"), Some((0, 6, 0)));
+        assert_eq!(version_triple("v0.6"), None);
+    }
+
+    #[test]
+    fn the_receipt_floor_is_the_first_release_that_receipts_on_a_304() {
+        let mut n = polling(7200);
+        n["app_version"] = "stack-v0.6.23+abc".into();
+        assert_eq!(row(&n).unwrap().verdict, Verdict::Warn, "one below the floor");
+        n["app_version"] = "stack-v0.6.10+abc".into();
+        assert_eq!(row(&n).unwrap().verdict, Verdict::Warn);
+        n["app_version"] = "stack-v0.6.24+abc".into();
+        assert_eq!(row(&n).unwrap().verdict, Verdict::Fail, "at the floor");
+        n["app_version"] = "noo-cli-v0.6.24-rc.1+abc".into();
+        assert_eq!(row(&n).unwrap().verdict, Verdict::Fail);
+        assert_eq!(BUNDLE_RECEIPT_MIN_VERSION, (0, 6, 24));
+    }
+
+    #[test]
+    fn an_unreadable_status_is_a_warn_not_silence() {
+        let mut n = polling(7200);
+        n[BUNDLE_STATUS_KEY] = json!({"unreadable": true});
+        let c = row(&n).unwrap();
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.starts_with("could not read the bundle status"), "{}", c.detail);
+    }
+
+    #[test]
+    fn a_stamp_ahead_of_this_clock_says_the_clocks_disagree() {
+        let c = row(&polling(-600)).unwrap();
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.contains("the clocks disagree") && c.detail.contains("600s ahead"), "{}", c.detail);
+        // A few seconds of skew is not worth a row's attention.
+        let c = row(&polling(-30)).unwrap();
+        assert_eq!((c.verdict, c.detail.as_str()), (Verdict::Ok, "last fetch receipt 0s ago"));
+    }
+
+    #[test]
+    fn a_gateway_start_ahead_of_this_clock_is_no_uptime() {
+        let text = format!("noo_gateway_start_time_seconds {}\n", NOW - 90);
+        assert_eq!(uptime_from_metrics(Some(&text), NOW), Some(90));
+        let ahead = format!("noo_gateway_start_time_seconds {}\n", NOW + 90);
+        assert_eq!(uptime_from_metrics(Some(&ahead), NOW), None);
+        assert_eq!(uptime_from_metrics(None, NOW), None);
+        assert_eq!(uptime_from_metrics(Some("nothing here\n"), NOW), None);
+    }
+
+    #[test]
+    fn the_status_is_read_only_for_a_node_the_row_judges() {
+        assert!(bundle_row_applies(&polling(0), NOW));
+        let mut ctl = polling(0);
+        ctl["self_node"] = true.into();
+        assert!(!bundle_row_applies(&ctl, NOW));
+        let mut off = polling(0);
+        off["status"] = "offline".into();
+        assert!(!bundle_row_applies(&off, NOW));
+        let mut quiet = polling(0);
+        quiet["last_heartbeat"] = stamp(NOW - 600).into();
+        assert!(!bundle_row_applies(&quiet, NOW));
+        let own = crate::test_src::own_code(include_str!("cluster_verify.rs"));
+        let inject = crate::test_src::fn_body(&own, "fn with_harness_wanted(");
+        assert!(inject.contains("if bundle_row_applies(&n, now_unix()) { read_bundle_status(g, &id) }"));
+    }
+
+    #[test]
+    fn the_remedy_follows_the_nodes_os_and_names_both_when_unknown() {
+        let mut mac = polling(7200);
+        mac["hostd"]["host"]["os"] = "darwin".into();
+        let r = row(&mac).unwrap().remedy.unwrap();
+        assert!(r.contains("sudo launchctl print system/net.noomesh.fetch") && r.contains("noo enroll --resume") && !r.contains("systemctl"), "{r}");
+        let mut unknown = polling(7200);
+        unknown["hostd"] = Value::Null;
+        let r = row(&unknown).unwrap().remedy.unwrap();
+        assert!(r.contains("systemctl status noo-fetch.timer") && r.contains("net.noomesh.fetch"), "{r}");
+    }
+
+    #[test]
+    fn a_restaged_bundle_is_aged_from_staging() {
+        let mut n = polling(0);
+        n[BUNDLE_STATUS_KEY] = json!({"staged_at": stamp(NOW - 7200), "fetched_at": null});
+        let c = row(&n).unwrap();
+        assert_eq!(c.verdict, Verdict::Warn, "a node that never sent a receipt since the restage is not failed");
+        assert!(c.detail.contains("no fetch receipt since the bundle was staged 2h ago"), "{}", c.detail);
+        n[BUNDLE_STATUS_KEY] = json!({"staged_at": stamp(NOW - 60), "fetched_at": null});
+        assert_eq!(row(&n).unwrap().verdict, Verdict::Ok);
+    }
+
+    #[test]
+    fn the_first_minutes_after_the_gateway_started_are_not_judged() {
+        let mut n = polling(7200);
+        n[GATEWAY_UPTIME_KEY] = 300.into();
+        let c = row(&n).unwrap();
+        assert_eq!(c.verdict, Verdict::Ok);
+        assert!(c.detail.starts_with("the controller started 5m ago"), "{}", c.detail);
+        n[GATEWAY_UPTIME_KEY] = BUNDLE_FETCH_GATEWAY_GRACE_SECS.into();
+        assert_eq!(row(&n).unwrap().verdict, Verdict::Fail, "past the grace the receipt age speaks");
+    }
+
+    #[test]
+    fn no_row_for_the_controller_an_offline_node_or_a_missing_bundle() {
+        let mut ctl = polling(7200);
+        ctl["self_node"] = true.into();
+        assert!(row(&ctl).is_none());
+        let mut off = polling(7200);
+        off["status"] = "offline".into();
+        assert!(row(&off).is_none());
+        let mut stale_beat = polling(7200);
+        stale_beat["last_heartbeat"] = stamp(NOW - 600).into();
+        assert!(row(&stale_beat).is_none(), "the online row speaks");
+        let mut no_beat = polling(7200);
+        no_beat.as_object_mut().unwrap().remove("last_heartbeat");
+        assert!(row(&no_beat).is_none());
+        let mut none = polling(7200);
+        none.as_object_mut().unwrap().remove(BUNDLE_STATUS_KEY);
+        assert!(row(&none).is_none(), "a 404 carries no status");
+    }
+
+    #[test]
+    fn node_checks_carry_the_bundle_fetch_row_only_with_the_status() {
+        let with = node_checks(&polling(7200), "", "", NOW, None);
+        assert!(with.iter().any(|c| c.name == "bundle fetch" && c.verdict == Verdict::Fail));
+        let mut bare = polling(7200);
+        bare.as_object_mut().unwrap().remove(BUNDLE_STATUS_KEY);
+        assert!(node_checks(&bare, "", "", NOW, None).iter().all(|c| c.name != "bundle fetch"));
+    }
+
+    fn refusing(refusals: Value) -> Value {
+        json!({"id": "node-a", "reconcile_refusals": refusals})
+    }
+
+    #[test]
+    fn an_unowned_refusal_warns_with_scope_target_reason_and_since() {
+        let c = reconcile_refusals_check("node-a", &refusing(json!([
+            {"scope": "placement_env", "target": "vllm/HF_TOKEN", "reason": "not a tuning key", "since": "2026-11-20T00:00:00Z"},
+            {"scope": "models_dir", "target": "/models", "reason": "not writable"},
+        ]))).unwrap();
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert_eq!(c.detail, "node-a: placement_env=vllm/HF_TOKEN: not a tuning key (since 2026-11-20T00:00:00Z) | models_dir=/models: not writable");
+        assert_eq!(c.remedy.as_deref(), Some("noo cluster show node-a   # the reason names its own fix"));
+    }
+
+    #[test]
+    fn owned_scopes_are_left_to_their_rows_and_none_means_no_row() {
+        let owned: Vec<Value> = OWNED_REFUSAL_SCOPES.iter().map(|s| json!({"scope": s, "target": "t", "reason": "r"})).collect();
+        assert!(reconcile_refusals_check("node-a", &refusing(Value::Array(owned))).is_none());
+        assert!(reconcile_refusals_check("node-a", &refusing(json!([]))).is_none());
+        assert!(reconcile_refusals_check("node-a", &json!({"id": "node-a"})).is_none());
+        let mixed = refusing(json!([
+            {"scope": "backend_tls", "target": "vllm", "reason": "no leaf"},
+            {"scope": "helper_image", "target": "img", "reason": "unstaged"},
+        ]));
+        let c = reconcile_refusals_check("node-a", &mixed).unwrap();
+        assert!(c.detail.contains("helper_image=img") && !c.detail.contains("backend_tls"), "{}", c.detail);
+    }
+
+    #[test]
+    fn an_ollama_env_refusal_says_what_is_missing_and_names_its_own_remedy() {
+        let reason = "the native Ollama is a boot service (/p/x.plist, root's), which this agent cannot edit, and it lacks OLLAMA_KEEP_ALIVE, OLLAMA_CONTEXT_LENGTH: run `noo enroll --resume` on that Mac to apply them; by hand instead: run `sudo plutil -replace EnvironmentVariables.OLLAMA_KEEP_ALIVE -string '-1' /p/x.plist; sudo launchctl bootstrap system /p/x.plist`";
+        let c = reconcile_refusals_check("node-a", &refusing(json!([{"scope": "ollama_env", "target": "ollama", "reason": reason}]))).unwrap();
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert_eq!(c.detail, "node-a: ollama_env=ollama: settings missing on the node's native Ollama (OLLAMA_KEEP_ALIVE, OLLAMA_CONTEXT_LENGTH); the node cannot write them itself");
+        assert_eq!(c.remedy.as_deref(), Some("on node-a: noo enroll --resume   # asks for the Mac's admin password"));
+        // An older agent's reason (no keys list) still reads whole.
+        let old = reconcile_refusals_check("node-a", &refusing(json!([{"scope": "ollama_env", "target": "ollama", "reason": "x".repeat(400)}]))).unwrap();
+        assert!(old.detail.contains("settings missing on the node's native Ollama;") && !old.detail.contains("xxx"), "{}", old.detail);
+        // Mixed with another scope: both remedies, the generic one for the other.
+        let mixed = reconcile_refusals_check("node-a", &refusing(json!([
+            {"scope": "ollama_env", "target": "ollama", "reason": reason},
+            {"scope": "models_dir", "target": "/m", "reason": "not writable"},
+        ]))).unwrap();
+        assert_eq!(mixed.remedy.as_deref(), Some("on node-a: noo enroll --resume   # asks for the Mac's admin password; noo cluster show node-a   # the reason names its own fix"));
+    }
+
+    #[test]
+    fn an_ollama_env_detail_names_all_six_keys_in_either_wording_and_falls_back_on_garbage() {
+        let six = "OLLAMA_NO_CLOUD, OLLAMA_CONTEXT_LENGTH, OLLAMA_KEEP_ALIVE, OLLAMA_HOST, OLLAMA_MODELS, OLLAMA_FLASH_ATTENTION";
+        let want = format!("node-a: ollama_env=ollama: settings missing on the node's native Ollama ({six}); the node cannot write them itself");
+        // The new wording and the OLD one (an agent not yet rolled) carry the same list.
+        let new = format!("the native Ollama is a boot service (/p/x.plist, root's), which this agent cannot edit, and it lacks {six}: run `noo enroll --resume` on this Mac to apply them; or by hand on the Mac run `sudo x`");
+        let old = format!("the native Ollama is a boot service (/p/x.plist, root's), which this agent cannot edit, and it lacks {six}: on the Mac run `sudo x`, or run `noo enroll --resume`");
+        for reason in [new, old] {
+            let c = reconcile_refusals_check("node-a", &refusing(json!([{"scope": "ollama_env", "target": "ollama", "reason": reason}]))).unwrap();
+            assert_eq!(c.detail, want);
+        }
+        // Garbled: no list, or a "list" that is not setting names.
+        for garbled in ["lacks", "and it lacks : run", "it lacks some words here: run", "and it lacks \u{0}\u{1}: x"] {
+            let c = reconcile_refusals_check("node-a", &refusing(json!([{"scope": "ollama_env", "target": "ollama", "reason": garbled}]))).unwrap();
+            assert_eq!(c.detail, "node-a: ollama_env=ollama: settings missing on the node's native Ollama; the node cannot write them itself", "{garbled}");
+        }
+        // More than the closed set: counted, not cut mid-name.
+        let many = (0..12).map(|i| format!("OLLAMA_K{i}")).collect::<Vec<_>>().join(", ");
+        let c = reconcile_refusals_check("node-a", &refusing(json!([{"scope": "ollama_env", "target": "ollama", "reason": format!("and it lacks {many}: x")}]))).unwrap();
+        assert!(c.detail.contains("12 settings missing") && c.detail.contains("OLLAMA_K0, OLLAMA_K1, OLLAMA_K2)"), "{}", c.detail);
+    }
+
+    #[test]
+    fn a_long_reason_is_truncated() {
+        let long = "x".repeat(400);
+        let c = reconcile_refusals_check("node-a", &refusing(json!([{"scope": "mcp_server", "target": "s", "reason": long}]))).unwrap();
+        assert!(c.detail.chars().count() < 260 && c.detail.contains('…'), "{}", c.detail);
+    }
+
+    #[test]
+    fn node_checks_carry_the_reconcile_refusals_row() {
+        let n = refusing(json!([{"scope": "ollama_env", "target": "OLLAMA_X", "reason": "r"}]));
+        assert!(node_checks(&n, "", "", NOW, None).iter().any(|c| c.name == "reconcile refusals"));
+        assert!(node_checks(&refusing(json!([])), "", "", NOW, None).iter().all(|c| c.name != "reconcile refusals"));
+    }
+
+    /// The owned list and the filters of the rows that own the scopes must
+    /// move together: a scope added to one place only fails here.
+    #[test]
+    fn the_owned_scope_list_matches_the_rows_that_own_them() {
+        let own = crate::test_src::own_code(include_str!("cluster_verify.rs"));
+        let mut read: Vec<String> = Vec::new();
+        for marker in ["pub(crate) fn backend_starts_check(", "pub(crate) fn backend_doors_check_with(", "pub(crate) fn nodes_refusing_model_cache_url("] {
+            let body = crate::test_src::fn_body(&own, marker);
+            let mut rest = body;
+            while let Some(i) = rest.find("[\"scope\"] == \"") {
+                rest = &rest[i + "[\"scope\"] == \"".len()..];
+                let end = rest.find('"').unwrap();
+                read.push(rest[..end].to_string());
+            }
+        }
+        read.sort();
+        read.dedup();
+        let mut listed: Vec<String> = OWNED_REFUSAL_SCOPES.iter().map(|s| s.to_string()).collect();
+        listed.sort();
+        assert_eq!(read, listed, "a refusal scope an existing row reads must be in OWNED_REFUSAL_SCOPES, and the list holds no scope no row reads");
+    }
+
+    fn stale_egress(n_extra: Option<i64>, checked: Option<i64>) -> Value {
+        let mut e = json!({"state": "stale", "reason": "held, but the harness cannot reach the gateway at 10.0.0.5:8443 from inside its hold (the allow list may be stale): re-apply",
+            "stale_hosts": []});
+        if let Some(a) = checked {
+            e["checked_age_secs"] = a.into();
+        }
+        let mut n = json!({"id": "node-a", "self_node": false, "host_services": {"harness": {"state": "running", "egress": e}}});
+        if let Some(up) = n_extra {
+            n[GATEWAY_UPTIME_KEY] = up.into();
+        }
+        n
+    }
+
+    #[test]
+    fn a_stale_egress_check_that_ran_while_the_controller_was_down_is_starting() {
+        let c = harness_egress_check("node-a", &stale_egress(Some(90), Some(50))).unwrap();
+        assert_eq!(c.verdict, Verdict::Starting);
+        assert_eq!(c.detail, "the controller started 90s ago; the harness's last check (50s ago) ran while it was down; the harness re-checks every 60 s");
+        assert_eq!(c.remedy.as_deref(), Some("noo cluster verify --wait"));
+        // A check older than the gateway itself is the same case.
+        assert_eq!(harness_egress_check("node-a", &stale_egress(Some(30), Some(55))).unwrap().verdict, Verdict::Starting);
+    }
+
+    #[test]
+    fn a_stale_egress_check_made_after_the_gateway_was_up_still_fails() {
+        // 400/300: a check loop that died shows uptime and age growing together.
+        for (up, checked) in [(400, Some(40)), (170, Some(50)), (90, None), (400, Some(300)), (300, Some(250))] {
+            let c = harness_egress_check("node-a", &stale_egress(Some(up), checked)).unwrap();
+            assert_eq!(c.verdict, Verdict::Fail, "uptime {up}, checked {checked:?}");
+            assert!(c.detail.contains("cannot reach the gateway at 10.0.0.5:8443"), "{}", c.detail);
+            assert!(c.remedy.as_deref().unwrap().starts_with("noo cluster provision node-a"));
+        }
+        let unknown_uptime = harness_egress_check("node-a", &stale_egress(None, Some(50))).unwrap();
+        assert_eq!(unknown_uptime.verdict, Verdict::Fail);
+        assert_eq!(harness_egress_check("node-a", &stale_egress(Some(299), Some(250))).unwrap().verdict, Verdict::Starting, "just under the cap");
+    }
+
+    #[test]
+    fn wait_keeps_polling_while_the_egress_row_is_starting() {
+        let mut n = stale_egress(Some(90), Some(50));
+        n["status"] = "online".into();
+        assert!(warmup::node_still_starting(&n, NOW));
+        n[GATEWAY_UPTIME_KEY] = 400.into();
+        assert!(!warmup::node_still_starting(&n, NOW), "past the cap the wait ends and the row fails");
+        n.as_object_mut().unwrap().remove(GATEWAY_UPTIME_KEY);
+        assert!(!warmup::node_still_starting(&n, NOW));
+    }
+
+    #[test]
+    fn the_fleet_run_injects_the_uptime_and_the_bundle_status() {
+        let own = crate::test_src::own_code(include_str!("cluster_verify.rs"));
+        let run = crate::test_src::fn_body(&own, "pub fn cluster_verify(");
+        assert!(run.contains("par_map(&selected, |n| with_harness_wanted(g, n, gateway_uptime))"));
+        assert!(own.contains("with_harness_wanted(g, &n, uptime_from_metrics(read_gateway_metrics(g).as_deref(), now_unix()))"), "the single-node path injects the uptime too");
+        let metrics = run.find("read_gateway_metrics(g)").expect("the metrics read");
+        let node_loop = run.find("for (n, wanted) in selected.iter().zip(&enriched)").expect("the node loop");
+        assert!(metrics < node_loop, "the gateway start time must be read before the node loop");
+        let inject = crate::test_src::fn_body(&own, "fn with_harness_wanted(");
+        assert!(inject.contains("obj.insert(BUNDLE_STATUS_KEY.into(), b);"));
+        assert!(inject.contains("obj.insert(GATEWAY_UPTIME_KEY.into(), up.into());"));
     }
 }

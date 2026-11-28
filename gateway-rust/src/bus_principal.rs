@@ -781,6 +781,10 @@ mod publish_sites {
         "mesh/router.rs",
         "tasks.rs",
         "coordinator/dispatch.rs",
+        // A cancelled turn's stop message: published only on
+        // `harness.run.<node>`, built by `harness_run_subject` inside the file
+        // (its publish function is private and takes no caller subject).
+        "coordinator/turn_cancel.rs",
         "agent_messages.rs",
         "routes/admin.rs",
         "routes/cluster.rs",

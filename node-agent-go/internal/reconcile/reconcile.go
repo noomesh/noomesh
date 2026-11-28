@@ -146,6 +146,12 @@ type desiredConfig struct {
 	// job executor) send the same value, so nothing reloads the model at
 	// another context. Absent on an older gateway or when nothing is decided.
 	ChatContexts map[string]int `json:"chat_contexts"`
+	// The engine window the controller works out for each vLLM and
+	// llama.cpp chat model here (i1411): {"<model>": tokens}. Only the
+	// node's harness reads it (GET /harness/placement `chat_windows`), to fit
+	// a turn to the engine's real window; the agent sends nothing with it.
+	// Absent on an older gateway or when no such placement is readable.
+	ChatWindows map[string]int `json:"chat_windows"`
 	// This node's explicit unplaces (reap_unplaced.go): the ONLY thing the
 	// agent removes a backend container on. Absent on a controller that
 	// predates it, which then never has a container removed.
@@ -229,6 +235,9 @@ type Reconciler struct {
 	// chatContexts is desired-config's `chat_contexts` (ChatContext), keyed
 	// by chatContextKey. Guarded by harnessMu.
 	chatContexts map[string]int
+	// chatWindows is desired-config's `chat_windows` (ChatWindows), keyed by
+	// the model name as placed. Guarded by harnessMu.
+	chatWindows map[string]int
 	// harness is the ONE host service this node regulates:
 	// started and stopped per placement through the applier's sudoers
 	// grant, never a container and never a child of this process.
@@ -683,6 +692,7 @@ func (r *Reconciler) publishProfileAndEmbedTarget(ctx context.Context, t *tick) 
 	declareAddonWorkloads(t.desired)
 	r.recordChatPlacement(t.desired.Placements)
 	r.recordChatContexts(t.desired.ChatContexts)
+	r.recordChatWindows(t.desired.ChatWindows)
 	publishLanePlacements(t.desired.Placements)
 	publishKeepWarm(t.desired.Placements)
 	// Before the empty-state return below: a node with nothing placed still

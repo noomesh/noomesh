@@ -157,9 +157,15 @@ async fn handle_chat(
         let _ = guard_writer.send_close(reason).await;
     });
 
+    // Messages that arrived while a turn ran, in order; handled before the
+    // socket is read again, so a next message sent mid-turn is not lost.
+    let mut held: std::collections::VecDeque<Message> = std::collections::VecDeque::new();
     loop {
         // Client message or timeout (keepalive)
-        let msg = tokio::time::timeout(std::time::Duration::from_secs(30), stream.next()).await;
+        let msg = match held.pop_front() {
+            Some(m) => Ok(Some(Ok(m))),
+            None => tokio::time::timeout(std::time::Duration::from_secs(30), stream.next()).await,
+        };
         match msg {
             Ok(Some(Ok(Message::Text(text)))) => {
                 let chat_msg: ChatMessage = match serde_json::from_str(&text) {
@@ -248,21 +254,34 @@ async fn handle_chat(
                 // it is alive: its frames can be minutes apart, and the console
                 // gives up on a silent turn (0.6.15: Send stayed disabled).
                 let ka_writer = writer.clone();
-                let outcome = match crate::websocket::run_turn_with_keepalive(
+                // The client is read meanwhile: its `Close`, the end of the
+                // stream or a keepalive that cannot be sent drops the turn
+                // (i1379), as the HTTP route does with `AbortTurnOnDrop`.
+                let outcome = match crate::websocket::run_turn_watching_client(
                     run,
                     gate.revoked(),
                     crate::websocket::TURN_KEEPALIVE,
                     || {
                         let w = ka_writer.clone();
-                        async move {
-                            let _ = w.send_keepalive().await;
-                        }
+                        async move { w.send_keepalive().await }
                     },
+                    &mut stream,
+                    |m: &Message| match m {
+                        Message::Close(_) => crate::websocket::Inbound::Close,
+                        Message::Ping(_) | Message::Pong(_) => crate::websocket::Inbound::Ignore,
+                        Message::Text(t) => crate::websocket::Inbound::Hold(t.len()),
+                        Message::Binary(b) => crate::websocket::Inbound::Hold(b.len()),
+                    },
+                    &mut held,
                 )
                 .await
                 {
-                    Some(r) => r,
-                    None => {
+                    crate::websocket::TurnEnd::Done(r) => r,
+                    crate::websocket::TurnEnd::ClientGone => {
+                        tracing::info!(user_id = %user_id, conv_id = %conv_id, "ws_coordinator turn aborted: client gone");
+                        break;
+                    }
+                    crate::websocket::TurnEnd::Revoked => {
                         tracing::info!(user_id = %user_id, conv_id = %conv_id, "ws_coordinator turn dropped: session revoked");
                         // The turn in flight owns the console's last reply: end
                         // it there, so the composer unlocks even when the 4401
@@ -366,6 +385,27 @@ mod tests {
             run < 400,
             "run_streaming is no longer inside the principal scope"
         );
+    }
+
+    /// i1379: the turn is read alongside its client, and messages that
+    /// arrived mid-turn are handled before the socket is read again.
+    #[test]
+    fn the_turn_is_watched_for_its_client_and_mid_turn_messages_are_kept() {
+        let src = code();
+        let body = crate::test_src::fn_body(&src, "async fn handle_chat(");
+        assert!(body.contains("run_turn_watching_client("), "the turn no longer reads its client");
+        assert!(!body.contains("run_turn_with_keepalive("), "the turn is back to ignoring its client");
+        assert!(body.contains("TurnEnd::ClientGone"), "a client that left is no longer handled apart");
+        assert!(body.contains("held.pop_front()"), "messages held mid-turn are no longer handled first");
+        // Held messages are drained BEFORE the socket is read again.
+        let pop = body.find("held.pop_front()").unwrap();
+        let read = body.find("stream.next()").expect("the loop no longer reads the socket");
+        assert!(pop < read, "the socket is read before the held messages are drained");
+        // A client that left gets no further frame: its arm breaks before any send.
+        let gone = body.find("TurnEnd::ClientGone =>").expect("no ClientGone arm");
+        let arm = &body[gone..];
+        let brk = arm.find("break;").expect("the ClientGone arm no longer ends the loop");
+        assert!(!arm[..brk].contains("send"), "the ClientGone arm writes to a dead socket");
     }
 
     #[test]

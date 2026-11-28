@@ -475,6 +475,7 @@ func (a *Agent) Run() error {
 		}
 		hp.ModelContext = rec.ChatContextWindow(prof)
 		hp.ChatContexts = rec.ChatContexts()
+		hp.ChatWindows = rec.ChatWindows()
 		return hp
 	})
 

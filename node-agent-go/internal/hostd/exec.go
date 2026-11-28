@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 // Runner executes a host command. It exists as an interface for one reason:
@@ -51,6 +52,12 @@ func (ExecRunner) Run(ctx context.Context, dir string, extraEnv []string, name s
 	var errBuf bytes.Buffer
 	cmd.Stdout = io.Discard
 	cmd.Stderr = &errBuf
+	// A deadline kills the shell, but a child it started (a bounded docker
+	// call) can still hold the stderr pipe: WaitDelay closes the pipe so Run
+	// returns. (No process group: Setpgid changes the error Go reports for a
+	// missing working directory, which TestAMissingWorkingDirIsReportedNotSilent
+	// pins; each child carries its own bound instead.)
+	cmd.WaitDelay = 5 * time.Second
 	err := cmd.Run()
 	stderr := strings.TrimSpace(errBuf.String())
 	if err != nil && stderr == "" {

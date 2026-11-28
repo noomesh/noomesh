@@ -5,7 +5,8 @@
 //! gateway). Ports the Python surface in `noomesh/security_cli.py`:
 //! init, status, issue (node), issue-service, issue-gateway, rotate; plus
 //! `fix-modes` (private-key modes by reader, `pki::KeyReader`).
-//! `rotate-all` (rotation + docker restarts + health probe + auto-revert)
+//! `rotate-all` (rotation + docker restarts + health probe at the gateway's bound
+//! address + auto-revert, only when the gate reports a failure)
 //! lives in `commands/security.rs` with the rest of the WP-B1 surface.
 //!
 //! Profile-fidelity notes live in `src/pki.rs`; the compat proof against
